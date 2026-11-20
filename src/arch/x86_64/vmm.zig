@@ -1,5 +1,5 @@
-const limine = @import("limine.zig");
-const pmm = @import("pmm.zig");
+const limine = @import("../../boot/limine.zig");
+const pmm = @import("../../kernel/pmm.zig");
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;

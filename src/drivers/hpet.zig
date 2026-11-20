@@ -1,6 +1,6 @@
 const std = @import("std");
-const acpi = @import("acpi.zig");
-const vmm = @import("vmm.zig");
+const acpi = @import("../firmware/acpi.zig");
+const vmm = @import("../arch/x86_64/vmm.zig");
 
 var base: usize = 0;
 var period_fs: u64 = 0; // femtoseconds per counter tick

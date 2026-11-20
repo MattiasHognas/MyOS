@@ -1,7 +1,7 @@
 const std = @import("std");
 const root = @import("root"); // main.zig: print, halt
 const gdt = @import("gdt.zig");
-const apic = @import("../../apic.zig");
+const apic = @import("../../arch/x86_64/apic.zig");
 
 // ---- IDT table ----
 const Entry = extern struct {

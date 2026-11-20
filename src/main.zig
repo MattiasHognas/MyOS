@@ -1,17 +1,17 @@
 const std = @import("std");
-const limine = @import("limine.zig");
-const serial = @import("arch/x86_64/serial.zig");
+const limine = @import("boot/limine.zig");
+const serial = @import("drivers/serial.zig");
 const console = @import("kernel/console.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
 const idt = @import("arch/x86_64/idt.zig");
-const pmm = @import("pmm.zig");
-const vmm = @import("vmm.zig");
-const heap = @import("heap.zig");
-const acpi = @import("acpi.zig");
-const apic = @import("apic.zig");
-const cpu = @import("cpu.zig");
-const hpet = @import("hpet.zig");
-const keyboard = @import("keyboard.zig");
+const pmm = @import("kernel/pmm.zig");
+const vmm = @import("arch/x86_64/vmm.zig");
+const heap = @import("kernel/heap.zig");
+const acpi = @import("firmware/acpi.zig");
+const apic = @import("arch/x86_64/apic.zig");
+const cpu = @import("arch/x86_64/cpu.zig");
+const hpet = @import("drivers/hpet.zig");
+const keyboard = @import("drivers/ps2_keyboard.zig");
 
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};

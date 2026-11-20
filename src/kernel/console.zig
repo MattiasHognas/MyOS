@@ -1,5 +1,5 @@
 const std = @import("std");
-const limine = @import("../limine.zig");
+const limine = @import("../boot/limine.zig");
 
 const Font = struct { w: usize, h: usize, bpg: usize, glyphs: []const u8 };
 

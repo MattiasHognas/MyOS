@@ -1,7 +1,7 @@
 const cpu = @import("cpu.zig");
 const vmm = @import("vmm.zig");
-const acpi = @import("acpi.zig");
-const hpet = @import("hpet.zig");
+const acpi = @import("../../firmware/acpi.zig");
+const hpet = @import("../../drivers/hpet.zig");
 
 pub const IRQ_BASE: u8 = 32; // legacy IRQ n -> vector 32 + n
 pub const SPURIOUS: u8 = 0xFF;

@@ -1,6 +1,6 @@
 const std = @import("std");
 const root = @import("root");
-const pmm = @import("pmm.zig");
+const pmm = @import("../kernel/pmm.zig");
 
 fn r16(b: []const u8, o: usize) u16 {
     return std.mem.readInt(u16, b[o..][0..2], .little);

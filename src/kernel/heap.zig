@@ -1,6 +1,6 @@
 const std = @import("std");
-const pmm = @import("pmm.zig");
-const vmm = @import("vmm.zig");
+const pmm = @import("../kernel/pmm.zig");
+const vmm = @import("../arch/x86_64/vmm.zig");
 
 // Below this: HHDM (covers up to 16 TiB of RAM). Above: kernel image.
 const HEAP_START: usize = 0xFFFF_9000_0000_0000;

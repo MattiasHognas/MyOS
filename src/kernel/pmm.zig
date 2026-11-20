@@ -1,4 +1,4 @@
-const limine = @import("limine.zig");
+const limine = @import("../boot/limine.zig");
 
 pub const PAGE_SIZE = 4096;
 
