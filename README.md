@@ -2,7 +2,10 @@
 
 My own operating system
 
-## Delopment
+## Docs
+[Specs x86-64 (cheat sheet)](docs/specs-x86_64.md) 
+
+## Dev
 
 Install packages
 ```bash
