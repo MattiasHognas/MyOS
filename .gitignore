@@ -1,12 +1,11 @@
-# zig build artifacts
+# Build artifacts
 .zig-cache/
 zig-out/
 zig-pkg/
 *.o
+*.iso
+iso_root/
+initrd/
 
 # assets
 font.psf
-
-# iso files
-*.iso
-iso_root/

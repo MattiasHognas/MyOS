@@ -7,6 +7,13 @@ LIMINE=/usr/share/limine
 rm -rf iso_root
 mkdir -p iso_root/boot/limine iso_root/EFI/BOOT
 
+rm -rf initrd
+mkdir -p initrd/bin initrd/etc
+
+cp zig-out/bin/hello.elf initrd/bin/hello
+echo "Welcome to MyOS!" > initrd/etc/motd
+tar --format=ustar -cf iso_root/boot/initrd.tar -C initrd .
+
 cp zig-out/bin/kernel.elf iso_root/boot/
 cp limine.conf "$LIMINE"/limine-{bios.sys,bios-cd.bin,uefi-cd.bin} iso_root/boot/limine/
 cp "$LIMINE"/BOOTX64.EFI iso_root/EFI/BOOT/

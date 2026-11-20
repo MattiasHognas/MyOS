@@ -16,6 +16,8 @@ const thread = @import("kernel/thread.zig");
 const context = @import("arch/x86_64/context.zig");
 const syscall = @import("kernel/syscall.zig");
 const process = @import("kernel/process.zig");
+const vfs = @import("kernel/vfs.zig");
+const tarfs = @import("kernel/fs/tarfs.zig");
 
 export var module_request linksection(".limine_requests") = limine.ModuleRequest{};
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
@@ -62,6 +64,15 @@ pub const panic = std.debug.FullPanic(kernelPanic);
 
 const USER_CODE: u64 = 0x40_0000; // 4 MiB
 const USER_STACK: u64 = 0x80_0000; // top of the user stack (8 MiB)
+
+fn findModule(name: []const u8) ?[]const u8 {
+    const mods = response(&module_request);
+    for (mods.modules[0..mods.module_count]) |m| {
+        if (std.mem.endsWith(u8, std.mem.span(m.path), name))
+            return @as([*]const u8, @ptrFromInt(m.address))[0..m.size];
+    }
+    return null;
+}
 
 fn userThread() void {
     const code = pmm.alloc() orelse @panic("out of memory");
@@ -200,6 +211,10 @@ export fn kmain() callconv(.c) noreturn {
     print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
 
     syscall.init();
+
+    const initrd = findModule("initrd.tar") orelse @panic("no initrd.tar module");
+    vfs.mountRoot(tarfs.init(initrd));
+    _ = process.spawnPath("/bin/hello") catch |e| print("failed to start /bin/hello: {s}\n", .{@errorName(e)});
 
     const mods = response(&module_request);
     for (mods.modules[0..mods.module_count]) |m| {

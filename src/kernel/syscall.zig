@@ -1,7 +1,12 @@
 const root = @import("root");
 const thread = @import("thread.zig");
 const arch = @import("../arch/x86_64/syscall.zig");
+const heap = @import("heap.zig");
+const vfs = @import("vfs.zig");
 
+pub const OPEN = 4;
+pub const READ = 5;
+pub const CLOSE = 6;
 pub const WRITE = 0;
 pub const EXIT = 1;
 pub const YIELD = 2;
@@ -10,19 +15,58 @@ pub const GETTID = 3;
 const USER_END: u64 = 0x0000_8000_0000_0000; // user space is the lower half
 const ERR: u64 = @bitCast(@as(i64, -1));
 
+fn userSlice(ptr: u64, len: u64, max: u64) ?[]u8 {
+    if (len > max or ptr >= USER_END or ptr + len > USER_END) return null;
+    return @as([*]u8, @ptrFromInt(ptr))[0..len];
+}
+
 fn sysWrite(ptr: u64, len: u64) u64 {
-    // Never trust a pointer from user space: it must lie entirely in the lower half.
-    if (len > 4096 or ptr >= USER_END or ptr + len > USER_END) return ERR;
-    const s: [*]const u8 = @ptrFromInt(ptr);
+    const s = userSlice(ptr, len, 4096) orelse return ERR;
     var off: usize = 0;
-    while (off < len) : (off += 256) { // print's buffer is 512 bytes
-        root.print("{s}", .{s[off..@min(off + 256, len)]});
-    }
+    while (off < s.len) : (off += 256) root.print("{s}", .{s[off..@min(off + 256, s.len)]});
     return len;
+}
+
+fn fileOf(fd: u64) ?*vfs.OpenFile {
+    const p = thread.current().process orelse return null;
+    if (fd >= p.files.len) return null;
+    return p.files[fd];
+}
+
+fn sysOpen(ptr: u64, len: u64) u64 {
+    const path = userSlice(ptr, len, 256) orelse return ERR;
+    const node = vfs.lookup(path) orelse return ERR;
+    const p = thread.current().process orelse return ERR;
+    for (&p.files, 0..) |*slot, fd| {
+        if (slot.* != null) continue;
+        const of = heap.allocator.create(vfs.OpenFile) catch return ERR;
+        of.* = .{ .node = node };
+        slot.* = of;
+        return fd;
+    }
+    return ERR; // fd table full
+}
+
+fn sysRead(fd: u64, ptr: u64, len: u64) u64 {
+    const of = fileOf(fd) orelse return ERR;
+    const buf = userSlice(ptr, len, 1 << 20) orelse return ERR;
+    const n = vfs.read(&of.node, of.offset, buf);
+    of.offset += n;
+    return n; // 0 = end of file
+}
+
+fn sysClose(fd: u64) u64 {
+    const of = fileOf(fd) orelse return ERR;
+    heap.allocator.destroy(of);
+    thread.current().process.?.files[fd] = null;
+    return 0;
 }
 
 fn dispatch(f: *arch.Frame) void {
     f.rax = switch (f.rax) {
+        OPEN => sysOpen(f.rdi, f.rsi),
+        READ => sysRead(f.rdi, f.rsi, f.rdx),
+        CLOSE => sysClose(f.rdi),
         WRITE => sysWrite(f.rdi, f.rsi),
         EXIT => {
             root.print("[thread {d}] exit({d})\n", .{ thread.id(), f.rdi });

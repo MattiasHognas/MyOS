@@ -5,7 +5,8 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
 const arch_syscall = @import("../arch/x86_64/syscall.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
-const Process = @import("process.zig").Process;
+const proc = @import("process.zig"); // the file: for proc.destroy
+const Process = proc.Process; // the struct: for fields and parameters
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;
@@ -50,10 +51,7 @@ var zombies: ?*Thread = null;
 fn reap() void {
     while (zombies) |z| {
         zombies = z.next;
-        if (z.process) |p| {
-            vmm.destroyAddressSpace(p.root); // safe: we already switched CR3 away
-            heap.allocator.destroy(p);
-        }
+        if (z.process) |p| proc.destroy(p);
         heap.allocator.free(z.stack.?);
         heap.allocator.destroy(z);
     }
