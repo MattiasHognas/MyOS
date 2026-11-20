@@ -10,6 +10,7 @@ const heap = @import("heap.zig");
 const acpi = @import("acpi.zig");
 const apic = @import("apic.zig");
 const cpu = @import("cpu.zig");
+const hpet = @import("hpet.zig");
 
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};
@@ -17,6 +18,13 @@ export var memmap_request linksection(".limine_requests") = limine.MemmapRequest
 export var hhdm_request linksection(".limine_requests") = limine.HhdmRequest{};
 export var kaddr_request linksection(".limine_requests") = limine.KernelAddressRequest{};
 export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
+
+var ticks: u64 = 0;
+
+fn onTick(_: *idt.Frame) void {
+    ticks += 1;
+    if (ticks % 100 == 0) print("uptime: {d} s\n", .{ticks / 100});
+}
 
 fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
     const v: *volatile @TypeOf(req.*) = req;
@@ -68,8 +76,16 @@ export fn kmain() callconv(.c) noreturn {
     acpi.init(response(&rsdp_request).address, hhdm);
 
     apic.init();
+
+    hpet.init();
+    idt.register(apic.TIMER_VECTOR, onTick);
+    apic.timerInit(100);
+    print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
+
     idt.register(apic.IRQ_BASE + 1, keyboard);
     apic.route(1, apic.IRQ_BASE + 1);
     print("Boot complete. Press keys in the QEMU window.\n", .{});
     idle();
 }
+
+// in kmain, after apic.init():

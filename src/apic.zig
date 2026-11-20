@@ -1,9 +1,13 @@
 const cpu = @import("cpu.zig");
 const vmm = @import("vmm.zig");
 const acpi = @import("acpi.zig");
+const hpet = @import("hpet.zig");
 
 pub const IRQ_BASE: u8 = 32; // legacy IRQ n -> vector 32 + n
 pub const SPURIOUS: u8 = 0xFF;
+pub const TIMER_VECTOR: u8 = 48; // just past the legacy IRQ range (32-47)
+
+pub var ticks_per_ms: u32 = 0;
 
 var lapic: usize = 0;
 var ioapic: usize = 0;
@@ -86,4 +90,18 @@ pub fn route(irq: u8, vector: u8) void {
     const idx = gsi - ioapic_gsi_base;
     ioWrite(0x11 + 2 * idx, @as(u32, id()) << 24); // destination LAPIC
     ioWrite(0x10 + 2 * idx, low); // write low last: unmasks it
+}
+
+pub fn timerInit(hz: u32) void {
+    lapicReg(0x3E0).* = 0x3; // divide the bus clock by 16
+    lapicReg(0x320).* = 1 << 16; // masked, one-shot: measure only
+    lapicReg(0x380).* = 0xFFFF_FFFF; // start counting down
+
+    hpet.sleepNs(10_000_000); // 10 ms
+
+    const elapsed = 0xFFFF_FFFF - lapicReg(0x390).*;
+    ticks_per_ms = elapsed / 10;
+
+    lapicReg(0x320).* = @as(u32, TIMER_VECTOR) | (1 << 17); // periodic, unmasked
+    lapicReg(0x380).* = @intCast(@as(u64, ticks_per_ms) * 1000 / hz);
 }
