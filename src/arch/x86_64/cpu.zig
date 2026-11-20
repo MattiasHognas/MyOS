@@ -6,6 +6,21 @@ pub fn outb(port: u16, val: u8) void {
     );
 }
 
+pub fn outl(port: u16, val: u32) void {
+    asm volatile ("outl %[val], %[port]"
+        :
+        : [val] "{eax}" (val),
+          [port] "N{dx}" (port),
+    );
+}
+
+pub fn inl(port: u16) u32 {
+    return asm volatile ("inl %[port], %[ret]"
+        : [ret] "={eax}" (-> u32),
+        : [port] "N{dx}" (port),
+    );
+}
+
 pub fn inb(port: u16) u8 {
     return asm volatile ("inb %[port], %[ret]"
         : [ret] "={al}" (-> u8),

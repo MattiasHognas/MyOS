@@ -18,6 +18,8 @@ const syscall = @import("kernel/syscall.zig");
 const process = @import("kernel/process.zig");
 const vfs = @import("kernel/vfs.zig");
 const tarfs = @import("kernel/fs/tarfs.zig");
+const pci = @import("drivers/pci.zig");
+const nvme = @import("drivers/nvme.zig");
 
 export var module_request linksection(".limine_requests") = limine.ModuleRequest{};
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
@@ -65,6 +67,14 @@ pub const panic = std.debug.FullPanic(kernelPanic);
 const USER_CODE: u64 = 0x40_0000; // 4 MiB
 const USER_STACK: u64 = 0x80_0000; // top of the user stack (8 MiB)
 
+fn diskTest(dev: pci.Device) void {
+    nvme.init(dev) catch |e| return print("nvme init failed: {s}\n", .{@errorName(e)});
+    var sector: [4096]u8 = undefined;
+    nvme.read(0, 1, &sector) catch |e| return print("nvme read failed: {s}\n", .{@errorName(e)});
+    const end = std.mem.indexOfScalar(u8, &sector, 0) orelse 64;
+    print("disk LBA 0: \"{s}\"\n", .{sector[0..end]});
+}
+
 fn findModule(name: []const u8) ?[]const u8 {
     const mods = response(&module_request);
     for (mods.modules[0..mods.module_count]) |m| {
@@ -72,54 +82,6 @@ fn findModule(name: []const u8) ?[]const u8 {
             return @as([*]const u8, @ptrFromInt(m.address))[0..m.size];
     }
     return null;
-}
-
-fn userThread() void {
-    const code = pmm.alloc() orelse @panic("out of memory");
-    const stack = pmm.alloc() orelse @panic("out of memory");
-
-    const len = @intFromPtr(&user_prog_end) - @intFromPtr(&user_prog_start);
-    const src: [*]const u8 = @ptrCast(&user_prog_start);
-    @memcpy(pmm.physToVirt(code)[0..len], src[0..len]);
-
-    vmm.map(vmm.kernel_root, USER_CODE, code, vmm.USER, false); // read + execute
-    vmm.map(vmm.kernel_root, USER_STACK - pmm.PAGE_SIZE, stack, vmm.USER | vmm.WRITABLE | vmm.NX, false);
-
-    print("[thread {d}] entering ring 3\n", .{thread.id()});
-    context.enterUser(USER_CODE, USER_STACK);
-}
-
-fn spin(tag: u8) void {
-    var last = @atomicLoad(u64, &ticks, .monotonic);
-    while (true) {
-        const now = @atomicLoad(u64, &ticks, .monotonic);
-        if (now - last >= 200) { // 200 ticks = 2 s at 100 Hz
-            print("[{c}]", .{tag});
-            last = now;
-        }
-    }
-}
-
-fn spinA() void {
-    spin('A');
-}
-
-fn spinB() void {
-    spin('B');
-}
-
-fn ping() void {
-    for (0..3) |i| {
-        print("[thread {d}] ping {d}\n", .{ thread.id(), i });
-        thread.yield();
-    }
-}
-
-fn pong() void {
-    for (0..3) |i| {
-        print("[thread {d}] pong {d}\n", .{ thread.id(), i });
-        thread.yield();
-    }
 }
 
 fn onTick(_: *idt.Frame) void {
@@ -135,10 +97,6 @@ fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
 fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
     print("PANIC: {s}\n", .{msg});
     halt();
-}
-
-fn idle() noreturn {
-    while (true) asm volatile ("sti; hlt"); // sleep until the next interrupt
 }
 
 fn shell() noreturn {
@@ -206,6 +164,10 @@ export fn kmain() callconv(.c) noreturn {
     apic.init();
 
     hpet.init();
+
+    pci.scan();
+    if (pci.find(0x01, 0x08, 0x02)) |dev| diskTest(dev) else print("no NVMe controller\n", .{});
+
     idt.register(apic.TIMER_VECTOR, onTick);
     apic.timerInit(100);
     print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
@@ -215,14 +177,6 @@ export fn kmain() callconv(.c) noreturn {
     const initrd = findModule("initrd.tar") orelse @panic("no initrd.tar module");
     vfs.mountRoot(tarfs.init(initrd));
     _ = process.spawnPath("/bin/hello") catch |e| print("failed to start /bin/hello: {s}\n", .{@errorName(e)});
-
-    const mods = response(&module_request);
-    for (mods.modules[0..mods.module_count]) |m| {
-        const path = std.mem.span(m.path);
-        const image = @as([*]const u8, @ptrFromInt(m.address))[0..m.size];
-        print("starting {s} ({d} bytes)\n", .{ path, m.size });
-        _ = process.spawn(path, image) catch |e| print("  failed: {s}\n", .{@errorName(e)});
-    }
 
     keyboard.init();
     print("Boot complete.\n", .{});

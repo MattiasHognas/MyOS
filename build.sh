@@ -20,6 +20,11 @@ cp "$LIMINE"/BOOTX64.EFI iso_root/EFI/BOOT/
 
 cp zig-out/bin/hello.elf iso_root/boot/
 
+if [ ! -f disk.img ]; then
+    truncate -s 64M disk.img
+    printf 'Hello from the NVMe disk!' | dd of=disk.img conv=notrunc status=none
+fi
+
 xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
   -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
   -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \

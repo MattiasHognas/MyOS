@@ -6,6 +6,7 @@ zig-pkg/
 *.iso
 iso_root/
 initrd/
+disk.img
 
 # assets
 font.psf

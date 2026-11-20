@@ -27,5 +27,7 @@ Run iso
 ```bash
 qemu-system-x86_64 -M q35 -m 2G -cdrom os.iso \
   -bios /usr/share/edk2/x64/OVMF.4m.fd \
-  -serial stdio -no-reboot -no-shutdown
+  -serial stdio -no-reboot -no-shutdown -enable-kvm \
+  -drive file=disk.img,if=none,id=nvm,format=raw \
+  -device nvme,serial=myos0001,drive=nvm
 ```
