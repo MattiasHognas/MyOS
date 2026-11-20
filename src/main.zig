@@ -14,6 +14,7 @@ const hpet = @import("drivers/hpet.zig");
 const keyboard = @import("drivers/ps2_keyboard.zig");
 const thread = @import("kernel/thread.zig");
 const context = @import("arch/x86_64/context.zig");
+const syscall = @import("kernel/syscall.zig");
 
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};
@@ -24,20 +25,29 @@ export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
 
 var ticks: u64 = 0;
 
-// The user program as raw machine code. It gets copied into a user page,
-// because the kernel's own .text isn't mapped with the USER bit.
+// write("Hello from ring 3!\n") and yield, three times, then exit(0).
 comptime {
     asm (
         \\.section .rodata
         \\.global user_prog_start
         \\user_prog_start:
-        \\  xor %rax, %rax
+        \\  mov $3, %r12d
         \\1:
-        \\  inc %rax
-        \\  cmp $100000000, %rax
-        \\  jne 1b
-        \\  cli
-        \\  jmp .
+        \\  mov $0, %eax
+        \\  lea user_msg(%rip), %rdi
+        \\  mov $(user_msg_end - user_msg), %esi
+        \\  syscall
+        \\  mov $2, %eax
+        \\  syscall
+        \\  dec %r12d
+        \\  jnz 1b
+        \\  mov $1, %eax
+        \\  xor %edi, %edi
+        \\  syscall
+        \\  ud2
+        \\user_msg:
+        \\  .ascii "Hello from ring 3!\n"
+        \\user_msg_end:
         \\.global user_prog_end
         \\user_prog_end:
     );
@@ -187,6 +197,7 @@ export fn kmain() callconv(.c) noreturn {
     apic.timerInit(100);
     print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
 
+    syscall.init();
     _ = thread.spawn(userThread) catch @panic("spawn failed");
 
     keyboard.init();

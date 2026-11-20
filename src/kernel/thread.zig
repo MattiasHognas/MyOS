@@ -3,6 +3,7 @@ const heap = @import("heap.zig");
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
+const arch_syscall = @import("../arch/x86_64/syscall.zig"); // at the top
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;
@@ -88,7 +89,11 @@ pub fn yield() void {
     current = next;
     slice_left = SLICE_TICKS;
 
-    if (next.stack) |s| gdt.setKernelStack(@intFromPtr(s.ptr) + s.len);
+    if (next.stack) |s| {
+        const top = @intFromPtr(s.ptr) + s.len;
+        gdt.setKernelStack(top); // for interrupts from ring 3
+        arch_syscall.setKernelStack(top); // for syscalls
+    }
 
     context.switchTo(&prev.rsp, next.rsp);
 
