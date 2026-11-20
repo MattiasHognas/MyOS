@@ -2,6 +2,7 @@ const root = @import("root");
 const heap = @import("heap.zig");
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
+const gdt = @import("../arch/x86_64/gdt.zig");
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;
@@ -86,6 +87,9 @@ pub fn yield() void {
     next.state = .running;
     current = next;
     slice_left = SLICE_TICKS;
+
+    if (next.stack) |s| gdt.setKernelStack(@intFromPtr(s.ptr) + s.len);
+
     context.switchTo(&prev.rsp, next.rsp);
 
     reap(); // we're running again; any zombie is now some *other* thread

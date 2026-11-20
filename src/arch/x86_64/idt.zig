@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root"); // main.zig: print, halt
 const gdt = @import("gdt.zig");
 const apic = @import("../../arch/x86_64/apic.zig");
+const thread = @import("../../kernel/thread.zig"); // at the top of the file
 
 // ---- IDT table ----
 const Entry = extern struct {
@@ -152,6 +153,10 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
         return;
     }
     const name = if (f.vector < 32) names[f.vector] else "IRQ";
+    if ((f.cs & 3) == 3) { // fault came from ring 3: kill the thread, keep the kernel
+        root.print("\n*** thread {d}: {s} in user mode at RIP=0x{x}, killed\n", .{ thread.id(), name, f.rip });
+        thread.exit();
+    }
     root.print("\n*** {s} (vector {d}, error 0x{x})\n", .{ name, f.vector, f.error_code });
     root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });
     root.print("RSP=0x{x} RAX=0x{x} RBX=0x{x}\n", .{ f.rsp, f.rax, f.rbx });

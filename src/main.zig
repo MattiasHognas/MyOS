@@ -13,6 +13,7 @@ const cpu = @import("arch/x86_64/cpu.zig");
 const hpet = @import("drivers/hpet.zig");
 const keyboard = @import("drivers/ps2_keyboard.zig");
 const thread = @import("kernel/thread.zig");
+const context = @import("arch/x86_64/context.zig");
 
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};
@@ -23,15 +24,46 @@ export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
 
 var ticks: u64 = 0;
 
+// The user program as raw machine code. It gets copied into a user page,
+// because the kernel's own .text isn't mapped with the USER bit.
+comptime {
+    asm (
+        \\.section .rodata
+        \\.global user_prog_start
+        \\user_prog_start:
+        \\  xor %rax, %rax
+        \\1:
+        \\  inc %rax
+        \\  cmp $100000000, %rax
+        \\  jne 1b
+        \\  cli
+        \\  jmp .
+        \\.global user_prog_end
+        \\user_prog_end:
+    );
+}
+
+extern const user_prog_start: u8;
+extern const user_prog_end: u8;
+
 pub const panic = std.debug.FullPanic(kernelPanic);
 
-pub fn print(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
-    const flags = cpu.saveAndDisableInterrupts(); // whole message at once
-    defer cpu.restoreInterrupts(flags);
-    serial.puts(s);
-    if (console.ready) for (s) |c| console.putc(c);
+const USER_CODE: u64 = 0x40_0000; // 4 MiB
+const USER_STACK: u64 = 0x80_0000; // top of the user stack (8 MiB)
+
+fn userThread() void {
+    const code = pmm.alloc() orelse @panic("out of memory");
+    const stack = pmm.alloc() orelse @panic("out of memory");
+
+    const len = @intFromPtr(&user_prog_end) - @intFromPtr(&user_prog_start);
+    const src: [*]const u8 = @ptrCast(&user_prog_start);
+    @memcpy(pmm.physToVirt(code)[0..len], src[0..len]);
+
+    vmm.map(vmm.kernel_root, USER_CODE, code, vmm.USER, false); // read + execute
+    vmm.map(vmm.kernel_root, USER_STACK - pmm.PAGE_SIZE, stack, vmm.USER | vmm.WRITABLE | vmm.NX, false);
+
+    print("[thread {d}] entering ring 3\n", .{thread.id()});
+    context.enterUser(USER_CODE, USER_STACK);
 }
 
 fn spin(tag: u8) void {
@@ -48,12 +80,9 @@ fn spin(tag: u8) void {
 fn spinA() void {
     spin('A');
 }
+
 fn spinB() void {
     spin('B');
-}
-
-pub fn halt() noreturn {
-    while (true) asm volatile ("cli; hlt");
 }
 
 fn ping() void {
@@ -121,6 +150,19 @@ fn shell() noreturn {
     }
 }
 
+pub fn print(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
+    const flags = cpu.saveAndDisableInterrupts(); // whole message at once
+    defer cpu.restoreInterrupts(flags);
+    serial.puts(s);
+    if (console.ready) for (s) |c| console.putc(c);
+}
+
+pub fn halt() noreturn {
+    while (true) asm volatile ("cli; hlt");
+}
+
 export fn kmain() callconv(.c) noreturn {
     serial.init();
     gdt.init();
@@ -145,8 +187,7 @@ export fn kmain() callconv(.c) noreturn {
     apic.timerInit(100);
     print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
 
-    _ = thread.spawn(spinA) catch @panic("spawn failed");
-    _ = thread.spawn(spinB) catch @panic("spawn failed");
+    _ = thread.spawn(userThread) catch @panic("spawn failed");
 
     keyboard.init();
     print("Boot complete.\n", .{});

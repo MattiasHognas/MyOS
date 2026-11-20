@@ -1,37 +1,66 @@
-// Long mode ignores base and limit; only access byte + flags matter.
-//   0x9A = present | ring 0 | code | executable | readable
-//   0x92 = present | ring 0 | data | writable
-//   0xFA / 0xF2 = same, but ring 3 (DPL 3)
-//   flags 0xA = 4K granularity | 64-bit code (L), 0xC = 4K | 32-bit (data)
+const std = @import("std");
+
 var gdt = [_]u64{
     0x0000000000000000, // 0x00 null
     0x00AF9A000000FFFF, // 0x08 kernel code
     0x00CF92000000FFFF, // 0x10 kernel data
-    0x00CFF2000000FFFF, // 0x18 user data   (before user code, for sysret)
+    0x00CFF2000000FFFF, // 0x18 user data
     0x00AFFA000000FFFF, // 0x20 user code
-    // 0x28: TSS goes here later (step 14)
+    0, // 0x28 TSS low  (filled in init)
+    0, // 0x30 TSS high
 };
 
 pub const KERNEL_CODE = 0x08;
 pub const KERNEL_DATA = 0x10;
+pub const USER_DATA = 0x18 | 3; // | 3 = requested privilege level 3
+pub const USER_CODE = 0x20 | 3;
+const TSS_SEL = 0x28;
+
+// 64-bit TSS: 104 bytes, packed with 4-byte alignment.
+const Tss = extern struct {
+    reserved0: u32 = 0,
+    rsp0: u64 align(4) = 0, // kernel stack used when an interrupt arrives from ring 3
+    rsp1: u64 align(4) = 0,
+    rsp2: u64 align(4) = 0,
+    reserved1: u64 align(4) = 0,
+    ist: [7]u64 align(4) = @splat(0), // extra emergency stacks (double fault, later)
+    reserved2: u64 align(4) = 0,
+    reserved3: u16 = 0,
+    iopb: u16 = 104, // I/O bitmap past the end: all ports denied to ring 3
+};
+comptime {
+    std.debug.assert(@sizeOf(Tss) == 104);
+}
+
+var tss: Tss = .{};
+
+pub fn setKernelStack(top: u64) void {
+    tss.rsp0 = top;
+}
 
 const GdtPtr = extern struct {
     limit: u16,
-    base: u64 align(1), // lgdt wants exactly 10 bytes, no padding
+    base: u64 align(1),
 };
 
 pub fn init() void {
-    const ptr = GdtPtr{
-        .limit = @sizeOf(@TypeOf(gdt)) - 1,
-        .base = @intFromPtr(&gdt),
-    };
+    // TSS descriptor: 16 bytes spread over two GDT slots.
+    const base: u64 = @intFromPtr(&tss);
+    const limit: u64 = @sizeOf(Tss) - 1;
+    gdt[5] = (limit & 0xFFFF) |
+        ((base & 0xFFFF) << 16) |
+        (((base >> 16) & 0xFF) << 32) |
+        (0x89 << 40) | // present, 64-bit TSS (available)
+        (((limit >> 16) & 0xF) << 48) |
+        (((base >> 24) & 0xFF) << 56);
+    gdt[6] = base >> 32;
+
+    const ptr = GdtPtr{ .limit = @sizeOf(@TypeOf(gdt)) - 1, .base = @intFromPtr(&gdt) };
     asm volatile ("lgdt (%[p])"
         :
         : [p] "r" (&ptr),
         : .{ .memory = true });
 
-    // CS can't be set with mov; push the selector + return address and
-    // do a far return. Then load the data segment registers.
     asm volatile (
         \\ pushq $0x08
         \\ leaq 1f(%%rip), %%rax
@@ -45,6 +74,11 @@ pub fn init() void {
         \\ movw %%ax, %%fs
         \\ movw %%ax, %%gs
         ::: .{ .rax = true, .memory = true });
+
+    asm volatile ("ltr %[s]"
+        :
+        : [s] "r" (@as(u16, TSS_SEL)),
+    );
 }
 
 pub fn readCs() u16 {

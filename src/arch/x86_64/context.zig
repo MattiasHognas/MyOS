@@ -54,3 +54,19 @@ pub fn initStack(top: usize, start: usize, arg: usize) usize {
     s[6] = @intFromPtr(&thread_trampoline); // where `ret` goes
     return t - 7 * 8;
 }
+
+/// Jump to ring 3: build the frame iretq expects (SS, RSP, RFLAGS, CS, RIP).
+pub fn enterUser(rip: u64, rsp: u64) noreturn {
+    asm volatile (
+        \\ pushq $0x1B
+        \\ pushq %[rsp]
+        \\ pushq $0x202
+        \\ pushq $0x23
+        \\ pushq %[rip]
+        \\ iretq
+        :
+        : [rsp] "r" (rsp),
+          [rip] "r" (rip),
+    );
+    unreachable;
+}
