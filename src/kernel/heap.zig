@@ -1,6 +1,7 @@
 const std = @import("std");
 const pmm = @import("../kernel/pmm.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
+const cpu = @import("../arch/x86_64/cpu.zig");
 
 // Below this: HHDM (covers up to 16 TiB of RAM). Above: kernel image.
 const HEAP_START: usize = 0xFFFF_9000_0000_0000;
@@ -58,6 +59,9 @@ fn grow(min_bytes: usize) bool {
 }
 
 fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+
     if (alignment.toByteUnits() > MIN) @panic("heap: alignment > 16 unsupported; use pmm for pages");
     const n = round(len);
 
@@ -83,6 +87,8 @@ fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]
 }
 
 fn resize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
     const old = round(memory.len);
     const new = round(new_len);
     if (new > old) return false; // can't grow in place; caller reallocates
@@ -95,6 +101,8 @@ fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra
 }
 
 fn free(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
     insertFree(@intFromPtr(memory.ptr), round(memory.len));
 }
 

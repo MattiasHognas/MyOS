@@ -12,6 +12,7 @@ const apic = @import("arch/x86_64/apic.zig");
 const cpu = @import("arch/x86_64/cpu.zig");
 const hpet = @import("drivers/hpet.zig");
 const keyboard = @import("drivers/ps2_keyboard.zig");
+const thread = @import("kernel/thread.zig");
 
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};
@@ -27,17 +28,51 @@ pub const panic = std.debug.FullPanic(kernelPanic);
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
+    const flags = cpu.saveAndDisableInterrupts(); // whole message at once
+    defer cpu.restoreInterrupts(flags);
     serial.puts(s);
     if (console.ready) for (s) |c| console.putc(c);
+}
+
+fn spin(tag: u8) void {
+    var last = @atomicLoad(u64, &ticks, .monotonic);
+    while (true) {
+        const now = @atomicLoad(u64, &ticks, .monotonic);
+        if (now - last >= 200) { // 200 ticks = 2 s at 100 Hz
+            print("[{c}]", .{tag});
+            last = now;
+        }
+    }
+}
+
+fn spinA() void {
+    spin('A');
+}
+fn spinB() void {
+    spin('B');
 }
 
 pub fn halt() noreturn {
     while (true) asm volatile ("cli; hlt");
 }
 
+fn ping() void {
+    for (0..3) |i| {
+        print("[thread {d}] ping {d}\n", .{ thread.id(), i });
+        thread.yield();
+    }
+}
+
+fn pong() void {
+    for (0..3) |i| {
+        print("[thread {d}] pong {d}\n", .{ thread.id(), i });
+        thread.yield();
+    }
+}
+
 fn onTick(_: *idt.Frame) void {
     ticks += 1;
-    if (ticks % 100 == 0) print("uptime: {d} s\n", .{ticks / 100});
+    thread.tick();
 }
 
 fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
@@ -81,6 +116,7 @@ fn shell() noreturn {
                 print("{c}", .{c});
             },
         };
+        thread.yield();
         asm volatile ("sti; hlt"); // sleep until the next key or timer tick
     }
 }
@@ -108,6 +144,9 @@ export fn kmain() callconv(.c) noreturn {
     idt.register(apic.TIMER_VECTOR, onTick);
     apic.timerInit(100);
     print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
+
+    _ = thread.spawn(spinA) catch @panic("spawn failed");
+    _ = thread.spawn(spinB) catch @panic("spawn failed");
 
     keyboard.init();
     print("Boot complete.\n", .{});

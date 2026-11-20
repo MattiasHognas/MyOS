@@ -2,6 +2,7 @@ const std = @import("std");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
 const apic = @import("../arch/x86_64/apic.zig");
+const root = @import("root");
 
 // Scancode set 1, US layout, indexed by scancode 0x00-0x39. 0 = no character.
 const normal = "\x00\x1b1234567890-=\x08\tqwertyuiop[]\n\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";

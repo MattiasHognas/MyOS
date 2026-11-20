@@ -31,3 +31,17 @@ pub fn wrmsr(msr: u32, val: u64) void {
           [msr] "{ecx}" (msr),
     );
 }
+
+pub fn saveAndDisableInterrupts() u64 {
+    return asm volatile (
+        \\ pushfq
+        \\ popq %[f]
+        \\ cli
+        : [f] "=r" (-> u64),
+        :
+        : .{ .memory = true });
+}
+
+pub fn restoreInterrupts(flags: u64) void {
+    if ((flags & (1 << 9)) != 0) asm volatile ("sti" ::: .{ .memory = true }); // bit 9 = IF
+}

@@ -147,8 +147,8 @@ fn readCr2() u64 {
 export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
     if (f.vector >= 32) {
+        apic.eoi(); // BEFORE the handler: it may switch threads
         if (handlers[f.vector]) |h| h(f) else root.print("unhandled vector {d}\n", .{f.vector});
-        apic.eoi();
         return;
     }
     const name = if (f.vector < 32) names[f.vector] else "IRQ";

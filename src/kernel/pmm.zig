@@ -67,7 +67,6 @@ pub fn init(mm: *const limine.MemmapResponse, hhdm_offset: u64) void {
     reserve(0);
 }
 
-/// Returns the physical address of a free page, or null if memory is exhausted.
 pub fn alloc() ?u64 {
     for (0..total_pages) |n| {
         const p = (hint + n) % total_pages;
