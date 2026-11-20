@@ -15,7 +15,9 @@ const keyboard = @import("drivers/ps2_keyboard.zig");
 const thread = @import("kernel/thread.zig");
 const context = @import("arch/x86_64/context.zig");
 const syscall = @import("kernel/syscall.zig");
+const process = @import("kernel/process.zig");
 
+export var module_request linksection(".limine_requests") = limine.ModuleRequest{};
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};
 export var memmap_request linksection(".limine_requests") = limine.MemmapRequest{};
@@ -198,7 +200,14 @@ export fn kmain() callconv(.c) noreturn {
     print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
 
     syscall.init();
-    _ = thread.spawn(userThread) catch @panic("spawn failed");
+
+    const mods = response(&module_request);
+    for (mods.modules[0..mods.module_count]) |m| {
+        const path = std.mem.span(m.path);
+        const image = @as([*]const u8, @ptrFromInt(m.address))[0..m.size];
+        print("starting {s} ({d} bytes)\n", .{ path, m.size });
+        _ = process.spawn(path, image) catch |e| print("  failed: {s}\n", .{@errorName(e)});
+    }
 
     keyboard.init();
     print("Boot complete.\n", .{});

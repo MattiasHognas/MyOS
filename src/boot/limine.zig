@@ -50,3 +50,18 @@ pub const KernelAddressResponse = extern struct {
 
 pub const RsdpRequest = Request(0xc5e77b6b397e7b43, 0x27637845accdcf3c, RsdpResponse);
 pub const RsdpResponse = extern struct { revision: u64, address: u64 };
+
+pub const ModuleRequest = Request(0x3e7e279702be32af, 0xca1c4f3bd1280cee, ModuleResponse);
+pub const ModuleResponse = extern struct {
+    revision: u64,
+    module_count: u64,
+    modules: [*]*File,
+};
+pub const File = extern struct {
+    revision: u64,
+    address: u64, // HHDM virtual address of the file's contents
+    size: u64,
+    path: [*:0]const u8,
+    string: [*:0]const u8,
+    // more fields follow; not needed
+};

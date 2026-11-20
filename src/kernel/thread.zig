@@ -3,11 +3,12 @@ const heap = @import("heap.zig");
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
-const arch_syscall = @import("../arch/x86_64/syscall.zig"); // at the top
+const arch_syscall = @import("../arch/x86_64/syscall.zig");
+const vmm = @import("../arch/x86_64/vmm.zig");
+const Process = @import("process.zig").Process;
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;
-
 const STACK_SIZE = 16 * 1024;
 
 pub const State = enum { ready, running, dead };
@@ -15,14 +16,17 @@ pub const State = enum { ready, running, dead };
 pub const Thread = struct {
     id: usize,
     rsp: usize = 0,
-    stack: ?[]u8, // null for the boot thread (it runs on Limine's stack)
+    stack: ?[]u8,
     state: State,
     next: ?*Thread = null,
+    process: ?*Process = null,
 };
 
 var boot_thread: Thread = .{ .id = 0, .stack = null, .state = .running };
-var current: *Thread = &boot_thread;
+var current_thread: *Thread = &boot_thread;
 var next_id: usize = 1;
+
+var loaded_root: u64 = 0;
 
 // ---- FIFO ready queue ----
 var ready_head: ?*Thread = null;
@@ -46,16 +50,16 @@ var zombies: ?*Thread = null;
 fn reap() void {
     while (zombies) |z| {
         zombies = z.next;
+        if (z.process) |p| {
+            vmm.destroyAddressSpace(p.root); // safe: we already switched CR3 away
+            heap.allocator.destroy(p);
+        }
         heap.allocator.free(z.stack.?);
         heap.allocator.destroy(z);
     }
 }
 
-pub fn id() usize {
-    return current.id;
-}
-
-pub fn spawn(entry: *const fn () void) !*Thread {
+pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
     const t = try heap.allocator.create(Thread);
     errdefer heap.allocator.destroy(t);
     const stack = try heap.allocator.alloc(u8, STACK_SIZE);
@@ -65,6 +69,7 @@ pub fn spawn(entry: *const fn () void) !*Thread {
         .stack = stack,
         .state = .ready,
         .rsp = context.initStack(@intFromPtr(stack.ptr) + stack.len, @intFromPtr(&start), @intFromPtr(entry)),
+        .process = process,
     };
 
     const flags = cpu.saveAndDisableInterrupts();
@@ -80,19 +85,26 @@ pub fn yield() void {
     defer cpu.restoreInterrupts(flags);
 
     const next = dequeue() orelse return;
-    const prev = current;
+    const prev = current_thread;
+
     if (prev.state == .running) {
         prev.state = .ready;
         enqueue(prev);
     }
     next.state = .running;
-    current = next;
+    current_thread = next;
     slice_left = SLICE_TICKS;
 
     if (next.stack) |s| {
         const top = @intFromPtr(s.ptr) + s.len;
         gdt.setKernelStack(top); // for interrupts from ring 3
         arch_syscall.setKernelStack(top); // for syscalls
+    }
+
+    const new_root = if (next.process) |p| p.root else vmm.kernel_root;
+    if (new_root != loaded_root) {
+        vmm.loadRoot(new_root);
+        loaded_root = new_root;
     }
 
     context.switchTo(&prev.rsp, next.rsp);
@@ -107,11 +119,19 @@ pub fn tick() void {
 
 pub fn exit() noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: this thread is done
-    current.state = .dead;
-    current.next = zombies;
-    zombies = current;
+    current_thread.state = .dead;
+    current_thread.next = zombies;
+    zombies = current_thread;
     yield();
     root.halt();
+}
+
+pub fn current() *Thread {
+    return current_thread;
+}
+
+pub fn id() usize {
+    return current_thread.id;
 }
 
 fn start(entry: usize) callconv(.c) noreturn {

@@ -24,6 +24,8 @@ extern const __rodata_end: u8;
 extern const __data_start: u8;
 extern const __data_end: u8;
 
+pub const USER_END: u64 = 0x0000_8000_0000_0000;
+
 fn table(phys: u64) *[512]u64 {
     return @ptrCast(@alignCast(pmm.physToVirt(phys)));
 }
@@ -39,6 +41,14 @@ fn allocTable() u64 {
 fn next(entry: *u64) u64 {
     if (entry.* & PRESENT == 0) entry.* = allocTable() | PRESENT | WRITABLE | USER;
     return entry.* & ADDR_MASK;
+}
+
+fn freeTable(phys: u64, level: u6) void { // 2 = PDPT, 1 = PD, 0 = PT
+    for (table(phys)) |e| {
+        if (e & PRESENT == 0) continue;
+        if (level == 0) pmm.free(e & ADDR_MASK) else freeTable(e & ADDR_MASK, level - 1);
+    }
+    pmm.free(phys);
 }
 
 /// Map one page: 4 KiB, or 2 MiB if `huge`.
@@ -80,6 +90,29 @@ fn wrmsr(msr: u32, val: u64) void {
     );
 }
 
+/// New PML4: empty user half, kernel half shared with every other address space.
+pub fn createAddressSpace() u64 {
+    const root = allocTable();
+    @memcpy(table(root)[256..512], table(kernel_root)[256..512]);
+    return root;
+}
+
+pub fn loadRoot(root: u64) void {
+    asm volatile ("mov %[r], %%cr3"
+        :
+        : [r] "r" (root),
+        : .{ .memory = true });
+}
+
+/// Free every page and page table in the user half, then the PML4 itself.
+/// Must not be the currently loaded address space.
+pub fn destroyAddressSpace(root: u64) void {
+    for (table(root)[0..256]) |e| {
+        if (e & PRESENT != 0) freeTable(e & ADDR_MASK, 2);
+    }
+    pmm.free(root);
+}
+
 /// Map a device's registers uncached; returns the virtual address of `phys`.
 pub fn mapMmio(phys: u64, size: usize) usize {
     const base = phys & ~@as(u64, 0xFFF);
@@ -97,6 +130,9 @@ pub fn init(mm: *const limine.MemmapResponse, k: *const limine.KernelAddressResp
     wrmsr(0xC0000080, rdmsr(0xC0000080) | (1 << 11)); // EFER.NXE: allow the NX bit
 
     kernel_root = allocTable();
+
+    const kh = table(kernel_root);
+    for (256..512) |i| kh[i] = allocTable() | PRESENT | WRITABLE;
 
     // 1. HHDM: every memory map region, in 2 MiB pages.
     for (mm.entries[0..mm.entry_count]) |e| {
