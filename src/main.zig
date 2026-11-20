@@ -99,6 +99,13 @@ fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
     halt();
 }
 
+fn idle() noreturn {
+    while (true) {
+        thread.yield(); // let anything that's ready run
+        asm volatile ("sti; hlt"); // otherwise sleep until an interrupt
+    }
+}
+
 fn shell() noreturn {
     var line: [128]u8 = undefined;
     var len: usize = 0;
@@ -176,9 +183,9 @@ export fn kmain() callconv(.c) noreturn {
 
     const initrd = findModule("initrd.tar") orelse @panic("no initrd.tar module");
     vfs.mountRoot(tarfs.init(initrd));
-    _ = process.spawnPath("/bin/hello") catch |e| print("failed to start /bin/hello: {s}\n", .{@errorName(e)});
 
     keyboard.init();
+    _ = process.spawnPath("/bin/sh", null) catch |e| print("failed to start /bin/sh: {s}\n", .{@errorName(e)});
     print("Boot complete.\n", .{});
-    shell();
+    idle();
 }

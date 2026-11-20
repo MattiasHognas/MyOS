@@ -3,6 +3,9 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
 const apic = @import("../arch/x86_64/apic.zig");
 const root = @import("root");
+const thread = @import("../kernel/thread.zig");
+
+pub var waiter: ?*thread.Thread = null; // set by the getchar syscall
 
 // Scancode set 1, US layout, indexed by scancode 0x00-0x39. 0 = no character.
 const normal = "\x00\x1b1234567890-=\x08\tqwertyuiop[]\n\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";
@@ -67,6 +70,10 @@ fn onIrq(_: *idt.Frame) void {
     if (caps and std.ascii.isAlphabetic(c)) c ^= 0x20; // flip case
     if (ctrl and std.ascii.isAlphabetic(c)) c &= 0x1F; // Ctrl+C = 3, etc.
     push(c);
+    if (waiter) |w| {
+        waiter = null;
+        thread.wake(w);
+    }
 }
 
 pub fn init() void {

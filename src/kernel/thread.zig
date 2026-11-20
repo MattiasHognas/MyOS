@@ -12,7 +12,7 @@ const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;
 const STACK_SIZE = 16 * 1024;
 
-pub const State = enum { ready, running, dead };
+pub const State = enum { ready, running, blocked, dead };
 
 pub const Thread = struct {
     id: usize,
@@ -21,7 +21,28 @@ pub const Thread = struct {
     state: State,
     next: ?*Thread = null,
     process: ?*Process = null,
+    wake_pending: bool = false, // a wake() arrived before block()
+    wake_value: u64 = 0, // passed from waker to sleeper (e.g. exit code)
 };
+
+pub fn block() void {
+    const me = current_thread;
+    if (me.wake_pending) { // the event already happened
+        me.wake_pending = false;
+        return;
+    }
+    me.state = .blocked;
+    while (me.state == .blocked) yield(); // the idle thread is always ready
+    me.wake_pending = false;
+}
+
+pub fn wake(t: *Thread) void {
+    t.wake_pending = true;
+    if (t.state == .blocked) {
+        t.state = .ready;
+        enqueue(t);
+    }
+}
 
 var boot_thread: Thread = .{ .id = 0, .stack = null, .state = .running };
 var current_thread: *Thread = &boot_thread;

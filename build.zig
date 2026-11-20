@@ -18,22 +18,6 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
-    const hello = b.addExecutable(.{
-        .name = "hello.elf",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("app/hello.zig"),
-            .target = target,
-            .optimize = optimize,
-            .pic = false,
-            .sanitize_c = .off,
-        }),
-        .use_llvm = true,
-        .use_lld = true,
-    });
-    hello.entry = .{ .symbol_name = "_start" };
-    hello.setLinkerScript(b.path("app/linker.ld"));
-    b.installArtifact(hello);
-
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
         .root_module = b.createModule(.{
@@ -51,4 +35,31 @@ pub fn build(b: *std.Build) void {
     kernel.entry = .{ .symbol_name = "kmain" };
     kernel.setLinkerScript(b.path("linker.ld"));
     b.installArtifact(kernel);
+
+    userProgram(b, "hello", target, optimize);
+    userProgram(b, "sh", target, optimize);
+}
+
+fn userProgram(
+    b: *std.Build,
+    name: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const exe = b.addExecutable(.{
+        .name = b.fmt("{s}.elf", .{name}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("app/{s}.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+            .pic = false,
+            .sanitize_c = .off,
+            .strip = true,
+        }),
+        .use_llvm = true,
+        .use_lld = true,
+    });
+    exe.entry = .{ .symbol_name = "_start" };
+    exe.setLinkerScript(b.path("app/linker.ld"));
+    b.installArtifact(exe);
 }

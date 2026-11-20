@@ -10,6 +10,8 @@ mkdir -p iso_root/boot/limine iso_root/EFI/BOOT
 rm -rf initrd
 mkdir -p initrd/bin initrd/etc
 
+cp zig-out/bin/sh.elf initrd/bin/sh
+
 cp zig-out/bin/hello.elf initrd/bin/hello
 echo "Welcome to MyOS!" > initrd/etc/motd
 tar --format=ustar -cf iso_root/boot/initrd.tar -C initrd .
