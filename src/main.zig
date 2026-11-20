@@ -11,6 +11,7 @@ const acpi = @import("acpi.zig");
 const apic = @import("apic.zig");
 const cpu = @import("cpu.zig");
 const hpet = @import("hpet.zig");
+const keyboard = @import("keyboard.zig");
 
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};
@@ -20,6 +21,19 @@ export var kaddr_request linksection(".limine_requests") = limine.KernelAddressR
 export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
 
 var ticks: u64 = 0;
+
+pub const panic = std.debug.FullPanic(kernelPanic);
+
+pub fn print(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
+    serial.puts(s);
+    if (console.ready) for (s) |c| console.putc(c);
+}
+
+pub fn halt() noreturn {
+    while (true) asm volatile ("cli; hlt");
+}
 
 fn onTick(_: *idt.Frame) void {
     ticks += 1;
@@ -31,31 +45,44 @@ fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
     return v.response orelse @panic("Limine request not answered");
 }
 
-pub fn print(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
-    serial.puts(s);
-    if (console.ready) for (s) |c| console.putc(c);
-}
-
-pub const panic = std.debug.FullPanic(kernelPanic);
-
 fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
     print("PANIC: {s}\n", .{msg});
     halt();
-}
-
-fn keyboard(_: *idt.Frame) void {
-    const scancode = cpu.inb(0x60); // must be read, or no further key IRQs arrive
-    print("key: 0x{x}\n", .{scancode});
 }
 
 fn idle() noreturn {
     while (true) asm volatile ("sti; hlt"); // sleep until the next interrupt
 }
 
-pub fn halt() noreturn {
-    while (true) asm volatile ("cli; hlt");
+fn shell() noreturn {
+    var line: [128]u8 = undefined;
+    var len: usize = 0;
+    print("> ", .{});
+
+    while (true) {
+        while (keyboard.getChar()) |c| switch (c) {
+            '\n' => {
+                print("\n", .{});
+                if (len > 0) print("you typed: {s}\n", .{line[0..len]});
+                len = 0;
+                print("> ", .{});
+            },
+            0x08 => if (len > 0) {
+                len -= 1;
+                print("\x08 \x08", .{}); // back, blank it out, back again
+            },
+            3 => { // Ctrl+C
+                print("^C\n> ", .{});
+                len = 0;
+            },
+            else => if (c >= ' ' and len < line.len) {
+                line[len] = c;
+                len += 1;
+                print("{c}", .{c});
+            },
+        };
+        asm volatile ("sti; hlt"); // sleep until the next key or timer tick
+    }
 }
 
 export fn kmain() callconv(.c) noreturn {
@@ -82,10 +109,7 @@ export fn kmain() callconv(.c) noreturn {
     apic.timerInit(100);
     print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
 
-    idt.register(apic.IRQ_BASE + 1, keyboard);
-    apic.route(1, apic.IRQ_BASE + 1);
-    print("Boot complete. Press keys in the QEMU window.\n", .{});
-    idle();
+    keyboard.init();
+    print("Boot complete.\n", .{});
+    shell();
 }
-
-// in kmain, after apic.init():

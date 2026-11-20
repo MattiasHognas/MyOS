@@ -61,6 +61,10 @@ fn scroll() void {
 }
 
 pub fn putc(c: u8) void {
+    if (c == 0x08) {
+        if (col > 0) col -= 1;
+        return;
+    }
     if (c == '\n') {
         col = 0;
         row += 1;
