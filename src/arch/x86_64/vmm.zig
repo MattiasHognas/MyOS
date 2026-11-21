@@ -9,13 +9,13 @@ pub const NX: u64 = 1 << 63;
 pub const PWT: u64 = 1 << 3;
 pub const PCD: u64 = 1 << 4;
 
-const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-const MIB2: u64 = 2 * 1024 * 1024;
+// Separate from the HHDM, so these 4 KiB mappings never collide with its 2 MiB pages.
+var mmio_next: usize = 0xFFFF_A000_0000_0000;
 
 pub var kernel_root: u64 = 0; // physical address of our PML4
 
-// Separate from the HHDM, so these 4 KiB mappings never collide with its 2 MiB pages.
-var mmio_next: usize = 0xFFFF_A000_0000_0000;
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+const MIB2: u64 = 2 * 1024 * 1024;
 
 extern const __text_start: u8;
 extern const __text_end: u8;
@@ -26,10 +26,12 @@ extern const __data_end: u8;
 
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
 
+// Return a pointer to the 512-entry table at `phys`.
 fn table(phys: u64) *[512]u64 {
     return @ptrCast(@alignCast(pmm.physToVirt(phys)));
 }
 
+// Allocate a new 4 KiB page for a page table, and return its physical address.
 fn allocTable() u64 {
     const p = pmm.alloc() orelse @panic("vmm: out of memory");
     @memset(pmm.physToVirt(p)[0..pmm.PAGE_SIZE], 0);
@@ -43,12 +45,42 @@ fn next(entry: *u64) u64 {
     return entry.* & ADDR_MASK;
 }
 
+// Free a page table and all its children. `level` is 2 for PDPT, 1 for PD, 0 for PT.
 fn freeTable(phys: u64, level: u6) void { // 2 = PDPT, 1 = PD, 0 = PT
     for (table(phys)) |e| {
         if (e & PRESENT == 0) continue;
         if (level == 0) pmm.free(e & ADDR_MASK) else freeTable(e & ADDR_MASK, level - 1);
     }
     pmm.free(phys);
+}
+
+// Map a range of kernel virtual addresses to physical addresses, with the given flags. The range is inclusive of `start` and exclusive of `end`. The flags are the same as for `map()`, except that NX is implied for the text section.
+fn mapKernelRange(start: *const u8, end: *const u8, flags: u64, k: *const limine.KernelAddressResponse) void {
+    var v = @intFromPtr(start);
+    while (v < @intFromPtr(end)) : (v += pmm.PAGE_SIZE) {
+        map(kernel_root, v, v - k.virtual_base + k.physical_base, flags, false);
+    }
+}
+
+// Read the value of a model-specific register (MSR).
+fn rdmsr(msr: u32) u64 {
+    return asm volatile (
+        \\ rdmsr
+        \\ shlq $32, %%rdx
+        \\ orq %%rdx, %%rax
+        : [ret] "={rax}" (-> u64),
+        : [msr] "{ecx}" (msr),
+        : .{ .rdx = true });
+}
+
+// Write a value to a model-specific register (MSR).
+fn wrmsr(msr: u32, val: u64) void {
+    asm volatile ("wrmsr"
+        :
+        : [lo] "{eax}" (@as(u32, @truncate(val))),
+          [hi] "{edx}" (@as(u32, @truncate(val >> 32))),
+          [msr] "{ecx}" (msr),
+    );
 }
 
 // Map one page: 4 KiB, or 2 MiB if `huge`.
@@ -64,32 +96,6 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
     t[idx] = (phys & ADDR_MASK) | flags | PRESENT | (if (huge) HUGE else 0);
 }
 
-fn mapKernelRange(start: *const u8, end: *const u8, flags: u64, k: *const limine.KernelAddressResponse) void {
-    var v = @intFromPtr(start);
-    while (v < @intFromPtr(end)) : (v += pmm.PAGE_SIZE) {
-        map(kernel_root, v, v - k.virtual_base + k.physical_base, flags, false);
-    }
-}
-
-fn rdmsr(msr: u32) u64 {
-    return asm volatile (
-        \\ rdmsr
-        \\ shlq $32, %%rdx
-        \\ orq %%rdx, %%rax
-        : [ret] "={rax}" (-> u64),
-        : [msr] "{ecx}" (msr),
-        : .{ .rdx = true });
-}
-
-fn wrmsr(msr: u32, val: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [lo] "{eax}" (@as(u32, @truncate(val))),
-          [hi] "{edx}" (@as(u32, @truncate(val >> 32))),
-          [msr] "{ecx}" (msr),
-    );
-}
-
 // New PML4: empty user half, kernel half shared with every other address space.
 pub fn createAddressSpace() u64 {
     const root = allocTable();
@@ -97,6 +103,7 @@ pub fn createAddressSpace() u64 {
     return root;
 }
 
+// Load root
 pub fn loadRoot(root: u64) void {
     asm volatile ("mov %[r], %%cr3"
         :

@@ -25,6 +25,7 @@ fn ioRead(reg: u32) u32 {
     return @as(*volatile u32, @ptrFromInt(ioapic + 0x10)).*;
 }
 
+// Write a register to the I/O APIC.
 fn ioWrite(reg: u32, val: u32) void {
     @as(*volatile u32, @ptrFromInt(ioapic)).* = reg;
     @as(*volatile u32, @ptrFromInt(ioapic + 0x10)).* = val;
@@ -45,10 +46,12 @@ fn disablePic() void {
     }
 }
 
+// Send an EOI to the local APIC.
 pub fn eoi() void {
     lapicReg(0xB0).* = 0;
 }
 
+// Return the local APIC ID of this CPU.
 pub fn id() u8 {
     return @truncate(lapicReg(0x20).* >> 24);
 }

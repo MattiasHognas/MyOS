@@ -9,11 +9,8 @@ var gdt = [_]u64{
     0, // 0x28 TSS low  (filled in init)
     0, // 0x30 TSS high
 };
+var tss: Tss = .{};
 
-pub const KERNEL_CODE = 0x08;
-pub const KERNEL_DATA = 0x10;
-pub const USER_DATA = 0x18 | 3; // | 3 = requested privilege level 3
-pub const USER_CODE = 0x20 | 3;
 const TSS_SEL = 0x28;
 
 // 64-bit TSS: 104 bytes, packed with 4-byte alignment.
@@ -28,21 +25,28 @@ const Tss = extern struct {
     reserved3: u16 = 0,
     iopb: u16 = 104, // I/O bitmap past the end: all ports denied to ring 3
 };
-comptime {
-    std.debug.assert(@sizeOf(Tss) == 104);
-}
-
-var tss: Tss = .{};
-
-pub fn setKernelStack(top: u64) void {
-    tss.rsp0 = top;
-}
 
 const GdtPtr = extern struct {
     limit: u16,
     base: u64 align(1),
 };
 
+pub const KERNEL_CODE = 0x08;
+pub const KERNEL_DATA = 0x10;
+pub const USER_DATA = 0x18 | 3; // | 3 = requested privilege level 3
+pub const USER_CODE = 0x20 | 3;
+
+// The GDT is loaded with `lgdt`, and the TSS is loaded with `ltr`. The TSS is used to switch to a kernel stack when an interrupt arrives from ring 3. The I/O bitmap in the TSS prevents ring 3 code from accessing I/O ports.
+comptime {
+    std.debug.assert(@sizeOf(Tss) == 104);
+}
+
+// Set the kernel stack pointer in the TSS. This is used when an interrupt arrives from ring 3.
+pub fn setKernelStack(top: u64) void {
+    tss.rsp0 = top;
+}
+
+// Initialize the GDT and TSS. Loads the GDT and sets up segment registers. Panics if the CPU does not support 64-bit mode.
 pub fn init() void {
     // TSS descriptor: 16 bytes spread over two GDT slots.
     const base: u64 = @intFromPtr(&tss);
@@ -81,6 +85,7 @@ pub fn init() void {
     );
 }
 
+// Return the current value of the CS register.
 pub fn readCs() u16 {
     return asm volatile ("movw %%cs, %[ret]"
         : [ret] "=r" (-> u16),

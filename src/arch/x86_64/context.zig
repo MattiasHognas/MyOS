@@ -36,6 +36,7 @@ comptime {
 extern fn switch_context(old: *usize, new: usize) callconv(.c) void;
 extern fn thread_trampoline() callconv(.c) void;
 
+// Switch to a new thread, saving the current RSP in `old_rsp` and loading `new_rsp`.
 pub fn switchTo(old_rsp: *usize, new_rsp: usize) void {
     switch_context(old_rsp, new_rsp);
 }

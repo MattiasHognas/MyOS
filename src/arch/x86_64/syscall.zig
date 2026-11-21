@@ -1,5 +1,10 @@
 const cpu = @import("cpu.zig");
 
+export var syscall_kernel_rsp: u64 = 0; // current thread's kernel stack top
+export var syscall_user_rsp: u64 = 0; // scratch, only used with interrupts off
+
+var handler: *const fn (*Frame) void = undefined;
+
 pub const Frame = extern struct {
     r9: u64,
     r8: u64,
@@ -12,11 +17,6 @@ pub const Frame = extern struct {
     rflags: u64, // user RFLAGS (CPU put it in R11)
     rsp: u64, // user RSP
 };
-
-export var syscall_kernel_rsp: u64 = 0; // current thread's kernel stack top
-export var syscall_user_rsp: u64 = 0; // scratch, only used with interrupts off
-
-var handler: *const fn (*Frame) void = undefined;
 
 // Entry: the CPU has cleared IF (via SFMASK), so the scratch global is safe.
 comptime {
@@ -51,18 +51,22 @@ comptime {
         \\  sysretq
     );
 }
+
 extern fn syscall_entry() callconv(.c) void;
 
+// The CPU calls this when a syscall occurs. It may switch threads, so it must not return.
 export fn syscall_handler_c(f: *Frame) callconv(.c) void {
     asm volatile ("sti"); // long syscalls may be preempted
     handler(f);
     asm volatile ("cli"); // the exit path must not be interrupted
 }
 
+// Set the kernel stack pointer for the current thread. This is used when a syscall or interrupt occurs.
 pub fn setKernelStack(top: u64) void {
     syscall_kernel_rsp = top;
 }
 
+// Initialize the syscall handler. The handler is called with a pointer to a Frame struct, which contains the syscall number and arguments. The handler must set f->rax to the return value.
 pub fn init(h: *const fn (*Frame) void) void {
     handler = h;
     cpu.wrmsr(0xC0000080, cpu.rdmsr(0xC0000080) | 1); // EFER.SCE: enable syscall

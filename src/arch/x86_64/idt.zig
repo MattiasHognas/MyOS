@@ -5,6 +5,9 @@ const apic = @import("../../arch/x86_64/apic.zig");
 const thread = @import("../../kernel/thread.zig");
 const process = @import("../../kernel/process.zig");
 
+var idt = std.mem.zeroes([256]Entry);
+var handlers: [256]?Handler = @splat(null);
+
 // IDT table
 const Entry = extern struct {
     offset_low: u16,
@@ -16,7 +19,17 @@ const Entry = extern struct {
     reserved: u32,
 };
 
-var idt = std.mem.zeroes([256]Entry);
+// The CPU pushes an error code.
+const names = [32][]const u8{
+    "Divide error",         "Debug",               "NMI",            "Breakpoint",
+    "Overflow",             "Bound range",         "Invalid opcode", "Device not available",
+    "Double fault",         "Coprocessor overrun", "Invalid TSS",    "Segment not present",
+    "Stack fault",          "General protection",  "Page fault",     "Reserved",
+    "x87 FP",               "Alignment check",     "Machine check",  "SIMD FP",
+    "Virtualization",       "Control protection",  "Reserved",       "Reserved",
+    "Reserved",             "Reserved",            "Reserved",       "Reserved",
+    "Hypervisor injection", "VMM communication",   "Security",       "Reserved",
+};
 
 const IdtPtr = extern struct {
     limit: u16,
@@ -24,12 +37,8 @@ const IdtPtr = extern struct {
 };
 
 pub const Handler = *const fn (*Frame) void;
-var handlers: [256]?Handler = @splat(null);
 
-pub fn register(vector: u8, h: Handler) void {
-    handlers[vector] = h;
-}
-
+// Set an IDT entry to point to a given handler.
 fn setGate(vec: usize, handler: usize) void {
     idt[vec] = .{
         .offset_low = @truncate(handler),
@@ -103,6 +112,40 @@ comptime {
     );
 }
 
+// Read the CR2 register, which contains the faulting address for a page fault.
+fn readCr2() u64 {
+    return asm volatile ("mov %%cr2, %[ret]"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+// The CPU calls this when an interrupt or exception occurs. It may switch threads, so it must not return.
+export fn interruptHandler(f: *Frame) callconv(.c) void {
+    if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
+    if (f.vector >= 32) {
+        apic.eoi(); // BEFORE the handler: it may switch threads
+        if (handlers[f.vector]) |h| h(f) else root.print("unhandled vector {d}\n", .{f.vector});
+        return;
+    }
+    const name = if (f.vector < 32) names[f.vector] else "IRQ";
+    if ((f.cs & 3) == 3) { // fault came from ring 3: kill the thread, keep the kernel
+        root.print("\n*** thread {d}: {s} in user mode at RIP=0x{x}, killed\n", .{ thread.id(), name, f.rip });
+        process.exit(255); // the parent sees exit code 255 for a crash
+    }
+    root.print("\n*** {s} (vector {d}, error 0x{x})\n", .{ name, f.vector, f.error_code });
+    root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });
+    root.print("RSP=0x{x} RAX=0x{x} RBX=0x{x}\n", .{ f.rsp, f.rax, f.rbx });
+    if (f.vector == 14) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
+
+    if (f.vector == 3) return; // breakpoint: resume after int3
+    root.halt();
+}
+
+// Register a handler for a given vector. The handler is called with a pointer to the stack frame. The handler may switch threads, so it must not return.
+pub fn register(vector: u8, h: Handler) void {
+    handlers[vector] = h;
+}
+
 // The stack as isr_common leaves it, lowest address first.
 pub const Frame = extern struct {
     r15: u64,
@@ -129,44 +172,7 @@ pub const Frame = extern struct {
     ss: u64,
 };
 
-const names = [32][]const u8{
-    "Divide error",         "Debug",               "NMI",            "Breakpoint",
-    "Overflow",             "Bound range",         "Invalid opcode", "Device not available",
-    "Double fault",         "Coprocessor overrun", "Invalid TSS",    "Segment not present",
-    "Stack fault",          "General protection",  "Page fault",     "Reserved",
-    "x87 FP",               "Alignment check",     "Machine check",  "SIMD FP",
-    "Virtualization",       "Control protection",  "Reserved",       "Reserved",
-    "Reserved",             "Reserved",            "Reserved",       "Reserved",
-    "Hypervisor injection", "VMM communication",   "Security",       "Reserved",
-};
-
-fn readCr2() u64 {
-    return asm volatile ("mov %%cr2, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-}
-
-export fn interruptHandler(f: *Frame) callconv(.c) void {
-    if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
-    if (f.vector >= 32) {
-        apic.eoi(); // BEFORE the handler: it may switch threads
-        if (handlers[f.vector]) |h| h(f) else root.print("unhandled vector {d}\n", .{f.vector});
-        return;
-    }
-    const name = if (f.vector < 32) names[f.vector] else "IRQ";
-    if ((f.cs & 3) == 3) { // fault came from ring 3: kill the thread, keep the kernel
-        root.print("\n*** thread {d}: {s} in user mode at RIP=0x{x}, killed\n", .{ thread.id(), name, f.rip });
-        process.exit(255); // the parent sees exit code 255 for a crash
-    }
-    root.print("\n*** {s} (vector {d}, error 0x{x})\n", .{ name, f.vector, f.error_code });
-    root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });
-    root.print("RSP=0x{x} RAX=0x{x} RBX=0x{x}\n", .{ f.rsp, f.rax, f.rbx });
-    if (f.vector == 14) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
-
-    if (f.vector == 3) return; // breakpoint: resume after int3
-    root.halt();
-}
-
+// Initialize the IDT. Sets up stubs for all vectors, then loads the IDT register.
 pub fn init() void {
     inline for (0..256) |i| setGate(i, @intFromPtr(stub(i)));
     const ptr = IdtPtr{ .limit = @sizeOf(@TypeOf(idt)) - 1, .base = @intFromPtr(&idt) };

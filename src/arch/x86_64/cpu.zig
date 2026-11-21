@@ -1,3 +1,4 @@
+// Write a byte to an I/O port.
 pub fn outb(port: u16, val: u8) void {
     asm volatile ("outb %[val], %[port]"
         :
@@ -5,7 +6,7 @@ pub fn outb(port: u16, val: u8) void {
           [port] "N{dx}" (port),
     );
 }
-
+// Write a 32-bit value to an I/O port.
 pub fn outl(port: u16, val: u32) void {
     asm volatile ("outl %[val], %[port]"
         :
@@ -14,6 +15,7 @@ pub fn outl(port: u16, val: u32) void {
     );
 }
 
+// Read a 32-bit value from an I/O port.
 pub fn inl(port: u16) u32 {
     return asm volatile ("inl %[port], %[ret]"
         : [ret] "={eax}" (-> u32),
@@ -21,6 +23,7 @@ pub fn inl(port: u16) u32 {
     );
 }
 
+// Read a byte from an I/O port.
 pub fn inb(port: u16) u8 {
     return asm volatile ("inb %[port], %[ret]"
         : [ret] "={al}" (-> u8),
@@ -28,6 +31,7 @@ pub fn inb(port: u16) u8 {
     );
 }
 
+// Read a 64-bit value from an I/O port.
 pub fn rdmsr(msr: u32) u64 {
     return asm volatile (
         \\ rdmsr
@@ -38,6 +42,7 @@ pub fn rdmsr(msr: u32) u64 {
         : .{ .rdx = true });
 }
 
+// Write a 64-bit value to an MSR.
 pub fn wrmsr(msr: u32, val: u64) void {
     asm volatile ("wrmsr"
         :
@@ -46,7 +51,7 @@ pub fn wrmsr(msr: u32, val: u64) void {
           [msr] "{ecx}" (msr),
     );
 }
-
+// Read the current value of the RFLAGS register.
 pub fn saveAndDisableInterrupts() u64 {
     return asm volatile (
         \\ pushfq
@@ -57,6 +62,7 @@ pub fn saveAndDisableInterrupts() u64 {
         : .{ .memory = true });
 }
 
+// Restore the RFLAGS register, which may re-enable interrupts.
 pub fn restoreInterrupts(flags: u64) void {
     if ((flags & (1 << 9)) != 0) asm volatile ("sti" ::: .{ .memory = true }); // bit 9 = IF
 }
