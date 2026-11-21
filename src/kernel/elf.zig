@@ -4,18 +4,23 @@ const vmm = @import("../arch/x86_64/vmm.zig");
 
 pub const Error = error{ BadMagic, NotX86_64, NotExecutable, BadSegment, OutOfMemory };
 
+// Read a little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
 fn r16(b: []const u8, o: usize) u16 {
     return std.mem.readInt(u16, b[o..][0..2], .little);
 }
+
+// Read a little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
 fn r32(b: []const u8, o: usize) u32 {
     return std.mem.readInt(u32, b[o..][0..4], .little);
 }
+
+// Read a little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
 fn r64(b: []const u8, o: usize) u64 {
     return std.mem.readInt(u64, b[o..][0..8], .little);
 }
 
-/// Load `image` into address space `root`. Returns the entry point.
-/// On error the caller destroys the address space (it may be partly filled).
+// Load `image` into address space `root`. Returns the entry point.
+// On error the caller destroys the address space (it may be partly filled).
 pub fn load(root: u64, image: []const u8) Error!u64 {
     if (image.len < 64 or !std.mem.eql(u8, image[0..4], "\x7fELF")) return error.BadMagic;
     if (image[4] != 2 or image[5] != 1 or r16(image, 18) != 0x3E) return error.NotX86_64; // 64-bit, little endian, x86-64

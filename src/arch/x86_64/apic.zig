@@ -14,20 +14,12 @@ var ioapic: usize = 0;
 var ioapic_gsi_base: u32 = 0;
 var ioapic_entries: u32 = 0;
 
-// ---- Local APIC ----
+// Local APIC
 fn lapicReg(off: usize) *volatile u32 {
     return @ptrFromInt(lapic + off);
 }
 
-pub fn eoi() void {
-    lapicReg(0xB0).* = 0;
-}
-
-pub fn id() u8 {
-    return @truncate(lapicReg(0x20).* >> 24);
-}
-
-// ---- I/O APIC: select a register at +0x00, access it at +0x10 ----
+// I/O APIC: select a register at +0x00, access it at +0x10
 fn ioRead(reg: u32) u32 {
     @as(*volatile u32, @ptrFromInt(ioapic)).* = reg;
     return @as(*volatile u32, @ptrFromInt(ioapic + 0x10)).*;
@@ -38,7 +30,7 @@ fn ioWrite(reg: u32, val: u32) void {
     @as(*volatile u32, @ptrFromInt(ioapic + 0x10)).* = val;
 }
 
-// ---- Legacy PIC: move it off the exception vectors, then mask everything ----
+// Legacy PIC: move it off the exception vectors, then mask everything
 fn disablePic() void {
     const seq = [_][2]u16{
         .{ 0x20, 0x11 }, .{ 0xA0, 0x11 }, // start init
@@ -53,6 +45,15 @@ fn disablePic() void {
     }
 }
 
+pub fn eoi() void {
+    lapicReg(0xB0).* = 0;
+}
+
+pub fn id() u8 {
+    return @truncate(lapicReg(0x20).* >> 24);
+}
+
+// Initialize the APIC subsystem. Disables the legacy PIC, enables the local APIC, and sets up the I/O APIC. Panics if no I/O APIC is found.
 pub fn init() void {
     if (acpi.has_8259) disablePic();
 
@@ -76,7 +77,7 @@ pub fn init() void {
     }
 }
 
-/// Deliver legacy IRQ `irq` as `vector` to this CPU.
+// Deliver legacy IRQ `irq` as `vector` to this CPU.
 pub fn route(irq: u8, vector: u8) void {
     const gsi = acpi.irqToGsi(irq);
     if (gsi < ioapic_gsi_base or gsi >= ioapic_gsi_base + ioapic_entries)
@@ -92,6 +93,7 @@ pub fn route(irq: u8, vector: u8) void {
     ioWrite(0x10 + 2 * idx, low); // write low last: unmasks it
 }
 
+// Initialize the APIC subsystem. Disables the legacy PIC, enables the local APIC, and sets up the I/O APIC. Panics if no I/O APIC is found.
 pub fn timerInit(hz: u32) void {
     lapicReg(0x3E0).* = 0x3; // divide the bus clock by 16
     lapicReg(0x320).* = 1 << 16; // masked, one-shot: measure only

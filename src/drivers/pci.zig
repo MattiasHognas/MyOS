@@ -1,6 +1,10 @@
 const root = @import("root");
 const cpu = @import("../arch/x86_64/cpu.zig");
 
+var devices: [64]Device = undefined;
+var count: usize = 0;
+
+// A PCI device, as reported by the PCI configuration space. The caller must ensure that the device is valid (vendor ID != 0xFFFF).
 pub const Device = struct {
     bus: u8,
     dev: u8,
@@ -12,25 +16,26 @@ pub const Device = struct {
     progif: u8,
 };
 
+// Read a 32-bit value from the given offset in the PCI configuration space of the given device. The caller must ensure that the offset is valid for the device's header type.
 fn readRaw(bus: u8, dev: u8, func: u8, off: u8) u32 {
     cpu.outl(0xCF8, 0x8000_0000 | (@as(u32, bus) << 16) | (@as(u32, dev) << 11) |
         (@as(u32, func) << 8) | (off & 0xFC));
     return cpu.inl(0xCFC);
 }
 
+// Read a 32-bit value from the given offset in the PCI configuration space of the given device. The caller must ensure that the offset is valid for the device's header type.
 pub fn read32(d: Device, off: u8) u32 {
     return readRaw(d.bus, d.dev, d.func, off);
 }
 
+// Write a 32-bit value to the given offset in the PCI configuration space of the given device. The caller must ensure that the offset is valid for the device's header type.
 pub fn write32(d: Device, off: u8, val: u32) void {
     cpu.outl(0xCF8, 0x8000_0000 | (@as(u32, d.bus) << 16) | (@as(u32, d.dev) << 11) |
         (@as(u32, d.func) << 8) | (off & 0xFC));
     cpu.outl(0xCFC, val);
 }
 
-var devices: [64]Device = undefined;
-var count: usize = 0;
-
+// Scan the PCI bus for devices. Populates `devices` and `count`. This is called once at boot.
 pub fn scan() void {
     for (0..256) |b| for (0..32) |d| for (0..8) |f| {
         const bus: u8 = @intCast(b);
@@ -63,6 +68,7 @@ pub fn scan() void {
     };
 }
 
+// Find the first device with the given class, subclass, and programming interface. Returns null if no such device exists.
 pub fn find(class: u8, subclass: u8, progif: u8) ?Device {
     for (devices[0..count]) |d| {
         if (d.class == class and d.subclass == subclass and d.progif == progif) return d;
@@ -70,7 +76,7 @@ pub fn find(class: u8, subclass: u8, progif: u8) ?Device {
     return null;
 }
 
-/// Physical address of a memory BAR (handles 64-bit BARs).
+// Physical address of a memory BAR (handles 64-bit BARs).
 pub fn bar(d: Device, idx: u8) u64 {
     const lo = read32(d, 0x10 + idx * 4);
     const addr: u64 = lo & 0xFFFF_FFF0;
@@ -78,7 +84,7 @@ pub fn bar(d: Device, idx: u8) u64 {
     return addr;
 }
 
-/// Allow the device to respond to memory accesses and to do DMA.
+// Allow the device to respond to memory accesses and to do DMA.
 pub fn enableBusMaster(d: Device) void {
     write32(d, 0x04, read32(d, 0x04) | 0b110);
 }

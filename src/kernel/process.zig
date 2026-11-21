@@ -7,6 +7,9 @@ const context = @import("../arch/x86_64/context.zig");
 const vfs = @import("vfs.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 
+const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
+const STACK_PAGES = 4; // 16 KiB
+
 pub const Process = struct {
     root: u64,
     entry: u64,
@@ -15,9 +18,7 @@ pub const Process = struct {
     waiter: ?*thread.Thread = null, // woken with the exit code when we exit
 };
 
-const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
-const STACK_PAGES = 4; // 16 KiB
-
+// Exit the current process with the given exit code. The current thread is marked as dead, and any thread that is waiting for this process to exit is woken with the exit code. The current thread is then blocked forever, and will be reaped by the scheduler.
 pub fn exit(code: u64) noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: we're done
     const p = thread.current().process.?;
@@ -28,6 +29,7 @@ pub fn exit(code: u64) noreturn {
     thread.exit();
 }
 
+// Create a new process that runs the given ELF image in user space. The process is created with a new address space, and a new thread is spawned to run it. The current thread is blocked until the new thread exits, at which point the new thread's exit value is returned.
 pub fn spawnPath(path: []const u8, waiter: ?*thread.Thread) !*Process {
     const node = vfs.lookup(path) orelse return error.FileNotFound;
     const image = try heap.allocator.alloc(u8, node.size);
@@ -36,6 +38,7 @@ pub fn spawnPath(path: []const u8, waiter: ?*thread.Thread) !*Process {
     return spawn(path, image, waiter);
 }
 
+// Free all resources associated with a process. The process must have exited, and no threads must be running in it. The process's address space is destroyed, and all open files are closed.
 pub fn destroy(p: *Process) void {
     for (p.files) |f| if (f) |of| heap.allocator.destroy(of);
     vmm.destroyAddressSpace(p.root);
@@ -43,6 +46,7 @@ pub fn destroy(p: *Process) void {
     heap.allocator.destroy(p);
 }
 
+// Create a new process that runs the given ELF image in user space. The process is created with a new address space, and a new thread is spawned to run it. The current thread is blocked until the new thread exits, at which point the new thread's exit value is returned.
 pub fn spawn(name: []const u8, image: []const u8, waiter: ?*thread.Thread) !*Process {
     const root = vmm.createAddressSpace();
     errdefer vmm.destroyAddressSpace(root);
@@ -65,6 +69,7 @@ pub fn spawn(name: []const u8, image: []const u8, waiter: ?*thread.Thread) !*Pro
     return p;
 }
 
+// Start executing the current thread's process in user space. The process must have been created with spawn() and have a valid entry point. The thread's stack pointer is set to the top of the user stack, and the CPU switches to user mode. This function does not return.
 fn userStart() void {
     const p = thread.current().process.?;
     context.enterUser(p.entry, STACK_TOP - 8); // -8: as if _start had been called

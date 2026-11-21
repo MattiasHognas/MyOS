@@ -40,8 +40,8 @@ pub fn switchTo(old_rsp: *usize, new_rsp: usize) void {
     switch_context(old_rsp, new_rsp);
 }
 
-/// Prepare a fresh stack so that switching to it calls start(arg).
-/// Returns the initial RSP for the new thread.
+// Prepare a fresh stack so that switching to it calls start(arg).
+// Returns the initial RSP for the new thread.
 pub fn initStack(top: usize, start: usize, arg: usize) usize {
     const t = top & ~@as(usize, 15); // 16-byte aligned
     const s: [*]usize = @ptrFromInt(t - 7 * 8);
@@ -55,7 +55,7 @@ pub fn initStack(top: usize, start: usize, arg: usize) usize {
     return t - 7 * 8;
 }
 
-/// Jump to ring 3: build the frame iretq expects (SS, RSP, RFLAGS, CS, RIP).
+// Jump to ring 3: build the frame iretq expects (SS, RSP, RFLAGS, CS, RIP).
 pub fn enterUser(rip: u64, rsp: u64) noreturn {
     asm volatile (
         \\ pushq $0x1B

@@ -2,10 +2,22 @@
 
 My own operating system
 
-## Docs
+## Documentation
 [Specs x86-64 (cheat sheet)](docs/specs-x86_64.md) 
 
-## Dev
+## Usage
+
+### Commands
+
+- `zig build`: normal kernel and userspace builds.
+- `./build.sh`: normal ISO creation, plus a `disk.img` only if absent.
+- `zig build test-host`: native host unit tests using an injected fake filesystem.
+- `zig build test-kernel`: compile the test kernel (no QEMU boot).
+- `zig build test-qemu`: package a separate test ISO and run QEMU.
+- `zig build test`: run both host and QEMU tests.
+
+
+### Development
 
 Install packages
 ```bash

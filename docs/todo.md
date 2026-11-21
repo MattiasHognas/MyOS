@@ -11,11 +11,11 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 **Goal:** Every subsystem has automated tests; establish the test harness before changing critical kernel code, then expand it alongside every subsequent milestone.
 
 ### 1.1 Test infrastructure
-- [ ] Separate hardware-independent code for host-side Zig unit tests.
-- [ ] Add a kernel test build mode and in-kernel test runner.
-- [ ] Add a reliable test success/failure exit mechanism for QEMU.
-- [ ] Write a script to build, boot QEMU, capture serial output, assert results, and enforce timeouts.
-- [ ] Save relevant logs and failure diagnostics.
+- [x] Separate hardware-independent code for host-side Zig unit tests.
+- [x] Add a kernel test build mode and in-kernel test runner.
+- [x] Add a reliable test success/failure exit mechanism for QEMU.
+- [x] Write a script to build, boot QEMU, capture serial output, assert results, and enforce timeouts.
+- [x] Save relevant logs and failure diagnostics.
 
 ### 1.2 Test suites
 - [ ] Test physical memory and kernel heap allocation.

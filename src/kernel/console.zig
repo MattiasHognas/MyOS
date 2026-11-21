@@ -1,6 +1,14 @@
 const std = @import("std");
 const limine = @import("../boot/limine.zig");
 
+var fb: [*]u32 = undefined;
+var stride: usize = 0; // pixels per row
+var cols: usize = 0;
+var rows: usize = 0;
+var col: usize = 0;
+var row: usize = 0;
+const fg: u32 = 0xE0E0E0;
+const bg: u32 = 0x101820;
 const Font = struct { w: usize, h: usize, bpg: usize, glyphs: []const u8 };
 
 // Parsed at compile time; a bad font file is a compile error.
@@ -21,25 +29,8 @@ const font: Font = blk: {
 };
 
 pub var ready = false;
-var fb: [*]u32 = undefined;
-var stride: usize = 0; // pixels per row
-var cols: usize = 0;
-var rows: usize = 0;
-var col: usize = 0;
-var row: usize = 0;
-const fg: u32 = 0xE0E0E0;
-const bg: u32 = 0x101820;
 
-pub fn init(f: *const limine.Framebuffer) void {
-    if (f.bpp != 32) @panic("framebuffer is not 32 bpp");
-    fb = @ptrCast(@alignCast(f.address));
-    stride = f.pitch / 4;
-    cols = f.width / font.w;
-    rows = f.height / font.h;
-    @memset(fb[0 .. stride * f.height], bg);
-    ready = true;
-}
-
+// Draw a glyph at the given character coordinates (not pixel coordinates).
 fn drawGlyph(c: u8, cx: usize, cy: usize) void {
     const glyph = font.glyphs[@as(usize, c) * font.bpg ..][0..font.bpg];
     const bytes_per_row = (font.w + 7) / 8;
@@ -53,6 +44,7 @@ fn drawGlyph(c: u8, cx: usize, cy: usize) void {
     }
 }
 
+// Scroll the framebuffer up by one line. The caller must ensure that the framebuffer is ready.
 fn scroll() void {
     const line_px = stride * font.h;
     const total = line_px * rows;
@@ -60,6 +52,7 @@ fn scroll() void {
     @memset(fb[total - line_px .. total], bg);
 }
 
+// Write a character to the framebuffer. The caller must ensure that the framebuffer is ready.
 pub fn putc(c: u8) void {
     if (c == 0x08) {
         if (col > 0) col -= 1;
@@ -80,4 +73,15 @@ pub fn putc(c: u8) void {
         scroll();
         row = rows - 1;
     }
+}
+
+// Initialize the framebuffer.
+pub fn init(f: *const limine.Framebuffer) void {
+    if (f.bpp != 32) @panic("framebuffer is not 32 bpp");
+    fb = @ptrCast(@alignCast(f.address));
+    stride = f.pitch / 4;
+    cols = f.width / font.w;
+    rows = f.height / font.h;
+    @memset(fb[0 .. stride * f.height], bg);
+    ready = true;
 }

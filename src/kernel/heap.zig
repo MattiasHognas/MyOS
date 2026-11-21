@@ -10,13 +10,24 @@ const MIN = 16; // granularity + max supported alignment
 
 const Chunk = struct { size: usize, next: ?*Chunk }; // lives inside free memory
 
+const vtable = std.mem.Allocator.VTable{
+    .alloc = alloc,
+    .resize = resize,
+    .remap = remap,
+    .free = free,
+};
+
+pub const allocator = std.mem.Allocator{ .ptr = undefined, .vtable = &vtable };
+
 var free_list: ?*Chunk = null; // sorted by address
 var heap_end: usize = HEAP_START;
 
+// Round up to the next multiple of MIN, or MIN if smaller. The caller must ensure that the result does not overflow usize.
 fn round(n: usize) usize {
     return std.mem.alignForward(usize, @max(n, MIN), MIN);
 }
 
+// Insert a free chunk at the given address and size into the free list, merging with adjacent chunks if possible. The caller must ensure that the chunk does not overlap any existing free chunk, and must disable interrupts to avoid races with alloc() and free().
 fn insertFree(addr: usize, size: usize) void {
     var prev: ?*Chunk = null;
     var cur = free_list;
@@ -58,6 +69,7 @@ fn grow(min_bytes: usize) bool {
     return got >= min_bytes;
 }
 
+// Allocate a block of memory of at least `len` bytes, aligned to `alignment`. Returns null if no memory is available. The caller must disable interrupts to avoid races with free().
 fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -86,6 +98,7 @@ fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]
     }
 }
 
+// Resize a block of memory in place. Returns true if the block was shrunk, false if it was grown (the caller reallocates). The caller must disable interrupts to avoid races with alloc() and free().
 fn resize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -96,21 +109,14 @@ fn resize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: 
     return true;
 }
 
+// Remap a block of memory to a new address. Returns the new slice, or null if the remap failed. The caller must disable interrupts to avoid races with alloc() and free().
 fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
     return if (resize(ctx, memory, a, new_len, ra)) memory.ptr else null;
 }
 
+// Free a block of memory. The caller must disable interrupts to avoid races with alloc() and free().
 fn free(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     insertFree(@intFromPtr(memory.ptr), round(memory.len));
 }
-
-const vtable = std.mem.Allocator.VTable{
-    .alloc = alloc,
-    .resize = resize,
-    .remap = remap,
-    .free = free,
-};
-
-pub const allocator = std.mem.Allocator{ .ptr = undefined, .vtable = &vtable };

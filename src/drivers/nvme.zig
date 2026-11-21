@@ -56,19 +56,24 @@ var bounce: u64 = 0; // one DMA page for all transfers
 pub var sector_size: u32 = 512;
 pub var sector_count: u64 = 0;
 
+// Read a 32-bit register at offset `off` from the NVMe controller's MMIO region.
 fn reg32(off: usize) *volatile u32 {
     return @ptrFromInt(regs + off);
 }
+
+// Read a 64-bit register at offset `off` from the NVMe controller's MMIO region.
 fn reg64(off: usize) *volatile u64 {
     return @ptrFromInt(regs + off);
 }
 
+// Allocate a page of physical memory and zero it. Returns the physical address.
 fn zeroedPage() u64 {
     const p = pmm.alloc() orelse @panic("nvme: out of memory");
     @memset(pmm.physToVirt(p)[0..pmm.PAGE_SIZE], 0);
     return p;
 }
 
+// Create a submission/completion queue pair. Returns the queues, which are mapped into the HHDM.
 fn makeQueue(qid: usize) Queue {
     const sq = zeroedPage();
     const cq = zeroedPage();
@@ -82,6 +87,7 @@ fn makeQueue(qid: usize) Queue {
     };
 }
 
+// Submit a command to the queue and wait for its completion. Returns an error if the command failed or timed out.
 fn submit(q: *Queue, cmd_in: Sqe) !void {
     var cmd = cmd_in;
     cmd.cdw0 |= @as(u32, q.cid) << 16;
@@ -105,6 +111,7 @@ fn submit(q: *Queue, cmd_in: Sqe) !void {
     if (status != 0) return error.CommandFailed;
 }
 
+// Wait for the controller to reach the desired ready state. Returns an error if the controller reports a fatal error or times out.
 fn waitReady(want: bool) !void {
     const deadline = hpet.nanos() + 2_000_000_000;
     while (((reg32(0x1C).* & 1) != 0) != want) { // CSTS.RDY
@@ -113,6 +120,7 @@ fn waitReady(want: bool) !void {
     }
 }
 
+// Initialize the NVMe driver. Finds the first NVMe device on the PCI bus, enables it, and sets up the admin and I/O queues. Returns an error if the device is not found or fails to initialize.
 pub fn init(dev: pci.Device) !void {
     pci.enableBusMaster(dev);
     regs = vmm.mapMmio(pci.bar(dev, 0), 0x4000);
@@ -149,7 +157,7 @@ pub fn init(dev: pci.Device) !void {
     root.print("nvme: {d} sectors of {d} bytes ({d} MiB)\n", .{ sector_count, sector_size, sector_count * sector_size / (1024 * 1024) });
 }
 
-/// Read `count` sectors starting at `lba` into `buf`. At most one page per call.
+// Read `count` sectors starting at `lba` into `buf`. At most one page per call.
 pub fn read(lba: u64, count: u32, buf: []u8) !void {
     const bytes = count * sector_size;
     if (count == 0 or bytes > pmm.PAGE_SIZE or buf.len < bytes) return error.BadRequest;

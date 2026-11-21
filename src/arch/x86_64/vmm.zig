@@ -51,7 +51,7 @@ fn freeTable(phys: u64, level: u6) void { // 2 = PDPT, 1 = PD, 0 = PT
     pmm.free(phys);
 }
 
-/// Map one page: 4 KiB, or 2 MiB if `huge`.
+// Map one page: 4 KiB, or 2 MiB if `huge`.
 pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
     const last: u6 = if (huge) 1 else 0;
     var t = table(root);
@@ -90,7 +90,7 @@ fn wrmsr(msr: u32, val: u64) void {
     );
 }
 
-/// New PML4: empty user half, kernel half shared with every other address space.
+// New PML4: empty user half, kernel half shared with every other address space.
 pub fn createAddressSpace() u64 {
     const root = allocTable();
     @memcpy(table(root)[256..512], table(kernel_root)[256..512]);
@@ -104,8 +104,8 @@ pub fn loadRoot(root: u64) void {
         : .{ .memory = true });
 }
 
-/// Free every page and page table in the user half, then the PML4 itself.
-/// Must not be the currently loaded address space.
+// Free every page and page table in the user half, then the PML4 itself.
+// Must not be the currently loaded address space.
 pub fn destroyAddressSpace(root: u64) void {
     for (table(root)[0..256]) |e| {
         if (e & PRESENT != 0) freeTable(e & ADDR_MASK, 2);
@@ -113,7 +113,7 @@ pub fn destroyAddressSpace(root: u64) void {
     pmm.free(root);
 }
 
-/// Map a device's registers uncached; returns the virtual address of `phys`.
+// Map a device's registers uncached; returns the virtual address of `phys`.
 pub fn mapMmio(phys: u64, size: usize) usize {
     const base = phys & ~@as(u64, 0xFFF);
     const end = (phys + size + 0xFFF) & ~@as(u64, 0xFFF);

@@ -5,7 +5,7 @@ const apic = @import("../../arch/x86_64/apic.zig");
 const thread = @import("../../kernel/thread.zig");
 const process = @import("../../kernel/process.zig");
 
-// ---- IDT table ----
+// IDT table
 const Entry = extern struct {
     offset_low: u16,
     selector: u16,
@@ -42,7 +42,7 @@ fn setGate(vec: usize, handler: usize) void {
     };
 }
 
-// ---- Stubs, generated at compile time ----
+// Stubs, generated at compile time.
 // The CPU pushes an error code only for some vectors. The stub pushes a
 // dummy 0 for the others, so every frame has the same layout.
 fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
@@ -59,7 +59,7 @@ fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
     }.h;
 }
 
-// ---- Common path: save registers, call Zig, restore, iretq ----
+// Common path: save registers, call Zig, restore, iretq
 comptime {
     asm (
         \\.section .text

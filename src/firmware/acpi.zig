@@ -2,16 +2,37 @@ const std = @import("std");
 const root = @import("root");
 const pmm = @import("../kernel/pmm.zig");
 
+var root_table: []const u8 = &.{}; // XSDT (8-byte entries) or RSDT (4-byte)
+var entry_size: usize = 8;
+
+// What the MADT tells us
+pub const IoApic = struct { id: u8, addr: u32, gsi_base: u32 };
+pub const Override = struct { gsi: u32, flags: u16 }; // flags: polarity bits 0-1, trigger bits 2-3
+
+pub var lapic_addr: u64 = 0;
+pub var has_8259 = false; // legacy PICs present (mask them in step 9)
+pub var cpu_ids: [64]u8 = undefined;
+pub var cpu_count: usize = 0;
+pub var ioapics: [8]IoApic = undefined;
+pub var ioapic_count: usize = 0;
+pub var irq_overrides: [16]?Override = @splat(null);
+
+// Read a 16-bit little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
 fn r16(b: []const u8, o: usize) u16 {
     return std.mem.readInt(u16, b[o..][0..2], .little);
 }
+
+// Read a 32-bit little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
 fn r32(b: []const u8, o: usize) u32 {
     return std.mem.readInt(u32, b[o..][0..4], .little);
 }
+
+// Read a 64-bit little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
 fn r64(b: []const u8, o: usize) u64 {
     return std.mem.readInt(u64, b[o..][0..8], .little);
 }
 
+// Return true if the bytes in `b` sum to 0 modulo 256. The caller must ensure that `b` is large enough.
 fn checksumOk(b: []const u8) bool {
     var sum: u8 = 0;
     for (b) |x| sum +%= x; // wrapping add
@@ -24,9 +45,7 @@ fn tableAt(phys: u64) []const u8 {
     return pmm.physToVirt(phys)[0..len];
 }
 
-var root_table: []const u8 = &.{}; // XSDT (8-byte entries) or RSDT (4-byte)
-var entry_size: usize = 8;
-
+// Find the first table with the given signature. Returns null if no such table exists. The caller must ensure that `sig` is a 4-byte string.
 pub fn findTable(sig: *const [4]u8) ?[]const u8 {
     var off: usize = 36;
     while (off + entry_size <= root_table.len) : (off += entry_size) {
@@ -37,23 +56,12 @@ pub fn findTable(sig: *const [4]u8) ?[]const u8 {
     return null;
 }
 
-// ---- What the MADT tells us ----
-pub const IoApic = struct { id: u8, addr: u32, gsi_base: u32 };
-pub const Override = struct { gsi: u32, flags: u16 }; // flags: polarity bits 0-1, trigger bits 2-3
-
-pub var lapic_addr: u64 = 0;
-pub var has_8259 = false; // legacy PICs present (mask them in step 9)
-pub var cpu_ids: [64]u8 = undefined;
-pub var cpu_count: usize = 0;
-pub var ioapics: [8]IoApic = undefined;
-pub var ioapic_count: usize = 0;
-pub var irq_overrides: [16]?Override = @splat(null);
-
-/// Legacy IRQ (keyboard = 1, PIT = 0) -> I/O APIC input (GSI).
+// Legacy IRQ (keyboard = 1, PIT = 0) -> I/O APIC input (GSI).
 pub fn irqToGsi(irq: u8) u32 {
     return if (irq_overrides[irq]) |o| o.gsi else irq;
 }
 
+// Parse the MADT (APIC) table. Updates `lapic_addr`, `has_8259`, `cpu_ids`, `cpu_count`, `ioapics`, `ioapic_count`, and `irq_overrides`.
 fn parseMadt(m: []const u8) void {
     lapic_addr = r32(m, 36);
     has_8259 = (r32(m, 40) & 1) != 0;
@@ -82,6 +90,7 @@ fn parseMadt(m: []const u8) void {
     }
 }
 
+// Initialize the ACPI subsystem. `rsdp_addr` is the physical address of the RSDP (or an HHDM pointer to it). `hhdm` is the HHDM offset. Panics if the ACPI tables are invalid or missing.
 pub fn init(rsdp_addr: u64, hhdm: u64) void {
     // Newer Limine revisions give a physical address; older ones an HHDM pointer.
     const phys = if (rsdp_addr >= hhdm) rsdp_addr - hhdm else rsdp_addr;

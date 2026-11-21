@@ -37,7 +37,7 @@ pub fn getChar() u8 {
     return @truncate(syscall(7, 0, 0, 0));
 }
 
-/// Start a program and wait for it. Returns its exit code, or ERR if it couldn't start.
+// Start a program and wait for it. Returns its exit code, or ERR if it couldn't start.
 pub fn run(path: []const u8) u64 {
     return syscall(8, @intFromPtr(path.ptr), path.len, 0);
 }
