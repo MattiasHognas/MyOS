@@ -138,7 +138,7 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
 /// page was mapped to (the caller decides whether to free it), or null if
 /// `virt` was not mapped by a 4 KiB page. Page tables are kept.
 ///
-/// With several CPUs the other ones need a TLB shootdown too (milestone 5).
+/// With several CPUs the other ones need a TLB shootdown too.
 pub fn unmap(root: u64, virt: u64) ?u64 {
     var t = table(root);
     var level: u6 = 3;

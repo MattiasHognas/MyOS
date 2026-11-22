@@ -4,12 +4,15 @@ A dependency-ordered roadmap for building a small x86-64 operating system in Zig
 
 ## Primary goal
 
-**Run an unmodified .NET executable safely and fast, on several cores, on top of a minimal kernel core.** That is milestone 8, and it is the first point at which the project counts as having reached its goal.
+**Run an unmodified .NET executable safely and fast, on several cores, on top of a minimal kernel core.** That is milestone 9, and it is the first point at which the project counts as having reached its goal.
 
-- **On the critical path:** 2 (safety), 3 (process startup, descriptors, user memory, time), 5 (SMP), 7.1 (SSE/FPU state and TLS) and 8 (Linux binary compatibility).
-- **Not required for the goal:** 4 (persistent storage; programs can ship in the initrd), 6 (networking; only needed for network programs) and 7.2 (porting a libc; a statically linked foreign binary brings its own, though a small C program is a useful stepping stone).
-- **After the goal:** 9 (graphical environment) is planned and will be done; it just does not gate the primary goal.
+- **What counts:** a .NET Native AOT program built on Linux for linux-musl, statically linked. The JIT-based runtime (`dotnet app.dll`) is a later step (9.3).
+- **One ABI:** MyOS's native syscall ABI is Linux's x86-64 ABI (decided 2026-11-23, see 2.5). There is no translation layer and no libc to port: MyOS's own programs and foreign binaries make the same calls. 64-bit only.
+- **On the critical path:** 2 (safety, plus per-CPU state and FPU/SSE state), 3 (SMP), 4 (first foreign program), 5 (user memory), 6 (files, descriptors, time; as far as the runtime needs them), 7 (threads and futexes), 8 (signals) and 9 (.NET, measured).
+- **Not required for the goal:** 11 (persistent storage; programs can ship in the initrd) and 12 (networking; only needed for network programs).
+- **After the goal:** 10 (graphical environment) is planned and will be done; it just does not gate the primary goal.
 - **Minimal core:** when a feature is only needed off the critical path, prefer leaving it out or keeping it in user space over growing the kernel.
+- **Order:** SMP comes before the feature work, so everything after it is written and tested on several cores; a foreign hello-world comes right after, so Linux compatibility is tested from then on rather than discovered at the end.
 
 ## Current foundation
 
@@ -34,7 +37,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Test ELF parsing, failed loading, and rollback (valid image contents and `.bss`, 14 malformed/truncated images, no leaked pages, spawn rollback after partial loads).
 - [x] Test valid/invalid syscall buffers and kernel/user isolation (`/test/syscalls` checks 39 cases from ring 3; reading kernel memory, `cli` and writing own code kill only the process). Unmapped user buffers: `/test/user_pointers` (2.1).
 - [x] Test scheduler transitions, process lifecycle, waits, and cleanup (FIFO round robin, wake-before-block, exit codes, no page/heap leaks after normal and crashed processes).
-- [x] Test VFS and filesystem behavior (lookup, contents, offsets and EOF on the initrd; an injected fake filesystem on the host; malformed tarfs archives and boundary conditions). Storage write tests: 4.2.
+- [x] Test VFS and filesystem behavior (lookup, contents, offsets and EOF on the initrd; an injected fake filesystem on the host; malformed tarfs archives and boundary conditions). Storage write tests: 11.2.
 
 ### 1.3 CI and debugging
 - [x] Add GitHub Actions kernel/app builds (`.github/workflows/ci.yml`; pinned Zig, checksum-verified Limine and font).
@@ -109,23 +112,28 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
   - [x] The last user page is never mapped (`vmm.USER_MAP_END`; see the `sysretq` item in 2.5).
 - [ ] Cap segment sizes (`memsz`) against a per-process memory limit, so one ELF cannot ask for all physical memory.
 - [ ] Verify the entry point is inside an executable loaded segment.
-- [ ] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages.
+- [ ] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages (a JIT later needs pages that go from writable to executable with `mprotect`, never both at once; see 9.3).
 - [x] Roll back every allocated page and table on loading failure.
 - [x] Add malformed and truncated ELF tests.
 - [ ] Split ELF header/segment validation from page mapping so it runs in host tests, and fuzz it there.
 
 ### 2.5 Syscall and context-switch correctness
+- [x] Decide whether the syscall numbers, error values and struct layouts follow Linux. Decided (2026-11-23): the native ABI is Linux's x86-64 syscall ABI, for MyOS's own programs too; no translation layer. Only the 64-bit `syscall` interface (no `int 0x80`, no x32).
+- [ ] Move the existing syscalls to Linux's numbers and argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`): `read` 0, `write` 1, `open` 2, `close` 3. Keep the ones with no Linux equivalent (`getchar`, `run`) on private numbers far above Linux's range until 6 replaces them.
+- [ ] Return Linux's negative errno values from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig`.
+- [ ] Introduce the per-CPU structure reached through GS, with `swapgs` on every entry from and exit to ring 3, while there is still one CPU (moved from the SMP milestone, so the entry assembly is audited once, in its final shape).
+- [ ] Enable SSE (CR0/CR4) and save and restore the extended CPU state per thread on context switch: XSAVE with the area sized from CPUID, AVX enabled where supported, FXSAVE as the fallback. Build user programs with SSE; the kernel stays soft-float. Today user code is soft-float too, and no foreign binary runs without SSE2.
 - [ ] Audit `syscall` entry and exit assembly for register preservation and ABI stack alignment.
 - [ ] Validate return RIP/RSP and avoid unsafe `sysretq` for noncanonical or invalid return states.
   - [x] Close the known case: a `syscall` instruction at the very end of user space returns to a non-canonical address, and `sysretq` then faults in ring 0 on the user's stack pointer (Intel). The ELF loader now refuses to map the last user page or put the entry point there (tested with segments at, across and just below it).
   - [ ] Still to do: check the saved return address in the exit path itself (needed once `mmap` or signals can put code or return addresses anywhere), and fall back to `iretq` when it is not safe.
 - [ ] Verify interrupt masking and preemption across syscall entry, blocking, and return.
 - [ ] Verify stack and address-space switches during timer interrupts and syscalls.
-- [ ] Define errno-style syscall error codes and return them from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig`. Do this before milestone 3 adds syscalls.
-- [ ] Decide now whether the syscall numbers, error values and struct layouts follow Linux (see 8.1): choosing Linux-compatible values here avoids renumbering everything later.
-- [ ] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions.
+- [ ] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions (where it is Linux's, say so and list only what MyOS implements).
 - [ ] Test from ring 3 that syscalls preserve callee-saved registers and RFLAGS, keep the stack aligned, and survive preemption mid-syscall.
 - [ ] Test that each failure case in `/test/syscalls` returns its specific error code.
+- [ ] Test that floating-point, SSE and AVX registers survive preemption between two processes, and that a new thread starts with clean extended state (nothing leaks from the previous owner).
+- [ ] Fuzz the syscall interface from ring 3 (random numbers and arguments, fixed seed in CI): the kernel must survive and leak nothing.
 - [x] Clear all general-purpose registers on the first entry to user mode, so no kernel value leaks to the program (`context.enterUser`; tested from ring 3 by `/test/entry_regs`).
 
 ### 2.6 Memory-management correctness
@@ -156,20 +164,21 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Stress-test repeated spawn/exit, wait, wakeup, orphaning, and failure paths.
 
 ### 2.8 Synchronization and timers
-Moved up from 5.1: pipes, blocking I/O, sleep and interrupt-driven drivers in milestones 3 and 4 need these long before SMP does.
-- [ ] Add interrupt-aware spinlocks with interrupt-state restoration (on one CPU they only mask interrupts; 5.1 makes them SMP-safe).
+Pipes, blocking I/O, sleep and interrupt-driven drivers need these, and SMP (milestone 3) builds directly on them.
+- [ ] Add interrupt-aware spinlocks with interrupt-state restoration, as real atomic locks from the start (on one CPU the atomic never contends, and milestone 3 needs no rewrite).
 - [ ] Add wait queues and replace the single-`waiter` pointers (keyboard, process wait) with them.
 - [ ] Add mutexes for code that may block while holding a lock.
 - [ ] Add kernel timers: a timeout queue driven by the timer tick, for sleep, driver timeouts and later TCP.
 - [ ] Test several waiters on one queue, wake-before-block, timer ordering and expiry, and mutex hand-off under preemption.
 
 ### 2.9 Further hardening
-From the code review before 2.2. None of these fix a known hole; they shrink what a future bug can do. Do them after 2.2 to 2.8, in roughly this order.
+From the code review before 2.2. None of these fix a known hole; they shrink what a future bug can do. Do them after 2.2 to 2.8, in roughly this order. The random-number generator, stack protectors and page zeroing are wanted before the primary goal; page-table isolation and address randomization can wait until after it.
 - [x] Enable UMIP when CPU-supported, so ring 3 cannot read kernel table addresses with `sgdt`/`sidt` (`usercopy.init`; tested by `/test/umip`).
+- [ ] Add a kernel random-number generator: a CSPRNG seeded from RDSEED/RDRAND where present, plus timing jitter. Stack-protector canaries, address randomization, `AT_RANDOM` (4.1) and `getrandom` (6.4) all draw from it.
 - [ ] Build the kernel with stack protectors and test that a smashed kernel stack is detected.
 - [ ] Add a speculation barrier after the user range check in the user-copy path, and audit other user-controlled indexes (syscall number, file descriptor) for Spectre v1.
 - [ ] Decide on kernel page-table isolation: detect CPUs that need it (Meltdown) and either implement it or refuse to run untrusted code on them.
-- [ ] Randomize the kernel's load address and the user stack and program base (KASLR/ASLR); needs the PIE loading of 8.2 for programs.
+- [ ] Randomize the kernel's load address and the user stack and program base (KASLR/ASLR); needs the PIE loading of 4.1 for programs.
 - [ ] Poison freed heap memory and freed pages in debug builds to catch use-after-free.
 - [ ] Zero pages when they are freed or before they reach another process, as a rule in one place instead of at each call site.
 
@@ -177,147 +186,33 @@ From the code review before 2.2. None of these fix a known hole; they shrink wha
 
 ---
 
-## 3. Useful userspace and shell
-
-**Goal:** Run practical programs with arguments, files, and predictable process behavior.
-
-### 3.1 Process startup
-- [ ] Define the initial userspace stack/ABI layout.
-- [ ] Pass `argc`, `argv`, and `envp` to spawned programs.
-- [ ] Update user startup code to read arguments/environment.
-- [ ] Parse command lines with arguments and basic quoting.
-- [ ] Test empty, long, invalid, and multi-argument commands.
-
-### 3.2 VFS and directories
-- [ ] Distinguish regular files from directories in VFS nodes.
-- [ ] Add directory lookup and `readdir` operations.
-- [ ] Add `stat`-like metadata queries.
-- [ ] Normalize paths and handle `.` and `..`.
-- [ ] Add mount-point traversal so multiple filesystems can coexist.
-- [ ] Add create/write/truncate/unlink/mkdir operations to the VFS interface.
-- [ ] Add a small in-memory filesystem (ramfs) mounted at `/tmp`, so redirection (3.4) has somewhere to write and the write API is proven before FAT32 (4.5).
-- [ ] Define consistent VFS error codes that map onto the syscall error codes (2.5).
-- [ ] Test directory lookup, `readdir`, `stat`, `.`/`..` normalization, mount traversal and error codes (host tests with fake filesystems, plus initrd tests in QEMU).
-- [ ] Test ramfs create, write, read-back, truncate, unlink and out-of-memory on the host and from ring 3.
-- [ ] Run the tarfs parser in host tests and fuzz it with malformed archives.
-
-### 3.3 Descriptors and I/O
-- [ ] Reserve FDs 0/1/2 for stdin/stdout/stderr.
-- [ ] Route console I/O through descriptor-backed devices.
-- [ ] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 3.4 depend on it.
-- [ ] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling.
-- [ ] Support generic open/read/write/close plus `seek` where applicable.
-- [ ] Define file-offset, ownership, and descriptor inheritance rules.
-- [ ] Add descriptor duplication and pipes.
-- [ ] Add a `poll`-style syscall to wait on several descriptors at once (needed by network servers in 6.3 and the compositor in 9.3).
-- [ ] Test EOF, partial I/O, invalid descriptors, and cleanup.
-- [ ] Test terminal line editing and `poll` (ready, blocking, and timeout cases) with input injected over serial.
-
-### 3.4 Commands and shell features
-- [ ] Implement `echo`, `cat`, `ls`, `pwd`, `cd`, and `clear`.
-- [ ] Support absolute and relative paths and working directories.
-- [ ] Display meaningful command errors and exit statuses.
-- [ ] Implement basic input/output redirection once descriptors are ready.
-- [ ] Implement pipelines once pipes are available.
-- [ ] Add `mkdir` and removal commands after writable filesystems exist.
-- [ ] Test commands, paths, redirection and pipelines with scripted shell sessions in QEMU (input via serial, output checked in the log).
-
-### 3.5 User memory and process control
-- [ ] Define user virtual-memory regions.
-- [ ] Implement anonymous mapping/unmapping and resource reclamation.
-- [ ] Expose `brk` or `mmap` and add a small userspace allocator.
-- [ ] Assign stable PIDs and track parent-child relationships.
-- [ ] Define generalized process waiting and exit-code handling.
-- [ ] Support Ctrl+C termination of foreground jobs.
-- [ ] Add monotonic timekeeping and a sleep syscall.
-- [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 4.5 and libc in 7 need it).
-- [ ] Start an `init` process that launches the shell, restarts it when it exits, and adopts orphans (2.7).
-- [ ] Implement a basic `ps` command.
-- [ ] Test map/unmap and out-of-memory from ring 3, PID and parent tracking, waiting on exited children, sleep accuracy, Ctrl+C termination, wall-clock time, and the shell being restarted after `exit`.
-
-**Milestone 3 done when:** Commands such as `ls /bin`, `cat /etc/motd`, and `echo hello` work, and programs accept arguments.
-
----
-
-## 4. Persistent storage and FAT32
-
-**Goal:** Read and write files that survive a reboot.
-
-### 4.1 Block-device layer
-- [ ] Define a generic block-device interface for read/write/capacity/block size.
-- [ ] Add device registration and consistent I/O error reporting.
-- [ ] Validate LBA ranges, buffer sizes, and alignment.
-- [ ] Add a small block cache with explicit flush (FAT32 writes in 4.5 rely on it for flush ordering).
-- [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, error propagation, and cache hits, eviction and flush.
-
-### 4.2 NVMe
-- [ ] Implement NVMe write operations.
-- [ ] Support multi-page transfers with PRP lists or another valid DMA mechanism.
-- [ ] Add PCI MSI/MSI-X support and switch NVMe from polling to interrupt-driven completion (legacy PCI interrupt routing would need an ACPI AML interpreter; the network driver in 6.1 reuses this).
-- [ ] Validate namespace geometry and bounds.
-- [ ] Handle command errors, timeouts, and controller failures.
-- [ ] Audit DMA allocation, synchronization, and queue handling.
-- [ ] Test repeated and boundary-crossing reads/writes using disposable images, including write-then-read-back and persistence across a reboot (storage write tests, moved from 1.2).
-
-### 4.3 Partition discovery
-- [ ] Parse GPT headers and partition entries.
-- [ ] Verify GPT checksums and bounds.
-- [ ] Expose partitions as block devices.
-- [ ] Test corrupted and empty partition tables.
-
-### 4.4 FAT32 read support
-- [ ] Validate FAT32 BPB/boot-sector fields.
-- [ ] Read FAT entries and traverse cluster chains.
-- [ ] Enumerate directories and open nested paths.
-- [ ] Read multi-cluster files.
-- [ ] Support 8.3 names, then long filename entries.
-- [ ] Detect invalid clusters, loops, and malformed metadata.
-- [ ] Mount FAT32 through the VFS.
-- [ ] Test reads against generated fixture images (4.6), including corrupted boot sectors, cluster loops and bad directory entries.
-
-### 4.5 FAT32 write support
-- [ ] Allocate/free clusters safely.
-- [ ] Create files and directories.
-- [ ] Write, extend, truncate, and delete files.
-- [ ] Update directory entries and filesystem metadata.
-- [ ] Add flush ordering and document crash-consistency limits.
-- [ ] Test filesystem integrity from both MyOS and Linux after writes.
-
-### 4.6 Reproducible disk fixtures
-- [ ] Generate disposable GPT/FAT32 disk images with scripts.
-- [ ] Populate fixtures using Linux `mkfs.fat`/`mcopy` tools.
-- [ ] Check MyOS writes by remounting/inspecting the image from Linux.
-- [ ] Run read/write regressions in CI, never against real user disks.
-
-**Milestone 4 done when:** A FAT32 volume can be mounted and files persist correctly across reboot.
-
----
-
-## 5. SMP and synchronization
+## 3. SMP
 
 **Goal:** Safely use multiple CPU cores.
 
-### 5.1 Synchronization
-The primitives themselves come from 2.8; this section makes them and their users safe on several CPUs.
-- [ ] Make the 2.8 spinlocks real locks (atomic acquire, not just interrupt masking).
+Moved up (it was milestone 5): bringing up SMP while the kernel is small is far cheaper than retrofitting it onto pipes, a terminal, `mmap`, futexes and signals written for one CPU. Everything after this milestone is written and tested on several cores.
+
+### 3.1 Synchronization
+The primitives come from 2.8 and are already real locks; this section makes their users safe on several CPUs.
+- [ ] Decide and document the kernel's preemption and locking model: whether kernel code can be preempted, which locks disable interrupts, and what may be held across a block.
 - [ ] Audit existing `cli`/`sti` critical sections and replace every one that assumes a single CPU.
 - [ ] Make mutexes and wait queues safe against wakeups from another CPU.
 - [ ] Define lock-ordering rules and test contention.
 
-### 5.2 Per-CPU state
-- [ ] Introduce per-CPU data structures.
+### 3.2 Per-CPU state
+The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [ ] Move current-thread, scheduler, syscall-stack, and interrupt state to per-CPU storage.
-- [ ] Configure GS-based CPU-local addressing and correct `swapgs` transitions.
-- [ ] Initialize separate GDT/TSS and guarded stacks for each CPU.
+- [ ] Initialize separate GDT/TSS, emergency (IST) stacks and guarded stacks for each CPU.
 - [ ] Test per-CPU state and `swapgs` transitions (syscalls, interrupts from ring 0 and ring 3) with one and several CPUs.
 
-### 5.3 Bring up application processors
+### 3.3 Bring up application processors
 - [ ] Request SMP information through Limine.
 - [ ] Start APs and initialize CPU-local structures.
+- [ ] Apply the per-CPU control-register settings on every AP: SMEP, SMAP, UMIP, CR0.WP, the `syscall` MSRs and the extended-state setup from 2.5.
 - [ ] Configure local APIC/timer and interrupts per CPU.
 - [ ] Print and test online CPU counts.
 
-### 5.4 SMP scheduling and memory
+### 3.4 SMP scheduling and memory
 - [ ] Protect shared scheduler state.
 - [ ] Choose per-CPU queues or a documented global-queue scheduling model.
 - [ ] Support cross-CPU wakeups and inter-processor interrupts.
@@ -325,23 +220,294 @@ The primitives themselves come from 2.8; this section makes them and their users
 - [ ] Synchronize PMM, heap, page tables, and drivers.
 - [ ] Implement cross-CPU TLB shootdowns.
 - [ ] Stress-test simultaneous allocations, processes, interrupts, and I/O.
+- [ ] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run.
+- [ ] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
 
-**Milestone 5 done when:** Multiple cores safely execute user threads and syscalls concurrently.
+**Milestone 3 done when:** Multiple cores safely execute user threads and syscalls concurrently, and CI runs the test suite on several CPUs.
 
 ---
 
-## 6. Networking
+## 4. First foreign program
+
+**Goal:** Run an unmodified, statically linked musl C program built on Linux.
+
+This is the smallest end-to-end slice of Linux compatibility. It comes early on purpose: from here on, new kernel features are checked against real foreign binaries instead of only against MyOS's own programs.
+
+### 4.1 Process startup
+- [ ] Build the initial user stack the way Linux does: `argc`, `argv`, `envp`, then the auxiliary vector (`AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`, `AT_PAGESZ`, `AT_RANDOM`, ...). `AT_RANDOM` needs the random-number generator from 2.9.
+- [ ] Pass arguments and environment to spawned programs.
+- [ ] Update the Zig user startup code to read arguments/environment.
+- [ ] Parse command lines with arguments and basic quoting.
+- [ ] Load position-independent executables (`ET_DYN`) at a chosen load bias.
+- [ ] Give each thread its own FS base: `arch_prctl(ARCH_SET_FS)`, saved and restored on context switch; enable FSGSBASE when the CPU has it.
+  - The kernel does not set up the TLS block from `PT_TLS`: on Linux the C library does that itself, from the program headers it finds through `AT_PHDR`.
+- [ ] Extend the syscall ABI document from 2.5 with the startup stack, the auxiliary vector and TLS.
+- [ ] Test empty, long, invalid, and multi-argument commands, and check the stack layout from ring 3.
+
+### 4.2 Minimal syscall set
+- [ ] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs.
+- [ ] Record what the target programs really ask for: run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
+- [ ] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
+
+### 4.3 Fixtures
+- [ ] Keep prebuilt fixture binaries (with the commands that built them) and run them as QEMU tests, checking their output.
+- [ ] Run a static and a static-PIE musl hello-world built on Linux, with arguments and environment.
+- [ ] Test malformed `ET_DYN` images and an unknown syscall number from ring 3.
+
+**Milestone 4 done when:** An unmodified static musl hello-world built on Linux prints its arguments on MyOS, as a CI test on several CPUs.
+
+---
+
+## 5. User memory
+
+**Goal:** Give processes the virtual memory model runtimes expect: reserve large ranges, commit them piece by piece, change permissions, and fail safely when memory runs out.
+
+Designed once, demand-paged from the start, instead of an eager `mmap` first and demand paging later.
+
+- [ ] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults.
+- [ ] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
+- [ ] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
+- [ ] Implement `mprotect`, `munmap` of partial ranges, `madvise(MADV_DONTNEED)` and `brk`, with resource reclamation.
+- [ ] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes).
+- [ ] Shoot down TLB entries on the other CPUs on `munmap` and `mprotect` (3.4).
+- [ ] Define the out-of-memory policy: when a page fault cannot be given a page, the process is killed and the kernel carries on; tie it to the per-process limits of 2.6.
+- [ ] Add a small userspace allocator for the Zig programs on top of `mmap`.
+- [ ] Test reserve-then-commit of a multi-gigabyte range, permission changes, partial unmaps, faults on `PROT_NONE` pages, stack growth up to its limit, the out-of-memory kill, and page faults on several CPUs at once in one address space (once threads exist, 7).
+
+**Milestone 5 done when:** A program can reserve a multi-gigabyte range and commit it piece by piece, and a program that exhausts memory is the only casualty.
+
+---
+
+## 6. Files, descriptors, and shell
+
+**Goal:** Run practical programs with files, pipes, a terminal and predictable process behavior.
+
+Every syscall added here takes Linux's number, signature and struct layout (`stat`, `timespec`, `iovec`, `dirent64`, `pollfd`, ...) from the start.
+
+### 6.1 VFS and directories
+- [ ] Distinguish regular files from directories in VFS nodes.
+- [ ] Add directory lookup and `readdir` operations (`getdents64`).
+- [ ] Add `stat`-like metadata queries (`fstat`/`newfstatat`).
+- [ ] Normalize paths and handle `.` and `..`.
+- [ ] Add mount-point traversal so multiple filesystems can coexist.
+- [ ] Add create/write/truncate/unlink/mkdir operations to the VFS interface.
+- [ ] Add a small in-memory filesystem (ramfs) mounted at `/tmp`, so redirection (6.3) has somewhere to write and the write API is proven before FAT32 (11.5).
+- [ ] Define consistent VFS error codes that map onto the syscall error codes (2.5).
+- [ ] Test directory lookup, `readdir`, `stat`, `.`/`..` normalization, mount traversal and error codes (host tests with fake filesystems, plus initrd tests in QEMU).
+- [ ] Test ramfs create, write, read-back, truncate, unlink and out-of-memory on the host and from ring 3.
+- [ ] Run the tarfs parser in host tests and fuzz it with malformed archives.
+
+### 6.2 Descriptors and I/O
+- [ ] Reserve FDs 0/1/2 for stdin/stdout/stderr.
+- [ ] Route console I/O through descriptor-backed devices.
+- [ ] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 6.3 depend on it.
+- [ ] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling. Keep it small; anything richer belongs in user space.
+- [ ] Support generic open/read/write/close plus `seek` where applicable (`openat`, `lseek`).
+- [ ] Define file-offset, ownership, and descriptor inheritance rules.
+- [ ] Add descriptor duplication and pipes (`dup`/`dup3`, `pipe2`).
+- [ ] Add `poll` to wait on several descriptors at once (needed by network servers in 12.3 and the compositor in 10.3).
+- [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
+- [ ] Add `epoll` and `eventfd` on top of `poll`.
+- [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents (the list from 4.2 says which).
+- [ ] Test EOF, partial I/O, invalid descriptors, and cleanup.
+- [ ] Test terminal line editing and `poll` (ready, blocking, and timeout cases) with input injected over serial.
+
+### 6.3 Commands and shell features
+- [ ] Implement `echo`, `cat`, `ls`, `pwd`, `cd`, and `clear`.
+- [ ] Support absolute and relative paths and working directories.
+- [ ] Display meaningful command errors and exit statuses.
+- [ ] Implement basic input/output redirection once descriptors are ready.
+- [ ] Implement pipelines once pipes are available.
+- [ ] Add `mkdir` and removal commands after writable filesystems exist.
+- [ ] Build MyOS's own Zig programs for Zig's `x86_64-linux` target and use the standard library (`std.fs`, allocators, later `std.Thread`) instead of the hand-written wrappers in `app/lib.zig`, once the kernel implements the syscalls the standard library's startup and I/O paths make (the syscall trace from 4.2 shows what is missing). Until then `app/lib.zig` keeps its own wrappers, on Linux's numbers.
+- [ ] Build a few small C utilities with a stock Linux musl toolchain and run them (this replaces the libc port of the former milestone 7).
+- [ ] Test commands, paths, redirection and pipelines with scripted shell sessions in QEMU (input via serial, output checked in the log).
+
+### 6.4 Process control and time
+- [ ] Decide how programs are started, and replace the private `run` syscall: either `clone(CLONE_VM|CLONE_VFORK)` plus `execve` (what musl's `posix_spawn` uses; no `fork` or copy-on-write needed), or one private spawn syscall kept outside Linux's numbers.
+- [ ] Assign stable PIDs and track parent-child relationships.
+- [ ] Define generalized process waiting and exit-code handling (`wait4`).
+- [ ] Support Ctrl+C termination of foreground jobs.
+- [ ] Add monotonic timekeeping and a sleep syscall (`clock_gettime`, `nanosleep`), on a calibrated TSC clock where the TSC is invariant and HPET otherwise: runtimes read the clock constantly.
+- [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 11.5 need it).
+- [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.
+- [ ] Start an `init` process that launches the shell, restarts it when it exits, and adopts orphans (2.7).
+- [ ] Implement a basic `ps` command.
+- [ ] Test PID and parent tracking, waiting on exited children, sleep accuracy, Ctrl+C termination, wall-clock time, and the shell being restarted after `exit`.
+- [ ] Test each syscall from ring 3 against Linux's documented results and error codes, including the struct layouts.
+
+**Milestone 6 done when:** Commands such as `ls /bin`, `cat /etc/motd`, and `echo hello` work, alone and in pipelines, from MyOS's own programs and from C programs built on Linux.
+
+---
+
+## 7. Threads and futexes
+
+**Goal:** Run multi-threaded programs, with the threads of one process on different cores.
+
+- [ ] Support multiple threads per process, with shared address space and descriptor table; revisit the single-thread assumptions documented in 2.7.
+- [ ] Implement `clone` for threads (`CLONE_VM`, `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_CLEARTID`) and `exit` versus `exit_group`.
+- [ ] Implement `futex` wait and wake with timeouts (timers from 2.8), including the wake on thread exit that `pthread_join` relies on.
+- [ ] Wake futex waiters across CPUs, and keep TLB shootdowns (5) correct when threads of one process run on several cores.
+- [ ] Test thread creation and join, TLS isolation between threads, futex wake-before-wait and timeouts, and many threads under preemption on several CPUs.
+- [ ] Run a statically linked multi-threaded C program (pthreads, musl) built on Linux as a fixture.
+
+**Milestone 7 done when:** An unmodified multi-threaded program built on Linux runs with its threads spread over several cores.
+
+---
+
+## 8. Signals
+
+**Goal:** Deliver signals the way Linux does, so runtimes can handle their own faults and stop their own threads.
+
+- [ ] Implement `rt_sigaction`, `rt_sigprocmask`, `sigaltstack` and `rt_sigreturn`, delivering signals on the return to user mode.
+- [ ] Turn user faults into `SIGSEGV`, `SIGBUS`, `SIGFPE` and `SIGILL` with `siginfo` and a register context (including the extended state from 2.5), instead of always killing the process (2.2); runtimes use this for null checks and stack probes.
+- [ ] Implement `kill`/`tgkill` and default actions; deliver Ctrl+C (6.4) as `SIGINT`.
+- [ ] Interrupt blocking syscalls with `EINTR` or restart them.
+- [ ] Check the saved return address and flags that `rt_sigreturn` restores (the remaining `sysretq` item in 2.5): a handler can put anything there.
+- [ ] Test handlers that return, handlers that modify the saved context, nested and masked signals, the alternate stack, and signals sent to another thread on another CPU.
+- [ ] Run a statically linked Go or Rust program (threads, futexes and signals in earnest).
+
+**Milestone 8 done when:** A statically linked Go program built on Linux runs unmodified.
+
+---
+
+## 9. .NET, fast and multicore
+
+**Goal:** Run an unmodified .NET Native AOT program, on several cores, with measured performance. This is the primary goal.
+
+### 9.1 .NET Native AOT
+- [ ] Implement what the list from 4.2 shows the .NET runtime still needs. Expected, to be confirmed by the trace: `/proc` and cgroup files for CPU and memory limits, `membarrier`, and thread suspension through signals.
+- [ ] Run a .NET Native AOT hello-world (built for linux-musl, statically linked, invariant globalization).
+- [ ] Run one that allocates enough to exercise the GC, then a multi-threaded one.
+- [ ] Add them to the fixture binaries (4.3) and run them as QEMU tests on several CPUs.
+
+### 9.2 Fast and multicore
+"Fast" is part of the goal, so it is measured rather than assumed.
+- [ ] Run foreign multi-threaded programs on all CPUs: threads of one process on different cores, cross-CPU futex wakeups and TLB shootdowns on `munmap`/`mprotect`.
+- [ ] Add a benchmark suite run in QEMU with KVM and on real hardware: syscall round trip, context switch, page fault, thread create/join, futex ping-pong, and `mmap`/`munmap` churn.
+- [ ] Benchmark a multi-threaded .NET workload (allocation-heavy and CPU-bound) for throughput and scaling from 1 to N cores, and compare with the same binary on Linux on the same machine.
+- [ ] Profile and remove the hot spots the benchmarks show (the profiling items in 13 move up when this starts); candidates are per-CPU run queues, lock contention in the PMM and VMM, PCID to avoid TLB flushes, 2 MiB pages for large anonymous mappings, and a vDSO so `clock_gettime` needs no syscall.
+- [ ] Known slow paths from the code review before 2.2, to measure first and fix where the benchmarks say so:
+  - `read`/`write` bounce every 256 bytes through a kernel stack buffer, and `write` goes through the formatter as well.
+  - Spawning a program copies the whole file to the heap and then into pages, although the initrd is already in memory (Debug builds: about 1.1 MiB per spawn, debug info included).
+  - `print` keeps interrupts off while it writes to the polled serial port: about 22 ms for 256 bytes at 115200 baud, more than two timer ticks.
+  - The kernel heap is first-fit over an address-sorted list with interrupts off; allocation and free are linear in the number of free chunks.
+  - The page allocator scans its bitmap one bit at a time, now with interrupts off.
+  - Every process switch reloads CR3 without PCID and flushes the TLB.
+- [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
+
+### 9.3 Dynamic linking and the JIT runtime
+Does not gate the milestone: the goal is met by a statically linked Native AOT binary.
+- [ ] Load the ELF interpreter named by `PT_INTERP`, so dynamically linked programs run with musl's unmodified loader and shared libraries on disk.
+- [ ] Run a dynamically linked hello-world built on Linux; test malformed `PT_INTERP` headers.
+- [ ] Run the JIT-based .NET runtime (`dotnet app.dll`): it needs dynamic linking, file-backed mappings, many files on disk, and memory that changes from writable to executable (see the permission item in 2.4).
+
+**Milestone 9 done when:** An unmodified .NET Native AOT program runs on MyOS without being rebuilt for it, uses several cores, cannot crash or corrupt the kernel, and its measured performance is recorded against Linux on the same hardware.
+
+---
+
+## 10. Graphical environment
+
+**Goal:** Display multiple interactive windows and run a graphical terminal.
+
+### 10.1 Graphics
+- [ ] Expose framebuffer information through a safe userspace API.
+- [ ] Implement pixel, rectangle, image, and text rendering.
+- [ ] Add back-buffering and a display update mechanism.
+- [ ] Implement a basic software renderer.
+- [ ] Test rendering on the host against reference images.
+
+### 10.2 Input
+- [ ] Expose generic keyboard and pointer events to userspace.
+- [ ] Add mouse support (PS/2 or USB).
+- [ ] Track pointer coordinates and button states.
+- [ ] Implement focus and event routing.
+- [ ] Test event delivery and focus with injected input events.
+
+### 10.3 Window system
+- [ ] Implement a basic userspace compositor/window manager.
+- [ ] Create/destroy windows and draw decorations.
+- [ ] Support movement, resizing, overlap, and focus.
+- [ ] Add shared memory mappings between processes (window buffers need them).
+- [ ] Add IPC for graphical clients, with the compositor waiting on input and clients through `poll` (6.2).
+- [ ] Build a graphical terminal and minimal desktop/launcher.
+- [ ] Add a simple editor or file viewer.
+- [ ] Test window management and graphical IPC with scripted clients, checking framebuffer output.
+
+**Milestone 10 done when:** Multiple user applications can display and interact through windows.
+
+---
+
+## 11. Persistent storage and FAT32
+
+**Goal:** Read and write files that survive a reboot.
+
+Off the critical path (programs can ship in the initrd). It does not depend on milestone 10 and can be taken any time after milestone 6.
+
+### 11.1 Block-device layer
+- [ ] Define a generic block-device interface for read/write/capacity/block size.
+- [ ] Add device registration and consistent I/O error reporting.
+- [ ] Validate LBA ranges, buffer sizes, and alignment.
+- [ ] Add a small block cache with explicit flush (FAT32 writes in 11.5 rely on it for flush ordering).
+- [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, error propagation, and cache hits, eviction and flush.
+
+### 11.2 NVMe
+- [ ] Implement NVMe write operations.
+- [ ] Support multi-page transfers with PRP lists or another valid DMA mechanism.
+- [ ] Add PCI MSI/MSI-X support and switch NVMe from polling to interrupt-driven completion (legacy PCI interrupt routing would need an ACPI AML interpreter; the network driver in 12.1 reuses this).
+- [ ] Validate namespace geometry and bounds.
+- [ ] Handle command errors, timeouts, and controller failures.
+- [ ] Audit DMA allocation, synchronization, and queue handling.
+- [ ] Test repeated and boundary-crossing reads/writes using disposable images, including write-then-read-back and persistence across a reboot (storage write tests, moved from 1.2).
+
+### 11.3 Partition discovery
+- [ ] Parse GPT headers and partition entries.
+- [ ] Verify GPT checksums and bounds.
+- [ ] Expose partitions as block devices.
+- [ ] Test corrupted and empty partition tables.
+
+### 11.4 FAT32 read support
+- [ ] Validate FAT32 BPB/boot-sector fields.
+- [ ] Read FAT entries and traverse cluster chains.
+- [ ] Enumerate directories and open nested paths.
+- [ ] Read multi-cluster files.
+- [ ] Support 8.3 names, then long filename entries.
+- [ ] Detect invalid clusters, loops, and malformed metadata.
+- [ ] Mount FAT32 through the VFS.
+- [ ] Test reads against generated fixture images (11.6), including corrupted boot sectors, cluster loops and bad directory entries.
+
+### 11.5 FAT32 write support
+- [ ] Allocate/free clusters safely.
+- [ ] Create files and directories.
+- [ ] Write, extend, truncate, and delete files.
+- [ ] Update directory entries and filesystem metadata.
+- [ ] Add flush ordering and document crash-consistency limits.
+- [ ] Test filesystem integrity from both MyOS and Linux after writes.
+
+### 11.6 Reproducible disk fixtures
+- [ ] Generate disposable GPT/FAT32 disk images with scripts.
+- [ ] Populate fixtures using Linux `mkfs.fat`/`mcopy` tools.
+- [ ] Check MyOS writes by remounting/inspecting the image from Linux.
+- [ ] Run read/write regressions in CI, never against real user disks.
+
+**Milestone 11 done when:** A FAT32 volume can be mounted and files persist correctly across reboot.
+
+---
+
+## 12. Networking
 
 **Goal:** Communicate with other machines over IP.
 
-### 6.1 Network hardware
+Off the critical path (only network programs need it). It can be taken any time after milestone 6.
+
+### 12.1 Network hardware
 - [ ] Define a generic network-device interface.
 - [ ] Choose the first network device: virtio-net is simpler than e1000e and its virtio groundwork is reusable for virtio-blk and virtio-gpu; e1000e matches real hardware.
-- [ ] Implement the driver with TX/RX rings, using MSI/MSI-X interrupts (4.2).
+- [ ] Implement the driver with TX/RX rings, using MSI/MSI-X interrupts (11.2).
 - [ ] Handle RX interrupts and link state.
 - [ ] Send/receive Ethernet frames in QEMU networking tests.
 
-### 6.2 Network protocols
+### 12.2 Network protocols
 - [ ] Implement Ethernet frame parsing and ARP.
 - [ ] Implement IPv4 packets, validation, and checksums.
 - [ ] Add static IP/netmask/gateway configuration (QEMU user networking: 10.0.2.15/24, gateway 10.0.2.2).
@@ -353,144 +519,17 @@ The primitives themselves come from 2.8; this section makes them and their users
 - [ ] Add DNS resolution.
 - [ ] Test protocol parsing, checksums and state machines on the host with recorded and malformed packets.
 
-### 6.3 Sockets and programs
-- [ ] Define socket create/bind/listen/accept/connect/send/receive/close syscalls.
+### 12.3 Sockets and programs
+- [ ] Define socket create/bind/listen/accept/connect/send/receive/close syscalls (Linux's numbers and layouts).
 - [ ] Implement `ping` and a small TCP client.
 - [ ] Implement a minimal HTTP client or server.
 - [ ] Add network integration tests with a host-side peer.
 
-**Milestone 6 done when:** MyOS can ping a peer and establish a TCP connection.
+**Milestone 12 done when:** MyOS can ping a peer and establish a TCP connection.
 
 ---
 
-## 7. C compatibility and libc
-
-**Goal:** Execute small statically linked C applications.
-
-### 7.1 Define the ABI
-- [ ] Extend the syscall ABI document from 2.5 with everything the libc port relies on.
-- [ ] Enable SSE (CR0/CR4), save and restore FPU/SSE state per thread on context switch, and build user programs with SSE; today kernel and user code are soft-float and compiled C code will not run.
-- [ ] Define userspace startup, initial stack, arguments, environment, and TLS.
-- [ ] Implement missing memory, file, time, and process syscalls needed by the selected libc.
-- [ ] Add ABI conformance tests, including floating-point registers surviving preemption between two processes.
-
-### 7.2 Port libc and utilities
-- [ ] Select a small libc (e.g. musl) and implement an OS-specific syscall adapter.
-- [ ] Support memory allocation and standard file/console I/O.
-- [ ] Support basic time and process functions.
-- [ ] Implement required thread-local-storage initialization.
-- [ ] Compile and run statically linked C hello-world.
-- [ ] Port a few small command-line utilities.
-- [ ] Do not require dynamic linking for initial success; it comes with the ELF interpreter in 8.2.
-- [ ] Run the C programs and utilities as QEMU tests and check their output.
-
-**Milestone 7 done when:** A statically linked C program runs without the custom Zig userspace runtime.
-
----
-
-## 8. Linux binary compatibility
-
-**Goal:** Run unmodified Linux x86-64 executables built by other toolchains: first statically linked C, Go or Rust programs, then a managed runtime such as .NET Native AOT. A binary targets an OS ABI, not just the CPU, so this milestone is about speaking Linux's ABI.
-
-### 8.1 Linux syscall ABI
-- [ ] Choose the model: make the native syscall ABI Linux-compatible, or give foreign processes a Linux "personality" that translates to native calls (decision prepared in 2.5).
-- [ ] Use Linux syscall numbers, six argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`) and negative-errno return values.
-- [ ] Match Linux struct layouts wherever user memory is read or written (`stat`, `timespec`, `iovec`, `dirent64`, `sigaction`, `pollfd`, ...).
-- [ ] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs.
-- [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `getdents64`, `readlink`, `readv`/`writev`, `pread`/`pwrite`, `fstat`/`newfstatat`.
-- [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `clock_gettime`, `nanosleep`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.
-- [ ] Add `epoll` and `eventfd` on top of `poll` (3.3).
-- [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents.
-- [ ] Test each syscall from ring 3 against Linux's documented results and error codes, including the struct layouts.
-
-### 8.2 ELF loading and process startup
-- [ ] Load position-independent executables (`ET_DYN`) at a chosen load bias.
-- [ ] Set up the initial thread's TLS block from `PT_TLS`.
-- [ ] Pass the auxiliary vector after `envp` (`AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`, `AT_PAGESZ`, `AT_RANDOM`, ...), extending the stack layout from 3.1.
-- [ ] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes).
-- [ ] Load the ELF interpreter named by `PT_INTERP` so dynamically linked programs can run with a ported `ld.so` and shared libraries on disk (moved from 7.2).
-- [ ] Test static, static-PIE and dynamically linked hello-world binaries built on Linux, plus malformed `PT_TLS`/`PT_INTERP` headers.
-
-### 8.3 Threads and futexes
-- [ ] Support multiple threads per process (moved from 10), with shared address space and descriptor table; revisit the single-thread assumptions documented in 2.7.
-- [ ] Implement `clone` for threads (`CLONE_VM`, `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_CLEARTID`), `set_tid_address`, and `exit` versus `exit_group`.
-- [ ] Give each thread its own FS base: `arch_prctl(ARCH_SET_FS)`, saved and restored on context switch; enable FSGSBASE when the CPU has it.
-- [ ] Implement `futex` wait and wake with timeouts (timers from 2.8), including the wake on thread exit that `pthread_join` relies on.
-- [ ] Test thread creation and join, TLS isolation between threads, futex wake-before-wait and timeouts, and many threads under preemption (and on several CPUs once 5 is done).
-
-### 8.4 Memory management for runtimes
-- [ ] Complete `mmap`: `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader).
-- [ ] Implement `mprotect`, `munmap` of partial ranges, and `madvise(MADV_DONTNEED)`.
-- [ ] Add demand paging and overcommit (moved from 10): garbage collectors reserve huge virtual ranges and commit them piece by piece.
-- [ ] Save and restore extended CPU state with XSAVE and enable AVX where supported (7.1 covers only FPU/SSE).
-- [ ] Test reserve-then-commit of a multi-gigabyte range, permission changes, partial unmaps, faults on `PROT_NONE` pages, and AVX registers surviving preemption.
-
-### 8.5 Signals
-- [ ] Implement `rt_sigaction`, `rt_sigprocmask`, `sigaltstack` and `rt_sigreturn`, delivering signals on the return to user mode.
-- [ ] Turn user faults into `SIGSEGV`, `SIGBUS`, `SIGFPE` and `SIGILL` with `siginfo` and a register context, instead of always killing the process (2.2); runtimes use this for null checks and stack probes.
-- [ ] Implement `kill`/`tgkill` and default actions; deliver Ctrl+C (3.5) as `SIGINT`.
-- [ ] Interrupt blocking syscalls with `EINTR` or restart them.
-- [ ] Test handlers that return, handlers that modify the saved context, nested and masked signals, the alternate stack, and signals sent to another thread.
-
-### 8.6 Foreign programs
-- [ ] Run an unmodified statically linked musl C program built on Linux.
-- [ ] Run a statically linked Go or Rust program (threads, futexes and signals in earnest).
-- [ ] Run a .NET Native AOT hello-world (built for linux-musl, statically linked, invariant globalization), then one that allocates enough to exercise the GC.
-- [ ] Run a dynamically linked program through the ELF interpreter.
-- [ ] Keep prebuilt fixture binaries (with the commands that built them) and run them as QEMU tests, checking their output.
-
-### 8.7 Fast and multicore
-"Fast" is part of the goal, so it is measured rather than assumed.
-- [ ] Run foreign multi-threaded programs on all CPUs (needs milestone 5): threads of one process on different cores, cross-CPU futex wakeups and TLB shootdowns on `munmap`/`mprotect`.
-- [ ] Add a benchmark suite run in QEMU with KVM and on real hardware: syscall round trip, context switch, page fault, thread create/join, futex ping-pong, and `mmap`/`munmap` churn.
-- [ ] Benchmark a multi-threaded .NET workload (allocation-heavy and CPU-bound) for throughput and scaling from 1 to N cores, and compare with the same binary on Linux on the same machine.
-- [ ] Profile and remove the hot spots the benchmarks show (the profiling items in 10 move up when this starts); candidates are per-CPU run queues, lock contention in the PMM and VMM, PCID to avoid TLB flushes, and 2 MiB pages for large anonymous mappings.
-- [ ] Known slow paths from the code review before 2.2, to measure first and fix where the benchmarks say so:
-  - `read`/`write` bounce every 256 bytes through a kernel stack buffer, and `write` goes through the formatter as well.
-  - Spawning a program copies the whole file to the heap and then into pages, although the initrd is already in memory (Debug builds: about 1.1 MiB per spawn, debug info included).
-  - `print` keeps interrupts off while it writes to the polled serial port: about 22 ms for 256 bytes at 115200 baud, more than two timer ticks.
-  - The kernel heap is first-fit over an address-sorted list with interrupts off; allocation and free are linear in the number of free chunks.
-  - The page allocator scans its bitmap one bit at a time, now with interrupts off.
-  - Every process switch reloads CR3 without PCID and flushes the TLB.
-- [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
-
-**Milestone 8 done when:** An unmodified .NET Native AOT program runs on MyOS without being rebuilt for it, uses several cores, cannot crash or corrupt the kernel, and its measured performance is recorded against Linux on the same hardware.
-
----
-
-## 9. Graphical environment
-
-**Goal:** Display multiple interactive windows and run a graphical terminal.
-
-### 9.1 Graphics
-- [ ] Expose framebuffer information through a safe userspace API.
-- [ ] Implement pixel, rectangle, image, and text rendering.
-- [ ] Add back-buffering and a display update mechanism.
-- [ ] Implement a basic software renderer.
-- [ ] Test rendering on the host against reference images.
-
-### 9.2 Input
-- [ ] Expose generic keyboard and pointer events to userspace.
-- [ ] Add mouse support (PS/2 or USB).
-- [ ] Track pointer coordinates and button states.
-- [ ] Implement focus and event routing.
-- [ ] Test event delivery and focus with injected input events.
-
-### 9.3 Window system
-- [ ] Implement a basic userspace compositor/window manager.
-- [ ] Create/destroy windows and draw decorations.
-- [ ] Support movement, resizing, overlap, and focus.
-- [ ] Add shared memory mappings between processes (moved from 10; window buffers need them).
-- [ ] Add IPC for graphical clients, with the compositor waiting on input and clients through `poll` (3.3).
-- [ ] Build a graphical terminal and minimal desktop/launcher.
-- [ ] Add a simple editor or file viewer.
-- [ ] Test window management and graphical IPC with scripted clients, checking framebuffer output.
-
-**Milestone 9 done when:** Multiple user applications can display and interact through windows.
-
----
-
-## 10. Long-term / optional
+## 13. Long-term / optional
 
 ### Hardware and platform
 - [ ] USB xHCI and USB HID devices.
@@ -500,8 +539,8 @@ The primitives themselves come from 2.8; this section makes them and their users
 - [ ] CPU feature discovery and more QEMU/real-hardware testing.
 
 ### Advanced processes and memory
-- [ ] Copy-on-write and shared file-backed mappings (demand paging and private file mappings: 8.4).
-- [ ] `fork`/`exec` semantics if desired.
+- [ ] Copy-on-write and shared file-backed mappings (demand paging and private file mappings: 5).
+- [ ] `fork`/`exec` semantics if desired. A static busybox would then supply the standard utilities and a broad compatibility test.
 - [ ] User/group permissions.
 
 ### Performance and observability
