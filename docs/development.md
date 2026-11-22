@@ -137,7 +137,7 @@ the terminal.
 | `src/kernel/fs/` | Filesystems (`tarfs` for the initrd) |
 | `src/kernel/debug/` | Assertions, backtraces, ELF symbol lookup, log formatting |
 | `src/assets/` | Console font (fetched, not committed) |
-| `app/` | User programs (`sh`, `hello`) and their runtime `lib.zig`; linked at 0x400000 by `app/linker.ld` |
+| `app/` | User programs (`sh`, `hello`) and their runtime `lib.zig`; linked by `app/linker.ld`, each at its own address set in `build.zig` |
 | `tests/host/` | Host unit tests |
 | `tests/kernel/` | In-kernel test suite, its kernel-side helpers, the crash scenarios and the QEMU fw_cfg reader |
 | `tests/user/` | Ring 3 test programs, packaged as `/test/<name>` in the test initrd |
@@ -205,7 +205,8 @@ the QEMU tests and all tests ("Run Test Task"); the test explorer runs single
 host tests through `zig build test-host -Dtest-filter=<name>`. "Debug Test"
 builds them with `zig build debug-test-host -Dtest-filter=<name>`, which puts the
 binary at `zig-out/bin/debug-unit-tests` for the debugger. The launch
-configuration "MyOS: Debug kernel (QEMU)" boots the OS in QEMU under the
+configurations "MyOS: Debug kernel (QEMU)" and "MyOS: Debug kernel + user
+programs (QEMU)" boot the OS in QEMU under the
 debugger; see [debugging.md](debugging.md#debugging-in-vs-code).
 
 ## Troubleshooting

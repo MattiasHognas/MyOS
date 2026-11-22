@@ -33,7 +33,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Run debug and optimized builds (CI matrix over Debug, ReleaseSafe and ReleaseFast; the test kernel follows `-Doptimize`).
 - [x] Publish serial logs on failures (per-scenario logs in `zig-out/test/<scenario>/`, printed by `scripts/test-qemu.sh` on failure and uploaded by CI as `serial-logs-<mode>`; verified with a `simulate_failure` run).
 - [x] Add QEMU/GDB debugging instructions (`docs/debugging.md`, `scripts/run-qemu.sh --gdb`, `scripts/kernel.gdb`).
-- [x] Add VS Code kernel debugging under QEMU (`.vscode/launch.json` "MyOS: Debug kernel (QEMU)" with CodeLLDB over QEMU's GDB server; `docs/debugging.md`).
+- [x] Add VS Code kernel debugging under QEMU (`.vscode/launch.json` "MyOS: Debug kernel (QEMU)" and "MyOS: Debug kernel + user programs (QEMU)" with CodeLLDB over QEMU's GDB server, including user programs, which keep debug info in Debug builds and are linked at distinct addresses; `docs/debugging.md`).
 - [x] Add symbolized kernel faults and backtraces (kernel `.symtab` via Limine, frame-pointer walk; tested by in-kernel tests and the `panic`/`fault` scenarios).
 - [x] Add log levels, subsystem assertions, and optional allocation diagnostics (`std.log` with `-Dlog-level`, `kernel/debug/assert.zig` with `-Dassertions`, heap stats and `-Dalloc-debug`).
 - [x] Track host-code coverage and explicit integration-test scenarios where practical (`zig build coverage` with kcov, uploaded by CI as `host-coverage`; QEMU scenarios `tests`, `panic`, `fault`).

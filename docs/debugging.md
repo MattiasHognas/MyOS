@@ -103,7 +103,8 @@ Notes:
   kernel runs; that is expected.
 - With KVM, use hardware breakpoints only. With `--no-kvm` (TCG) both kinds work.
 - To debug a user program, add its symbols: `add-symbol-file zig-out/bin/sh.elf`
-  (user programs are linked at fixed addresses).
+  (user programs are linked at fixed, distinct addresses, and keep their debug
+  info in Debug builds), e.g. also `add-symbol-file zig-out/bin/hello.elf`.
 
 ## Debugging in VS Code
 
@@ -111,7 +112,9 @@ The same QEMU GDB server works from the editor, with the CodeLLDB extension
 (`vadimcn.vscode-lldb`, in the workspace recommendations):
 
 1. Set breakpoints in the kernel sources.
-2. Run and Debug -> "MyOS: Debug kernel (QEMU)" (F5).
+2. Run and Debug -> "MyOS: Debug kernel (QEMU)" (F5) for the kernel alone, or
+   "MyOS: Debug kernel + user programs (QEMU)" to also stop at breakpoints
+   in `app/`.
 
 This runs the task "MyOS: QEMU (wait for debugger)" (`scripts/build.sh`, then
 `scripts/run-qemu.sh --gdb --no-kvm`) and attaches LLDB to `localhost:1234`
@@ -128,8 +131,18 @@ task's terminal.
   breakpoint on the next line.
 - The task uses `--no-kvm` so that editor breakpoints work before the kernel is
   loaded (see the notes above), so the OS runs slower than a normal run.
-- To debug a user program too, load its symbols in the Debug Console:
-  `target modules add zig-out/bin/sh.elf`.
+- "MyOS: Debug kernel + user programs (QEMU)" also loads the symbols of
+  `sh.elf` and `hello.elf`, so breakpoints in `app/` work in the same session
+  as kernel breakpoints. Each user program is linked at its own address
+  (`sh` at `0x400000`, `hello` at `0x800000`, see `build.zig`), which is what
+  lets the debugger tell them apart. For a new user program, give it a free
+  address in `build.zig` and add a `target modules add` line to
+  `.vscode/launch.json`.
+- User programs keep their symbols and debug info in Debug builds only
+  (`strip` in `build.zig`), so this needs the default `scripts/build.sh` build.
+- Stepping over a syscall does not follow it
+  into the kernel. Set a kernel breakpoint (e.g. in the syscall handler) to
+  cross over.
 
 ## Other QEMU tools
 

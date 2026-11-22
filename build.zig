@@ -42,9 +42,9 @@ pub fn build(b: *std.Build) void {
 
     const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false, kopts);
     b.installArtifact(kernel);
-    const exe_hello = userProgram(b, "hello", "app/hello.zig", target, optimize);
+    const exe_hello = userProgram(b, "hello", "app/hello.zig", 0x80_0000, target, optimize);
     b.installArtifact(exe_hello);
-    const exe_shell = userProgram(b, "sh", "app/sh.zig", target, optimize);
+    const exe_shell = userProgram(b, "sh", "app/sh.zig", 0x40_0000, target, optimize);
     b.installArtifact(exe_shell);
 
     // User-mode test programs, packaged into the test initrd as /test/<name>.
@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     inline for (.{ "syscalls", "kernel_read", "privileged", "write_text" }) |name| {
-        const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", target, optimize);
+        const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, target, optimize);
         exe.root_module.addImport("lib", user_lib);
         b.installArtifact(exe); // scripts/build.sh --package-test picks them up from zig-out/bin
     }
@@ -209,11 +209,14 @@ fn kernelArtifact(
     return kernel;
 }
 
-/// Build and install the user program `name`.elf from `root`.
+/// Build the user program `name`.elf from `root`, linked at address `base`.
+/// `sh` and `hello` get different bases so a debugger can load the symbols of
+/// both at once (docs/debugging.md); the kernel accepts any user address.
 fn userProgram(
     b: *std.Build,
     name: []const u8,
     root: []const u8,
+    base: u64,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
@@ -225,12 +228,19 @@ fn userProgram(
             .optimize = optimize,
             .pic = false,
             .sanitize_c = .off,
-            .strip = true,
+            // Debug builds keep symbols and DWARF so user programs can be
+            // debugged under QEMU (docs/debugging.md); they are not loaded.
+            .strip = optimize != .debug,
         }),
         .use_llvm = true,
         .use_lld = true,
     });
     exe.entry = .{ .symbol_name = "_start" };
-    exe.setLinkerScript(b.path("app/linker.ld"));
+    // app/linker.ld places the program at USER_BASE, defined here.
+    const script = b.addWriteFiles().add(
+        b.fmt("{s}.ld", .{name}),
+        b.fmt("USER_BASE = 0x{x};\n{s}", .{ base, @embedFile("app/linker.ld") }),
+    );
+    exe.setLinkerScript(script);
     return exe;
 }

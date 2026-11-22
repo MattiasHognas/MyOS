@@ -1,9 +1,15 @@
 {
+  // Debugging under QEMU; see docs/debugging.md ("Debugging in VS Code").
+  // Each configuration builds the OS, boots it paused in QEMU, attaches to
+  // QEMU's GDB server and continues to the first breakpoint (QEMU starts
+  // halted at the reset vector because of -S).
+  //
+  // The second configuration also loads the symbols of the user programs.
+  // That works because each one is linked at its own address (build.zig);
+  // add a "target modules add" line for every new user program.
   "version": "0.2.0",
   "configurations": [
     {
-      // Builds the OS, boots it paused in QEMU and attaches to QEMU's GDB
-      // server. See docs/debugging.md ("Debugging in VS Code").
       "name": "MyOS: Debug kernel (QEMU)",
       "type": "lldb",
       "request": "launch",
@@ -15,8 +21,24 @@
       "processCreateCommands": [
         "gdb-remote localhost:1234"
       ],
-      // QEMU starts halted at the reset vector (-S); run on to the first
-      // breakpoint instead of stopping there.
+      "postRunCommands": [
+        "continue"
+      ]
+    },
+    {
+      "name": "MyOS: Debug kernel + user programs (QEMU)",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "MyOS: QEMU (wait for debugger)",
+      "postDebugTask": "MyOS: Stop QEMU (debug)",
+      "targetCreateCommands": [
+        "target create ${workspaceFolder}/zig-out/bin/kernel.elf",
+        "target modules add ${workspaceFolder}/zig-out/bin/sh.elf",
+        "target modules add ${workspaceFolder}/zig-out/bin/hello.elf"
+      ],
+      "processCreateCommands": [
+        "gdb-remote localhost:1234"
+      ],
       "postRunCommands": [
         "continue"
       ]

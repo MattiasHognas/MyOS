@@ -1,6 +1,7 @@
+/* USER_BASE (the link address) is prepended by build.zig, per program. */
 ENTRY(_start)
 SECTIONS {
-    . = 0x400000;
+    . = USER_BASE;
     .text   : { *(.text .text.*) }
     . = ALIGN(4096);
     .rodata : { *(.rodata .rodata.*) }

@@ -17,7 +17,7 @@
       "problemMatcher": []
     },
     {
-      // preLaunchTask of the "MyOS: Debug kernel (QEMU)" launch configuration.
+      // preLaunchTask of the "MyOS: Debug kernel ... (QEMU)" launch configurations.
       // --no-kvm: under TCG, breakpoints set from the editor work before the
       // kernel is loaded; under KVM only hardware breakpoints do.
       "label": "MyOS: QEMU (wait for debugger)",
