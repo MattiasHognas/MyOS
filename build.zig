@@ -96,35 +96,20 @@ pub fn build(b: *std.Build) void {
     const test_kernel_step = b.step("test-kernel", "Compile the QEMU test kernel");
     test_kernel_step.dependOn(&install_test_kernel.step);
 
-    const host_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/host/main.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-        .filters = test_filters,
-    });
-    // Hardware-independent kernel modules, compiled natively for the host tests.
-    inline for (.{
-        .{ "vfs", "src/kernel/vfs.zig" },
-        .{ "symbols", "src/kernel/debug/symbols.zig" },
-        .{ "log_format", "src/kernel/debug/log_format.zig" },
-    }) |m| {
-        host_tests.root_module.addImport(m[0], b.createModule(.{
-            .root_source_file = b.path(m[1]),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }));
-    }
+    const host_tests = hostTests(b, test_filters, false);
     const run_host_tests = b.addRunArtifact(host_tests);
     const host_step = b.step("test-host", "Run native unit tests with fakes");
     host_step.dependOn(&run_host_tests.step);
 
-    // Host-code coverage with kcov (must be installed). Report: zig-out/coverage/index.html
-    const run_coverage = b.addSystemCommand(&.{ "kcov", "--clean" });
-    run_coverage.addPrefixedDirectoryArg("--include-path=", b.path("src"));
+    // Host-code coverage with kcov (scripts/coverage.sh explains how to install
+    // it if it is missing). Report: zig-out/coverage/index.html
+    const run_coverage = b.addSystemCommand(&.{"bash"});
+    run_coverage.addFileArg(b.path("scripts/coverage.sh")); // tracked: edits re-run coverage
+    run_coverage.addDirectoryArg(b.path("src"));
     const coverage_dir = run_coverage.addOutputDirectoryArg("coverage");
-    run_coverage.addArtifactArg(host_tests);
+    // kcov can't read the debug info of Zig's own x86 backend (it reports 0
+    // lines), so coverage uses a separate LLVM build of the host tests.
+    run_coverage.addArtifactArg(hostTests(b, test_filters, true));
     const install_coverage = b.addInstallDirectory(.{
         .source_dir = coverage_dir,
         .install_dir = .prefix,
@@ -143,6 +128,32 @@ pub fn build(b: *std.Build) void {
     const all = b.step("test", "Run host tests and QEMU kernel tests");
     all.dependOn(&run_host_tests.step);
     all.dependOn(&run_qemu.step);
+}
+
+/// The native host test binary, with the hardware-independent kernel modules
+/// it tests. `use_llvm` selects the LLVM backend (needed by kcov).
+fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Build.Step.Compile {
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/host/main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+        .filters = filters,
+        .use_llvm = use_llvm,
+    });
+    inline for (.{
+        .{ "vfs", "src/kernel/vfs.zig" },
+        .{ "symbols", "src/kernel/debug/symbols.zig" },
+        .{ "log_format", "src/kernel/debug/log_format.zig" },
+    }) |m| {
+        tests.root_module.addImport(m[0], b.createModule(.{
+            .root_source_file = b.path(m[1]),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }));
+    }
+    return tests;
 }
 
 /// Kernel configuration exposed to the kernel as `build_options`.

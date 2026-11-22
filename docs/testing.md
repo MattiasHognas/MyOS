@@ -86,6 +86,10 @@ installed (most distributions package it; on Ubuntu 24.04, build it with
 `scripts/install-kcov.sh`). Coverage covers host-tested code only; kernel code that runs only in
 QEMU is checked by the scenarios above instead.
 
+Coverage uses its own build of the host tests with the LLVM backend: kcov
+cannot read the debug info of Zig's self-hosted x86 backend (used by
+`zig build test-host`) and would report 0 lines.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push and pull request:
