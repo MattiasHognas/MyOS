@@ -103,10 +103,3 @@ pub fn init() void {
         : [s] "r" (@as(u16, TSS_SEL)),
     );
 }
-
-/// Return the current code segment selector (CS). The low two bits are the current privilege level.
-pub fn readCs() u16 {
-    return asm volatile ("movw %%cs, %[ret]"
-        : [ret] "=r" (-> u16),
-    );
-}

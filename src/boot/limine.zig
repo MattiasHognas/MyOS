@@ -57,11 +57,6 @@ pub const HhdmResponse = extern struct { revision: u64, offset: u64 };
 
 /// Memory map type for RAM that is free for the kernel to use.
 pub const MEMMAP_USABLE = 0;
-/// Printable names of the memory map types, indexed by `MemmapEntry.type`.
-pub const memmap_names = [_][]const u8{
-    "usable", "reserved",               "ACPI reclaimable", "ACPI NVS",
-    "bad",    "bootloader reclaimable", "kernel+modules",   "framebuffer",
-};
 
 /// Ask where the kernel image was loaded in physical and virtual memory.
 pub const KernelAddressRequest = Request(0x71ba76863cc55f63, 0xb2644a48c516a487, KernelAddressResponse);

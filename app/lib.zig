@@ -44,6 +44,11 @@ pub fn close(fd: u64) void {
     _ = syscall(6, fd, 0, 0);
 }
 
+/// Give the CPU to another ready thread.
+pub fn yield() void {
+    _ = syscall(2, 0, 0, 0);
+}
+
 /// Block until a key is pressed and return its character.
 pub fn getChar() u8 {
     return @truncate(syscall(7, 0, 0, 0));

@@ -67,9 +67,15 @@ export fn _start() callconv(.c) noreturn {
     expect(again != ERR); // 35: slots are reusable after close
     lib.close(again);
 
+    // yield returns 0 and the process keeps running, with the same thread ID.
+    const tid = lib.syscall(3, 0, 0, 0);
+    expect(lib.syscall(2, 0, 0, 0) == 0); // 36
+    lib.yield();
+    expect(lib.syscall(3, 0, 0, 0) == tid); // 37
+
     // Unknown syscall numbers fail; gettid works.
-    expect(lib.syscall(999, 0, 0, 0) == ERR); // 36
-    expect(lib.syscall(3, 0, 0, 0) != 0); // 37: user threads never have ID 0
+    expect(lib.syscall(999, 0, 0, 0) == ERR); // 38
+    expect(lib.syscall(3, 0, 0, 0) != 0); // 39: user threads never have ID 0
 
     lib.exit(0);
 }

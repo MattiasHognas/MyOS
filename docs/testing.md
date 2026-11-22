@@ -6,7 +6,7 @@ change or add a subsystem.
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
 | Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF symbol lookup, log formatting), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, scheduler and processes, syscalls from ring 3, tarfs, symbolization, fw_cfg. |
+| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, scheduler and processes, syscalls from ring 3, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests and all QEMU scenarios. Add

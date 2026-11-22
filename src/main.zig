@@ -118,58 +118,8 @@ export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
 /// Limine request for the kernel's own ELF file, used to symbolize backtraces.
 export var exec_file_request linksection(".limine_requests") = limine.ExecutableFileRequest{};
 
-/// Timer interrupts received since the APIC timer was started (100 Hz).
-var ticks: u64 = 0;
-
-// Built-in ring 3 test program: write("Hello from ring 3!\n") and yield,
-// three times, then exit(0).
-comptime {
-    asm (
-        \\.section .rodata
-        \\.global user_prog_start
-        \\user_prog_start:
-        \\  mov $3, %r12d
-        \\1:
-        \\  mov $0, %eax
-        \\  lea user_msg(%rip), %rdi
-        \\  mov $(user_msg_end - user_msg), %esi
-        \\  syscall
-        \\  mov $2, %eax
-        \\  syscall
-        \\  dec %r12d
-        \\  jnz 1b
-        \\  mov $1, %eax
-        \\  xor %edi, %edi
-        \\  syscall
-        \\  ud2
-        \\user_msg:
-        \\  .ascii "Hello from ring 3!\n"
-        \\user_msg_end:
-        \\.global user_prog_end
-        \\user_prog_end:
-    );
-}
-
-/// Start of the built-in ring 3 test program.
-extern const user_prog_start: u8;
-/// End of the built-in ring 3 test program.
-extern const user_prog_end: u8;
-
 /// Kernel panic handler, used for `@panic` and safety checks anywhere in the kernel.
 pub const panic = std.debug.FullPanic(kernelPanic);
-
-const USER_CODE: u64 = 0x40_0000; // 4 MiB
-const USER_STACK: u64 = 0x80_0000; // top of the user stack (8 MiB)
-
-/// Initialize the NVMe controller `dev` and print the start of LBA 0 as a
-/// string (up to the first NUL byte). Errors are printed, not propagated.
-fn diskTest(dev: pci.Device) void {
-    nvme.init(dev) catch |e| return log.err("nvme init failed: {s}", .{@errorName(e)});
-    var sector: [4096]u8 = undefined;
-    nvme.read(0, 1, &sector) catch |e| return log.err("nvme read failed: {s}", .{@errorName(e)});
-    const end = std.mem.indexOfScalar(u8, &sector, 0) orelse 64;
-    log.info("disk LBA 0: \"{s}\"", .{sector[0..end]});
-}
 
 /// Return the contents of the first boot module whose path ends with `name`,
 /// or null if there is none. Panics if Limine did not answer the module request.
@@ -182,10 +132,9 @@ fn findModule(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Timer interrupt handler: count the tick and let the scheduler preempt the
-/// current thread when its time slice is used up.
+/// Timer interrupt handler: let the scheduler preempt the current thread
+/// when its time slice is used up.
 fn onTick(_: *idt.Frame) void {
-    ticks += 1;
     thread.tick();
 }
 
@@ -196,6 +145,9 @@ fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
     const v: *volatile @TypeOf(req.*) = req;
     return v.response orelse @panic("Limine request not answered");
 }
+
+/// True once the NVMe controller has been initialized successfully.
+var nvme_ready = false;
 
 /// Set while a panic is being reported, so a panic inside the panic handler
 /// (e.g. while printing the backtrace) halts instead of recursing.
@@ -222,40 +174,6 @@ fn idle() noreturn {
     while (true) {
         thread.yield(); // let anything that's ready run
         asm volatile ("sti; hlt"); // otherwise sleep until an interrupt
-    }
-}
-
-/// Built-in kernel-mode shell that reads lines from the keyboard and echoes
-/// them back. Superseded by the user-space `/bin/sh`; kept for debugging.
-fn shell() noreturn {
-    var line: [128]u8 = undefined;
-    var len: usize = 0;
-    print("> ", .{});
-
-    while (true) {
-        while (keyboard.getChar()) |c| switch (c) {
-            '\n' => {
-                print("\n", .{});
-                if (len > 0) print("you typed: {s}\n", .{line[0..len]});
-                len = 0;
-                print("> ", .{});
-            },
-            0x08 => if (len > 0) {
-                len -= 1;
-                print("\x08 \x08", .{}); // back, blank it out, back again
-            },
-            3 => { // Ctrl+C
-                print("^C\n> ", .{});
-                len = 0;
-            },
-            else => if (c >= ' ' and len < line.len) {
-                line[len] = c;
-                len += 1;
-                print("{c}", .{c});
-            },
-        };
-        thread.yield();
-        asm volatile ("sti; hlt"); // sleep until the next key or timer tick
     }
 }
 
@@ -516,18 +434,13 @@ fn testTarfsRead(image: []const u8, path: []const u8, offset: u64, buf: []u8) ?u
     return vfs.read(&node, offset, buf);
 }
 
-/// Test callback: return true if spawning a process from a non-ELF image fails.
-fn testInvalidElfRejected() bool {
-    const invalid = "not an ELF";
-
-    const child = process.spawn(
-        "invalid",
-        invalid,
-        null,
-    ) catch return true;
-
-    _ = child;
-    return false;
+/// Test callback: read the sector at `lba` from the NVMe disk into `buf`.
+/// Returns the sector's bytes, or null if there is no working NVMe disk or
+/// the read fails.
+fn testNvmeRead(lba: u64, buf: []u8) ?[]u8 {
+    if (!nvme_ready) return null;
+    nvme.read(lba, 1, buf) catch return null;
+    return buf[0..nvme.sector_size];
 }
 
 /// Test callback: return the name of the function containing code address
@@ -632,7 +545,6 @@ fn runTestScenario() noreturn {
         .heap_stats = testHeapStats,
         .address_space_roundtrip = testAddressSpaceRoundtrip,
         .vmm_map_translate = testVmmMapTranslate,
-        .invalid_elf_rejected = testInvalidElfRejected,
         .symbolize = testSymbolize,
         .capture_backtrace = testCaptureBacktrace,
         .fw_cfg_read = testFwCfgRead,
@@ -644,6 +556,7 @@ fn runTestScenario() noreturn {
         .scheduler_round_robin = testSchedulerRoundRobin,
         .wake_before_block = testWakeBeforeBlock,
         .tarfs_read = testTarfsRead,
+        .nvme_read = testNvmeRead,
     });
 }
 
@@ -679,7 +592,11 @@ export fn kmain() callconv(.c) noreturn {
     hpet.init();
 
     pci.scan();
-    if (pci.find(0x01, 0x08, 0x02)) |dev| diskTest(dev) else log.warn("no NVMe controller", .{});
+    if (pci.find(0x01, 0x08, 0x02)) |dev| {
+        if (nvme.init(dev)) {
+            nvme_ready = true;
+        } else |e| log.err("nvme init failed: {s}", .{@errorName(e)});
+    } else log.warn("no NVMe controller", .{});
 
     idt.register(apic.TIMER_VECTOR, onTick);
     apic.timerInit(100);

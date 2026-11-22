@@ -3,7 +3,6 @@
 //! Used for kernel logging from the very first instruction, before the
 //! framebuffer console exists. QEMU forwards it to the host terminal.
 
-const std = @import("std");
 const COM1 = 0x3F8;
 
 /// Write the byte `val` to I/O port `port`.
@@ -46,11 +45,4 @@ pub fn init() void {
 /// Write the string `s` to the serial port.
 pub fn puts(s: []const u8) void {
     for (s) |c| putc(c);
-}
-
-/// Format `args` with `fmt` and write the result to the serial port.
-/// Output longer than 512 bytes is replaced by `<print overflow>`.
-pub fn print(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    puts(std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n");
 }

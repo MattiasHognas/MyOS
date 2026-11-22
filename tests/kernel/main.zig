@@ -7,7 +7,6 @@
 const std = @import("std");
 const qemu_exit = @import("qemu_exit");
 
-/// Kernel services the tests may use, provided by `src/main.zig`.
 /// Result of loading an ELF image for inspection (see `Api.elf_probe`).
 pub const ElfProbe = struct {
     /// Entry point returned by the loader.
@@ -22,6 +21,7 @@ const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
 const PTE_NX: u64 = 1 << 63;
 
+/// Kernel services the tests may use, provided by `src/main.zig`.
 pub const Api = struct {
     log: *const fn ([]const u8) void,
 
@@ -34,7 +34,6 @@ pub const Api = struct {
     heap_stats: *const fn () bool,
     address_space_roundtrip: *const fn () bool,
     vmm_map_translate: *const fn () bool,
-    invalid_elf_rejected: *const fn () bool,
 
     /// Name of the function containing a code address, or null.
     symbolize: *const fn (u64) ?[]const u8,
@@ -60,6 +59,8 @@ pub const Api = struct {
     wake_before_block: *const fn () bool,
     /// Mount a tar image, read a file from an offset, remount the initrd.
     tarfs_read: *const fn ([]const u8, []const u8, u64, []u8) ?usize,
+    /// Read one sector of the NVMe disk; null if there is no disk or the read fails.
+    nvme_read: *const fn (u64, []u8) ?[]u8,
 
     has_file: *const fn ([]const u8) bool,
     file_size: *const fn ([]const u8) ?u64,
@@ -124,7 +125,6 @@ fn addressSpaceTest(api: Api) TestError!void {
     try check(api.address_space_roundtrip());
 }
 
-/// Spawning a process from a non-ELF image fails.
 /// Heap usage counters follow allocations, shrinks and frees.
 fn heapStats(api: Api) TestError!void {
     try check(api.heap_stats());
@@ -498,8 +498,18 @@ fn tarfsMalformed(api: Api) TestError!void {
     try check(api.has_file("/etc/motd"));
 }
 
-fn invalidElf(api: Api) TestError!void {
-    try check(api.invalid_elf_rejected());
+/// The NVMe driver reads the marker `scripts/test-qemu.sh` writes at the
+/// start of the test disk; the rest of the sector and the next one are zero.
+fn nvmeRead(api: Api) TestError!void {
+    const marker = "Hello from the NVMe test disk!";
+    var buf: [4096]u8 = @splat(0xAA);
+    const first = api.nvme_read(0, &buf) orelse return error.Failed;
+    try check(first.len >= 512 and std.mem.startsWith(u8, first, marker));
+    try check(std.mem.allEqual(u8, first[marker.len..], 0));
+    const second = api.nvme_read(1, &buf) orelse return error.Failed;
+    try check(std.mem.allEqual(u8, second, 0));
+    // Reading past the end of the 64 MiB disk fails instead of returning data.
+    try check(api.nvme_read(1 << 40, &buf) == null);
 }
 
 /// Known initrd files are found and missing ones are not.
@@ -605,8 +615,8 @@ pub fn run(api: Api) noreturn {
             .func = vmmMapTranslate,
         },
         .{
-            .name = "reject invalid ELF magic",
-            .func = invalidElf,
+            .name = "NVMe sector reads",
+            .func = nvmeRead,
         },
         .{
             .name = "VFS lookup",

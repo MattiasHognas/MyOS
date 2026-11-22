@@ -23,7 +23,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Test kernel heap allocation and memory read/write.
 - [x] Test virtual memory mapping and permissions (address-space create/destroy, map and translate, user/writable/NX bits from ELF segment flags). Unmapping and exhaustion tests: 2.6.
 - [x] Test ELF parsing, failed loading, and rollback (valid image contents and `.bss`, 14 malformed/truncated images, no leaked pages, spawn rollback after partial loads).
-- [x] Test valid/invalid syscall buffers and kernel/user isolation (`/test/syscalls` checks 37 cases from ring 3; reading kernel memory, `cli` and writing own code kill only the process). Unmapped user buffers are covered by 2.1.
+- [x] Test valid/invalid syscall buffers and kernel/user isolation (`/test/syscalls` checks 39 cases from ring 3; reading kernel memory, `cli` and writing own code kill only the process). Unmapped user buffers are covered by 2.1.
 - [x] Test scheduler transitions, process lifecycle, waits, and cleanup (FIFO round robin, wake-before-block, exit codes, no page/heap leaks after normal and crashed processes).
 - [x] Test VFS and filesystem behavior (lookup, contents, offsets and EOF on the initrd; an injected fake filesystem on the host; malformed tarfs archives and boundary conditions). Storage write tests: 4.2.
 
