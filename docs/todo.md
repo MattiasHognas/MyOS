@@ -31,10 +31,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Add GitHub Actions kernel/app builds (`.github/workflows/ci.yml`; pinned Zig, checksum-verified Limine and font).
 - [x] Run host unit tests and QEMU integration tests in CI.
 - [x] Run debug and optimized builds (CI matrix over Debug, ReleaseSafe and ReleaseFast; the test kernel follows `-Doptimize`).
-- [ ] Publish serial logs on failures.
-  - [x] Per-scenario logs in `zig-out/test/<scenario>/`, printed by `scripts/test-qemu.sh` when a check fails.
-  - [x] CI uploads them as the `serial-logs-<mode>` artifact on failure.
-  - [ ] Confirm the upload with a deliberately failing run on GitHub.
+- [x] Publish serial logs on failures (per-scenario logs in `zig-out/test/<scenario>/`, printed by `scripts/test-qemu.sh` on failure and uploaded by CI as `serial-logs-<mode>`; verified with a `simulate_failure` run).
 - [x] Add QEMU/GDB debugging instructions (`docs/debugging.md`, `scripts/run-qemu.sh --gdb`, `scripts/kernel.gdb`).
 - [x] Add symbolized kernel faults and backtraces (kernel `.symtab` via Limine, frame-pointer walk; tested by in-kernel tests and the `panic`/`fault` scenarios).
 - [x] Add log levels, subsystem assertions, and optional allocation diagnostics (`std.log` with `-Dlog-level`, `kernel/debug/assert.zig` with `-Dassertions`, heap stats and `-Dalloc-debug`).
