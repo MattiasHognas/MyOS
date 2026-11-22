@@ -23,7 +23,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Test kernel heap allocation and memory read/write.
 - [x] Test virtual memory mapping and permissions (address-space create/destroy, map and translate, user/writable/NX bits from ELF segment flags). Unmapping and exhaustion tests: 2.6.
 - [x] Test ELF parsing, failed loading, and rollback (valid image contents and `.bss`, 14 malformed/truncated images, no leaked pages, spawn rollback after partial loads).
-- [x] Test valid/invalid syscall buffers and kernel/user isolation (`/test/syscalls` checks 39 cases from ring 3; reading kernel memory, `cli` and writing own code kill only the process). Unmapped user buffers are covered by 2.1.
+- [x] Test valid/invalid syscall buffers and kernel/user isolation (`/test/syscalls` checks 39 cases from ring 3; reading kernel memory, `cli` and writing own code kill only the process). Unmapped user buffers: `/test/user_pointers` (2.1).
 - [x] Test scheduler transitions, process lifecycle, waits, and cleanup (FIFO round robin, wake-before-block, exit codes, no page/heap leaks after normal and crashed processes).
 - [x] Test VFS and filesystem behavior (lookup, contents, offsets and EOF on the initrd; an injected fake filesystem on the host; malformed tarfs archives and boundary conditions). Storage write tests: 4.2.
 
@@ -47,15 +47,15 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 **Goal:** Broken or malicious user programs cannot corrupt or crash the kernel.
 
 ### 2.1 Safe user-memory access
-- [ ] Implement `copyFromUser(dst, src, len)` and `copyToUser(dst, src, len)`; replace direct user-buffer dereferences in every syscall.
-- [ ] Validate canonical user addresses and use overflow-safe range checks.
-- [ ] Mark the user-copy routines so the page-fault handler can tell a fault inside them from a genuine kernel fault and resume at an error path (moved from 2.2; the next item needs it).
-- [ ] Handle faults inside user-copy routines by returning an error, not panicking.
-- [ ] Handle unmapped, partially mapped, read-only, and page-crossing buffers.
-- [ ] Enable SMEP when CPU-supported.
-- [ ] Enable SMAP when CPU-supported, using `stac`/`clac` only in controlled user-access sections.
-- [ ] Test null pointers, kernel pointers, overflow, invalid pages, and boundary crossings.
-- [ ] Test that SMEP and SMAP are really on: the kernel faults when it executes or touches user memory outside a user-access section (QEMU runs with `-cpu max`, which has both).
+- [x] Implement `copyFromUser(dst, src)` and `copyToUser(dst, src)` (`src/kernel/uaccess.zig`; the length is the kernel slice's); replace direct user-buffer dereferences in every syscall (`write`, `open`, `run` and `read` copy through kernel buffers; `userSlice` is gone).
+- [x] Validate canonical user addresses and use overflow-safe range checks (`src/kernel/user_range.zig`, host-tested).
+- [x] Mark the user-copy routines so the page-fault handler can tell a fault inside them from a genuine kernel fault and resume at an error path (`user_copy_start`/`user_copy_end`/`user_copy_fault` labels in `src/arch/x86_64/usercopy.zig`, `fixup` called from `interruptHandler`).
+- [x] Handle faults inside user-copy routines by returning an error, not panicking (`error.Fault`; the syscall returns `ERR`).
+- [x] Handle unmapped, partially mapped, read-only, and page-crossing buffers (CR0.WP is set so ring 0 writes to read-only user pages fault too).
+- [x] Enable SMEP when CPU-supported.
+- [x] Enable SMAP when CPU-supported, using `stac`/`clac` only in controlled user-access sections (only around the copy instruction in `user_copy`; interrupt entry runs `clac` and `syscall` entry masks AC).
+- [x] Test null pointers, kernel pointers, overflow, invalid pages, and boundary crossings (host tests for the range check, in-kernel "user copy routines" test, `/test/user_pointers` with 27 checks from ring 3).
+- [x] Test that SMEP and SMAP are really on: the kernel faults when it executes or touches user memory outside a user-access section (QEMU scenarios `smap` and `smep`, plus an in-kernel check of CR0/CR4; QEMU runs with `-cpu max`, which has both).
 
 **Done when:** Every syscall rejects invalid user addresses without crashing the kernel.
 
@@ -63,7 +63,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Allocate an independent double-fault emergency stack.
 - [ ] Configure the TSS IST entry and double-fault IDT gate.
 - [ ] Consider a separate NMI IST stack.
-- [x] Distinguish faults in user mode from kernel faults (`cs & 3` in `interruptHandler`). Recoverable faults during user copies: 2.1.
+- [x] Distinguish faults in user mode from kernel faults (`cs & 3` in `interruptHandler`; faults during user copies are recovered, see 2.1).
 - [x] Terminate the offending process for ordinary unrecoverable user faults (exit code 255; tested by `/test/kernel_read`, `/test/privileged` and `/test/write_text`).
 - [x] Print vector, error code, RIP, RSP, and CR2 (for page faults) in kernel fault diagnostics (checked by the `fault` scenario).
 - [ ] Print the same details for user faults; the message currently shows only the fault name and RIP.

@@ -19,6 +19,7 @@ pub const arch = struct {
         pub const gdt = @import("arch/x86_64/gdt.zig");
         pub const idt = @import("arch/x86_64/idt.zig");
         pub const syscall = @import("arch/x86_64/syscall.zig");
+        pub const usercopy = @import("arch/x86_64/usercopy.zig");
         pub const vmm = @import("arch/x86_64/vmm.zig");
     };
 };
@@ -51,6 +52,8 @@ pub const kernel = struct {
     pub const process = @import("kernel/process.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
+    pub const uaccess = @import("kernel/uaccess.zig");
+    pub const user_range = @import("kernel/user_range.zig");
     pub const vfs = @import("kernel/vfs.zig");
 
     /// Debugging aids: assertions, backtraces, symbol lookup and log formatting.
@@ -238,6 +241,7 @@ export fn kmain() callconv(.c) noreturn {
     const hhdm = response(&hhdm_request).offset;
     pmm.init(mm, hhdm);
     vmm.init(mm, response(&kaddr_request), hhdm);
+    arch.x86_64.usercopy.init(); // SMEP/SMAP: from here on, user memory only through kernel.uaccess
     log.info("memory: {d} MiB free", .{pmm.free_pages * pmm.PAGE_SIZE / (1024 * 1024)});
 
     const exec_file: *volatile @TypeOf(exec_file_request) = &exec_file_request;

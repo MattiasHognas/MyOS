@@ -2,8 +2,9 @@
 //!
 //! User programs pass the syscall number in RAX and up to three arguments in
 //! RDI, RSI and RDX; the result is returned in RAX. Failures return `ERR`
-//! (all bits set, i.e. -1). Pointers from user space are checked with
-//! `userSlice` before use.
+//! (all bits set, i.e. -1). User memory is never dereferenced directly: data
+//! is copied to and from kernel buffers with `uaccess.copyFromUser` and
+//! `uaccess.copyToUser`, which fail cleanly on bad pointers.
 
 const root = @import("root");
 const thread = @import("thread.zig");
@@ -13,6 +14,8 @@ const vfs = @import("vfs.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const keyboard = @import("../drivers/ps2_keyboard.zig");
 const proc = @import("process.zig");
+const uaccess = @import("uaccess.zig");
+const user_range = @import("user_range.zig");
 
 /// `getchar() -> char`: block until a key is pressed and return it.
 pub const GETCHAR = 7;
@@ -33,7 +36,10 @@ pub const YIELD = 2;
 /// `gettid() -> id`: return the calling thread's ID.
 pub const GETTID = 3;
 
-const USER_END: u64 = 0x0000_8000_0000_0000; // user space is the lower half
+/// Longest path accepted from user space, in bytes.
+const MAX_PATH = 256;
+/// Size of the kernel bounce buffer used to move data to and from user space.
+const CHUNK = 256;
 const ERR: u64 = @bitCast(@as(i64, -1));
 
 /// `GETCHAR`: return the next key from the keyboard buffer, blocking the
@@ -48,11 +54,21 @@ fn sysGetChar() u64 {
     }
 }
 
+/// Copy a path of `len` bytes from the user address `ptr` into `buf`.
+/// Returns null if it is longer than `MAX_PATH` or cannot be read.
+fn userPath(buf: *[MAX_PATH]u8, ptr: u64, len: u64) ?[]const u8 {
+    if (len > MAX_PATH) return null;
+    const path = buf[0..@intCast(len)];
+    uaccess.copyFromUser(path, ptr) catch return null;
+    return path;
+}
+
 /// `RUN`: spawn the program at the user-space path (`ptr`, `len`) as a child
 /// process and block until it exits. Returns the child's exit code, or `ERR`
 /// if the path is invalid or the program cannot be started.
 fn sysRun(ptr: u64, len: u64) u64 {
-    const path = userSlice(ptr, len, 256) orelse return ERR;
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = userPath(&path_buf, ptr, len) orelse return ERR;
     const me = thread.current();
     _ = proc.spawnPath(path, me) catch return ERR;
     const flags = cpu.saveAndDisableInterrupts();
@@ -61,20 +77,20 @@ fn sysRun(ptr: u64, len: u64) u64 {
     return me.wake_value;
 }
 
-/// Turn a user pointer and length into a slice, or return null if the range
-/// is longer than `max` bytes or not entirely inside user space. The pages are
-/// not checked for being mapped.
-fn userSlice(ptr: u64, len: u64, max: u64) ?[]u8 {
-    if (len > max or ptr >= USER_END or ptr + len > USER_END) return null;
-    return @as([*]u8, @ptrFromInt(ptr))[0..len];
-}
-
 /// `WRITE`: print the user string (`ptr`, `len`) to the serial port and
-/// console. Returns `len`, or `ERR` if the range is invalid or over 4 KiB.
+/// console. Returns `len`, or `ERR` if the range is over 4 KiB, outside user
+/// space or not readable. If only a later part is unreadable, the part before
+/// it has already been printed.
 fn sysWrite(ptr: u64, len: u64) u64 {
-    const s = userSlice(ptr, len, 4096) orelse return ERR;
-    var off: usize = 0;
-    while (off < s.len) : (off += 256) root.print("{s}", .{s[off..@min(off + 256, s.len)]});
+    if (len > 4096 or !user_range.valid(ptr, len)) return ERR;
+    var chunk: [CHUNK]u8 = undefined;
+    var off: u64 = 0;
+    while (off < len) {
+        const part = chunk[0..@intCast(@min(CHUNK, len - off))];
+        uaccess.copyFromUser(part, ptr + off) catch return ERR;
+        root.print("{s}", .{part});
+        off += part.len;
+    }
     return len;
 }
 
@@ -90,7 +106,8 @@ fn fileOf(fd: u64) ?*vfs.OpenFile {
 /// in the lowest free descriptor slot. Returns the descriptor, or `ERR` if the
 /// path is invalid, the file doesn't exist or the descriptor table is full.
 fn sysOpen(ptr: u64, len: u64) u64 {
-    const path = userSlice(ptr, len, 256) orelse return ERR;
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = userPath(&path_buf, ptr, len) orelse return ERR;
     const node = vfs.lookup(path) orelse return ERR;
     const p = thread.current().process orelse return ERR;
     for (&p.files, 0..) |*slot, fd| {
@@ -106,12 +123,22 @@ fn sysOpen(ptr: u64, len: u64) u64 {
 /// `READ`: read up to `len` bytes (max 1 MiB) from descriptor `fd` into the
 /// user buffer at `ptr`, advancing the file offset. Returns the number of
 /// bytes read, 0 at end of file, or `ERR` if `fd` or the buffer is invalid.
+/// On `ERR` the file offset is unchanged, though part of the buffer may have
+/// been written.
 fn sysRead(fd: u64, ptr: u64, len: u64) u64 {
     const of = fileOf(fd) orelse return ERR;
-    const buf = userSlice(ptr, len, 1 << 20) orelse return ERR;
-    const n = vfs.read(&of.node, of.offset, buf);
-    of.offset += n;
-    return n; // 0 = end of file
+    if (len > 1 << 20 or !user_range.valid(ptr, len)) return ERR;
+    var chunk: [CHUNK]u8 = undefined;
+    var done: u64 = 0;
+    while (done < len) {
+        const want: usize = @intCast(@min(CHUNK, len - done));
+        const n = vfs.read(&of.node, of.offset + done, chunk[0..want]);
+        if (n == 0) break; // end of file
+        uaccess.copyToUser(ptr + done, chunk[0..n]) catch return ERR;
+        done += n;
+    }
+    of.offset += done;
+    return done;
 }
 
 /// `CLOSE`: free the open file behind descriptor `fd` and clear its slot.

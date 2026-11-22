@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    inline for (.{ "syscalls", "kernel_read", "privileged", "write_text" }) |name| {
+    inline for (.{ "syscalls", "kernel_read", "privileged", "write_text", "user_pointers" }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, target, optimize);
         exe.root_module.addImport("lib", user_lib);
         b.installArtifact(exe); // scripts/build.sh --package-test picks them up from zig-out/bin
@@ -157,6 +157,7 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "vfs", "src/kernel/vfs.zig" },
         .{ "symbols", "src/kernel/debug/symbols.zig" },
         .{ "log_format", "src/kernel/debug/log_format.zig" },
+        .{ "user_range", "src/kernel/user_range.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),

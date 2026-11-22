@@ -92,12 +92,13 @@ pub fn setKernelStack(top: u64) void {
 /// Enable the `syscall` instruction and route it to `h`.
 ///
 /// Sets EFER.SCE, the segment selectors in STAR, the entry point in LSTAR and
-/// masks TF, IF and DF in SFMASK. `h` receives the saved user registers and
+/// masks TF, IF, DF and AC in SFMASK (AC so a user program cannot enter the
+/// kernel with SMAP's user-access override set). `h` receives the saved user registers and
 /// returns its result by writing `f.rax`.
 pub fn init(h: *const fn (*Frame) void) void {
     handler = h;
     cpu.wrmsr(0xC0000080, cpu.rdmsr(0xC0000080) | 1); // EFER.SCE: enable syscall
     cpu.wrmsr(0xC0000081, (@as(u64, 0x13) << 48) | (@as(u64, 0x08) << 32)); // STAR: selectors
     cpu.wrmsr(0xC0000082, @intFromPtr(&syscall_entry)); // LSTAR: entry point
-    cpu.wrmsr(0xC0000084, 0x700); // SFMASK: clear TF, IF, DF
+    cpu.wrmsr(0xC0000084, 0x40700); // SFMASK: clear TF, IF, DF, AC
 }

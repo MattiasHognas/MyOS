@@ -9,6 +9,8 @@
 #   tests  run the in-kernel test suite; must report MYOS_TEST_PASS
 #   panic  fail a subsystem assertion; must print a symbolized backtrace
 #   fault  page-fault in kernel mode; must print CR2 and a symbolized backtrace
+#   smap   read user memory from the kernel outside a user copy; must page-fault
+#   smep   execute user memory from the kernel; must page-fault
 #
 # Logs: zig-out/test/<scenario>/serial.log (raw) and serial-clean.log.
 #
@@ -113,6 +115,22 @@ run_scenario() {
             expect_line '^backtrace:$'
             expect_line '^  #0 0x[0-9a-f]{16} [^ ]*scenarioFault\+0x'
             ;;
+        smap)
+            # Error 0x1: protection violation on a supervisor read of a present page.
+            expect_status 3
+            expect_line '^\*\*\* Page fault \(vector 14, error 0x1\)$'
+            expect_line '^CR2=0x400000 \(faulting address\)$'
+            expect_line '^  #0 0x[0-9a-f]{16} [^ ]*scenarioSmap\+0x'
+            if grep -q 'not enforced' "$log"; then fail "the kernel read user memory"; fi
+            ;;
+        smep)
+            # Error 0x11: protection violation on a supervisor instruction fetch.
+            expect_status 3
+            expect_line '^\*\*\* Page fault \(vector 14, error 0x11\)$'
+            expect_line '^RIP=0x400000 '
+            expect_line '^CR2=0x400000 \(faulting address\)$'
+            if grep -q 'not enforced' "$log"; then fail "the kernel executed user memory"; fi
+            ;;
         *)
             echo "unknown scenario: $scenario" >&2
             exit 2
@@ -129,7 +147,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests panic fault)
+((${#scenarios[@]})) || scenarios=(tests panic fault smap smep)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 if [[ "${MYOS_SIMULATE_FAILURE:-}" == true ]]; then

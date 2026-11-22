@@ -84,3 +84,63 @@ pub fn saveAndDisableInterrupts() u64 {
 pub fn restoreInterrupts(flags: u64) void {
     if ((flags & (1 << 9)) != 0) asm volatile ("sti" ::: .{ .memory = true }); // bit 9 = IF
 }
+
+/// Registers returned by `cpuid`.
+pub const CpuidResult = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+/// Run `cpuid` for `leaf` and `subleaf`.
+pub fn cpuid(leaf: u32, subleaf: u32) CpuidResult {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (eax),
+          [b] "={ebx}" (ebx),
+          [c] "={ecx}" (ecx),
+          [d] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [sub] "{ecx}" (subleaf),
+    );
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+/// Read control register CR0.
+pub fn readCr0() u64 {
+    return asm volatile ("mov %%cr0, %[ret]"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+/// Write control register CR0.
+pub fn writeCr0(val: u64) void {
+    asm volatile ("mov %[val], %%cr0"
+        :
+        : [val] "r" (val),
+        : .{ .memory = true });
+}
+
+/// Read control register CR4.
+pub fn readCr4() u64 {
+    return asm volatile ("mov %%cr4, %[ret]"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+/// Write control register CR4.
+pub fn writeCr4(val: u64) void {
+    asm volatile ("mov %[val], %%cr4"
+        :
+        : [val] "r" (val),
+        : .{ .memory = true });
+}
+
+/// Return the current RFLAGS value.
+pub fn readFlags() u64 {
+    return asm volatile (
+        \\ pushfq
+        \\ popq %[f]
+        : [f] "=r" (-> u64),
+        :
+        : .{ .memory = true });
+}

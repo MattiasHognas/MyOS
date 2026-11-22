@@ -5,8 +5,8 @@ change or add a subsystem.
 
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
-| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF symbol lookup, log formatting), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, scheduler and processes, syscalls from ring 3, tarfs, NVMe reads, symbolization, fw_cfg. |
+| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF symbol lookup, log formatting, user address-range checks), compiled natively with fakes. Fast; covered by `zig build coverage`. |
+| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, scheduler and processes, syscalls from ring 3, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests and all QEMU scenarios. Add
@@ -25,6 +25,8 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 | `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines |
 | `panic` | Fails a subsystem assertion two calls deep | Exit code 1, the panic message, a symbolized backtrace through `scenarioPanicInner` and `scenarioPanic` |
 | `fault` | Writes to an unmapped kernel address | Exit code 1, `Page fault`, the right CR2, backtrace frame `#0` in `scenarioFault` |
+| `smap` | Reads a mapped user page from kernel code outside a user copy | Exit code 1, `Page fault` with error 0x1 and CR2 = the user page, frame `#0` in `scenarioSmap` (SMAP is enforced) |
+| `smep` | Calls code in a mapped user page from ring 0 | Exit code 1, `Page fault` with error 0x11, RIP and CR2 = the user page (SMEP is enforced) |
 
 Run a subset with `scripts/test-qemu.sh tests panic` (after `zig build test-kernel`
 and `zig build`). The timeout per boot is 45 s, or `MYOS_QEMU_TIMEOUT` seconds.
@@ -63,7 +65,7 @@ create a second copy of the module and its global state. To add a test:
 ## User-mode test programs
 
 Programs in `tests/user/` run in ring 3 and test the kernel from the outside
-(syscall validation, user/kernel isolation). The build installs each as
+(syscall validation, bad user pointers, user/kernel isolation). The build installs each as
 `zig-out/bin/test-<name>.elf`, and `scripts/build.sh --package-test` puts them
 in the test initrd as `/test/<name>`. In-kernel tests run them with
 `api.run_program("/test/<name>")`, which returns the exit code (255 if the

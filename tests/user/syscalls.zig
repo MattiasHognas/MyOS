@@ -3,8 +3,8 @@
 //!
 //! Exits with 0 if every check passes, otherwise with the number of the first
 //! failing check, so the kernel test can report which one broke. Only invalid
-//! values the kernel rejects without touching memory are used here; unmapped
-//! user pointers are not tested yet (they need fault-safe user copies, todo 2.1).
+//! values the kernel rejects without touching memory are used here; unmapped,
+//! partly mapped and read-only buffers are tested by `/test/user_pointers`.
 
 const lib = @import("lib");
 

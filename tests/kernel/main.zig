@@ -309,6 +309,37 @@ fn userSyscalls() TestError!void {
     try check(code == 0);
 }
 
+/// Bad user pointers (unmapped, partly mapped, read-only) fail the syscall
+/// and nothing else, checked from ring 3; no memory is leaked.
+fn userPointers() TestError!void {
+    _ = helpers.runProgram("/test/user_pointers"); // warm up: the heap may grow
+    const pages = pmm.free_pages;
+    const heap_bytes = helpers.heapInUse();
+    const code = helpers.runProgram("/test/user_pointers") orelse return error.Failed;
+    if (code != 0) {
+        var buf: [64]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&buf, "  /test/user_pointers failed check {d}\n", .{code}) catch "");
+    }
+    try check(code == 0);
+    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+}
+
+/// `copyFromUser`/`copyToUser` against mapped, unmapped, partly mapped and
+/// read-only pages, kernel pointers and overflowing ranges.
+fn userCopy() TestError!void {
+    const failed = helpers.userCopyChecks();
+    if (failed != 0) {
+        var buf: [64]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&buf, "  user copy failed check {d}\n", .{failed}) catch "");
+    }
+    try check(failed == 0);
+}
+
+/// Ring 0 write protection, SMEP and SMAP are on (QEMU's `-cpu max` has both).
+fn userProtectionOn() TestError!void {
+    try check(helpers.userProtectionOn());
+}
+
 /// Ring 3 cannot read kernel memory, run privileged instructions, or write
 /// its own code: each attempt kills only that process (exit code 255).
 fn userIsolation() TestError!void {
@@ -557,6 +588,26 @@ noinline fn scenarioFault() void {
     p.* = 0xDEAD;
 }
 
+/// Integration-test scenario "smap": read a user page from kernel code
+/// outside a user copy. With SMAP on this must page-fault; if the read goes
+/// through, the panic makes the scenario fail.
+noinline fn scenarioSmap() void {
+    if (!helpers.enterUserPageSpace()) @panic("smap scenario: out of memory");
+    const p: *const volatile u8 = @ptrFromInt(helpers.USER_PAGE);
+    const byte = p.*;
+    std.debug.panic("SMAP not enforced: the kernel read 0x{x} from user memory", .{byte});
+}
+
+/// Integration-test scenario "smep": call code in a user page from ring 0.
+/// With SMEP on the instruction fetch must page-fault; if the `ret` there
+/// runs, the panic makes the scenario fail.
+noinline fn scenarioSmep() void {
+    if (!helpers.enterUserPageSpace()) @panic("smep scenario: out of memory");
+    const user_code: *const fn () callconv(.c) void = @ptrFromInt(helpers.USER_PAGE);
+    user_code();
+    @panic("SMEP not enforced: the kernel executed user memory");
+}
+
 /// Entry point of the test kernel, called by `kmain` after boot: run the
 /// scenario the host passed through fw_cfg (`opt/myos/scenario`, default
 /// "tests"). Never returns; every scenario ends by exiting QEMU.
@@ -566,6 +617,8 @@ pub fn run() noreturn {
     log.info("test scenario: {s}", .{scenario});
     if (std.mem.eql(u8, scenario, "panic")) scenarioPanic();
     if (std.mem.eql(u8, scenario, "fault")) scenarioFault();
+    if (std.mem.eql(u8, scenario, "smap")) scenarioSmap();
+    if (std.mem.eql(u8, scenario, "smep")) scenarioSmep();
     if (!std.mem.eql(u8, scenario, "tests")) std.debug.panic("unknown test scenario '{s}'", .{scenario});
     runCases();
 }
@@ -628,6 +681,9 @@ fn runCases() noreturn {
         .{ .name = "ELF reject malformed images", .func = elfRejectMalformed },
         .{ .name = "ELF spawn rollback", .func = elfSpawnRollback },
         .{ .name = "syscall buffer and fd validation (ring 3)", .func = userSyscalls },
+        .{ .name = "user copy routines (bad, partial and read-only ranges)", .func = userCopy },
+        .{ .name = "bad user pointers in syscalls (ring 3)", .func = userPointers },
+        .{ .name = "SMEP, SMAP and ring 0 write protection enabled", .func = userProtectionOn },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },
         .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin },

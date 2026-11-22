@@ -14,6 +14,7 @@ const apic = @import("../../arch/x86_64/apic.zig");
 const thread = @import("../../kernel/thread.zig");
 const process = @import("../../kernel/process.zig");
 const backtrace = @import("../../kernel/debug/backtrace.zig");
+const usercopy = @import("usercopy.zig");
 
 var idt = std.mem.zeroes([256]Entry);
 var handlers: [256]?Handler = @splat(null);
@@ -84,7 +85,10 @@ fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
 }
 
 // Common path for all stubs: save registers, call interruptHandler, restore,
-// drop the vector and error code, iretq.
+// drop the vector and error code, iretq. With SMAP on, RFLAGS.AC is cleared
+// (`clac`, written as bytes) so an interrupt that arrives inside a user copy,
+// or from a user program that set AC, cannot run the handler (or a thread it
+// switches to) with user-memory access allowed. `iretq` restores the old flags.
 comptime {
     asm (
         \\.section .text
@@ -105,6 +109,10 @@ comptime {
         \\  push %r13
         \\  push %r14
         \\  push %r15
+        \\  cmpb $0, smap_enabled(%rip)
+        \\  je 1f
+        \\  .byte 0x0f, 0x01, 0xca
+        \\1:
         \\  mov %rsp, %rdi
         \\  cld
         \\  call interruptHandler
@@ -142,7 +150,9 @@ fn readCr2() u64 {
 ///   the handler installed with `register`. The handler may switch threads, so
 ///   the EOI must already have been sent.
 /// - Exceptions from ring 3 terminate the current process with exit code 255.
-/// - Exceptions from ring 0 print the register state and a symbolized
+/// - Page faults on user memory inside a user copy (`usercopy.zig`) resume at
+///   the copy's error path: the syscall fails, nothing is killed.
+/// - Other exceptions from ring 0 print the register state and a symbolized
 ///   backtrace, then halt, except breakpoints (`int3`), which resume.
 export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
@@ -155,6 +165,12 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
     if ((f.cs & 3) == 3) { // fault came from ring 3: kill the thread, keep the kernel
         root.print("\n*** thread {d}: {s} in user mode at RIP=0x{x}, killed\n", .{ thread.id(), name, f.rip });
         process.exit(255); // the parent sees exit code 255 for a crash
+    }
+    if (f.vector == 14) {
+        if (usercopy.fixup(f.rip, readCr2())) |resume_at| { // bad user pointer in a syscall
+            f.rip = resume_at;
+            return;
+        }
     }
     root.print("\n*** {s} (vector {d}, error 0x{x})\n", .{ name, f.vector, f.error_code });
     root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });

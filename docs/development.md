@@ -129,11 +129,11 @@ the terminal.
 | Path | Contents |
 | --- | --- |
 | `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
-| `src/arch/x86_64/` | GDT/TSS, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, port I/O |
+| `src/arch/x86_64/` | GDT/TSS, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, fault-tolerant user copies and SMEP/SMAP (`usercopy`), port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
-| `src/kernel/` | Physical memory (`pmm`), heap, threads/scheduler, processes, ELF loader, syscalls, VFS, console |
+| `src/kernel/` | Physical memory (`pmm`), heap, threads/scheduler, processes, ELF loader, syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
 | `src/kernel/fs/` | Filesystems (`tarfs` for the initrd) |
 | `src/kernel/debug/` | Assertions, backtraces, ELF symbol lookup, log formatting |
 | `src/assets/` | Console font (fetched, not committed) |
@@ -150,7 +150,7 @@ the terminal.
 
 Limine loads `kernel.elf` and `initrd.tar`, answers the requests in
 `src/main.zig`, and jumps to `kmain`. `kmain` brings up, in order: serial, GDT,
-IDT, framebuffer console, PMM, page tables, kernel symbols, ACPI, APIC, HPET,
+IDT, framebuffer console, PMM, page tables, SMEP/SMAP, kernel symbols, ACPI, APIC, HPET,
 PCI (and NVMe if present), the APIC timer, syscalls and the initrd. The
 normal kernel then starts `/bin/sh` and becomes the idle thread; the test
 kernel runs the scenario QEMU asks for instead.
@@ -172,9 +172,13 @@ test image).
 ### Adding a syscall
 
 1. Add the number and an implementation to `src/kernel/syscall.zig` and a case
-   in `dispatch`. Validate every user pointer with `userSlice`.
+   in `dispatch`. Never dereference a user pointer: copy the data into a
+   kernel buffer with `uaccess.copyFromUser`, or out with
+   `uaccess.copyToUser`, and return `ERR` when they fail with `error.Fault`
+   (with SMAP on, a direct access is a kernel page fault).
 2. Add a wrapper to `app/lib.zig` (the numbers must match).
-3. Test it from ring 3 in `tests/user/syscalls.zig` (see [testing](testing.md)).
+3. Test it from ring 3 in `tests/user/syscalls.zig`, and its pointer
+   arguments in `tests/user/user_pointers.zig` (see [testing](testing.md)).
 
 ### Conventions
 

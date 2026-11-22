@@ -9,6 +9,8 @@ const std = @import("std");
 const kernel_root = @import("root");
 const cpu = kernel_root.arch.x86_64.cpu;
 const vmm = kernel_root.arch.x86_64.vmm;
+const usercopy = kernel_root.arch.x86_64.usercopy;
+const uaccess = kernel_root.kernel.uaccess;
 const nvme = kernel_root.drivers.nvme;
 const elf = kernel_root.kernel.elf;
 const heap = kernel_root.kernel.heap;
@@ -287,4 +289,125 @@ pub fn heapStats() bool {
         s3.frees == s0.frees + 1 and
         s3.bytes_in_use == s0.bytes_in_use and
         s3.bytes_mapped >= s3.bytes_in_use;
+}
+
+/// Address of the user page mapped by `enterUserPageSpace`.
+pub const USER_PAGE: u64 = 0x40_0000;
+
+/// Allocate a zeroed page and map it at `virt` in `root` with `flags`.
+/// Returns its physical address, or null if memory ran out.
+fn mapUserPage(root: u64, virt: u64, flags: u64) ?u64 {
+    const phys = pmm.alloc() orelse return null;
+    @memset(pmm.physToVirt(phys)[0..pmm.PAGE_SIZE], 0);
+    vmm.map(root, virt, phys, flags, false);
+    return phys;
+}
+
+/// True if copying `len` bytes from user address `addr` fails with a fault.
+fn readFaults(addr: u64, len: usize) bool {
+    var buf: [32]u8 = undefined;
+    return uaccess.copyFromUser(buf[0..len], addr) == error.Fault;
+}
+
+/// True if copying `len` bytes to user address `addr` fails with a fault.
+fn writeFaults(addr: u64, len: usize) bool {
+    const buf: [32]u8 = @splat(0xEE);
+    return uaccess.copyToUser(addr, buf[0..len]) == error.Fault;
+}
+
+/// Exercise `copyFromUser`/`copyToUser` against a private address space with
+/// two writable pages at 0x400000, a hole at 0x402000 and a read-only page
+/// at 0x403000. Returns 0 if everything behaves, otherwise the number of the
+/// first failing check.
+pub fn userCopyChecks() u32 {
+    const flags = cpu.saveAndDisableInterrupts(); // no thread switch while the root is swapped
+    defer cpu.restoreInterrupts(flags);
+    const pages_before = pmm.free_pages;
+    const root = vmm.createAddressSpace();
+    const rw = vmm.USER | vmm.WRITABLE | vmm.NX;
+    const p0 = mapUserPage(root, 0x40_0000, rw);
+    const p1 = mapUserPage(root, 0x40_1000, rw);
+    const ro = mapUserPage(root, 0x40_3000, vmm.USER | vmm.NX);
+    vmm.loadRoot(root);
+    const failed = userCopyChecksIn(p0, p1, ro);
+    vmm.loadRoot(vmm.kernel_root);
+    vmm.destroyAddressSpace(root);
+    if (failed != 0) return failed;
+    return if (pmm.free_pages == pages_before) 0 else 100;
+}
+
+/// The checks of `userCopyChecks`, run with its address space loaded.
+/// `p0`, `p1` and `ro` are the physical pages behind 0x400000, 0x401000 and 0x403000.
+fn userCopyChecksIn(p0: ?u64, p1: ?u64, ro: ?u64) u32 {
+    const first = pmm.physToVirt(p0 orelse return 1);
+    const second = pmm.physToVirt(p1 orelse return 1);
+    const readonly = pmm.physToVirt(ro orelse return 1);
+    const end = kernel_root.kernel.user_range.USER_END;
+    var buf: [16]u8 = undefined;
+
+    // A buffer crossing a page boundary is written and read back whole.
+    const msg = "0123456789abcdef";
+    uaccess.copyToUser(0x40_0FF8, msg) catch return 2;
+    if (!std.mem.eql(u8, first[0xFF8..0x1000], msg[0..8])) return 3;
+    if (!std.mem.eql(u8, second[0..8], msg[8..])) return 4;
+    uaccess.copyFromUser(&buf, 0x40_0FF8) catch return 5;
+    if (!std.mem.eql(u8, &buf, msg)) return 6;
+
+    // Unmapped page, null, and never-mapped parts of user space.
+    if (!readFaults(0x40_2000, 8) or !writeFaults(0x40_2000, 8)) return 7;
+    if (!readFaults(0, 8) or !writeFaults(0, 8)) return 8;
+    if (!readFaults(0x7000_0000_0000, 8)) return 9;
+
+    // Partly mapped: starts in the second page, runs into the hole. The
+    // bytes before the hole were written, as documented.
+    if (!readFaults(0x40_1FF8, 16) or !writeFaults(0x40_1FF8, 16)) return 10;
+    if (second[0xFFF] != 0xEE) return 11;
+    // The last mapped bytes on their own are fine.
+    uaccess.copyFromUser(buf[0..8], 0x40_1FF8) catch return 12;
+
+    // Read-only page: readable, not writable, contents untouched.
+    readonly[0] = 0x77;
+    uaccess.copyFromUser(buf[0..1], 0x40_3000) catch return 13;
+    if (buf[0] != 0x77) return 14;
+    if (!writeFaults(0x40_3000, 8) or readonly[0] != 0x77) return 15;
+    // Starting in the read-only page and running off its end fails as well.
+    if (!writeFaults(0x40_3FF8, 16)) return 16;
+
+    // Kernel pointers, the end of user space, and address + length overflow
+    // are rejected before any memory is touched.
+    if (!readFaults(@intFromPtr(&buf), 8) or !writeFaults(@intFromPtr(&buf), 8)) return 17;
+    if (!readFaults(0xFFFF_8000_0000_0000, 8) or !readFaults(end, 1)) return 18;
+    if (!readFaults(end - 4, 8) or !writeFaults(end - 4, 8)) return 19;
+    if (!readFaults(std.math.maxInt(u64) - 3, 8) or !writeFaults(std.math.maxInt(u64) - 3, 8)) return 20;
+    if (!readFaults(0x8000_0000_0000 + 0x1000, 8)) return 21; // non-canonical
+
+    // Empty copies succeed without touching memory, even at unmapped addresses.
+    uaccess.copyFromUser(buf[0..0], 0x40_2000) catch return 22;
+    uaccess.copyToUser(end, buf[0..0]) catch return 23;
+
+    // The user-access window is closed again after successful and failed copies.
+    if (cpu.readFlags() & (1 << 18) != 0) return 24; // RFLAGS.AC
+    return 0;
+}
+
+/// True if write protection in ring 0, SMEP and SMAP are all switched on,
+/// both in the kernel's bookkeeping and in the control registers.
+pub fn userProtectionOn() bool {
+    const cr4 = cpu.readCr4();
+    return usercopy.smep_enabled and usercopy.smapEnabled() and
+        cr4 & (1 << 20) != 0 and cr4 & (1 << 21) != 0 and
+        cpu.readCr0() & (1 << 16) != 0;
+}
+
+/// For the `smap` and `smep` scenarios: switch to a new address space with
+/// one user-accessible, writable, executable page at `USER_PAGE` that holds a
+/// single `ret` instruction. Interrupts stay off so the scheduler keeps this
+/// address space loaded. Returns false if memory ran out.
+pub fn enterUserPageSpace() bool {
+    _ = cpu.saveAndDisableInterrupts();
+    const root = vmm.createAddressSpace();
+    const phys = mapUserPage(root, USER_PAGE, vmm.USER | vmm.WRITABLE) orelse return false;
+    pmm.physToVirt(phys)[0] = 0xC3; // ret
+    vmm.loadRoot(root);
+    return true;
 }
