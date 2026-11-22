@@ -1,32 +1,32 @@
 {
-  // Open this file in VS Code (File > Open Workspace from File...) to get the
-  // project's editor setup. In a workspace window VS Code ignores the Zig
-  // extension settings in .vscode/settings.json, so they are repeated here:
-  // keep the two files in sync.
-  "folders": [
-    {
-      "path": "."
-    }
-  ],
-  "settings": {
-    "zig.zls.enabled": "on",
-    "zig.zls.path": "zls",
-    "zig.initialSetupDone": true,
-    "zig.testArgs": [
-      "build",
-      "test-host",
-      "-Dtest-filter=${filter}"
-    ],
-    "zig.debugTestArgs": [
-      "build",
-      "debug-test-host",
-      "-Dtest-filter=${filter}"
-    ]
-  },
-  "extensions": {
-    "recommendations": [
-      "ziglang.vscode-zig",
-      "vadimcn.vscode-lldb"
-    ]
-  }
+	// Open this file in VS Code (File > Open Workspace from File...) to get the
+	// project's editor setup. In a workspace window VS Code ignores the Zig
+	// extension settings in .vscode/settings.json, so they are repeated here:
+	// keep the two files in sync.
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"zig.zls.enabled": "on",
+		"zig.zls.path": "zls",
+		"zig.initialSetupDone": true,
+		"zig.testArgs": [
+			"build",
+			"test-host",
+			"-Dtest-filter=${filter}"
+		],
+		"zig.debugTestArgs": [
+			"build",
+			"debug-test-host",
+			"-Dtest-filter=${filter}"
+		]
+	},
+	"extensions": {
+		"recommendations": [
+			"ziglang.vscode-zig",
+			"vadimcn.vscode-lldb"
+		]
+	}
 }
