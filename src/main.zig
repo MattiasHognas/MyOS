@@ -4,7 +4,8 @@
 //! `kmain` (CPU tables, memory, ACPI/APIC/timers, PCI, syscalls, the initrd)
 //! and finally starts `/bin/sh` as the first user process. Also provides the
 //! kernel-wide `print`, `halt` and panic handler that other modules reach via
-//! `@import("root")`, plus the callbacks used by the in-kernel test suite.
+//! `@import("root")`. The test kernel (`kernel-test.elf`) hands control to
+//! `tests/kernel/` after boot instead of starting the shell.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -29,7 +30,6 @@ pub const boot = struct {
 
 /// Hardware device drivers.
 pub const drivers = struct {
-    pub const fw_cfg = @import("drivers/fw_cfg.zig");
     pub const hpet = @import("drivers/hpet.zig");
     pub const nvme = @import("drivers/nvme.zig");
     pub const pci = @import("drivers/pci.zig");
@@ -89,7 +89,6 @@ const vfs = kernel.vfs;
 const tarfs = kernel.fs.tarfs;
 const pci = drivers.pci;
 const nvme = drivers.nvme;
-const fw_cfg = drivers.fw_cfg;
 const assert = kernel.debug.assert;
 const backtrace = kernel.debug.backtrace;
 const log_format = kernel.debug.log_format;
@@ -146,8 +145,11 @@ fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
     return v.response orelse @panic("Limine request not answered");
 }
 
+/// The initrd image. Public so tests can mount other archives and restore it.
+pub var initrd_image: []const u8 = &.{};
+
 /// True once the NVMe controller has been initialized successfully.
-var nvme_ready = false;
+pub var nvme_ready = false;
 
 /// Set while a panic is being reported, so a panic inside the panic handler
 /// (e.g. while printing the backtrace) halts instead of recursing.
@@ -218,348 +220,6 @@ pub fn halt() noreturn {
     while (true) asm volatile ("cli; hlt");
 }
 
-// Test-only service callbacks passed to the kernel test suite. Using callbacks
-// avoids importing a second copy of PMM/VFS into the test module (which would
-// duplicate module global state).
-
-/// Test callback: write `s` to the serial port.
-fn testLog(s: []const u8) void {
-    serial.puts(s);
-}
-
-/// Test callback: return the number of free physical pages.
-fn testFreePages() usize {
-    return pmm.free_pages;
-}
-
-/// Test callback: return true if a file exists at `path`.
-fn testHasFile(path: []const u8) bool {
-    return vfs.lookup(path) != null;
-}
-
-/// Test callback: return the size of the file at `path`, or null if it doesn't exist.
-fn testFileSize(path: []const u8) ?u64 {
-    const node = vfs.lookup(path) orelse return null;
-    return node.size;
-}
-
-/// Test callback: read from the file at `path` starting at `offset` into
-/// `buf`. Returns the number of bytes read, or null if the file doesn't exist.
-fn testReadFileAt(
-    path: []const u8,
-    offset: u64,
-    buf: []u8,
-) ?usize {
-    const node = vfs.lookup(path) orelse return null;
-    return vfs.read(&node, offset, buf);
-}
-
-/// Test callback: write a pattern to both ends of physical page `page` through
-/// the HHDM and return true if it reads back correctly.
-fn testPageRw(page: u64) bool {
-    const memory =
-        pmm.physToVirt(page)[0..pmm.PAGE_SIZE];
-
-    memory[0] = 0xA5;
-    memory[pmm.PAGE_SIZE - 1] = 0x5A;
-
-    return memory[0] == 0xA5 and
-        memory[pmm.PAGE_SIZE - 1] == 0x5A;
-}
-
-/// Test callback: allocate 257 bytes from the kernel heap, fill and verify
-/// them, then free them. Returns false on allocation failure or mismatch.
-fn testHeapRoundtrip() bool {
-    const memory = heap.allocator.alloc(
-        u8,
-        257,
-    ) catch return false;
-
-    defer heap.allocator.free(memory);
-
-    @memset(memory, 0xBC);
-
-    for (memory) |byte| {
-        if (byte != 0xBC) return false;
-    }
-
-    return true;
-}
-
-/// Test callback: create and destroy an address space and return true if
-/// exactly one page was used and all pages were given back.
-fn testAddressSpaceRoundtrip() bool {
-    const before = pmm.free_pages;
-    const address_space =
-        vmm.createAddressSpace();
-
-    if (pmm.free_pages + 1 != before) {
-        vmm.destroyAddressSpace(address_space);
-        return false;
-    }
-
-    vmm.destroyAddressSpace(address_space);
-
-    return pmm.free_pages == before;
-}
-
-/// The initrd image, kept so tests can mount other archives and restore it.
-var initrd_image: []const u8 = &.{};
-
-/// Shorthand for the test module's types.
-const KernelTests = if (build_options.is_test) @import("kernel_tests") else struct {
-    pub const ElfProbe = struct { entry: u64, pte: u64 };
-};
-
-/// Test callback: load the ELF `image` into a fresh address space, then report
-/// its entry point and the leaf page-table entry mapping `addr`, and copy the
-/// bytes at `addr` (up to the end of that page) into `out`. Returns null if
-/// loading fails. The address space is always destroyed again.
-fn testElfProbe(image: []const u8, addr: u64, out: []u8) ?KernelTests.ElfProbe {
-    const root = vmm.createAddressSpace();
-    defer vmm.destroyAddressSpace(root);
-    const entry = kernel.elf.load(root, image) catch return null;
-    const pte = vmm.leafEntry(root, addr) orelse 0;
-    if (vmm.translate(root, addr)) |phys| {
-        const n = @min(out.len, pmm.PAGE_SIZE - (addr % pmm.PAGE_SIZE));
-        @memcpy(out[0..n], pmm.physToVirt(phys)[0..n]);
-    }
-    return .{ .entry = entry, .pte = pte };
-}
-
-/// Test callback: `testElfProbe` on the file at `path`.
-fn testElfProbePath(path: []const u8, addr: u64, out: []u8) ?KernelTests.ElfProbe {
-    const node = vfs.lookup(path) orelse return null;
-    const image = heap.allocator.alloc(u8, node.size) catch return null;
-    defer heap.allocator.free(image);
-    if (vfs.read(&node, 0, image) != node.size) return null;
-    return testElfProbe(image, addr, out);
-}
-
-/// Test callback: return true if `process.spawn` rejects `image` and leaves
-/// physical memory and the heap exactly as they were (full rollback).
-fn testSpawnFailsCleanly(image: []const u8) bool {
-    const pages = pmm.free_pages;
-    const in_use = heap.stats().bytes_in_use;
-    _ = process.spawn("bad", image, null) catch
-        return pmm.free_pages == pages and heap.stats().bytes_in_use == in_use;
-    return false; // it started; the test fails (the process runs on its own)
-}
-
-/// Test callback: run the program at `path` as a child process of the current
-/// thread and wait for it. Returns its exit code (255 if it was killed by a
-/// fault), or null if it could not be started.
-fn testRunProgram(path: []const u8) ?u64 {
-    const me = thread.current();
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    _ = process.spawnPath(path, me) catch return null;
-    thread.block(); // until the child calls process.exit
-    return me.wake_value;
-}
-
-/// Test callback: bytes currently allocated from the kernel heap.
-fn testHeapInUse() usize {
-    return heap.stats().bytes_in_use;
-}
-
-// State shared by the scheduler test's worker threads.
-var sched_log: [8]u8 = undefined;
-var sched_len: usize = 0;
-var sched_done: usize = 0;
-var sched_waiter: ?*thread.Thread = null;
-
-/// Scheduler test worker: append `tag` to the log three times, yielding after
-/// each, then report completion. Interrupts stay off so only the explicit
-/// yields switch threads, which makes the interleaving deterministic.
-fn schedWorker(tag: u8) void {
-    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
-    for (0..3) |_| {
-        if (sched_len < sched_log.len) sched_log[sched_len] = tag;
-        sched_len += 1;
-        thread.yield();
-    }
-    sched_done += 1;
-    if (sched_done == 2) thread.wake(sched_waiter.?);
-}
-
-/// First scheduler test worker.
-fn schedWorkerA() void {
-    schedWorker('A');
-}
-
-/// Second scheduler test worker.
-fn schedWorkerB() void {
-    schedWorker('B');
-}
-
-/// Test callback: run two kernel threads that yield to each other and check
-/// that they alternate in FIFO order, that the waiting thread is woken when
-/// both are done, and that their stacks and thread structs are freed.
-fn testSchedulerRoundRobin() bool {
-    const in_use = heap.stats().bytes_in_use;
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    sched_len = 0;
-    sched_done = 0;
-    sched_waiter = thread.current();
-    const a = thread.spawn(schedWorkerA, null) catch return false;
-    const b = thread.spawn(schedWorkerB, null) catch return false;
-    if (b.id <= a.id or a.state != .ready) return false;
-    while (sched_done < 2) thread.block();
-    return sched_len == 6 and
-        std.mem.eql(u8, sched_log[0..6], "ABABAB") and
-        heap.stats().bytes_in_use == in_use; // both threads reaped
-}
-
-/// Test callback: a wake that arrives before `block` must make `block`
-/// return immediately (otherwise this test hangs and times out).
-fn testWakeBeforeBlock() bool {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    const me = thread.current();
-    thread.wake(me);
-    if (!me.wake_pending or me.state != .running) return false;
-    thread.block();
-    return !me.wake_pending and me.state == .running;
-}
-
-/// Test callback: mount the tar archive `image`, read the file at `path` from
-/// `offset` into `buf`, then remount the initrd. Returns the bytes read, or
-/// null if the file is not found.
-fn testTarfsRead(image: []const u8, path: []const u8, offset: u64, buf: []u8) ?usize {
-    const fs = tarfs.init(image);
-    defer _ = tarfs.init(initrd_image);
-    const node = fs.lookup(fs.ctx, path) orelse return null;
-    return vfs.read(&node, offset, buf);
-}
-
-/// Test callback: read the sector at `lba` from the NVMe disk into `buf`.
-/// Returns the sector's bytes, or null if there is no working NVMe disk or
-/// the read fails.
-fn testNvmeRead(lba: u64, buf: []u8) ?[]u8 {
-    if (!nvme_ready) return null;
-    nvme.read(lba, 1, buf) catch return null;
-    return buf[0..nvme.sector_size];
-}
-
-/// Test callback: return the name of the function containing code address
-/// `addr`, or null if it can't be symbolized.
-fn testSymbolize(addr: u64) ?[]const u8 {
-    const sym = backtrace.symbolize(addr) orelse return null;
-    return sym.name;
-}
-
-/// Test callback: store the return addresses of the caller's frame chain in
-/// `out`, innermost first (the first one points into the caller).
-noinline fn testCaptureBacktrace(out: []u64) usize {
-    return backtrace.capture(@frameAddress(), out);
-}
-
-/// Test callback: in a fresh address space, map one user page, check that
-/// `vmm.translate` finds it (including an offset into the page) and that
-/// neighbouring pages are unmapped, then destroy the address space and check
-/// that no physical pages leaked.
-fn testVmmMapTranslate() bool {
-    const before = pmm.free_pages;
-    const root = vmm.createAddressSpace();
-    const virt: u64 = 0x40_0000;
-    const phys = pmm.alloc() orelse {
-        vmm.destroyAddressSpace(root);
-        return false;
-    };
-    vmm.map(root, virt, phys, vmm.USER | vmm.WRITABLE, false);
-    const ok = vmm.translate(root, virt) == phys and
-        vmm.translate(root, virt + 0x123) == phys + 0x123 and
-        vmm.translate(root, virt + pmm.PAGE_SIZE) == null and
-        vmm.translate(root, virt - pmm.PAGE_SIZE) == null and
-        vmm.translate(root, 0x7FFF_0000_0000) == null;
-    vmm.destroyAddressSpace(root); // frees the mapped page and its tables too
-    return ok and pmm.free_pages == before;
-}
-
-/// Test callback: check that the heap usage counters track an allocation,
-/// a shrink and a free, and return to their starting value.
-fn testHeapStats() bool {
-    const s0 = heap.stats();
-    const mem = heap.allocator.alloc(u8, 100) catch return false;
-    const s1 = heap.stats();
-    const shrunk = heap.allocator.resize(mem, 20);
-    const s2 = heap.stats();
-    heap.allocator.free(mem[0..20]);
-    const s3 = heap.stats();
-    return s1.allocs == s0.allocs + 1 and
-        s1.bytes_in_use == s0.bytes_in_use + 112 and // 100 rounded up to 16
-        s1.peak_bytes >= s1.bytes_in_use and
-        shrunk and s2.bytes_in_use == s0.bytes_in_use + 32 and
-        s3.frees == s0.frees + 1 and
-        s3.bytes_in_use == s0.bytes_in_use and
-        s3.bytes_mapped >= s3.bytes_in_use;
-}
-
-/// Test callback: read the fw_cfg file `name` into `buf`.
-fn testFwCfgRead(name: []const u8, buf: []u8) ?[]u8 {
-    return fw_cfg.readFile(name, buf);
-}
-
-/// Integration-test scenario "panic": fail a subsystem assertion two calls
-/// deep, so the panic output must contain a symbolized backtrace through
-/// these functions.
-noinline fn scenarioPanic() void {
-    scenarioPanicInner(true);
-}
-
-/// Inner frame of `scenarioPanic`.
-noinline fn scenarioPanicInner(fail: bool) void {
-    assert.check(.scenario, !fail, "deliberate test panic", .{});
-}
-
-/// Integration-test scenario "fault": write to an unmapped kernel address, so
-/// the page-fault report must show CR2 and a symbolized backtrace.
-noinline fn scenarioFault() void {
-    const p: *volatile u64 = @ptrFromInt(0xFFFF_B000_0000_0000);
-    p.* = 0xDEAD;
-}
-
-/// Run the test kernel: pick the scenario passed by the host through fw_cfg
-/// (`opt/myos/scenario`, default "tests") and run it. Never returns; every
-/// scenario ends by exiting QEMU.
-fn runTestScenario() noreturn {
-    var buf: [32]u8 = undefined;
-    const scenario = fw_cfg.readFile("opt/myos/scenario", &buf) orelse "tests";
-    log.info("test scenario: {s}", .{scenario});
-    if (std.mem.eql(u8, scenario, "panic")) scenarioPanic();
-    if (std.mem.eql(u8, scenario, "fault")) scenarioFault();
-    if (!std.mem.eql(u8, scenario, "tests")) std.debug.panic("unknown test scenario '{s}'", .{scenario});
-
-    @import("kernel_tests").run(.{
-        .log = testLog,
-        .alloc_page = pmm.alloc,
-        .free_page = pmm.free,
-        .free_pages = testFreePages,
-        .has_file = testHasFile,
-        .file_size = testFileSize,
-        .read_file_at = testReadFileAt,
-        .page_rw = testPageRw,
-        .heap_roundtrip = testHeapRoundtrip,
-        .heap_stats = testHeapStats,
-        .address_space_roundtrip = testAddressSpaceRoundtrip,
-        .vmm_map_translate = testVmmMapTranslate,
-        .symbolize = testSymbolize,
-        .capture_backtrace = testCaptureBacktrace,
-        .fw_cfg_read = testFwCfgRead,
-        .elf_probe = testElfProbe,
-        .elf_probe_path = testElfProbePath,
-        .spawn_fails_cleanly = testSpawnFailsCleanly,
-        .run_program = testRunProgram,
-        .heap_in_use = testHeapInUse,
-        .scheduler_round_robin = testSchedulerRoundRobin,
-        .wake_before_block = testWakeBeforeBlock,
-        .tarfs_read = testTarfsRead,
-        .nvme_read = testNvmeRead,
-    });
-}
-
 /// Kernel entry point, jumped to by Limine.
 ///
 /// Initializes the subsystems in dependency order, mounts the initrd as the
@@ -607,8 +267,8 @@ export fn kmain() callconv(.c) noreturn {
     initrd_image = findModule("initrd.tar") orelse @panic("no initrd.tar module");
     vfs.mountRoot(tarfs.init(initrd_image));
 
-    // The test kernel runs an integration-test scenario instead of the shell.
-    if (comptime build_options.is_test) runTestScenario();
+    // The test kernel runs an integration-test scenario (tests/kernel/) instead of the shell.
+    if (comptime build_options.is_test) @import("kernel_tests").run();
 
     keyboard.init();
     _ = process.spawnPath("/bin/sh", null) catch |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});

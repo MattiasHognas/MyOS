@@ -89,7 +89,7 @@ whatever is in `zig-out/bin`.
 | --- | --- |
 | `zig-out/bin/` | `kernel.elf`, `kernel-test.elf`, user programs (`hello.elf`, `sh.elf`, `test-*.elf`) |
 | `os.iso`, `iso_root/`, `initrd/` | Bootable image and the files packed into it (from `scripts/build.sh`) |
-| `disk.img` | NVMe test disk; kept between builds, delete it to recreate |
+| `disk.img` | Empty 64 MiB NVMe disk for `scripts/run-qemu.sh`; kept between builds, delete it to recreate |
 | `zig-out/test/` | Test ISO and per-scenario serial logs (`<scenario>/serial.log`) |
 | `zig-out/docs/` | Generated API docs (serve over HTTP: `python3 -m http.server -d zig-out/docs`) |
 | `zig-out/coverage/` | kcov report |
@@ -128,10 +128,10 @@ the terminal.
 
 | Path | Contents |
 | --- | --- |
-| `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling, test scenarios and test callbacks |
+| `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
 | `src/arch/x86_64/` | GDT/TSS, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
-| `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe, QEMU fw_cfg |
+| `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
 | `src/kernel/` | Physical memory (`pmm`), heap, threads/scheduler, processes, ELF loader, syscalls, VFS, console |
 | `src/kernel/fs/` | Filesystems (`tarfs` for the initrd) |
@@ -139,7 +139,7 @@ the terminal.
 | `src/assets/` | Console font (fetched, not committed) |
 | `app/` | User programs (`sh`, `hello`) and their runtime `lib.zig`; linked at 0x400000 by `app/linker.ld` |
 | `tests/host/` | Host unit tests |
-| `tests/kernel/` | In-kernel test suite |
+| `tests/kernel/` | In-kernel test suite, its kernel-side helpers, the crash scenarios and the QEMU fw_cfg reader |
 | `tests/user/` | Ring 3 test programs, packaged as `/test/<name>` in the test initrd |
 | `tests/support/` | QEMU exit device helper for the test kernel |
 | `scripts/` | Build, run, test, CI install scripts and the GDB setup |

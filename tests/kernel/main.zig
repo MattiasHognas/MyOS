@@ -1,71 +1,27 @@
 //! In-kernel integration tests, run inside QEMU by the test kernel.
 //!
-//! The kernel passes an `Api` of callbacks so the tests use the kernel's own
-//! module instances. Results are logged to serial as `[PASS]`/`[FAIL]` lines
-//! followed by `MYOS_TEST_PASS` or `MYOS_TEST_FAIL`, then QEMU is exited.
+//! `kmain` calls `run` in the test kernel. The tests reach the kernel through
+//! `@import("root")` (see `helpers.zig`), so they use the kernel's own module
+//! instances. `run` picks the scenario the host asked for: the test cases
+//! below, or a deliberate panic or fault. Results are logged to serial as
+//! `[PASS]`/`[FAIL]` lines followed by `MYOS_TEST_PASS` or `MYOS_TEST_FAIL`,
+//! then QEMU is exited.
 
 const std = @import("std");
 const qemu_exit = @import("qemu_exit");
-
-/// Result of loading an ELF image for inspection (see `Api.elf_probe`).
-pub const ElfProbe = struct {
-    /// Entry point returned by the loader.
-    entry: u64,
-    /// Leaf page-table entry mapping the probed address, or 0 if unmapped.
-    pte: u64,
-};
+const root = @import("root");
+const helpers = @import("helpers.zig");
+const fw_cfg = @import("fw_cfg.zig");
+const pmm = root.kernel.pmm;
+const serial = root.drivers.serial;
+const assert = root.kernel.debug.assert;
+const log = std.log.scoped(.tests);
 
 /// x86-64 page-table entry bits, for checking `ElfProbe.pte`.
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
 const PTE_NX: u64 = 1 << 63;
-
-/// Kernel services the tests may use, provided by `src/main.zig`.
-pub const Api = struct {
-    log: *const fn ([]const u8) void,
-
-    alloc_page: *const fn () ?u64,
-    free_page: *const fn (u64) void,
-    free_pages: *const fn () usize,
-    page_rw: *const fn (u64) bool,
-
-    heap_roundtrip: *const fn () bool,
-    heap_stats: *const fn () bool,
-    address_space_roundtrip: *const fn () bool,
-    vmm_map_translate: *const fn () bool,
-
-    /// Name of the function containing a code address, or null.
-    symbolize: *const fn (u64) ?[]const u8,
-    /// Return addresses of the caller's frame chain, innermost first.
-    capture_backtrace: *const fn ([]u64) usize,
-    /// Read a QEMU fw_cfg file into the buffer.
-    fw_cfg_read: *const fn ([]const u8, []u8) ?[]u8,
-
-    /// Load an ELF image into a scratch address space and inspect address `addr`
-    /// (bytes copied into the buffer); null if loading fails.
-    elf_probe: *const fn ([]const u8, u64, []u8) ?ElfProbe,
-    /// Same as `elf_probe` for an ELF file in the VFS.
-    elf_probe_path: *const fn ([]const u8, u64, []u8) ?ElfProbe,
-    /// True if spawning the image fails and leaks no pages or heap memory.
-    spawn_fails_cleanly: *const fn ([]const u8) bool,
-    /// Run a program and wait for it: its exit code, or null if it can't start.
-    run_program: *const fn ([]const u8) ?u64,
-    /// Bytes currently allocated from the kernel heap.
-    heap_in_use: *const fn () usize,
-    /// Two yielding kernel threads alternate and are cleaned up.
-    scheduler_round_robin: *const fn () bool,
-    /// A wake before block makes block return immediately.
-    wake_before_block: *const fn () bool,
-    /// Mount a tar image, read a file from an offset, remount the initrd.
-    tarfs_read: *const fn ([]const u8, []const u8, u64, []u8) ?usize,
-    /// Read one sector of the NVMe disk; null if there is no disk or the read fails.
-    nvme_read: *const fn (u64, []u8) ?[]u8,
-
-    has_file: *const fn ([]const u8) bool,
-    file_size: *const fn ([]const u8) ?u64,
-    read_file_at: *const fn ([]const u8, u64, []u8) ?usize,
-};
 
 const TestError = error{ Failed, OutOfMemory };
 
@@ -75,32 +31,32 @@ fn check(ok: bool) TestError!void {
 }
 
 /// Allocating a page returns an aligned, non-zero, usable page and decrements the free count.
-fn pageAccounting(api: Api) TestError!void {
-    const before = api.free_pages();
-    const page = api.alloc_page() orelse
+fn pageAccounting() TestError!void {
+    const before = pmm.free_pages;
+    const page = pmm.alloc() orelse
         return error.OutOfMemory;
-    defer api.free_page(page);
+    defer pmm.free(page);
 
     try check(page != 0 and page % 4096 == 0);
-    try check(api.free_pages() + 1 == before);
-    try check(api.page_rw(page));
+    try check(pmm.free_pages + 1 == before);
+    try check(helpers.pageRw(page));
 }
 
 /// Consecutive allocations return distinct pages and are all accounted for.
-fn multiplePages(api: Api) TestError!void {
-    const before = api.free_pages();
+fn multiplePages() TestError!void {
+    const before = pmm.free_pages;
 
     var pages: [8]u64 = undefined;
     var used: usize = 0;
 
     defer {
         for (pages[0..used]) |page| {
-            api.free_page(page);
+            pmm.free(page);
         }
     }
 
     while (used < pages.len) {
-        const p = api.alloc_page() orelse
+        const p = pmm.alloc() orelse
             return error.OutOfMemory;
 
         for (pages[0..used]) |other| {
@@ -112,36 +68,36 @@ fn multiplePages(api: Api) TestError!void {
         used += 1;
     }
 
-    try check(api.free_pages() + pages.len == before);
+    try check(pmm.free_pages + pages.len == before);
 }
 
 /// The kernel heap can allocate, fill and free a block.
-fn heapTest(api: Api) TestError!void {
-    try check(api.heap_roundtrip());
+fn heapTest() TestError!void {
+    try check(helpers.heapRoundtrip());
 }
 
 /// Creating and destroying an address space does not leak pages.
-fn addressSpaceTest(api: Api) TestError!void {
-    try check(api.address_space_roundtrip());
+fn addressSpaceTest() TestError!void {
+    try check(helpers.addressSpaceRoundtrip());
 }
 
 /// Heap usage counters follow allocations, shrinks and frees.
-fn heapStats(api: Api) TestError!void {
-    try check(api.heap_stats());
+fn heapStats() TestError!void {
+    try check(helpers.heapStats());
 }
 
 /// A mapped page translates back to its physical address; unmapped pages don't.
-fn vmmMapTranslate(api: Api) TestError!void {
-    try check(api.vmm_map_translate());
+fn vmmMapTranslate() TestError!void {
+    try check(helpers.vmmMapTranslate());
 }
 
 /// The kernel's own functions are symbolized from its ELF symbol table.
-fn symbolizeKnownFunctions(api: Api) TestError!void {
-    const name = api.symbolize(@intFromPtr(&symbolTarget)) orelse return error.Failed;
+fn symbolizeKnownFunctions() TestError!void {
+    const name = helpers.symbolize(@intFromPtr(&symbolTarget)) orelse return error.Failed;
     try check(std.mem.endsWith(u8, name, "symbolTarget"));
-    const run_name = api.symbolize(@intFromPtr(&run) + 1) orelse return error.Failed;
+    const run_name = helpers.symbolize(@intFromPtr(&run) + 1) orelse return error.Failed;
     try check(std.mem.endsWith(u8, run_name, "run"));
-    try check(api.symbolize(0) == null);
+    try check(helpers.symbolize(0) == null);
 }
 
 /// Target for the symbolization test; never called.
@@ -150,34 +106,34 @@ noinline fn symbolTarget() callconv(.c) void {
 }
 
 /// Backtraces follow the frame chain through named functions.
-fn backtraceThroughFrames(api: Api) TestError!void {
-    try backtraceOuter(api);
+fn backtraceThroughFrames() TestError!void {
+    try backtraceOuter();
 }
 
 /// Outer frame of the backtrace test.
-noinline fn backtraceOuter(api: Api) TestError!void {
-    try backtraceInner(api);
+noinline fn backtraceOuter() TestError!void {
+    try backtraceInner();
     asm volatile (""); // keep this from being a tail call
 }
 
 /// Inner frame of the backtrace test: capture and check the chain.
-noinline fn backtraceInner(api: Api) TestError!void {
+noinline fn backtraceInner() TestError!void {
     var frames: [16]u64 = undefined;
-    const n = api.capture_backtrace(&frames);
+    const n = helpers.captureBacktrace(&frames);
     try check(n >= 3);
-    const inner = api.symbolize(frames[0] - 1) orelse return error.Failed;
-    const outer = api.symbolize(frames[1] - 1) orelse return error.Failed;
+    const inner = helpers.symbolize(frames[0] - 1) orelse return error.Failed;
+    const outer = helpers.symbolize(frames[1] - 1) orelse return error.Failed;
     try check(std.mem.endsWith(u8, inner, "backtraceInner"));
     try check(std.mem.endsWith(u8, outer, "backtraceOuter"));
     asm volatile ("");
 }
 
 /// The host passed the scenario name through QEMU's fw_cfg device.
-fn fwCfgScenario(api: Api) TestError!void {
+fn fwCfgScenario() TestError!void {
     var buf: [32]u8 = undefined;
-    const scenario = api.fw_cfg_read("opt/myos/scenario", &buf) orelse return error.Failed;
+    const scenario = fw_cfg.readFile("opt/myos/scenario", &buf) orelse return error.Failed;
     try check(std.mem.eql(u8, scenario, "tests"));
-    try check(api.fw_cfg_read("opt/myos/does-not-exist", &buf) == null);
+    try check(fw_cfg.readFile("opt/myos/does-not-exist", &buf) == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,41 +202,41 @@ fn buildElf(spec: ElfSpec) []const u8 {
 }
 
 /// A valid image loads: entry point, contents, zeroed .bss, and no leaked pages.
-fn elfLoadValid(api: Api) TestError!void {
-    const before = api.free_pages();
+fn elfLoadValid() TestError!void {
+    const before = pmm.free_pages;
     var out: [32]u8 = undefined;
 
-    const p = api.elf_probe(buildElf(.{}), 0x40_0000, &out) orelse return error.Failed;
+    const p = helpers.elfProbe(buildElf(.{}), 0x40_0000, &out) orelse return error.Failed;
     try check(p.entry == 0x40_0000);
     try check(std.mem.allEqual(u8, out[0..16], 0xAA)); // file contents
     try check(std.mem.allEqual(u8, out[16..32], 0)); // .bss tail of the first page
 
-    _ = api.elf_probe(buildElf(.{}), 0x40_1000, &out) orelse return error.Failed;
+    _ = helpers.elfProbe(buildElf(.{}), 0x40_1000, &out) orelse return error.Failed;
     try check(std.mem.allEqual(u8, &out, 0)); // second page: all .bss
 
-    try check(api.free_pages() == before);
+    try check(pmm.free_pages == before);
 }
 
 /// Segment flags become page permissions: user, writable only if W, NX unless X.
-fn elfLoadPermissions(api: Api) TestError!void {
+fn elfLoadPermissions() TestError!void {
     var out: [8]u8 = undefined;
-    const rx = api.elf_probe(buildElf(.{ .flags = 5 }), 0x40_0000, &out) orelse return error.Failed;
+    const rx = helpers.elfProbe(buildElf(.{ .flags = 5 }), 0x40_0000, &out) orelse return error.Failed;
     try check(rx.pte & PTE_PRESENT != 0 and rx.pte & PTE_USER != 0);
     try check(rx.pte & PTE_WRITABLE == 0 and rx.pte & PTE_NX == 0);
 
-    const rw = api.elf_probe(buildElf(.{ .flags = 6 }), 0x40_0000, &out) orelse return error.Failed;
+    const rw = helpers.elfProbe(buildElf(.{ .flags = 6 }), 0x40_0000, &out) orelse return error.Failed;
     try check(rw.pte & PTE_USER != 0 and rw.pte & PTE_WRITABLE != 0 and rw.pte & PTE_NX != 0);
 
-    const r = api.elf_probe(buildElf(.{ .flags = 4 }), 0x40_0000, &out) orelse return error.Failed;
+    const r = helpers.elfProbe(buildElf(.{ .flags = 4 }), 0x40_0000, &out) orelse return error.Failed;
     try check(r.pte & PTE_USER != 0 and r.pte & PTE_WRITABLE == 0 and r.pte & PTE_NX != 0);
 }
 
 /// The real /bin/hello: every PT_LOAD segment from its program headers is
 /// mapped for user mode with exactly the permissions its flags ask for
 /// (writable only if W, non-executable unless X), and page 0 stays unmapped.
-fn elfLoadHelloPermissions(api: Api) TestError!void {
+fn elfLoadHelloPermissions() TestError!void {
     var hdr: [4096]u8 = undefined;
-    const n = api.read_file_at("/bin/hello", 0, &hdr) orelse return error.Failed;
+    const n = helpers.readFileAt("/bin/hello", 0, &hdr) orelse return error.Failed;
     try check(n >= 64);
     const phoff = std.mem.readInt(u64, hdr[32..40], .little);
     const phnum = std.mem.readInt(u16, hdr[56..58], .little);
@@ -294,7 +250,7 @@ fn elfLoadHelloPermissions(api: Api) TestError!void {
         if (std.mem.readInt(u32, ph[0..4], .little) != 1) continue; // PT_LOAD only
         const flags = std.mem.readInt(u32, ph[4..8], .little);
         const vaddr = std.mem.readInt(u64, ph[16..24], .little);
-        const p = api.elf_probe_path("/bin/hello", vaddr, &out) orelse return error.Failed;
+        const p = helpers.elfProbePath("/bin/hello", vaddr, &out) orelse return error.Failed;
         try check(p.pte & PTE_PRESENT != 0 and p.pte & PTE_USER != 0);
         try check((p.pte & PTE_WRITABLE != 0) == (flags & 2 != 0));
         try check((p.pte & PTE_NX == 0) == (flags & 1 != 0));
@@ -303,13 +259,13 @@ fn elfLoadHelloPermissions(api: Api) TestError!void {
     }
     try check(loads >= 2 and executable >= 1);
 
-    const zero = api.elf_probe_path("/bin/hello", 0, &out) orelse return error.Failed;
+    const zero = helpers.elfProbePath("/bin/hello", 0, &out) orelse return error.Failed;
     try check(zero.pte == 0);
 }
 
 /// Malformed or unsupported images are rejected without leaking pages.
-fn elfRejectMalformed(api: Api) TestError!void {
-    const before = api.free_pages();
+fn elfRejectMalformed() TestError!void {
+    const before = pmm.free_pages;
     var out: [8]u8 = undefined;
     const bad = [_]ElfSpec{
         .{ .len = 63 }, // shorter than the ELF header
@@ -327,63 +283,63 @@ fn elfRejectMalformed(api: Api) TestError!void {
         .{ .offset = 0x1000, .filesz = 0x100 }, // file data past the end of the image
         .{ .entry = 0xFFFF_FFFF_8000_0000 }, // entry point in the kernel
     };
-    for (bad) |spec| try check(api.elf_probe(buildElf(spec), 0x40_0000, &out) == null);
-    try check(api.free_pages() == before);
+    for (bad) |spec| try check(helpers.elfProbe(buildElf(spec), 0x40_0000, &out) == null);
+    try check(pmm.free_pages == before);
 }
 
 /// A failure after some segments were already loaded rolls everything back.
-fn elfSpawnRollback(api: Api) TestError!void {
+fn elfSpawnRollback() TestError!void {
     // First segment loads (pages allocated), the second is in the kernel half.
-    try check(api.spawn_fails_cleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0xFFFF_8000_0000_0000 })));
-    try check(api.spawn_fails_cleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0x40_0123 })));
-    try check(api.spawn_fails_cleanly(buildElf(.{ .machine = 3 })));
-    try check(api.spawn_fails_cleanly("not an ELF"));
+    try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0xFFFF_8000_0000_0000 })));
+    try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0x40_0123 })));
+    try check(helpers.spawnFailsCleanly(buildElf(.{ .machine = 3 })));
+    try check(helpers.spawnFailsCleanly("not an ELF"));
 }
 
 // ---------------------------------------------------------------------------
 // User mode: syscalls, isolation, process lifecycle
 
 /// Syscall buffer and descriptor validation, checked from ring 3.
-fn userSyscalls(api: Api) TestError!void {
-    const code = api.run_program("/test/syscalls") orelse return error.Failed;
+fn userSyscalls() TestError!void {
+    const code = helpers.runProgram("/test/syscalls") orelse return error.Failed;
     if (code != 0) {
         var buf: [64]u8 = undefined;
-        api.log(std.fmt.bufPrint(&buf, "  /test/syscalls failed check {d}\n", .{code}) catch "");
+        serial.puts(std.fmt.bufPrint(&buf, "  /test/syscalls failed check {d}\n", .{code}) catch "");
     }
     try check(code == 0);
 }
 
 /// Ring 3 cannot read kernel memory, run privileged instructions, or write
 /// its own code: each attempt kills only that process (exit code 255).
-fn userIsolation(api: Api) TestError!void {
-    try check(api.run_program("/test/kernel_read") == 255);
-    try check(api.run_program("/test/privileged") == 255);
-    try check(api.run_program("/test/write_text") == 255);
+fn userIsolation() TestError!void {
+    try check(helpers.runProgram("/test/kernel_read") == 255);
+    try check(helpers.runProgram("/test/privileged") == 255);
+    try check(helpers.runProgram("/test/write_text") == 255);
 }
 
 /// Spawn, run, wait and exit: exit codes reach the parent, and a finished or
 /// crashed process leaves no pages or heap memory behind.
-fn processLifecycle(api: Api) TestError!void {
-    try check(api.run_program("/bin/hello") == 0);
-    try check(api.run_program("/does/not/exist") == null);
+fn processLifecycle() TestError!void {
+    try check(helpers.runProgram("/bin/hello") == 0);
+    try check(helpers.runProgram("/does/not/exist") == null);
 
     // The first runs above may have grown the heap; measure from here.
-    const pages = api.free_pages();
-    const heap_bytes = api.heap_in_use();
-    try check(api.run_program("/bin/hello") == 0);
-    try check(api.run_program("/test/kernel_read") == 255);
-    try check(api.free_pages() == pages);
-    try check(api.heap_in_use() == heap_bytes);
+    const pages = pmm.free_pages;
+    const heap_bytes = helpers.heapInUse();
+    try check(helpers.runProgram("/bin/hello") == 0);
+    try check(helpers.runProgram("/test/kernel_read") == 255);
+    try check(pmm.free_pages == pages);
+    try check(helpers.heapInUse() == heap_bytes);
 }
 
 /// Kernel threads take turns in FIFO order and are reaped after exiting.
-fn schedulerRoundRobin(api: Api) TestError!void {
-    try check(api.scheduler_round_robin());
+fn schedulerRoundRobin() TestError!void {
+    try check(helpers.schedulerRoundRobin());
 }
 
 /// A wake that arrives before block is not lost.
-fn wakeBeforeBlock(api: Api) TestError!void {
-    try check(api.wake_before_block());
+fn wakeBeforeBlock() TestError!void {
+    try check(helpers.wakeBeforeBlock());
 }
 
 // ---------------------------------------------------------------------------
@@ -426,48 +382,48 @@ fn buildTar(members: []const TarMember, end_marker: bool) []const u8 {
 }
 
 /// Read `path` from `image` into a buffer and compare it with `want` (null = not found).
-fn expectTarFile(api: Api, image: []const u8, path: []const u8, want: ?[]const u8) TestError!void {
+fn expectTarFile(image: []const u8, path: []const u8, want: ?[]const u8) TestError!void {
     var buf: [64]u8 = undefined;
-    const n = api.tarfs_read(image, path, 0, &buf);
+    const n = helpers.tarfsRead(image, path, 0, &buf);
     if (want) |w| {
         try check(n != null and std.mem.eql(u8, buf[0..n.?], w));
     } else try check(n == null);
 }
 
 /// Normal archives: several files, path normalization, directories ignored.
-fn tarfsLookup(api: Api) TestError!void {
+fn tarfsLookup() TestError!void {
     const img = buildTar(&.{
         .{ .name = "./etc/", .typ = '5' },
         .{ .name = "./etc/a", .data = "alpha" },
         .{ .name = "b", .data = "bravo!" },
         .{ .name = "empty" },
     }, true);
-    try expectTarFile(api, img, "/etc/a", "alpha");
-    try expectTarFile(api, img, "etc/a", "alpha");
-    try expectTarFile(api, img, "/b", "bravo!");
-    try expectTarFile(api, img, "/empty", "");
-    try expectTarFile(api, img, "/etc", null); // directories are not files
-    try expectTarFile(api, img, "/", null);
-    try expectTarFile(api, img, "", null);
-    try expectTarFile(api, img, "/etc/a/x", null);
+    try expectTarFile(img, "/etc/a", "alpha");
+    try expectTarFile(img, "etc/a", "alpha");
+    try expectTarFile(img, "/b", "bravo!");
+    try expectTarFile(img, "/empty", "");
+    try expectTarFile(img, "/etc", null); // directories are not files
+    try expectTarFile(img, "/", null);
+    try expectTarFile(img, "", null);
+    try expectTarFile(img, "/etc/a/x", null);
 }
 
 /// Offsets at, past and inside the file; short buffers get partial reads.
-fn tarfsBoundaries(api: Api) TestError!void {
+fn tarfsBoundaries() TestError!void {
     const img = buildTar(&.{.{ .name = "f", .data = "0123456789" }}, true);
     var buf: [4]u8 = undefined;
-    try check(api.tarfs_read(img, "/f", 0, &buf) == 4 and std.mem.eql(u8, &buf, "0123"));
-    try check(api.tarfs_read(img, "/f", 8, &buf) == 2 and std.mem.eql(u8, buf[0..2], "89"));
-    try check(api.tarfs_read(img, "/f", 10, &buf) == 0);
-    try check(api.tarfs_read(img, "/f", 1 << 40, &buf) == 0);
-    try check(api.tarfs_read(img, "/f", 0, buf[0..0]) == 0);
+    try check(helpers.tarfsRead(img, "/f", 0, &buf) == 4 and std.mem.eql(u8, &buf, "0123"));
+    try check(helpers.tarfsRead(img, "/f", 8, &buf) == 2 and std.mem.eql(u8, buf[0..2], "89"));
+    try check(helpers.tarfsRead(img, "/f", 10, &buf) == 0);
+    try check(helpers.tarfsRead(img, "/f", 1 << 40, &buf) == 0);
+    try check(helpers.tarfsRead(img, "/f", 0, buf[0..0]) == 0);
 }
 
 /// Malformed archives: missing end marker, truncated data, short or garbage
 /// headers and names without a terminator never read out of bounds.
-fn tarfsMalformed(api: Api) TestError!void {
+fn tarfsMalformed() TestError!void {
     // No end marker: the files are still found.
-    try expectTarFile(api, buildTar(&.{.{ .name = "a", .data = "x" }}, false), "/a", "x");
+    try expectTarFile(buildTar(&.{.{ .name = "a", .data = "x" }}, false), "/a", "x");
 
     // Data runs past the end of the archive: that entry and everything after
     // it are ignored, earlier entries still work.
@@ -476,58 +432,58 @@ fn tarfsMalformed(api: Api) TestError!void {
         .{ .name = "big", .size_field = "00000077777" },
         .{ .name = "after", .data = "never" },
     }, false);
-    try expectTarFile(api, truncated, "/ok", "fine");
-    try expectTarFile(api, truncated, "/big", null);
-    try expectTarFile(api, truncated, "/after", null);
+    try expectTarFile(truncated, "/ok", "fine");
+    try expectTarFile(truncated, "/big", null);
+    try expectTarFile(truncated, "/after", null);
 
     // Archive shorter than one header.
-    try expectTarFile(api, buildTar(&.{.{ .name = "a", .data = "x" }}, false)[0..100], "/a", null);
-    try expectTarFile(api, "", "/a", null);
+    try expectTarFile(buildTar(&.{.{ .name = "a", .data = "x" }}, false)[0..100], "/a", null);
+    try expectTarFile("", "/a", null);
 
     // Non-octal size field: parsed as size 0.
-    try expectTarFile(api, buildTar(&.{.{ .name = "z", .size_field = "zzzz" }}, true), "/z", "");
+    try expectTarFile(buildTar(&.{.{ .name = "z", .size_field = "zzzz" }}, true), "/z", "");
 
     // A 100-byte name without a NUL terminator.
     const long_name: [100]u8 = @splat('n');
-    try expectTarFile(api, buildTar(&.{.{ .name = &long_name, .data = "long" }}, true), "/" ++ long_name, "long");
+    try expectTarFile(buildTar(&.{.{ .name = &long_name, .data = "long" }}, true), "/" ++ long_name, "long");
 
     // Unknown entry types (e.g. symlinks) are not files.
-    try expectTarFile(api, buildTar(&.{.{ .name = "link", .typ = '2' }}, true), "/link", null);
+    try expectTarFile(buildTar(&.{.{ .name = "link", .typ = '2' }}, true), "/link", null);
 
     // The real initrd is mounted again afterwards.
-    try check(api.has_file("/etc/motd"));
+    try check(helpers.hasFile("/etc/motd"));
 }
 
 /// The NVMe driver reads the marker `scripts/test-qemu.sh` writes at the
 /// start of the test disk; the rest of the sector and the next one are zero.
-fn nvmeRead(api: Api) TestError!void {
+fn nvmeRead() TestError!void {
     const marker = "Hello from the NVMe test disk!";
     var buf: [4096]u8 = @splat(0xAA);
-    const first = api.nvme_read(0, &buf) orelse return error.Failed;
+    const first = helpers.nvmeRead(0, &buf) orelse return error.Failed;
     try check(first.len >= 512 and std.mem.startsWith(u8, first, marker));
     try check(std.mem.allEqual(u8, first[marker.len..], 0));
-    const second = api.nvme_read(1, &buf) orelse return error.Failed;
+    const second = helpers.nvmeRead(1, &buf) orelse return error.Failed;
     try check(std.mem.allEqual(u8, second, 0));
     // Reading past the end of the 64 MiB disk fails instead of returning data.
-    try check(api.nvme_read(1 << 40, &buf) == null);
+    try check(helpers.nvmeRead(1 << 40, &buf) == null);
 }
 
 /// Known initrd files are found and missing ones are not.
-fn vfsLookup(api: Api) TestError!void {
-    try check(api.has_file("/etc/motd"));
-    try check(api.has_file("/bin/sh"));
-    try check(!api.has_file("/does-not-exist"));
+fn vfsLookup() TestError!void {
+    try check(helpers.hasFile("/etc/motd"));
+    try check(helpers.hasFile("/bin/sh"));
+    try check(!helpers.hasFile("/does-not-exist"));
 }
 
 /// `/etc/motd` has the expected size and contents.
-fn vfsContents(api: Api) TestError!void {
-    const size = api.file_size("/etc/motd") orelse
+fn vfsContents() TestError!void {
+    const size = helpers.fileSize("/etc/motd") orelse
         return error.Failed;
 
     try check(size == "Welcome to MyOS!\n".len);
 
     var buf: [64]u8 = undefined;
-    const n = api.read_file_at(
+    const n = helpers.readFileAt(
         "/etc/motd",
         0,
         &buf,
@@ -542,10 +498,10 @@ fn vfsContents(api: Api) TestError!void {
 }
 
 /// Reads honour the offset and return 0 at or past end of file.
-fn vfsOffsets(api: Api) TestError!void {
+fn vfsOffsets() TestError!void {
     var buf: [8]u8 = undefined;
 
-    const n = api.read_file_at(
+    const n = helpers.readFileAt(
         "/etc/motd",
         8,
         &buf,
@@ -558,33 +514,65 @@ fn vfsOffsets(api: Api) TestError!void {
         "to MyOS!",
     ));
 
-    const end = api.file_size("/etc/motd") orelse
+    const end = helpers.fileSize("/etc/motd") orelse
         return error.Failed;
 
     try check(
-        (api.read_file_at("/etc/motd", end, &buf) orelse
+        (helpers.readFileAt("/etc/motd", end, &buf) orelse
             return error.Failed) == 0,
     );
 
     try check(
-        (api.read_file_at("/etc/motd", end + 10, &buf) orelse
+        (helpers.readFileAt("/etc/motd", end + 10, &buf) orelse
             return error.Failed) == 0,
     );
 }
 
 /// Size and read queries for a missing file return null.
-fn missingFile(api: Api) TestError!void {
+fn missingFile() TestError!void {
     var buf: [32]u8 = undefined;
 
     try check(
-        api.read_file_at("/missing", 0, &buf) == null,
+        helpers.readFileAt("/missing", 0, &buf) == null,
     );
-    try check(api.file_size("/missing") == null);
+    try check(helpers.fileSize("/missing") == null);
+}
+
+/// Integration-test scenario "panic": fail a subsystem assertion two calls
+/// deep, so the panic output must contain a symbolized backtrace through
+/// these functions.
+noinline fn scenarioPanic() void {
+    scenarioPanicInner(true);
+}
+
+/// Inner frame of `scenarioPanic`.
+noinline fn scenarioPanicInner(fail: bool) void {
+    assert.check(.scenario, !fail, "deliberate test panic", .{});
+}
+
+/// Integration-test scenario "fault": write to an unmapped kernel address, so
+/// the page-fault report must show CR2 and a symbolized backtrace.
+noinline fn scenarioFault() void {
+    const p: *volatile u64 = @ptrFromInt(0xFFFF_B000_0000_0000);
+    p.* = 0xDEAD;
+}
+
+/// Entry point of the test kernel, called by `kmain` after boot: run the
+/// scenario the host passed through fw_cfg (`opt/myos/scenario`, default
+/// "tests"). Never returns; every scenario ends by exiting QEMU.
+pub fn run() noreturn {
+    var buf: [32]u8 = undefined;
+    const scenario = fw_cfg.readFile("opt/myos/scenario", &buf) orelse "tests";
+    log.info("test scenario: {s}", .{scenario});
+    if (std.mem.eql(u8, scenario, "panic")) scenarioPanic();
+    if (std.mem.eql(u8, scenario, "fault")) scenarioFault();
+    if (!std.mem.eql(u8, scenario, "tests")) std.debug.panic("unknown test scenario '{s}'", .{scenario});
+    runCases();
 }
 
 /// Run every test case, log the results and exit QEMU with 0 if all passed, 1 otherwise.
-pub fn run(api: Api) noreturn {
-    api.log("MYOS_TEST_BEGIN\n");
+fn runCases() noreturn {
+    serial.puts("MYOS_TEST_BEGIN\n");
 
     var passed: usize = 0;
     var failed: usize = 0;
@@ -662,12 +650,12 @@ pub fn run(api: Api) noreturn {
     };
 
     inline for (cases) |case| {
-        if (case.func(api)) |_| {
+        if (case.func()) |_| {
             passed += 1;
-            api.log("[PASS] " ++ case.name ++ "\n");
+            serial.puts("[PASS] " ++ case.name ++ "\n");
         } else |_| {
             failed += 1;
-            api.log("[FAIL] " ++ case.name ++ "\n");
+            serial.puts("[FAIL] " ++ case.name ++ "\n");
         }
     }
 
@@ -679,13 +667,13 @@ pub fn run(api: Api) noreturn {
         .{ passed, failed },
     ) catch unreachable;
 
-    api.log(line);
+    serial.puts(line);
 
     if (failed == 0 and passed == cases.len) {
-        api.log("MYOS_TEST_PASS\n");
+        serial.puts("MYOS_TEST_PASS\n");
         qemu_exit.exit(0);
     }
 
-    api.log("MYOS_TEST_FAIL\n");
+    serial.puts("MYOS_TEST_FAIL\n");
     qemu_exit.exit(1);
 }

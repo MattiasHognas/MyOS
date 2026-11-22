@@ -34,7 +34,7 @@ PANIC: scenario: assertion failed: deliberate test panic
 backtrace:
   #0 0xffffffff800112ea main.scenarioPanicInner+0x4a
   #1 0xffffffff8001115e main.scenarioPanic+0xe
-  #2 0xffffffff80000666 main.runTestScenario+0x106
+  #2 0xffffffff80000666 main.run+0x106
   #3 0xffffffff80000480 kmain+0x3e0
 ```
 
@@ -45,7 +45,7 @@ RSP=0xffff80000ff78d08 RAX=0xffffb00000000000 RBX=0x0
 CR2=0xffffb00000000000 (faulting address)
 backtrace:
   #0 0xffffffff80010fad main.scenarioFault+0x1d
-  #1 0xffffffff80000699 main.runTestScenario+0x139
+  #1 0xffffffff80000699 main.run+0x139
 ```
 
 How it works: the kernel is built with frame pointers, `kernel/debug/backtrace.zig`

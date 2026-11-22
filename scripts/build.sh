@@ -45,8 +45,7 @@ cp "$LIMINE"/limine-{bios.sys,bios-cd.bin,uefi-cd.bin} "$iso_root/boot/limine/"
 cp "$LIMINE/BOOTX64.EFI" "$iso_root/EFI/BOOT/"
 
 if [[ "$mode" == normal && ! -f disk.img ]]; then
-    truncate -s 64M disk.img
-    printf 'Hello from the NVMe disk!' | dd of=disk.img conv=notrunc status=none
+    truncate -s 64M disk.img # empty NVMe disk for scripts/run-qemu.sh
 fi
 
 xorriso -as mkisofs -R -r -J \

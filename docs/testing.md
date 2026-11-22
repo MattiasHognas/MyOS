@@ -17,8 +17,8 @@ against an optimized kernel. CI runs all three build modes.
 
 `scripts/test-qemu.sh` boots the test kernel (`zig-out/bin/kernel-test.elf`) once per
 scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
-(`-fw_cfg name=opt/myos/scenario,string=<name>`); `runTestScenario` in
-`src/main.zig` reads it with `drivers/fw_cfg.zig`.
+(`-fw_cfg name=opt/myos/scenario,string=<name>`); `run` in
+`tests/kernel/main.zig` reads it with `tests/kernel/fw_cfg.zig`.
 
 | Scenario | What the kernel does | What the script checks (kernel exit code; QEMU reports `code*2+1`) |
 | --- | --- | --- |
@@ -38,8 +38,8 @@ In the test kernel, `root.halt()` and the panic handler exit QEMU with status
 
 ### Adding a scenario
 
-1. Add a `noinline fn scenarioX() void` to `src/main.zig` and dispatch to it
-   in `runTestScenario`.
+1. Add a `noinline fn scenarioX() void` to `tests/kernel/main.zig` and dispatch
+   to it in `run`.
 2. Add a `X)` case to `run_scenario` in `scripts/test-qemu.sh` with its expected exit
    status (`expect_status`) and output (`expect_line`), and add it to the
    default list.
@@ -47,15 +47,18 @@ In the test kernel, `root.halt()` and the panic handler exit QEMU with status
 
 ## Adding in-kernel tests
 
-Tests in `tests/kernel/main.zig` can't import kernel modules directly (that
-would create a second copy of their global state). They call kernel services
-through the `Api` struct of callbacks, which `src/main.zig` fills in. To add a
-test:
+All test code lives in `tests/kernel/`; the only hooks in `src/main.zig` are
+the call to `run` after boot and the QEMU exit in `halt` and the panic handler.
+The tests reach the kernel through `@import("root")` (for example
+`root.kernel.pmm`), never by importing a kernel file by path: that would
+create a second copy of the module and its global state. To add a test:
 
-1. If it needs a new kernel service, add a field to `Api` and a `testX`
-   callback in `src/main.zig`, and pass it in `runTestScenario`.
-2. Write `fn myTest(api: Api) TestError!void` using `check(...)`.
-3. Add it to the `cases` list in `run`.
+1. If it needs to poke at kernel internals, add a helper to
+   `tests/kernel/helpers.zig`. A kernel declaration it needs may have to
+   become `pub`.
+2. Write `fn myTest() TestError!void` in `tests/kernel/main.zig` using
+   `check(...)`.
+3. Add it to the `cases` list in `runCases`.
 
 ## User-mode test programs
 

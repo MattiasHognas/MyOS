@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{ "syscalls", "kernel_read", "privileged", "write_text" }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", target, optimize);
         exe.root_module.addImport("lib", user_lib);
+        b.installArtifact(exe); // scripts/build.sh --package-test picks them up from zig-out/bin
     }
 
     // Generate API documentation. Autodoc uses `<artifact name>.zig` (or the

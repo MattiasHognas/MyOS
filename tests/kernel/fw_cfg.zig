@@ -6,7 +6,7 @@
 //! the signature check fails and every lookup returns null.
 
 const std = @import("std");
-const cpu = @import("../arch/x86_64/cpu.zig");
+const cpu = @import("root").arch.x86_64.cpu;
 
 const SELECTOR_PORT = 0x510;
 const DATA_PORT = 0x511;
