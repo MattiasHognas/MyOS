@@ -42,8 +42,10 @@ pub fn build(b: *std.Build) void {
 
     const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false, kopts);
     b.installArtifact(kernel);
-    _ = userProgram(b, "hello", "app/hello.zig", target, optimize);
-    _ = userProgram(b, "sh", "app/sh.zig", target, optimize);
+    const exe_hello = userProgram(b, "hello", "app/hello.zig", target, optimize);
+    b.installArtifact(exe_hello);
+    const exe_shell = userProgram(b, "sh", "app/sh.zig", target, optimize);
+    b.installArtifact(exe_shell);
 
     // User-mode test programs, packaged into the test initrd as /test/<name>.
     const user_lib = b.createModule(.{
@@ -221,6 +223,5 @@ fn userProgram(
     });
     exe.entry = .{ .symbol_name = "_start" };
     exe.setLinkerScript(b.path("app/linker.ld"));
-    b.installArtifact(exe);
     return exe;
 }
