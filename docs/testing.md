@@ -96,6 +96,11 @@ QEMU is checked by the scenarios above instead.
 - **Host test coverage**: runs `zig build coverage` and uploads the report.
   Informational; it does not fail the workflow.
 
+To check that a failing run publishes its serial logs, start the workflow by
+hand with **simulate failure** enabled (Actions → CI → Run workflow, or
+`gh workflow run ci.yml -f simulate_failure=true`). The QEMU tests then fail
+on purpose after running, and each matrix job uploads `serial-logs-<mode>`.
+
 CI gets Limine from its release tarball (`scripts/install-limine.sh`, checksum
 verified), kcov from source (`scripts/install-kcov.sh`), and the console font
 with `scripts/fetch-font.sh`.

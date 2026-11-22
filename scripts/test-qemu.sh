@@ -11,6 +11,9 @@
 #   fault  page-fault in kernel mode; must print CR2 and a symbolized backtrace
 #
 # Logs: zig-out/test/<scenario>/serial.log (raw) and serial-clean.log.
+#
+# MYOS_SIMULATE_FAILURE=true makes the run fail after all scenarios ran (used
+# by CI to check that the serial logs of a failing run are uploaded).
 set -euo pipefail
 cd "$(dirname "$0")/.."  # run from the repository root
 
@@ -128,6 +131,11 @@ run_scenario() {
 scenarios=("$@")
 ((${#scenarios[@]})) || scenarios=(tests panic fault)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
+
+if [[ "${MYOS_SIMULATE_FAILURE:-}" == true ]]; then
+    scenario="all"
+    fail "simulated failure (MYOS_SIMULATE_FAILURE=true)"
+fi
 
 if ((${#failures[@]})); then
     echo "QEMU integration tests failed:" >&2

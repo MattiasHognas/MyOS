@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Make the QEMU tests fail after running, to check that serial logs are uploaded"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,6 +54,8 @@ jobs:
 
       - name: QEMU integration tests
         run: zig build test-qemu -Doptimize=${{ matrix.optimize }}
+        env:
+          MYOS_SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
 
       - name: Build documentation
         if: matrix.optimize == 'Debug'
