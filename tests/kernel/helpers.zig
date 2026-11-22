@@ -579,32 +579,37 @@ pub fn kernelStacks() u32 {
     return 0;
 }
 
-/// Use at least `bytes` of stack and write to all of it. The buffer's
-/// address escapes, so the optimizer has to keep it on the stack.
-noinline fn touchStack(comptime bytes: usize) void {
+/// Use at least `bytes` of stack, write to all of it and return the lowest
+/// address written. The buffer's address escapes, so the optimizer has to
+/// keep it on the stack.
+noinline fn touchStack(comptime bytes: usize) usize {
     var pad: [bytes]u8 = undefined;
     @memset(&pad, 0xEE);
     std.mem.doNotOptimizeAway(&pad);
+    return @intFromPtr(&pad);
 }
 
 // State of the stack usage test's worker thread.
-var usage_before: ?usize = null;
-var usage_after: ?usize = null;
+var usage_needed: ?usize = null;
+var usage_measured: ?usize = null;
 var usage_waiter: ?*thread.Thread = null;
 
-/// Stack usage test worker: measure, use 1 KiB more stack, measure again.
+/// Stack usage test worker: write to 1 KiB of stack and compare the measured
+/// usage with how deep that write really was. Nothing is assumed about how
+/// much of the stack was used before: a timer interrupt may already have run
+/// on it before this function turned interrupts off.
 fn stackUsageWorker() void {
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
     const mine = thread.current().stack.?;
-    usage_before = kstack.used(mine);
-    touchStack(1024);
-    usage_after = kstack.used(mine);
+    const lowest = touchStack(1024);
+    usage_needed = @intFromPtr(mine.ptr) + mine.len - lowest;
+    usage_measured = kstack.used(mine);
     thread.wake(usage_waiter.?);
 }
 
 /// Check the stack high-water mark: a fresh stack counts as unused, writing
-/// to it is measured from the top, a thread's deeper call shows up as more
-/// usage, exited threads are recorded when reaped, and nothing in this test
+/// to it is measured from the top, a thread's usage covers the deepest
+/// address it wrote to, exited threads are recorded when reaped, and nothing in this test
 /// run has come close to filling its stack. Returns 0, or the number of the
 /// first failing check.
 pub fn stackUsage() u32 {
@@ -626,22 +631,19 @@ pub fn stackUsage() u32 {
     if (kstack.used(again) != 0) return 8;
     kstack.free(again);
 
-    // A thread that calls deeper has used more, by about what it asked for.
-    usage_before = null;
-    usage_after = null;
+    // A thread's usage is at least as deep as the lowest address it wrote to.
+    usage_needed = null;
+    usage_measured = null;
     usage_waiter = thread.current();
-    const peak_before = kstack.peak();
     _ = thread.spawn(stackUsageWorker, null) catch return 9;
     thread.block();
-    const before = usage_before orelse return 10;
-    const after = usage_after orelse return 11;
-    // Not exactly 1024 more: the first measurement includes the frames of
-    // the measuring call itself, and the buffer's frame has some overhead.
-    if (before == 0 or after < before + 768 or after > before + 2048) return 12;
-    // The worker is reaped by the next thread that is switched to; by now
-    // (we were switched to after it exited) its usage has been recorded.
+    const needed = usage_needed orelse return 10;
+    const measured = usage_measured orelse return 11;
+    if (needed < 1024 or measured < needed or measured > kstack.STACK_SIZE) return 12;
+    // The worker has exited and was reaped when this thread was switched
+    // back to, which recorded its usage.
     thread.yield();
-    if (kstack.peak() < after or kstack.peak() < peak_before) return 13;
+    if (kstack.peak() < measured) return 13;
 
     // This thread's own usage is plausible and can be recorded.
     const mine = thread.recordStackUsage() orelse return 14;
