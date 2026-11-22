@@ -1,6 +1,11 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Run only tests matching these filters",
+    ) orelse &.{};
     const Feature = std.Target.x86.Feature;
     var sub = std.Target.Cpu.Feature.Set.empty;
     var add = std.Target.Cpu.Feature.Set.empty;
@@ -48,6 +53,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = .Debug,
         }),
+        .filters = test_filters,
     });
     host_tests.root_module.addImport("vfs", b.createModule(.{
         .root_source_file = b.path("src/kernel/vfs.zig"),

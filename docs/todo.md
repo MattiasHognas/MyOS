@@ -18,12 +18,19 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [x] Save relevant logs and failure diagnostics.
 
 ### 1.2 Test suites
-- [ ] Test physical memory and kernel heap allocation.
-- [ ] Test virtual mappings, permissions, unmapping, and exhaustion.
+- [x] Test physical memory allocation and basic accounting.
+- [x] Test kernel heap allocation and memory read/write.
+- [ ] Test virtual memory mapping, permissions, unmapping, and exhaustion.
+  - [x] Test address-space creation and destruction.
 - [ ] Test ELF parsing, failed loading, and rollback.
+  - [x] Test rejection of invalid ELF magic.
 - [ ] Test valid/invalid syscall buffers and kernel/user isolation.
 - [ ] Test scheduler transitions, process lifecycle, waits, and cleanup.
 - [ ] Test VFS and filesystem behavior; later add storage write tests.
+  - [x] Test VFS lookup, file contents, offsets, and EOF.
+  - [x] Test VFS using an injected fake filesystem.
+  - [ ] Test malformed filesystem data and boundary conditions.
+  - [ ] Add storage write tests when NVMe writes are implemented.
 
 ### 1.3 CI and debugging
 - [ ] Add GitHub Actions kernel/app builds.

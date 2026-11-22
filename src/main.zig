@@ -165,6 +165,12 @@ pub fn halt() noreturn {
     while (true) asm volatile ("cli; hlt");
 }
 
+// Read a file into a buffer, for the test module. Returns null if the file doesn't exist.
+fn testReadFile(path: []const u8, buf: []u8) ?usize {
+    const node = vfs.lookup(path) orelse return null;
+    return vfs.read(&node, 0, buf);
+}
+
 // Test-only service callbacks. Using callbacks avoids importing a second copy
 // of PMM/VFS into the test module (which would duplicate module global state).
 fn testLog(s: []const u8) void {
@@ -181,10 +187,74 @@ fn testHasFile(path: []const u8) bool {
     return vfs.lookup(path) != null;
 }
 
-// Read a file into a buffer, for the test module. Returns null if the file doesn't exist.
-fn testReadFile(path: []const u8, buf: []u8) ?usize {
+fn testFileSize(path: []const u8) ?u64 {
     const node = vfs.lookup(path) orelse return null;
-    return vfs.read(&node, 0, buf);
+    return node.size;
+}
+
+fn testReadFileAt(
+    path: []const u8,
+    offset: u64,
+    buf: []u8,
+) ?usize {
+    const node = vfs.lookup(path) orelse return null;
+    return vfs.read(&node, offset, buf);
+}
+
+fn testPageRw(page: u64) bool {
+    const memory =
+        pmm.physToVirt(page)[0..pmm.PAGE_SIZE];
+
+    memory[0] = 0xA5;
+    memory[pmm.PAGE_SIZE - 1] = 0x5A;
+
+    return memory[0] == 0xA5 and
+        memory[pmm.PAGE_SIZE - 1] == 0x5A;
+}
+
+fn testHeapRoundtrip() bool {
+    const memory = heap.allocator.alloc(
+        u8,
+        257,
+    ) catch return false;
+
+    defer heap.allocator.free(memory);
+
+    @memset(memory, 0xBC);
+
+    for (memory) |byte| {
+        if (byte != 0xBC) return false;
+    }
+
+    return true;
+}
+
+fn testAddressSpaceRoundtrip() bool {
+    const before = pmm.free_pages;
+    const address_space =
+        vmm.createAddressSpace();
+
+    if (pmm.free_pages + 1 != before) {
+        vmm.destroyAddressSpace(address_space);
+        return false;
+    }
+
+    vmm.destroyAddressSpace(address_space);
+
+    return pmm.free_pages == before;
+}
+
+fn testInvalidElfRejected() bool {
+    const invalid = "not an ELF";
+
+    const child = process.spawn(
+        "invalid",
+        invalid,
+        null,
+    ) catch return true;
+
+    _ = child;
+    return false;
 }
 
 // The kernel's main entry point.
@@ -227,7 +297,12 @@ export fn kmain() callconv(.c) noreturn {
             .free_page = pmm.free,
             .free_pages = testFreePages,
             .has_file = testHasFile,
-            .read_file = testReadFile,
+            .file_size = testFileSize,
+            .read_file_at = testReadFileAt,
+            .page_rw = testPageRw,
+            .heap_roundtrip = testHeapRoundtrip,
+            .address_space_roundtrip = testAddressSpaceRoundtrip,
+            .invalid_elf_rejected = testInvalidElfRejected,
         });
     }
 

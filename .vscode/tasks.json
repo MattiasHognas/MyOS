@@ -1,0 +1,30 @@
+
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "MyOS: Host tests",
+      "type": "shell",
+      "command": "zig build test-host",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "MyOS: Kernel tests (QEMU)",
+      "type": "shell",
+      "command": "zig build test-qemu",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "MyOS: All tests",
+      "type": "shell",
+      "command": "zig build test",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}
