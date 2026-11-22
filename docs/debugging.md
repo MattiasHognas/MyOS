@@ -2,7 +2,7 @@
 
 ## Reading kernel output
 
-Everything the kernel prints goes to the serial port. `./run-qemu.sh` connects
+Everything the kernel prints goes to the serial port. `scripts/run-qemu.sh` connects
 it to your terminal; the test runs save it to `zig-out/test/<scenario>/serial.log`.
 
 Kernel messages go through `std.log` and look like `level(scope): message`:
@@ -64,16 +64,16 @@ addr2line -f -i -e zig-out/bin/kernel.elf 0xffffffff800112ea
 llvm-symbolizer --obj=zig-out/bin/kernel.elf 0xffffffff800112ea
 ```
 
-Use the ELF that was booted: `zig-out/bin/kernel.elf` for `./build.sh`,
+Use the ELF that was booted: `zig-out/bin/kernel.elf` for `scripts/build.sh`,
 `zig-out/bin/kernel-test.elf` for the QEMU tests.
 
 ## Debugging with QEMU and GDB
 
-1. Build a Debug kernel and the ISO: `./build.sh`
+1. Build a Debug kernel and the ISO: `scripts/build.sh`
 2. Start QEMU paused, with a GDB server on `localhost:1234`:
 
    ```bash
-   ./run-qemu.sh --gdb          # add --bios for legacy BIOS boot, --no-kvm for TCG
+   scripts/run-qemu.sh --gdb          # add --bios for legacy BIOS boot, --no-kvm for TCG
    ```
 
 3. In another terminal, attach GDB. `scripts/kernel.gdb` loads the kernel
@@ -109,6 +109,6 @@ Notes:
 
 - `-d int,cpu_reset -D qemu.log` logs every interrupt and CPU reset, which helps
   with triple faults (the machine reboots, or stops with `-no-reboot`). Pass it
-  after `--`: `./run-qemu.sh --no-kvm -- -d int,cpu_reset -D qemu.log`
+  after `--`: `scripts/run-qemu.sh --no-kvm -- -d int,cpu_reset -D qemu.log`
 - `-monitor stdio` instead of `-serial stdio` gives the QEMU monitor:
   `info registers`, `info mem` (page table mappings), `info tlb`, `x /10i $pc`.

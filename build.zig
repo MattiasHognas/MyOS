@@ -122,8 +122,8 @@ pub fn build(b: *std.Build) void {
     const coverage_step = b.step("coverage", "Run host tests under kcov and write zig-out/coverage");
     coverage_step.dependOn(&install_coverage.step);
 
-    // test-qemu.sh packages already installed binaries; it never calls zig build.
-    const run_qemu = b.addSystemCommand(&.{ "bash", "test-qemu.sh" });
+    // scripts/test-qemu.sh packages already installed binaries; it never calls zig build.
+    const run_qemu = b.addSystemCommand(&.{ "bash", "scripts/test-qemu.sh" });
     run_qemu.step.dependOn(&install_test_kernel.step);
     run_qemu.step.dependOn(b.getInstallStep());
     const qemu_step = b.step("test-qemu", "Run real kernel tests under QEMU");

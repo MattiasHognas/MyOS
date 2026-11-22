@@ -1,5 +1,5 @@
 # GDB setup for debugging the MyOS kernel under QEMU.
-# Start QEMU with ./run-qemu.sh --gdb, then: gdb -x scripts/kernel.gdb
+# Start QEMU with scripts/run-qemu.sh --gdb, then: gdb -x scripts/kernel.gdb
 set confirm off
 set pagination off
 set disassembly-flavor intel

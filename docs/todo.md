@@ -34,27 +34,20 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
   - [ ] Add storage write tests when NVMe writes are implemented.
 
 ### 1.3 CI and debugging
-- [ ] Add GitHub Actions kernel/app builds.
-  - [x] Write `.github/workflows/ci.yml` with pinned Zig, checksum-verified Limine (`scripts/install-limine.sh`) and font (`scripts/fetch-font.sh`).
-  - [ ] Confirm the first green run on GitHub.
-- [ ] Run host unit tests and QEMU integration tests in CI.
-  - [x] Workflow runs `zig build test-host` and `zig build test-qemu`.
-  - [ ] Confirm the first green run on GitHub.
-- [ ] Run debug and optimized builds.
-  - [x] Test kernel follows `-Doptimize`; all QEMU scenarios pass locally in Debug, ReleaseSafe and ReleaseFast.
-  - [x] CI matrix over Debug, ReleaseSafe and ReleaseFast.
-  - [ ] Confirm the first green run on GitHub.
+- [x] Add GitHub Actions kernel/app builds (`.github/workflows/ci.yml`; pinned Zig, checksum-verified Limine and font).
+- [x] Run host unit tests and QEMU integration tests in CI.
+- [x] Run debug and optimized builds (CI matrix over Debug, ReleaseSafe and ReleaseFast; the test kernel follows `-Doptimize`).
 - [ ] Publish serial logs on failures.
-  - [x] Per-scenario logs in `zig-out/test/<scenario>/`, printed by `test-qemu.sh` when a check fails.
+  - [x] Per-scenario logs in `zig-out/test/<scenario>/`, printed by `scripts/test-qemu.sh` when a check fails.
   - [x] CI uploads them as the `serial-logs-<mode>` artifact on failure.
   - [ ] Confirm the upload with a deliberately failing run on GitHub.
-- [x] Add QEMU/GDB debugging instructions (`docs/debugging.md`, `./run-qemu.sh --gdb`, `scripts/kernel.gdb`).
+- [x] Add QEMU/GDB debugging instructions (`docs/debugging.md`, `scripts/run-qemu.sh --gdb`, `scripts/kernel.gdb`).
 - [x] Add symbolized kernel faults and backtraces (kernel `.symtab` via Limine, frame-pointer walk; tested by in-kernel tests and the `panic`/`fault` scenarios).
 - [x] Add log levels, subsystem assertions, and optional allocation diagnostics (`std.log` with `-Dlog-level`, `kernel/debug/assert.zig` with `-Dassertions`, heap stats and `-Dalloc-debug`).
 - [ ] Track host-code coverage and explicit integration-test scenarios where practical.
   - [x] Explicit QEMU scenarios (`tests`, `panic`, `fault`) selected via fw_cfg; documented in `docs/testing.md`.
   - [x] `zig build coverage` (kcov) and an informational CI coverage job.
-  - [ ] Confirm a coverage report is produced (kcov is not installed locally; first run will be in CI).
+  - [ ] Confirm a coverage report is produced in CI (kcov is built from source by `scripts/install-kcov.sh`, since Ubuntu 24.04 has no kcov package).
 
 **Milestone 1 done when:** A clean checkout can automatically build and run regression tests, with clear failure reporting.
 

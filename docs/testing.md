@@ -7,7 +7,7 @@ change or add a subsystem.
 | --- | --- | --- | --- |
 | Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF symbol lookup, log formatting), compiled natively with fakes. Fast; covered by `zig build coverage`. |
 | In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, VFS on the initrd, symbolization, fw_cfg. |
-| QEMU scenarios | `zig build test-qemu` | `test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
+| QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests and all QEMU scenarios. Add
 `-Doptimize=ReleaseSafe` or `-Doptimize=ReleaseFast` to run the QEMU tests
@@ -15,7 +15,7 @@ against an optimized kernel. CI runs all three build modes.
 
 ## QEMU integration-test scenarios
 
-`test-qemu.sh` boots the test kernel (`zig-out/bin/kernel-test.elf`) once per
+`scripts/test-qemu.sh` boots the test kernel (`zig-out/bin/kernel-test.elf`) once per
 scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 (`-fw_cfg name=opt/myos/scenario,string=<name>`); `runTestScenario` in
 `src/main.zig` reads it with `drivers/fw_cfg.zig`.
@@ -26,7 +26,7 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 | `panic` | Fails a subsystem assertion two calls deep | Exit code 1, the panic message, a symbolized backtrace through `scenarioPanicInner` and `scenarioPanic` |
 | `fault` | Writes to an unmapped kernel address | Exit code 1, `Page fault`, the right CR2, backtrace frame `#0` in `scenarioFault` |
 
-Run a subset with `bash test-qemu.sh tests panic` (after `zig build test-kernel`
+Run a subset with `scripts/test-qemu.sh tests panic` (after `zig build test-kernel`
 and `zig build`). The timeout per boot is 45 s, or `MYOS_QEMU_TIMEOUT` seconds.
 
 Each scenario keeps its logs in `zig-out/test/<scenario>/serial.log` (raw) and
@@ -40,7 +40,7 @@ In the test kernel, `root.halt()` and the panic handler exit QEMU with status
 
 1. Add a `noinline fn scenarioX() void` to `src/main.zig` and dispatch to it
    in `runTestScenario`.
-2. Add a `X)` case to `run_scenario` in `test-qemu.sh` with its expected exit
+2. Add a `X)` case to `run_scenario` in `scripts/test-qemu.sh` with its expected exit
    status (`expect_status`) and output (`expect_line`), and add it to the
    default list.
 3. Document it in the table above.
@@ -68,7 +68,8 @@ test:
 
 `zig build coverage` runs the host tests under [kcov](https://github.com/SimonKagstrom/kcov)
 and writes an HTML report to `zig-out/coverage/index.html`. It needs `kcov`
-installed. Coverage covers host-tested code only; kernel code that runs only in
+installed (most distributions package it; on Ubuntu 24.04, build it with
+`scripts/install-kcov.sh`). Coverage covers host-tested code only; kernel code that runs only in
 QEMU is checked by the scenarios above instead.
 
 ## CI
@@ -82,4 +83,5 @@ QEMU is checked by the scenarios above instead.
   Informational; it does not fail the workflow.
 
 CI gets Limine from its release tarball (`scripts/install-limine.sh`, checksum
-verified) and the console font with `scripts/fetch-font.sh`.
+verified), kcov from source (`scripts/install-kcov.sh`), and the console font
+with `scripts/fetch-font.sh`.

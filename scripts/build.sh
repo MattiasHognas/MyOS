@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")/.."  # run from the repository root
 
 # Normal build: compile and package os.iso/disk.img as before.
 # Test packaging: use prebuilt artifacts and keep all files under zig-out/test/.

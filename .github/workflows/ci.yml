@@ -75,10 +75,14 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      # Ubuntu 24.04 has no kcov package, so build a pinned release.
       - name: Install kcov
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends kcov
+          sudo apt-get install -y --no-install-recommends cmake binutils-dev \
+            libssl-dev libcurl4-openssl-dev libelf-dev zlib1g-dev libdw-dev libiberty-dev
+          scripts/install-kcov.sh "$RUNNER_TEMP/kcov"
+          echo "$RUNNER_TEMP/kcov/bin" >> "$GITHUB_PATH"
 
       - name: Run host tests under kcov
         run: zig build coverage

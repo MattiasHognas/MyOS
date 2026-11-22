@@ -3,7 +3,7 @@
 # its serial output. The scenario name reaches the kernel through QEMU's
 # fw_cfg device (opt/myos/scenario).
 #
-# Usage: test-qemu.sh [scenario...]   (default: all scenarios)
+# Usage: scripts/test-qemu.sh [scenario...]   (default: all scenarios)
 #
 # Scenarios:
 #   tests  run the in-kernel test suite; must report MYOS_TEST_PASS
@@ -12,9 +12,10 @@
 #
 # Logs: zig-out/test/<scenario>/serial.log (raw) and serial-clean.log.
 set -euo pipefail
+cd "$(dirname "$0")/.."  # run from the repository root
 
 # Package the test ISO without recursively invoking zig build.
-bash build.sh --package-test
+bash scripts/build.sh --package-test
 
 out="zig-out/test"
 iso="$out/os.iso"

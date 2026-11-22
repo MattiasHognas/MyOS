@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Run os.iso (built by ./build.sh) in QEMU with serial output on the terminal.
+# Run os.iso (built by scripts/build.sh) in QEMU with serial output on the terminal.
 #
-# Usage: ./run-qemu.sh [--gdb] [--bios] [--no-kvm] [-- extra QEMU args]
+# Usage: scripts/run-qemu.sh [--gdb] [--bios] [--no-kvm] [-- extra QEMU args]
 #   --gdb     start paused and wait for GDB on localhost:1234 (see docs/debugging.md)
 #   --bios    boot with legacy BIOS instead of UEFI (OVMF)
 #   --no-kvm  use software emulation even if KVM is available
 set -euo pipefail
+cd "$(dirname "$0")/.."  # run from the repository root
 
 gdb=0
 bios=0
@@ -22,8 +23,8 @@ while (($#)); do
     shift
 done
 
-[[ -f os.iso ]] || { echo "os.iso not found; run ./build.sh first" >&2; exit 1; }
-[[ -f disk.img ]] || { echo "disk.img not found; run ./build.sh first" >&2; exit 1; }
+[[ -f os.iso ]] || { echo "os.iso not found; run scripts/build.sh first" >&2; exit 1; }
+[[ -f disk.img ]] || { echo "disk.img not found; run scripts/build.sh first" >&2; exit 1; }
 
 args=(
     -M q35 -m 2G -cdrom os.iso

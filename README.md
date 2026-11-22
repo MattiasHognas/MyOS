@@ -13,14 +13,14 @@ My own operating system
 ### Commands
 
 - `zig build`: normal kernel and userspace builds.
-- `./build.sh`: normal ISO creation, plus a `disk.img` only if absent.
+- `scripts/build.sh`: normal ISO creation, plus a `disk.img` only if absent.
 - `zig build test-host`: native host unit tests using an injected fake filesystem.
 - `zig build test-kernel`: compile the test kernel (no QEMU boot).
 - `zig build test-qemu`: package a separate test ISO and run the QEMU scenarios (`tests`, `panic`, `fault`).
 - `zig build test`: run both host and QEMU tests.
 - `zig build coverage`: run the host tests under kcov; report in `zig-out/coverage/`.
 - `zig build docs`: generate documentation.
-- `./run-qemu.sh [--gdb] [--bios] [--no-kvm]`: run `os.iso`; `--gdb` waits for `gdb -x scripts/kernel.gdb`.
+- `scripts/run-qemu.sh [--gdb] [--bios] [--no-kvm]`: run `os.iso`; `--gdb` waits for `gdb -x scripts/kernel.gdb`.
 
 Build options (also for the test commands): `-Doptimize=Debug|ReleaseSafe|ReleaseFast`,
 `-Dlog-level=err|warn|info|debug`, `-Dassertions=true|false`, `-Dalloc-debug=true|false`.
@@ -39,13 +39,12 @@ scripts/fetch-font.sh
 
 Build elf/iso
 ```bash
-chmod +x build.sh
-./build.sh
+scripts/build.sh
 ```
 
 Run iso
 ```bash
-./run-qemu.sh
+scripts/run-qemu.sh
 ```
 which runs
 ```bash
