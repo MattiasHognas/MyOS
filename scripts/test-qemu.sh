@@ -11,6 +11,8 @@
 #   fault  page-fault in kernel mode; must print CR2 and a symbolized backtrace
 #   smap   read user memory from the kernel outside a user copy; must page-fault
 #   smep   execute user memory from the kernel; must page-fault
+#   double_fault  fault with an unusable kernel stack; must print a
+#          double-fault report instead of triple-faulting
 #
 # Logs: zig-out/test/<scenario>/serial.log (raw) and serial-clean.log.
 #
@@ -100,6 +102,13 @@ run_scenario() {
             expect_line '^MYOS_TEST_PASS$'
             expect_line '^MYOS_TEST_SUMMARY passed=[1-9][0-9]* failed=0$'
             if grep -q '^\[FAIL\]' "$log"; then fail "failing test cases: $(grep '^\[FAIL\]' "$log" | tr '\n' ' ')"; fi
+            # User-fault diagnostics: process, fault, vector, error code, then RIP/RSP, and CR2 for page faults.
+            expect_line '^\*\*\* thread [0-9]+ \(/test/kernel_read\): Page fault in user mode \(vector 14, error 0x5\), killed$'
+            expect_line '^CR2=0xffffffff80000000 \(faulting address\)$'
+            expect_line '^\*\*\* thread [0-9]+ \(/test/privileged\): General protection in user mode \(vector 13, error 0x0\), killed$'
+            expect_line '^\*\*\* thread [0-9]+ \(/test/div_zero\): Divide error in user mode \(vector 0, error 0x0\), killed$'
+            expect_line '^\*\*\* thread [0-9]+ \(/test/invalid_opcode\): Invalid opcode in user mode \(vector 6, error 0x0\), killed$'
+            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+$'
             ;;
         panic)
             expect_status 3
@@ -132,6 +141,17 @@ run_scenario() {
             expect_line '^CR2=0x400000 \(faulting address\)$'
             if grep -q 'not enforced' "$log"; then fail "the kernel executed user memory"; fi
             ;;
+        double_fault)
+            # A triple fault would stop QEMU (-no-reboot) with status 0 and no report.
+            expect_status 3
+            expect_line '^\*\*\* Double fault \(vector 8, error 0x0\)$'
+            expect_line '^RSP=0xffffb00000001000 '
+            expect_line '^CR2=0xffffb00000000ff8 \(last page-fault address\)$'
+            expect_line '^thread [0-9]+ kernel stack 0x[0-9a-f]+-0x[0-9a-f]+; RSP is outside it: corrupt stack pointer$'
+            expect_line '^backtrace:$'
+            expect_line '^  #0 0x[0-9a-f]{16} [^ ]*doubleFaultThread\+0x'
+            if grep -q 'no double fault' "$log"; then fail "the kernel survived losing its stack"; fi
+            ;;
         *)
             echo "unknown scenario: $scenario" >&2
             exit 2
@@ -148,7 +168,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests panic fault smap smep)
+((${#scenarios[@]})) || scenarios=(tests panic fault smap smep double_fault)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 if [[ "${MYOS_SIMULATE_FAILURE:-}" == true ]]; then

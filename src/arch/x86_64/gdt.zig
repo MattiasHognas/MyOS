@@ -3,6 +3,14 @@
 //! In long mode segmentation is mostly unused, but the CPU still needs code and
 //! data descriptors for ring 0 and ring 3, plus a TSS whose `rsp0` field tells
 //! the CPU which kernel stack to switch to when an interrupt arrives from ring 3.
+//!
+//! The TSS also holds the interrupt stack table (IST): stacks the CPU switches
+//! to unconditionally for the exceptions that must not depend on the stack
+//! they interrupted. A double fault usually means the kernel stack itself is
+//! unusable (overflowed or a corrupt RSP); without its own stack the CPU could
+//! not even push the exception frame and would triple-fault, resetting the
+//! machine with no diagnostics. An NMI can arrive at any instruction,
+//! including the few at `syscall` entry that still run on the user's stack.
 
 const std = @import("std");
 
@@ -17,6 +25,18 @@ var gdt = [_]u64{
 };
 var tss: Tss = .{};
 
+/// Size of each emergency stack. Their handlers only print diagnostics and halt.
+pub const IST_STACK_SIZE = 16 * 1024;
+
+/// IST index (1-7, as used in IDT gates) of the double-fault stack.
+pub const IST_DOUBLE_FAULT = 1;
+/// IST index of the NMI stack.
+pub const IST_NMI = 2;
+
+// Emergency stacks, in .bss: independent of the heap and of every thread stack.
+var double_fault_stack: [IST_STACK_SIZE]u8 align(16) = undefined;
+var nmi_stack: [IST_STACK_SIZE]u8 align(16) = undefined;
+
 const TSS_SEL = 0x28;
 
 /// 64-bit TSS: 104 bytes, packed with 4-byte alignment.
@@ -27,7 +47,7 @@ const Tss = extern struct {
     rsp1: u64 align(4) = 0,
     rsp2: u64 align(4) = 0,
     reserved1: u64 align(4) = 0,
-    /// Interrupt stack table: extra emergency stacks (e.g. for double faults, not used yet).
+    /// Interrupt stack table: tops of the emergency stacks; `ist[n - 1]` is IST index n.
     ist: [7]u64 align(4) = @splat(0),
     reserved2: u64 align(4) = 0,
     reserved3: u16 = 0,
@@ -61,12 +81,32 @@ pub fn setKernelStack(top: u64) void {
     tss.rsp0 = top;
 }
 
+/// The memory of the emergency stack with IST index `index`
+/// (`IST_DOUBLE_FAULT` or `IST_NMI`); the CPU starts at its end.
+pub fn istStack(index: u3) []u8 {
+    return switch (index) {
+        IST_DOUBLE_FAULT => &double_fault_stack,
+        IST_NMI => &nmi_stack,
+        else => unreachable,
+    };
+}
+
+/// The stack top the TSS holds for IST index `index` (1-7); 0 if unused.
+pub fn istTop(index: u3) u64 {
+    return tss.ist[index - 1];
+}
+
 /// Install the GDT and TSS.
 ///
-/// Fills in the TSS descriptor, loads the GDT with `lgdt`, reloads CS with a
+/// Points the IST entries at the emergency stacks, fills in the TSS descriptor, loads the GDT with `lgdt`, reloads CS with a
 /// far return and the data segment registers with the kernel data selector,
 /// then loads the task register with `ltr`. Must run before `idt.init`.
 pub fn init() void {
+    inline for (.{ IST_DOUBLE_FAULT, IST_NMI }) |index| {
+        const stack = istStack(index);
+        tss.ist[index - 1] = @intFromPtr(stack.ptr) + stack.len;
+    }
+
     // TSS descriptor: 16 bytes spread over two GDT slots.
     const base: u64 = @intFromPtr(&tss);
     const limit: u64 = @sizeOf(Tss) - 1;

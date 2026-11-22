@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    inline for (.{ "syscalls", "kernel_read", "privileged", "write_text", "user_pointers", "entry_regs", "umip" }) |name| {
+    inline for (.{ "syscalls", "kernel_read", "privileged", "write_text", "user_pointers", "entry_regs", "umip", "div_zero", "invalid_opcode" }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, target, optimize);
         exe.root_module.addImport("lib", user_lib);
         b.installArtifact(exe); // scripts/build.sh --package-test picks them up from zig-out/bin

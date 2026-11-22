@@ -376,6 +376,29 @@ fn userIsolation() TestError!void {
     try check(helpers.runProgram("/test/umip") == 255); // sgdt
 }
 
+/// Ordinary CPU exceptions in ring 3 (divide error, invalid opcode) kill only
+/// the faulting process: the next program runs normally and nothing leaks.
+/// The host script checks the diagnostics these print.
+fn userFaults() TestError!void {
+    _ = helpers.runProgram("/test/div_zero"); // warm up: the heap may grow
+    const pages = pmm.free_pages;
+    const heap_bytes = helpers.heapInUse();
+    try check(helpers.runProgram("/test/div_zero") == 255);
+    try check(helpers.runProgram("/test/invalid_opcode") == 255);
+    try check(helpers.runProgram("/bin/hello") == 0);
+    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+}
+
+/// Double faults and NMIs have their own stacks, and the CPU switches to them.
+fn emergencyStacks() TestError!void {
+    const failed = helpers.emergencyStacks();
+    if (failed != 0) {
+        var buf: [64]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&buf, "  emergency stack check {d} failed\n", .{failed}) catch "");
+    }
+    try check(failed == 0);
+}
+
 /// Spawn, run, wait and exit: exit codes reach the parent, and a finished or
 /// crashed process leaves no pages or heap memory behind.
 fn processLifecycle() TestError!void {
@@ -636,6 +659,15 @@ noinline fn scenarioSmep() void {
     @panic("SMEP not enforced: the kernel executed user memory");
 }
 
+/// Integration-test scenario "double_fault": a kernel thread loses its stack
+/// (RSP points at unmapped memory) and then faults. Without the emergency
+/// stack this is a triple fault, i.e. a silent reset; with it, the kernel
+/// must print a double-fault report.
+noinline fn scenarioDoubleFault() void {
+    helpers.doubleFaultInThread();
+    @panic("double_fault scenario: no double fault was raised");
+}
+
 /// Entry point of the test kernel, called by `kmain` after boot: run the
 /// scenario the host passed through fw_cfg (`opt/myos/scenario`, default
 /// "tests"). Never returns; every scenario ends by exiting QEMU.
@@ -647,6 +679,7 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "fault")) scenarioFault();
     if (std.mem.eql(u8, scenario, "smap")) scenarioSmap();
     if (std.mem.eql(u8, scenario, "smep")) scenarioSmep();
+    if (std.mem.eql(u8, scenario, "double_fault")) scenarioDoubleFault();
     if (!std.mem.eql(u8, scenario, "tests")) std.debug.panic("unknown test scenario '{s}'", .{scenario});
     runCases();
 }
@@ -716,6 +749,8 @@ fn runCases() noreturn {
         .{ .name = "registers cleared on entry to user mode", .func = userEntryRegisters },
         .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
+        .{ .name = "user faults kill only the process (ring 3 exceptions)", .func = userFaults },
+        .{ .name = "double-fault and NMI emergency stacks", .func = emergencyStacks },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },
         .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin },
         .{ .name = "wake before block", .func = wakeBeforeBlock },

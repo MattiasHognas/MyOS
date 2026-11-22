@@ -48,6 +48,33 @@ backtrace:
   #1 0xffffffff80000699 main.run+0x139
 ```
 
+A fault in a user program kills only that program (exit code 255) and prints
+where it happened, without a backtrace:
+
+```
+*** thread 7 (/test/kernel_read): Page fault in user mode (vector 14, error 0x5), killed
+RIP=0x400038 RSP=0x7ffffffefed0 RFLAGS=0x10202
+CR2=0xffffffff80000000 (faulting address)
+```
+
+A double fault means the CPU could not deliver an exception, nearly always
+because the kernel stack is unusable. It is reported from its own emergency
+stack (as are NMIs), with the stack of the thread that was running:
+
+```
+*** Double fault (vector 8, error 0x0)
+RIP=0xffffffff8001d0b3 CS=0x8 RFLAGS=0x86
+RSP=0xffffb00000001000 RAX=0x286 RBX=0xffffffff8001d0a0
+CR2=0xffffb00000000ff8 (last page-fault address)
+thread 1 kernel stack 0xffff900000000040-0xffff900000004040; RSP is outside it: corrupt stack pointer
+backtrace:
+  #0 0xffffffff8001d0b3 helpers.doubleFaultThread+0x13
+```
+
+RSP just below the thread's stack reads "stack overflow" instead. Until
+kernel stacks have guard pages (todo 2.3), an overflow runs into heap memory
+and does not fault at all.
+
 How it works: the kernel is built with frame pointers, `kernel/debug/backtrace.zig`
 walks the RBP chain (checking each frame against the page tables first), and
 the names come from the kernel's own `.symtab`, which Limine passes to the kernel

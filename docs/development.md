@@ -65,7 +65,7 @@ scripts/run-qemu.sh   # boots into the shell; type "hello", or "exit"
 | `zig build docs` | Generate API docs from `//!` and `///` comments into `zig-out/docs/`. |
 | `zig build test-host` | Native host unit tests. |
 | `zig build test-kernel` | Compile the test kernel only (no QEMU). |
-| `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (`tests`, `panic`, `fault`). |
+| `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (`tests`, `panic`, `fault`, `smap`, `smep`, `double_fault`). |
 | `zig build test` | Host tests and QEMU scenarios. |
 | `zig build coverage` | Host tests under kcov; report in `zig-out/coverage/`. |
 
@@ -129,7 +129,7 @@ the terminal.
 | Path | Contents |
 | --- | --- |
 | `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
-| `src/arch/x86_64/` | GDT/TSS, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), port I/O |
+| `src/arch/x86_64/` | GDT/TSS with the double-fault and NMI emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |

@@ -71,15 +71,16 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 **Done when:** Every syscall rejects invalid user addresses without crashing the kernel.
 
 ### 2.2 Exception handling
-- [ ] Allocate an independent double-fault emergency stack.
-- [ ] Configure the TSS IST entry and double-fault IDT gate.
-- [ ] Consider a separate NMI IST stack.
-- [x] Distinguish faults in user mode from kernel faults (`cs & 3` in `interruptHandler`; faults during user copies are recovered, see 2.1).
+- [x] Allocate an independent double-fault emergency stack (16 KiB in `.bss`, `gdt.zig`).
+- [x] Configure the TSS IST entry and double-fault IDT gate (IST 1; in-kernel test "double-fault and NMI emergency stacks").
+- [x] Consider a separate NMI IST stack (done, IST 2: an NMI can hit the first instructions of `syscall` entry, which still run on the user's stack).
+- [x] Distinguish faults in user mode from kernel faults (`cs & 3` in `interruptHandler`; faults during user copies are recovered, see 2.1). NMIs, double faults and machine checks are kernel faults even when they interrupt ring 3.
 - [x] Terminate the offending process for ordinary unrecoverable user faults (exit code 255; tested by `/test/kernel_read`, `/test/privileged` and `/test/write_text`).
 - [x] Print vector, error code, RIP, RSP, and CR2 (for page faults) in kernel fault diagnostics (checked by the `fault` scenario).
-- [ ] Print the same details for user faults; the message currently shows only the fault name and RIP.
-- [ ] Test deliberate user faults, kernel faults, and double-fault diagnostics.
-- [ ] Until the emergency stack exists, a kernel stack overflow or a fault while handling a fault ends in a triple fault (silent reset) with no diagnostics; test that this no longer happens.
+- [x] Print the same details for user faults, with the thread and program name (checked from the serial log of the `tests` scenario).
+- [x] Test deliberate user faults, kernel faults, and double-fault diagnostics (`/test/div_zero` and `/test/invalid_opcode` besides the isolation programs; scenarios `fault` and `double_fault`).
+- [x] A fault with an unusable kernel stack no longer ends in a triple fault: the `double_fault` scenario gets a report with RIP, RSP, CR2, the thread's stack bounds and a backtrace.
+  - A real stack overflow still does not fault: thread stacks are heap allocations, so it runs into heap memory. The guard pages of 2.3 turn it into a page fault, which this stack then reports.
 
 **Done when:** User faults terminate only their process, and emergency faults produce useful diagnostics where possible.
 

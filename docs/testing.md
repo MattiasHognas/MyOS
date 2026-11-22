@@ -22,11 +22,12 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 
 | Scenario | What the kernel does | What the script checks (kernel exit code; QEMU reports `code*2+1`) |
 | --- | --- | --- |
-| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines |
+| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, and the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2) |
 | `panic` | Fails a subsystem assertion two calls deep | Exit code 1, the panic message, a symbolized backtrace through `scenarioPanicInner` and `scenarioPanic` |
 | `fault` | Writes to an unmapped kernel address | Exit code 1, `Page fault`, the right CR2, backtrace frame `#0` in `scenarioFault` |
 | `smap` | Reads a mapped user page from kernel code outside a user copy | Exit code 1, `Page fault` with error 0x1 and CR2 = the user page, frame `#0` in `scenarioSmap` (SMAP is enforced) |
 | `smep` | Calls code in a mapped user page from ring 0 | Exit code 1, `Page fault` with error 0x11, RIP and CR2 = the user page (SMEP is enforced) |
+| `double_fault` | A kernel thread points RSP at unmapped memory and pushes | Exit code 1, `Double fault` with the bad RSP, CR2, the thread's stack bounds and frame `#0` in `doubleFaultThread` (a triple fault would end QEMU with status 0 and no report) |
 
 Run a subset with `scripts/test-qemu.sh tests panic` (after `zig build test-kernel`
 and `zig build`). The timeout per boot is 45 s, or `MYOS_QEMU_TIMEOUT` seconds.
@@ -74,7 +75,9 @@ kernel killed the process for a fault).
 To add one: create `tests/user/<name>.zig` (import the runtime with
 `@import("lib")`, export `_start`), add `<name>` to the list in `build.zig`,
 and call it from a test in `tests/kernel/main.zig`. Report failures through
-the exit code, e.g. the number of the first failing check.
+the exit code, e.g. the number of the first failing check. For a program that is
+meant to be killed, the fault report it produces can be checked from the
+serial log in the `tests` case of `scripts/test-qemu.sh`.
 
 ## Adding host tests
 

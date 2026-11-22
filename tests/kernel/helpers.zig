@@ -11,6 +11,7 @@ const cpu = kernel_root.arch.x86_64.cpu;
 const vmm = kernel_root.arch.x86_64.vmm;
 const usercopy = kernel_root.arch.x86_64.usercopy;
 const idt = kernel_root.arch.x86_64.idt;
+const gdt = kernel_root.arch.x86_64.gdt;
 const uaccess = kernel_root.kernel.uaccess;
 const nvme = kernel_root.drivers.nvme;
 const elf = kernel_root.kernel.elf;
@@ -432,6 +433,94 @@ pub fn acClearedOnKernelEntry() u32 {
     if (cpu.readFlags() & RFLAGS_AC != 0) return 5;
     if (cpu.rdmsr(0xC0000084) & RFLAGS_AC == 0) return 6; // SFMASK must clear AC on syscall
     return 0;
+}
+
+/// A vector no device uses, for `emergencyStacks`.
+const IST_TEST_VECTOR = 0xF1;
+var ist_probe_frame: u64 = 0;
+
+/// Interrupt handler for `emergencyStacks`: record where the CPU pushed the
+/// interrupt frame, which tells which stack the handler runs on.
+fn istProbe(f: *idt.Frame) void {
+    ist_probe_frame = @intFromPtr(f);
+}
+
+/// True if `addr` lies in the emergency stack with IST index `index`.
+fn onIstStack(index: u3, addr: u64) bool {
+    const stack = gdt.istStack(index);
+    const low = @intFromPtr(stack.ptr);
+    return addr >= low and addr < low + stack.len;
+}
+
+/// Raise `IST_TEST_VECTOR` with its gate set to IST index `ist` and return
+/// the address of the frame its handler saw (0 if the handler never ran).
+fn istProbeFrame(ist: u3) u64 {
+    ist_probe_frame = 0;
+    idt.setGateIst(IST_TEST_VECTOR, ist);
+    asm volatile ("int $0xF1");
+    idt.setGateIst(IST_TEST_VECTOR, 0);
+    return ist_probe_frame;
+}
+
+/// Check the emergency stacks: the double-fault and NMI gates name their own
+/// IST entries, the TSS points those at the ends of two separate, 16-byte
+/// aligned stacks, no other exception uses an IST stack, and the CPU really
+/// switches to such a stack (and back) when a gate asks for it. Returns 0, or
+/// the number of the first failing check.
+pub fn emergencyStacks() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+
+    if (idt.gateIst(8) != gdt.IST_DOUBLE_FAULT) return 1;
+    if (idt.gateIst(2) != gdt.IST_NMI) return 2;
+    for (0..256) |vec| {
+        if (vec != 8 and vec != 2 and idt.gateIst(@intCast(vec)) != 0) return 3;
+    }
+
+    const df = gdt.istStack(gdt.IST_DOUBLE_FAULT);
+    const nmi = gdt.istStack(gdt.IST_NMI);
+    if (gdt.istTop(gdt.IST_DOUBLE_FAULT) != @intFromPtr(df.ptr) + df.len) return 4;
+    if (gdt.istTop(gdt.IST_NMI) != @intFromPtr(nmi.ptr) + nmi.len) return 5;
+    if (gdt.istTop(gdt.IST_DOUBLE_FAULT) % 16 != 0 or gdt.istTop(gdt.IST_NMI) % 16 != 0) return 6;
+    const df_low = @intFromPtr(df.ptr);
+    const nmi_low = @intFromPtr(nmi.ptr);
+    if (df_low < nmi_low + nmi.len and nmi_low < df_low + df.len) return 7; // they overlap
+    for (3..8) |index| {
+        if (gdt.istTop(@intCast(index)) != 0) return 8;
+    }
+
+    idt.register(IST_TEST_VECTOR, istProbe);
+    const plain = istProbeFrame(0);
+    if (plain == 0) return 9; // the handler never ran
+    if (onIstStack(gdt.IST_DOUBLE_FAULT, plain) or onIstStack(gdt.IST_NMI, plain)) return 10;
+    if (!onIstStack(gdt.IST_DOUBLE_FAULT, istProbeFrame(gdt.IST_DOUBLE_FAULT))) return 11;
+    if (!onIstStack(gdt.IST_NMI, istProbeFrame(gdt.IST_NMI))) return 12;
+    // Back on the thread's own stack: a local is not on an emergency stack.
+    var here: u8 = 0;
+    const here_addr = @intFromPtr(&here);
+    here = 1;
+    if (onIstStack(gdt.IST_DOUBLE_FAULT, here_addr) or onIstStack(gdt.IST_NMI, here_addr)) return 13;
+    return 0;
+}
+
+/// Thread body for the `double_fault` scenario: point RSP at unmapped kernel
+/// memory and push. The page fault cannot be delivered on that stack, so the
+/// CPU raises a double fault. This is what a kernel stack overflow into a
+/// guard page looks like.
+fn doubleFaultThread() void {
+    _ = cpu.saveAndDisableInterrupts();
+    asm volatile (
+        \\ movabs $0xFFFFB00000001000, %%rsp
+        \\ push %%rax
+    );
+}
+
+/// For the `double_fault` scenario: run `doubleFaultThread` in a kernel
+/// thread of its own, so the report can compare RSP with a thread stack.
+/// Returns only if the thread could not be started or survived.
+pub fn doubleFaultInThread() void {
+    _ = thread.spawn(doubleFaultThread, null) catch return;
+    for (0..100) |_| thread.yield();
 }
 
 // State shared by the PMM stress workers.
