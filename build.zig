@@ -104,6 +104,14 @@ pub fn build(b: *std.Build) void {
     const host_step = b.step("test-host", "Run native unit tests with fakes");
     host_step.dependOn(&run_host_tests.step);
 
+    // For the editor's "Debug Test": install the host tests where the VS Code
+    // Zig extension looks for them (zig.debugTestArgs in .vscode/settings.json).
+    // LLVM build, since debuggers read its debug info best (shared with coverage).
+    const llvm_host_tests = hostTests(b, test_filters, true);
+    const install_debug_tests = b.addInstallArtifact(llvm_host_tests, .{ .dest_sub_path = "debug-unit-tests" });
+    const debug_tests_step = b.step("debug-test-host", "Build the host tests for a debugger (zig-out/bin/debug-unit-tests)");
+    debug_tests_step.dependOn(&install_debug_tests.step);
+
     // Host-code coverage with kcov (scripts/coverage.sh explains how to install
     // it if it is missing). Report: zig-out/coverage/index.html
     const run_coverage = b.addSystemCommand(&.{"bash"});
@@ -112,7 +120,7 @@ pub fn build(b: *std.Build) void {
     const coverage_dir = run_coverage.addOutputDirectoryArg("coverage");
     // kcov can't read the debug info of Zig's own x86 backend (it reports 0
     // lines), so coverage uses a separate LLVM build of the host tests.
-    run_coverage.addArtifactArg(hostTests(b, test_filters, true));
+    run_coverage.addArtifactArg(llvm_host_tests);
     const install_coverage = b.addInstallDirectory(.{
         .source_dir = coverage_dir,
         .install_dir = .prefix,

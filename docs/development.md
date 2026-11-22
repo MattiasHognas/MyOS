@@ -202,7 +202,9 @@ test image).
 VS Code with the Zig extension and ZLS works out of the box
 (`.vscode/settings.json`). `.vscode/tasks.json` has tasks for the host tests,
 the QEMU tests and all tests ("Run Test Task"); the test explorer runs single
-host tests through `zig build test-host -Dtest-filter=<name>`.
+host tests through `zig build test-host -Dtest-filter=<name>`. "Debug Test"
+builds them with `zig build debug-test-host -Dtest-filter=<name>`, which puts the
+binary at `zig-out/bin/debug-unit-tests` for the debugger.
 
 ## Troubleshooting
 
