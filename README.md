@@ -15,7 +15,7 @@ My own operating system
 - `zig build test-kernel`: compile the test kernel (no QEMU boot).
 - `zig build test-qemu`: package a separate test ISO and run QEMU.
 - `zig build test`: run both host and QEMU tests.
-
+- `zig build docs`: generate documentation.
 
 ### Development
 

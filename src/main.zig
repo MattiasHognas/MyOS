@@ -68,7 +68,7 @@ pub const panic = std.debug.FullPanic(kernelPanic);
 const USER_CODE: u64 = 0x40_0000; // 4 MiB
 const USER_STACK: u64 = 0x80_0000; // top of the user stack (8 MiB)
 
-// Test the NVMe driver by reading the first sector of the disk and printing it to the console.
+/// Test the NVMe driver by reading the first sector of the disk and printing it to the console.
 fn diskTest(dev: pci.Device) void {
     nvme.init(dev) catch |e| return print("nvme init failed: {s}\n", .{@errorName(e)});
     var sector: [4096]u8 = undefined;
@@ -77,7 +77,7 @@ fn diskTest(dev: pci.Device) void {
     print("disk LBA 0: \"{s}\"\n", .{sector[0..end]});
 }
 
-// Return the GSI for an IRQ, taking into account any overrides in the MADT.
+/// Return the GSI for an IRQ, taking into account any overrides in the MADT.
 fn findModule(name: []const u8) ?[]const u8 {
     const mods = response(&module_request);
     for (mods.modules[0..mods.module_count]) |m| {
@@ -87,19 +87,19 @@ fn findModule(name: []const u8) ?[]const u8 {
     return null;
 }
 
-// Return the number of milliseconds since boot.
+/// Return the number of milliseconds since boot.
 fn onTick(_: *idt.Frame) void {
     ticks += 1;
     thread.tick();
 }
 
-// Return the Limine response for a request, or panic if the request was not answered.
+/// Return the Limine response for a request, or panic if the request was not answered.
 fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
     const v: *volatile @TypeOf(req.*) = req;
     return v.response orelse @panic("Limine request not answered");
 }
 
-// Convert a Limine physical address to a virtual address, using the HHDM offset.
+/// Convert a Limine physical address to a virtual address, using the HHDM offset.
 fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
     print("PANIC: {s}\n", .{msg});
     if (comptime build_options.is_test) {
@@ -109,7 +109,7 @@ fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
     halt();
 }
 
-// The idle thread runs when no other threads are ready. It yields to any ready threads, then sleeps until the next interrupt.
+/// The idle thread runs when no other threads are ready. It yields to any ready threads, then sleeps until the next interrupt.
 fn idle() noreturn {
     while (true) {
         thread.yield(); // let anything that's ready run
@@ -117,7 +117,7 @@ fn idle() noreturn {
     }
 }
 
-// A simple shell that reads lines from the keyboard and echoes them back.
+/// A simple shell that reads lines from the keyboard and echoes them back.
 fn shell() noreturn {
     var line: [128]u8 = undefined;
     var len: usize = 0;
@@ -150,7 +150,7 @@ fn shell() noreturn {
     }
 }
 
-// Print to both the serial port and the framebuffer console. The framebuffer console is not ready until after the kernel has initialized it, so we check `console.ready` before printing to it.
+/// Print to both the serial port and the framebuffer console. The framebuffer console is not ready until after the kernel has initialized it, so we check `console.ready` before printing to it.
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
@@ -160,29 +160,29 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     if (console.ready) for (s) |c| console.putc(c);
 }
 
-// The kernel's main entry point. Called by the bootloader.
+/// The kernel's main entry point. Called by the bootloader.
 pub fn halt() noreturn {
     while (true) asm volatile ("cli; hlt");
 }
 
-// Read a file into a buffer, for the test module. Returns null if the file doesn't exist.
+/// Read a file into a buffer, for the test module. Returns null if the file doesn't exist.
 fn testReadFile(path: []const u8, buf: []u8) ?usize {
     const node = vfs.lookup(path) orelse return null;
     return vfs.read(&node, 0, buf);
 }
 
-// Test-only service callbacks. Using callbacks avoids importing a second copy
-// of PMM/VFS into the test module (which would duplicate module global state).
+/// Test-only service callbacks. Using callbacks avoids importing a second copy
+/// of PMM/VFS into the test module (which would duplicate module global state).
 fn testLog(s: []const u8) void {
     serial.puts(s);
 }
 
-// Return the number of free pages, for the test module.
+/// Return the number of free pages, for the test module.
 fn testFreePages() usize {
     return pmm.free_pages;
 }
 
-// Return true if the file exists, for the test module.
+/// Return true if the file exists, for the test module.
 fn testHasFile(path: []const u8) bool {
     return vfs.lookup(path) != null;
 }
@@ -257,7 +257,7 @@ fn testInvalidElfRejected() bool {
     return false;
 }
 
-// The kernel's main entry point.
+/// The kernel's main entry point.
 export fn kmain() callconv(.c) noreturn {
     serial.init();
     gdt.init();

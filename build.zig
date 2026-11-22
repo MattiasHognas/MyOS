@@ -27,6 +27,20 @@ pub fn build(b: *std.Build) void {
     userProgram(b, "hello", target, optimize);
     userProgram(b, "sh", target, optimize);
 
+    // Generate API documentation
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = kernel.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+
+    const docs_step = b.step(
+        "docs",
+        "Generate kernel API documentation",
+    );
+
+    docs_step.dependOn(&install_docs.step);
+
     const test_kernel = kernelArtifact(b, "kernel-test.elf", target, .Debug, true);
     // Both consumers must share one module instance.
     const qemu_exit = b.createModule(.{
