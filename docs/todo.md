@@ -48,11 +48,13 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 ### 2.1 Safe user-memory access
 - [ ] Implement `copyFromUser(dst, src, len)` and `copyToUser(dst, src, len)`; replace direct user-buffer dereferences in every syscall.
 - [ ] Validate canonical user addresses and use overflow-safe range checks.
+- [ ] Mark the user-copy routines so the page-fault handler can tell a fault inside them from a genuine kernel fault and resume at an error path (moved from 2.2; the next item needs it).
 - [ ] Handle faults inside user-copy routines by returning an error, not panicking.
 - [ ] Handle unmapped, partially mapped, read-only, and page-crossing buffers.
 - [ ] Enable SMEP when CPU-supported.
 - [ ] Enable SMAP when CPU-supported, using `stac`/`clac` only in controlled user-access sections.
 - [ ] Test null pointers, kernel pointers, overflow, invalid pages, and boundary crossings.
+- [ ] Test that SMEP and SMAP are really on: the kernel faults when it executes or touches user memory outside a user-access section (QEMU runs with `-cpu max`, which has both).
 
 **Done when:** Every syscall rejects invalid user addresses without crashing the kernel.
 
@@ -60,9 +62,10 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Allocate an independent double-fault emergency stack.
 - [ ] Configure the TSS IST entry and double-fault IDT gate.
 - [ ] Consider a separate NMI IST stack.
-- [ ] Distinguish faults in user mode from recoverable faults during kernel user-copy operations and genuine kernel faults.
-- [ ] Terminate the offending process for ordinary unrecoverable user faults.
-- [ ] Print vector, error code, RIP, RSP, and CR2 (for page faults) in fault diagnostics.
+- [x] Distinguish faults in user mode from kernel faults (`cs & 3` in `interruptHandler`). Recoverable faults during user copies: 2.1.
+- [x] Terminate the offending process for ordinary unrecoverable user faults (exit code 255; tested by `/test/kernel_read`, `/test/privileged` and `/test/write_text`).
+- [x] Print vector, error code, RIP, RSP, and CR2 (for page faults) in kernel fault diagnostics (checked by the `fault` scenario).
+- [ ] Print the same details for user faults; the message currently shows only the fault name and RIP.
 - [ ] Test deliberate user faults, kernel faults, and double-fault diagnostics.
 
 **Done when:** User faults terminate only their process, and emergency faults produce useful diagnostics where possible.
@@ -86,14 +89,17 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages.
 - [x] Roll back every allocated page and table on loading failure.
 - [x] Add malformed and truncated ELF tests.
+- [ ] Split ELF header/segment validation from page mapping so it runs in host tests, and fuzz it there.
 
 ### 2.5 Syscall and context-switch correctness
 - [ ] Audit `syscall` entry and exit assembly for register preservation and ABI stack alignment.
 - [ ] Validate return RIP/RSP and avoid unsafe `sysretq` for noncanonical or invalid return states.
 - [ ] Verify interrupt masking and preemption across syscall entry, blocking, and return.
 - [ ] Verify stack and address-space switches during timer interrupts and syscalls.
-- [ ] Document the userspace syscall ABI, argument registers, clobbers, and return conventions.
+- [ ] Define errno-style syscall error codes and return them from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig`. Do this before milestone 3 adds syscalls.
+- [ ] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions.
 - [ ] Test from ring 3 that syscalls preserve callee-saved registers and RFLAGS, keep the stack aligned, and survive preemption mid-syscall.
+- [ ] Test that each failure case in `/test/syscalls` returns its specific error code.
 
 ### 2.6 Memory-management correctness
 - [ ] Reject invalid, misaligned, and double page frees in the physical allocator.
@@ -112,9 +118,18 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Review ready/running/blocked/dead transitions and prevent duplicate queue insertion.
 - [ ] Make block/wake semantics race-safe, including wake-before-block.
 - [ ] Handle children that exit before the parent begins waiting.
+- [ ] Handle parents that exit before their children (reparent or auto-reap the orphans).
 - [ ] Reap each exited thread/process exactly once.
 - [ ] Close open descriptors and free all resources on process exit and failed spawn.
-- [ ] Stress-test repeated spawn/exit, wait, wakeup, and failure paths.
+- [ ] Stress-test repeated spawn/exit, wait, wakeup, orphaning, and failure paths.
+
+### 2.8 Synchronization and timers
+Moved up from 5.1: pipes, blocking I/O, sleep and interrupt-driven drivers in milestones 3 and 4 need these long before SMP does.
+- [ ] Add interrupt-aware spinlocks with interrupt-state restoration (on one CPU they only mask interrupts; 5.1 makes them SMP-safe).
+- [ ] Add wait queues and replace the single-`waiter` pointers (keyboard, process wait) with them.
+- [ ] Add mutexes for code that may block while holding a lock.
+- [ ] Add kernel timers: a timeout queue driven by the timer tick, for sleep, driver timeouts and later TCP.
+- [ ] Test several waiters on one queue, wake-before-block, timer ordering and expiry, and mutex hand-off under preemption.
 
 **Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources.
 
@@ -137,16 +152,24 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Add `stat`-like metadata queries.
 - [ ] Normalize paths and handle `.` and `..`.
 - [ ] Add mount-point traversal so multiple filesystems can coexist.
-- [ ] Define consistent VFS error codes.
+- [ ] Add create/write/truncate/unlink/mkdir operations to the VFS interface.
+- [ ] Add a small in-memory filesystem (ramfs) mounted at `/tmp`, so redirection (3.4) has somewhere to write and the write API is proven before FAT32 (4.5).
+- [ ] Define consistent VFS error codes that map onto the syscall error codes (2.5).
 - [ ] Test directory lookup, `readdir`, `stat`, `.`/`..` normalization, mount traversal and error codes (host tests with fake filesystems, plus initrd tests in QEMU).
+- [ ] Test ramfs create, write, read-back, truncate, unlink and out-of-memory on the host and from ring 3.
+- [ ] Run the tarfs parser in host tests and fuzz it with malformed archives.
 
 ### 3.3 Descriptors and I/O
 - [ ] Reserve FDs 0/1/2 for stdin/stdout/stderr.
 - [ ] Route console I/O through descriptor-backed devices.
+- [ ] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 3.4 depend on it.
+- [ ] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling.
 - [ ] Support generic open/read/write/close plus `seek` where applicable.
 - [ ] Define file-offset, ownership, and descriptor inheritance rules.
 - [ ] Add descriptor duplication and pipes.
+- [ ] Add a `poll`-style syscall to wait on several descriptors at once (needed by network servers in 6.3 and the compositor in 8.3).
 - [ ] Test EOF, partial I/O, invalid descriptors, and cleanup.
+- [ ] Test terminal line editing and `poll` (ready, blocking, and timeout cases) with input injected over serial.
 
 ### 3.4 Commands and shell features
 - [ ] Implement `echo`, `cat`, `ls`, `pwd`, `cd`, and `clear`.
@@ -165,8 +188,10 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Define generalized process waiting and exit-code handling.
 - [ ] Support Ctrl+C termination of foreground jobs.
 - [ ] Add monotonic timekeeping and a sleep syscall.
+- [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 4.5 and libc in 7 need it).
+- [ ] Start an `init` process that launches the shell, restarts it when it exits, and adopts orphans (2.7).
 - [ ] Implement a basic `ps` command.
-- [ ] Test map/unmap and out-of-memory from ring 3, PID and parent tracking, waiting on exited children, sleep accuracy, and Ctrl+C termination.
+- [ ] Test map/unmap and out-of-memory from ring 3, PID and parent tracking, waiting on exited children, sleep accuracy, Ctrl+C termination, wall-clock time, and the shell being restarted after `exit`.
 
 **Milestone 3 done when:** Commands such as `ls /bin`, `cat /etc/motd`, and `echo hello` work, and programs accept arguments.
 
@@ -180,11 +205,13 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Define a generic block-device interface for read/write/capacity/block size.
 - [ ] Add device registration and consistent I/O error reporting.
 - [ ] Validate LBA ranges, buffer sizes, and alignment.
-- [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, and error propagation.
+- [ ] Add a small block cache with explicit flush (FAT32 writes in 4.5 rely on it for flush ordering).
+- [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, error propagation, and cache hits, eviction and flush.
 
 ### 4.2 NVMe
 - [ ] Implement NVMe write operations.
 - [ ] Support multi-page transfers with PRP lists or another valid DMA mechanism.
+- [ ] Add PCI MSI/MSI-X support and switch NVMe from polling to interrupt-driven completion (legacy PCI interrupt routing would need an ACPI AML interpreter; the network driver in 6.1 reuses this).
 - [ ] Validate namespace geometry and bounds.
 - [ ] Handle command errors, timeouts, and controller failures.
 - [ ] Audit DMA allocation, synchronization, and queue handling.
@@ -229,9 +256,10 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 **Goal:** Safely use multiple CPU cores.
 
 ### 5.1 Synchronization
-- [ ] Add interrupt-aware spinlocks with interrupt-state restoration.
-- [ ] Audit existing `cli`/`sti` critical sections and replace unsafe pseudo-locking.
-- [ ] Add mutexes and reliable wait queues.
+The primitives themselves come from 2.8; this section makes them and their users safe on several CPUs.
+- [ ] Make the 2.8 spinlocks real locks (atomic acquire, not just interrupt masking).
+- [ ] Audit existing `cli`/`sti` critical sections and replace every one that assumes a single CPU.
+- [ ] Make mutexes and wait queues safe against wakeups from another CPU.
 - [ ] Define lock-ordering rules and test contention.
 
 ### 5.2 Per-CPU state
@@ -266,14 +294,16 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 
 ### 6.1 Network hardware
 - [ ] Define a generic network-device interface.
-- [ ] Implement an e1000e driver with TX/RX descriptor rings.
+- [ ] Choose the first network device: virtio-net is simpler than e1000e and its virtio groundwork is reusable for virtio-blk and virtio-gpu; e1000e matches real hardware.
+- [ ] Implement the driver with TX/RX rings, using MSI/MSI-X interrupts (4.2).
 - [ ] Handle RX interrupts and link state.
 - [ ] Send/receive Ethernet frames in QEMU networking tests.
 
 ### 6.2 Network protocols
 - [ ] Implement Ethernet frame parsing and ARP.
 - [ ] Implement IPv4 packets, validation, and checksums.
-- [ ] Add static IP/netmask/gateway configuration.
+- [ ] Add static IP/netmask/gateway configuration (QEMU user networking: 10.0.2.15/24, gateway 10.0.2.2).
+- [ ] Add a DHCP client.
 - [ ] Implement ICMP echo (ping).
 - [ ] Implement UDP.
 - [ ] Implement TCP handshake, data exchange, close, retransmission, and timeouts.
@@ -296,10 +326,11 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 **Goal:** Execute small statically linked C applications.
 
 ### 7.1 Define the ABI
-- [ ] Document syscall numbers, calling convention, errors, and register clobbers.
+- [ ] Extend the syscall ABI document from 2.5 with everything the libc port relies on.
+- [ ] Enable SSE (CR0/CR4), save and restore FPU/SSE state per thread on context switch, and build user programs with SSE; today kernel and user code are soft-float and compiled C code will not run.
 - [ ] Define userspace startup, initial stack, arguments, environment, and TLS.
 - [ ] Implement missing memory, file, time, and process syscalls needed by the selected libc.
-- [ ] Add ABI conformance tests.
+- [ ] Add ABI conformance tests, including floating-point registers surviving preemption between two processes.
 
 ### 7.2 Port libc and utilities
 - [ ] Select a small libc (e.g. musl) and implement an OS-specific syscall adapter.
@@ -337,7 +368,8 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Implement a basic userspace compositor/window manager.
 - [ ] Create/destroy windows and draw decorations.
 - [ ] Support movement, resizing, overlap, and focus.
-- [ ] Add IPC for graphical clients.
+- [ ] Add shared memory mappings between processes (moved from 9; window buffers need them).
+- [ ] Add IPC for graphical clients, with the compositor waiting on input and clients through `poll` (3.3).
 - [ ] Build a graphical terminal and minimal desktop/launcher.
 - [ ] Add a simple editor or file viewer.
 - [ ] Test window management and graphical IPC with scripted clients, checking framebuffer output.
@@ -352,18 +384,19 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] USB xHCI and USB HID devices.
 - [ ] Additional storage/network devices.
 - [ ] ACPI power management, shutdown, and reboot.
+- [ ] Run the QEMU test scenarios under UEFI (OVMF) as well; CI currently boots them with legacy BIOS only.
 - [ ] CPU feature discovery and more QEMU/real-hardware testing.
 
 ### Advanced processes and memory
 - [ ] Copy-on-write, demand paging, and file-backed mappings.
 - [ ] `fork`/`exec` semantics if desired.
-- [ ] Shared memory and multiple threads per process.
+- [ ] Multiple threads per process.
 - [ ] User/group permissions.
 
 ### Performance and observability
 - [ ] CPU and memory usage statistics.
 - [ ] Scheduler tracing and kernel profiling.
-- [ ] Filesystem cache and asynchronous I/O.
+- [ ] Asynchronous I/O and a larger, smarter filesystem cache.
 
 ---
 
