@@ -22,10 +22,12 @@ sudo pacman -S zig zls limine xorriso qemu-desktop edk2-ovmf gdb kcov
 ```
 
 Debian/Ubuntu (Zig and Limine are not packaged in the right versions; install
-Zig from ziglang.org and Limine with the script, as CI does):
+them with the scripts, as CI does):
 
 ```bash
 sudo apt install qemu-system-x86 xorriso ovmf gdb
+scripts/install-zig.sh ~/.local/zig              # checksum-verified 0.17.1
+export PATH=~/.local/zig:$PATH
 scripts/install-limine.sh ~/.local/limine        # checksum-verified 12.10.0
 export LIMINE=~/.local/limine PATH=~/.local/limine:$PATH
 scripts/install-kcov.sh ~/.local                 # optional, for coverage

@@ -101,6 +101,14 @@ hand with **simulate failure** enabled (Actions → CI → Run workflow, or
 `gh workflow run ci.yml -f simulate_failure=true`). The QEMU tests then fail
 on purpose after running, and each matrix job uploads `serial-logs-<mode>`.
 
-CI gets Limine from its release tarball (`scripts/install-limine.sh`, checksum
+CI installs Zig from ziglang.org (`scripts/install-zig.sh`, checksum verified)
+and gets Limine from its release tarball (`scripts/install-limine.sh`, checksum
 verified), kcov from source (`scripts/install-kcov.sh`), and the console font
 with `scripts/fetch-font.sh`.
+
+Each job caches the Zig toolchain (keyed on the Zig version) and its Zig build
+cache `.zig-cache` (keyed on job, build mode and a hash of the sources, falling
+back to the newest cache of the same job). The build cache is dropped once it
+passes 1 GiB, so it is rebuilt from scratch now and then. To change the Zig
+version, update both `ZIG_VERSION` in the workflow and the version and
+checksum in `scripts/install-zig.sh`.

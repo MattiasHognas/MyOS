@@ -14,7 +14,11 @@ permissions:
   contents: read
 
 env:
+  # Keep in sync with scripts/install-zig.sh (which pins the checksum).
   ZIG_VERSION: 0.17.1
+  # One Zig cache directory per job, saved and restored by actions/cache.
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
 jobs:
   build-and-test:
@@ -28,9 +32,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: mlugg/setup-zig@v2
+      - name: Cache Zig toolchain
+        uses: actions/cache@v6
         with:
-          version: ${{ env.ZIG_VERSION }}
+          path: ${{ runner.temp }}/zig
+          key: zig-toolchain-${{ runner.os }}-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        run: |
+          scripts/install-zig.sh "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Cache Zig build cache
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ matrix.optimize }}-${{ hashFiles('build.zig', 'src/**', 'app/**', 'tests/**') }}
+          restore-keys: |
+            zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ matrix.optimize }}-
 
       - name: Install QEMU and xorriso
         run: |
@@ -69,6 +88,14 @@ jobs:
           path: zig-out/test/*/serial*.log
           if-no-files-found: ignore
 
+      # The build cache only grows; start over once it passes 1 GiB.
+      - name: Limit Zig build cache size
+        if: always()
+        run: |
+          if [ -d .zig-cache ] && [ "$(du -sm .zig-cache | cut -f1)" -gt 1024 ]; then
+            rm -rf .zig-cache
+          fi
+
   coverage:
     name: Host test coverage
     runs-on: ubuntu-24.04
@@ -78,9 +105,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: mlugg/setup-zig@v2
+      - name: Cache Zig toolchain
+        uses: actions/cache@v6
         with:
-          version: ${{ env.ZIG_VERSION }}
+          path: ${{ runner.temp }}/zig
+          key: zig-toolchain-${{ runner.os }}-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        run: |
+          scripts/install-zig.sh "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Cache Zig build cache
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-coverage-${{ hashFiles('build.zig', 'src/**', 'app/**', 'tests/**') }}
+          restore-keys: |
+            zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-coverage-
 
       # Ubuntu 24.04 has no kcov package, so build a pinned release.
       - name: Install kcov
@@ -99,3 +141,11 @@ jobs:
         with:
           name: host-coverage
           path: zig-out/coverage
+
+      # The build cache only grows; start over once it passes 1 GiB.
+      - name: Limit Zig build cache size
+        if: always()
+        run: |
+          if [ -d .zig-cache ] && [ "$(du -sm .zig-cache | cut -f1)" -gt 1024 ]; then
+            rm -rf .zig-cache
+          fi
