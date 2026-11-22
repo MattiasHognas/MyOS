@@ -45,6 +45,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Add VS Code kernel debugging under QEMU (`.vscode/launch.json` "MyOS: Debug kernel (QEMU)" and "MyOS: Debug kernel + user programs (QEMU)" with CodeLLDB over QEMU's GDB server, including user programs, which keep debug info in Debug builds and are linked at distinct addresses; `docs/debugging.md`).
 - [x] Add symbolized kernel faults and backtraces (kernel `.symtab` via Limine, frame-pointer walk; tested by in-kernel tests and the `panic`/`fault` scenarios).
 - [x] Add log levels, subsystem assertions, and optional allocation diagnostics (`std.log` with `-Dlog-level`, `kernel/debug/assert.zig` with `-Dassertions`, heap stats and `-Dalloc-debug`).
+- [x] Release automatically: every push to `main` that passes all build-and-test jobs is tagged `v<major>.<minor>.<patch>` and published as a GitHub release with the bootable ISO, the kernel ELF and checksums (`release` job in `ci.yml`, `scripts/build.sh --release`, `scripts/next-version.sh` with its own test script; the boot banner shows the version and the `tests` scenario checks it). The patch number is automatic (`0.0.x`); to bump the minor or major number, edit the `VERSION` file.
 - [x] Track host-code coverage and explicit integration-test scenarios where practical (`zig build coverage` with kcov, uploaded by CI as `host-coverage`; QEMU scenarios `tests`, `panic`, `fault`).
 
 **Milestone 1 done when:** A clean checkout can automatically build and run regression tests, with clear failure reporting.

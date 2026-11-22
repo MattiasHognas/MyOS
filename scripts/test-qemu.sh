@@ -96,6 +96,7 @@ run_scenario() {
     case "$scenario" in
         tests)
             expect_status 1
+            expect_line '^MyOS [^ ]+ booting$' # the banner names the version ("dev" unless -Dversion)
             expect_line '^MYOS_TEST_PASS$'
             expect_line '^MYOS_TEST_SUMMARY passed=[1-9][0-9]* failed=0$'
             if grep -q '^\[FAIL\]' "$log"; then fail "failing test cases: $(grep '^\[FAIL\]' "$log" | tr '\n' ' ')"; fi

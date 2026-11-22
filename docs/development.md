@@ -142,7 +142,8 @@ the terminal.
 | `tests/kernel/` | In-kernel test suite, its kernel-side helpers, the crash scenarios and the QEMU fw_cfg reader |
 | `tests/user/` | Ring 3 test programs, packaged as `/test/<name>` in the test initrd |
 | `tests/support/` | QEMU exit device helper for the test kernel |
-| `scripts/` | Build, run, test, CI install scripts and the GDB setup |
+| `scripts/` | Build, run, test, release, CI install scripts and the GDB setup |
+| `VERSION` | `<major>.<minor>` of the next release (see [releases](#releases)) |
 | `linker.ld`, `limine.conf` | Kernel link layout (higher half at 0xffffffff80000000) and boot menu |
 | `.github/workflows/ci.yml` | CI (see [testing](testing.md#ci)) |
 
@@ -179,6 +180,35 @@ test image).
 2. Add a wrapper to `app/lib.zig` (the numbers must match).
 3. Test it from ring 3 in `tests/user/syscalls.zig`, and its pointer
    arguments in `tests/user/user_pointers.zig` (see [testing](testing.md)).
+
+### Releases
+
+Every push to `main` that passes all three build-and-test jobs is released
+automatically by the `release` job in `.github/workflows/ci.yml`. Nothing is
+tagged by hand.
+
+- **Version**: `<major>.<minor>.<patch>`. `<major>.<minor>` is the contents of
+  the `VERSION` file; `<patch>` is one more than the highest existing tag
+  `v<major>.<minor>.*`, starting at 0 (`scripts/next-version.sh`, tested by
+  `scripts/test-next-version.sh`).
+- **Automatic part**: the patch number. With `VERSION` at `0.0`, releases are
+  `0.0.0`, `0.0.1`, `0.0.2`, ... with no manual step.
+- **Bumping the minor or major number**: change the one line in `VERSION`
+  (for example from `0.0` to `0.1`) and push it to `main` like any other
+  change. That push is released as `0.1.0`, and the patch number counts up
+  from there. Versions below 1.0 are published as pre-releases.
+- **Contents**: `myos-<version>.iso` (BIOS and UEFI, built with
+  `-Doptimize=ReleaseSafe`), `myos-<version>-kernel.elf` (the same kernel
+  with symbols, for backtraces) and `SHA256SUMS`. The release notes list the
+  commits since the previous release.
+- **Version in the kernel**: `-Dversion=<v>` sets the name in the boot banner
+  (`MyOS <v> booting`); ordinary builds say `dev`.
+- **Locally**: `scripts/build.sh --release <version>` writes the same files to
+  `zig-out/release/`. It rebuilds `zig-out/bin` in ReleaseSafe mode, so run
+  `zig build` afterwards to get the Debug binaries back.
+- Pushes to other branches and pull requests run the tests but never release.
+  Re-running the workflow on a commit that already has a version tag does
+  nothing.
 
 ### Conventions
 

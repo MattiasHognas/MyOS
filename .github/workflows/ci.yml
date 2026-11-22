@@ -71,6 +71,10 @@ jobs:
       - name: Host unit tests
         run: zig build test-host --summary all
 
+      - name: Release version script tests
+        if: matrix.optimize == 'Debug'
+        run: scripts/test-next-version.sh
+
       - name: QEMU integration tests
         run: zig build test-qemu -Doptimize=${{ matrix.optimize }}
         env:
@@ -95,6 +99,104 @@ jobs:
           if [ -d .zig-cache ] && [ "$(du -sm .zig-cache | cut -f1)" -gt 1024 ]; then
             rm -rf .zig-cache
           fi
+
+  # Every push to main that passes all three build-and-test jobs becomes a
+  # GitHub release: tag v<major>.<minor>.<patch>, with the bootable ISO, the
+  # kernel ELF (symbols) and checksums attached. <major>.<minor> comes from
+  # the VERSION file, <patch> counts up automatically (scripts/next-version.sh).
+  release:
+    name: Release
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the tag and the release
+    # One release at a time, in push order, so version numbers never collide.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # all tags, to find the next version
+
+      - name: Choose version
+        id: version
+        run: |
+          if tag="$(git describe --tags --exact-match --match 'v*' 2>/dev/null)"; then
+            echo "This commit is already released as $tag; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            version="$(scripts/next-version.sh)"
+            echo "Releasing $version"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache Zig toolchain
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig
+          key: zig-toolchain-${{ runner.os }}-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          scripts/install-zig.sh "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Install xorriso
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xorriso
+
+      - name: Install Limine
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          scripts/install-limine.sh "$RUNNER_TEMP/limine"
+          echo "LIMINE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/limine" >> "$GITHUB_PATH"
+
+      - name: Fetch console font
+        if: steps.version.outputs.skip != 'true'
+        run: scripts/fetch-font.sh
+
+      - name: Build release image
+        if: steps.version.outputs.skip != 'true'
+        run: scripts/build.sh --release "${{ steps.version.outputs.version }}"
+
+      # Creating the release also creates the tag on this commit. Versions
+      # below 1.0 are marked as pre-releases.
+      - name: Publish GitHub release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          prerelease=()
+          if [[ "$VERSION" == 0.* ]]; then prerelease=(--prerelease); fi
+          {
+            echo "Bootable image of MyOS $VERSION (x86-64, BIOS and UEFI), built from ${GITHUB_SHA::7} after all tests passed."
+            echo
+            echo "Run it in QEMU:"
+            echo
+            echo '```'
+            echo "qemu-system-x86_64 -machine q35 -cpu max -m 256M -serial stdio -cdrom myos-$VERSION.iso"
+            echo '```'
+            echo
+            echo "\`myos-$VERSION-kernel.elf\` is the kernel with symbols, for symbolizing backtraces. Verify downloads with \`sha256sum -c SHA256SUMS\`."
+            echo
+            echo "The image includes the Limine bootloader and the default8x16 console font from the kbd project."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "v$VERSION" \
+            zig-out/release/myos-* zig-out/release/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "MyOS $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes \
+            "${prerelease[@]}"
 
   coverage:
     name: Host test coverage

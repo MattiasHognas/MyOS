@@ -235,7 +235,7 @@ export fn kmain() callconv(.c) noreturn {
 
     const fb = response(&fb_request);
     console.init(fb.framebuffers[0]);
-    print("MyOS booting\n", .{});
+    print("MyOS {s} booting\n", .{build_options.version});
 
     const mm = response(&memmap_request);
     const hhdm = response(&hhdm_request).offset;

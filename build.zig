@@ -38,6 +38,11 @@ pub fn build(b: *std.Build) void {
             "alloc-debug",
             "Log every kernel heap allocation and free (default: false)",
         ) orelse false,
+        .version = b.option(
+            []const u8,
+            "version",
+            "Version shown in the boot banner; set by release builds (default: dev)",
+        ) orelse "dev",
     };
 
     const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false, kopts);
@@ -173,6 +178,7 @@ const KernelOptions = struct {
     log_level: std.log.Level,
     assertions: bool,
     alloc_debug: bool,
+    version: []const u8,
 };
 
 fn kernelArtifact(
@@ -206,6 +212,7 @@ fn kernelArtifact(
     options.addOption(std.log.Level, "log_level", kopts.log_level);
     options.addOption(bool, "assertions", kopts.assertions);
     options.addOption(bool, "alloc_debug", kopts.alloc_debug);
+    options.addOption([]const u8, "version", kopts.version);
     kernel.root_module.addOptions("build_options", options);
     return kernel;
 }

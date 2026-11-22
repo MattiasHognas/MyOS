@@ -4,7 +4,11 @@ cd "$(dirname "$0")/.."  # run from the repository root
 
 # Normal build: compile and package os.iso/disk.img as before.
 # Test packaging: use prebuilt artifacts and keep all files under zig-out/test/.
+# Release: build an optimized kernel that reports <version> and write
+#   zig-out/release/myos-<version>.iso, myos-<version>-kernel.elf (with
+#   symbols, for symbolizing backtraces) and SHA256SUMS.
 mode="${1:-normal}"
+iso_name="os.iso"
 case "$mode" in
     normal)
         zig build
@@ -15,7 +19,16 @@ case "$mode" in
         out_dir="zig-out/test"
         kernel="zig-out/bin/kernel-test.elf"
         ;;
-    *) echo "Usage: $0 [--package-test]" >&2; exit 2 ;;
+    --release)
+        version="${2:?Usage: $0 --release <version>}"
+        # ReleaseSafe: optimized, with Zig's safety checks still on.
+        zig build -Doptimize=ReleaseSafe -Dversion="$version"
+        out_dir="zig-out/release"
+        kernel="zig-out/bin/kernel.elf"
+        iso_name="myos-$version.iso"
+        rm -rf "$out_dir"
+        ;;
+    *) echo "Usage: $0 [--package-test | --release <version>]" >&2; exit 2 ;;
 esac
 
 LIMINE="${LIMINE:-/usr/share/limine}"
@@ -53,5 +66,13 @@ xorriso -as mkisofs -R -r -J \
     -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
     -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
     -efi-boot-part --efi-boot-image --protective-msdos-label \
-    "$iso_root" -o "$out_dir/os.iso"
-limine bios-install "$out_dir/os.iso"
+    "$iso_root" -o "$out_dir/$iso_name"
+limine bios-install "$out_dir/$iso_name"
+
+if [[ "$mode" == --release ]]; then
+    cp "$kernel" "$out_dir/myos-$version-kernel.elf"
+    rm -rf "$iso_root" "$initrd" # only the release files stay in $out_dir
+    (cd "$out_dir" && sha256sum myos-* >SHA256SUMS)
+    echo "release files in $out_dir:"
+    ls -l "$out_dir"
+fi

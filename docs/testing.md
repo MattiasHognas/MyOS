@@ -102,6 +102,9 @@ cannot read the debug info of Zig's self-hosted x86 backend (used by
 - **Build and test** (Debug, ReleaseSafe, ReleaseFast): builds the kernel and
   apps, runs the host tests and all QEMU scenarios, builds the docs (Debug only),
   and uploads the serial logs if anything fails.
+- **Release** (pushes to `main` only, after all three build-and-test jobs
+  pass): tags the commit and publishes a GitHub release. See
+  [releases](development.md#releases).
 - **Host test coverage**: runs `zig build coverage` and uploads the report.
   Informational; it does not fail the workflow.
 
