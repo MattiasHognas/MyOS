@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Builds the OS, boots it paused in QEMU and attaches to QEMU's GDB
+      // server. See docs/debugging.md ("Debugging in VS Code").
+      "name": "MyOS: Debug kernel (QEMU)",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "MyOS: QEMU (wait for debugger)",
+      "postDebugTask": "MyOS: Stop QEMU (debug)",
+      "targetCreateCommands": [
+        "target create ${workspaceFolder}/zig-out/bin/kernel.elf"
+      ],
+      "processCreateCommands": [
+        "gdb-remote localhost:1234"
+      ],
+      // QEMU starts halted at the reset vector (-S); run on to the first
+      // breakpoint instead of stopping there.
+      "postRunCommands": [
+        "continue"
+      ]
+    }
+  ]
+}

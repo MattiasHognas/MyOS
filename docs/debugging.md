@@ -105,6 +105,32 @@ Notes:
 - To debug a user program, add its symbols: `add-symbol-file zig-out/bin/sh.elf`
   (user programs are linked at fixed addresses).
 
+## Debugging in VS Code
+
+The same QEMU GDB server works from the editor, with the CodeLLDB extension
+(`vadimcn.vscode-lldb`, in the workspace recommendations):
+
+1. Set breakpoints in the kernel sources.
+2. Run and Debug -> "MyOS: Debug kernel (QEMU)" (F5).
+
+This runs the task "MyOS: QEMU (wait for debugger)" (`scripts/build.sh`, then
+`scripts/run-qemu.sh --gdb --no-kvm`) and attaches LLDB to `localhost:1234`
+with the symbols of `zig-out/bin/kernel.elf`. The serial output is in the
+task's terminal.
+
+- QEMU starts halted at the reset vector (`0xfff0`); the launch configuration
+  continues from there automatically (`postRunCommands`). If you ever see a
+  "signal SIGTRAP" stop at `0xfff0` with `addb %al, (%rax)` disassembly, that
+  is this initial halt, not a fault: press Continue (F5).
+- Stopping the debug session also quits QEMU (the task "MyOS: Stop QEMU (debug)").
+- Step Over works everywhere except directly in `kmain`: it has no caller, so
+  LLDB steps into the call instead. Use Step Out to get back, or set a
+  breakpoint on the next line.
+- The task uses `--no-kvm` so that editor breakpoints work before the kernel is
+  loaded (see the notes above), so the OS runs slower than a normal run.
+- To debug a user program too, load its symbols in the Debug Console:
+  `target modules add zig-out/bin/sh.elf`.
+
 ## Other QEMU tools
 
 - `-d int,cpu_reset -D qemu.log` logs every interrupt and CPU reset, which helps

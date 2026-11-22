@@ -204,7 +204,9 @@ VS Code with the Zig extension and ZLS works out of the box
 the QEMU tests and all tests ("Run Test Task"); the test explorer runs single
 host tests through `zig build test-host -Dtest-filter=<name>`. "Debug Test"
 builds them with `zig build debug-test-host -Dtest-filter=<name>`, which puts the
-binary at `zig-out/bin/debug-unit-tests` for the debugger.
+binary at `zig-out/bin/debug-unit-tests` for the debugger. The launch
+configuration "MyOS: Debug kernel (QEMU)" boots the OS in QEMU under the
+debugger; see [debugging.md](debugging.md#debugging-in-vs-code).
 
 ## Troubleshooting
 

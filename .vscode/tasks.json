@@ -17,6 +17,36 @@
       "problemMatcher": []
     },
     {
+      // preLaunchTask of the "MyOS: Debug kernel (QEMU)" launch configuration.
+      // --no-kvm: under TCG, breakpoints set from the editor work before the
+      // kernel is loaded; under KVM only hardware breakpoints do.
+      "label": "MyOS: QEMU (wait for debugger)",
+      "type": "shell",
+      "command": "scripts/build.sh && scripts/run-qemu.sh --gdb --no-kvm -- -pidfile zig-out/qemu-debug.pid",
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": {
+          "regexp": "^__no_problems_reported__$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^__never__$",
+          "endsPattern": "QEMU is waiting for GDB"
+        }
+      }
+    },
+    {
+      // postDebugTask: QEMU runs with -no-shutdown, so it only pauses when the
+      // debugger kills the session and has to be stopped separately.
+      "label": "MyOS: Stop QEMU (debug)",
+      "type": "shell",
+      "command": "pkill -F zig-out/qemu-debug.pid qemu-system; true",
+      "presentation": {
+        "reveal": "never"
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "MyOS: All tests",
       "type": "shell",
       "command": "zig build test",
