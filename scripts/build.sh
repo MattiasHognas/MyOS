@@ -28,6 +28,14 @@ mkdir -p "$iso_root/boot/limine" "$iso_root/EFI/BOOT" "$initrd/bin" "$initrd/etc
 cp zig-out/bin/sh.elf "$initrd/bin/sh"
 cp zig-out/bin/hello.elf "$initrd/bin/hello"
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
+if [[ "$mode" == --package-test ]]; then
+    # User-mode test programs: zig-out/bin/test-<name>.elf -> /test/<name>
+    mkdir -p "$initrd/test"
+    for f in zig-out/bin/test-*.elf; do
+        name="$(basename "$f" .elf)"
+        cp "$f" "$initrd/test/${name#test-}"
+    done
+fi
 tar --format=ustar -cf "$iso_root/boot/initrd.tar" -C "$initrd" .
 
 # Limine config always refers to /boot/kernel.elf.

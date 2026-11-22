@@ -128,22 +128,27 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
     t[idx] = (phys & ADDR_MASK) | flags | PRESENT | (if (huge) HUGE else 0);
 }
 
-/// Translate `virt` in the address space whose PML4 is `root` to a physical
-/// address. Returns null if it is not mapped. Handles 2 MiB pages. Only reads
-/// the page tables, so it is safe to call from fault handlers.
-pub fn translate(root: u64, virt: u64) ?u64 {
+/// Return the leaf page-table entry (PT entry, or PD entry of a 2 MiB page)
+/// that maps `virt` in the address space whose PML4 is `root`, or null if
+/// `virt` is not mapped. Only reads the page tables, so it is safe to call
+/// from fault handlers.
+pub fn leafEntry(root: u64, virt: u64) ?u64 {
     var t = table(root);
     var level: u6 = 3;
     while (true) : (level -= 1) {
         const e = t[@intCast((virt >> (12 + 9 * level)) & 0x1FF)];
         if (e & PRESENT == 0) return null;
-        const page_bits: u6 = 12 + 9 * level;
-        if (level == 0 or (level == 1 and e & HUGE != 0)) {
-            const mask = (@as(u64, 1) << page_bits) - 1;
-            return ((e & ADDR_MASK) & ~mask) | (virt & mask);
-        }
+        if (level == 0 or (level == 1 and e & HUGE != 0)) return e;
         t = table(e & ADDR_MASK);
     }
+}
+
+/// Translate `virt` in the address space whose PML4 is `root` to a physical
+/// address. Returns null if it is not mapped. Handles 2 MiB pages.
+pub fn translate(root: u64, virt: u64) ?u64 {
+    const e = leafEntry(root, virt) orelse return null;
+    const mask: u64 = if (e & HUGE != 0) MIB2 - 1 else pmm.PAGE_SIZE - 1;
+    return ((e & ADDR_MASK) & ~mask) | (virt & mask);
 }
 
 /// Create a new address space and return the physical address of its PML4.

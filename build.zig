@@ -42,8 +42,19 @@ pub fn build(b: *std.Build) void {
 
     const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false, kopts);
     b.installArtifact(kernel);
-    userProgram(b, "hello", target, optimize);
-    userProgram(b, "sh", target, optimize);
+    _ = userProgram(b, "hello", "app/hello.zig", target, optimize);
+    _ = userProgram(b, "sh", "app/sh.zig", target, optimize);
+
+    // User-mode test programs, packaged into the test initrd as /test/<name>.
+    const user_lib = b.createModule(.{
+        .root_source_file = b.path("app/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inline for (.{ "syscalls", "kernel_read", "privileged", "write_text" }) |name| {
+        const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", target, optimize);
+        exe.root_module.addImport("lib", user_lib);
+    }
 
     // Generate API documentation. Autodoc uses `<artifact name>.zig` (or the
     // first file it sees) as the module root, so the docs come from a copy of
@@ -176,16 +187,18 @@ fn kernelArtifact(
     return kernel;
 }
 
+/// Build and install the user program `name`.elf from `root`.
 fn userProgram(
     b: *std.Build,
     name: []const u8,
+    root: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) void {
+) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = b.fmt("{s}.elf", .{name}),
         .root_module = b.createModule(.{
-            .root_source_file = b.path(b.fmt("app/{s}.zig", .{name})),
+            .root_source_file = b.path(root),
             .target = target,
             .optimize = optimize,
             .pic = false,
@@ -198,4 +211,5 @@ fn userProgram(
     exe.entry = .{ .symbol_name = "_start" };
     exe.setLinkerScript(b.path("app/linker.ld"));
     b.installArtifact(exe);
+    return exe;
 }

@@ -385,6 +385,137 @@ fn testAddressSpaceRoundtrip() bool {
     return pmm.free_pages == before;
 }
 
+/// The initrd image, kept so tests can mount other archives and restore it.
+var initrd_image: []const u8 = &.{};
+
+/// Shorthand for the test module's types.
+const KernelTests = if (build_options.is_test) @import("kernel_tests") else struct {
+    pub const ElfProbe = struct { entry: u64, pte: u64 };
+};
+
+/// Test callback: load the ELF `image` into a fresh address space, then report
+/// its entry point and the leaf page-table entry mapping `addr`, and copy the
+/// bytes at `addr` (up to the end of that page) into `out`. Returns null if
+/// loading fails. The address space is always destroyed again.
+fn testElfProbe(image: []const u8, addr: u64, out: []u8) ?KernelTests.ElfProbe {
+    const root = vmm.createAddressSpace();
+    defer vmm.destroyAddressSpace(root);
+    const entry = kernel.elf.load(root, image) catch return null;
+    const pte = vmm.leafEntry(root, addr) orelse 0;
+    if (vmm.translate(root, addr)) |phys| {
+        const n = @min(out.len, pmm.PAGE_SIZE - (addr % pmm.PAGE_SIZE));
+        @memcpy(out[0..n], pmm.physToVirt(phys)[0..n]);
+    }
+    return .{ .entry = entry, .pte = pte };
+}
+
+/// Test callback: `testElfProbe` on the file at `path`.
+fn testElfProbePath(path: []const u8, addr: u64, out: []u8) ?KernelTests.ElfProbe {
+    const node = vfs.lookup(path) orelse return null;
+    const image = heap.allocator.alloc(u8, node.size) catch return null;
+    defer heap.allocator.free(image);
+    if (vfs.read(&node, 0, image) != node.size) return null;
+    return testElfProbe(image, addr, out);
+}
+
+/// Test callback: return true if `process.spawn` rejects `image` and leaves
+/// physical memory and the heap exactly as they were (full rollback).
+fn testSpawnFailsCleanly(image: []const u8) bool {
+    const pages = pmm.free_pages;
+    const in_use = heap.stats().bytes_in_use;
+    _ = process.spawn("bad", image, null) catch
+        return pmm.free_pages == pages and heap.stats().bytes_in_use == in_use;
+    return false; // it started; the test fails (the process runs on its own)
+}
+
+/// Test callback: run the program at `path` as a child process of the current
+/// thread and wait for it. Returns its exit code (255 if it was killed by a
+/// fault), or null if it could not be started.
+fn testRunProgram(path: []const u8) ?u64 {
+    const me = thread.current();
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    _ = process.spawnPath(path, me) catch return null;
+    thread.block(); // until the child calls process.exit
+    return me.wake_value;
+}
+
+/// Test callback: bytes currently allocated from the kernel heap.
+fn testHeapInUse() usize {
+    return heap.stats().bytes_in_use;
+}
+
+// State shared by the scheduler test's worker threads.
+var sched_log: [8]u8 = undefined;
+var sched_len: usize = 0;
+var sched_done: usize = 0;
+var sched_waiter: ?*thread.Thread = null;
+
+/// Scheduler test worker: append `tag` to the log three times, yielding after
+/// each, then report completion. Interrupts stay off so only the explicit
+/// yields switch threads, which makes the interleaving deterministic.
+fn schedWorker(tag: u8) void {
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    for (0..3) |_| {
+        if (sched_len < sched_log.len) sched_log[sched_len] = tag;
+        sched_len += 1;
+        thread.yield();
+    }
+    sched_done += 1;
+    if (sched_done == 2) thread.wake(sched_waiter.?);
+}
+
+/// First scheduler test worker.
+fn schedWorkerA() void {
+    schedWorker('A');
+}
+
+/// Second scheduler test worker.
+fn schedWorkerB() void {
+    schedWorker('B');
+}
+
+/// Test callback: run two kernel threads that yield to each other and check
+/// that they alternate in FIFO order, that the waiting thread is woken when
+/// both are done, and that their stacks and thread structs are freed.
+fn testSchedulerRoundRobin() bool {
+    const in_use = heap.stats().bytes_in_use;
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    sched_len = 0;
+    sched_done = 0;
+    sched_waiter = thread.current();
+    const a = thread.spawn(schedWorkerA, null) catch return false;
+    const b = thread.spawn(schedWorkerB, null) catch return false;
+    if (b.id <= a.id or a.state != .ready) return false;
+    while (sched_done < 2) thread.block();
+    return sched_len == 6 and
+        std.mem.eql(u8, sched_log[0..6], "ABABAB") and
+        heap.stats().bytes_in_use == in_use; // both threads reaped
+}
+
+/// Test callback: a wake that arrives before `block` must make `block`
+/// return immediately (otherwise this test hangs and times out).
+fn testWakeBeforeBlock() bool {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const me = thread.current();
+    thread.wake(me);
+    if (!me.wake_pending or me.state != .running) return false;
+    thread.block();
+    return !me.wake_pending and me.state == .running;
+}
+
+/// Test callback: mount the tar archive `image`, read the file at `path` from
+/// `offset` into `buf`, then remount the initrd. Returns the bytes read, or
+/// null if the file is not found.
+fn testTarfsRead(image: []const u8, path: []const u8, offset: u64, buf: []u8) ?usize {
+    const fs = tarfs.init(image);
+    defer _ = tarfs.init(initrd_image);
+    const node = fs.lookup(fs.ctx, path) orelse return null;
+    return vfs.read(&node, offset, buf);
+}
+
 /// Test callback: return true if spawning a process from a non-ELF image fails.
 fn testInvalidElfRejected() bool {
     const invalid = "not an ELF";
@@ -505,6 +636,14 @@ fn runTestScenario() noreturn {
         .symbolize = testSymbolize,
         .capture_backtrace = testCaptureBacktrace,
         .fw_cfg_read = testFwCfgRead,
+        .elf_probe = testElfProbe,
+        .elf_probe_path = testElfProbePath,
+        .spawn_fails_cleanly = testSpawnFailsCleanly,
+        .run_program = testRunProgram,
+        .heap_in_use = testHeapInUse,
+        .scheduler_round_robin = testSchedulerRoundRobin,
+        .wake_before_block = testWakeBeforeBlock,
+        .tarfs_read = testTarfsRead,
     });
 }
 
@@ -548,8 +687,8 @@ export fn kmain() callconv(.c) noreturn {
 
     syscall.init();
 
-    const initrd = findModule("initrd.tar") orelse @panic("no initrd.tar module");
-    vfs.mountRoot(tarfs.init(initrd));
+    initrd_image = findModule("initrd.tar") orelse @panic("no initrd.tar module");
+    vfs.mountRoot(tarfs.init(initrd_image));
 
     // The test kernel runs an integration-test scenario instead of the shell.
     if (comptime build_options.is_test) runTestScenario();

@@ -81,7 +81,7 @@ fn read(node: *const vfs.Node, offset: u64, buf: []u8) usize {
     return n;
 }
 
-/// Use the tar archive `image` as the filesystem and print the files it contains.
+/// Use the tar archive `image` as the filesystem and log (at debug level) the files it contains.
 ///
 /// `image` is not copied and must stay valid for as long as the filesystem is
 /// used. Returns a `vfs.Fs` to pass to `vfs.mountRoot`.
@@ -89,7 +89,7 @@ pub fn init(image: []const u8) vfs.Fs {
     archive = image;
     var off: usize = 0;
     while (next(&off)) |e| {
-        if (isFile(e)) log.info("/{s} ({d} bytes)", .{ e.name, e.data.len });
+        if (isFile(e)) log.debug("/{s} ({d} bytes)", .{ e.name, e.data.len });
     }
     return .{ .ctx = undefined, .lookup = lookup };
 }

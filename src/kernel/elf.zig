@@ -26,6 +26,12 @@ fn r64(b: []const u8, o: usize) u64 {
     return std.mem.readInt(u64, b[o..][0..8], .little);
 }
 
+/// Return `a + b`, or null if the sum overflows.
+fn add(a: u64, b: u64) ?u64 {
+    const sum, const overflow = @addWithOverflow(a, b);
+    return if (overflow == 0) sum else null;
+}
+
 /// Load the ELF executable `image` into the address space `root` and return
 /// its entry point.
 ///
@@ -43,10 +49,13 @@ pub fn load(root: u64, image: []const u8) Error!u64 {
     const phentsize = r16(image, 54);
     const phnum = r16(image, 56);
 
+    if (phnum != 0 and phentsize < 56) return error.BadSegment; // entries would overlap
+
     for (0..phnum) |i| {
-        const off = phoff + i * phentsize;
-        if (off + 56 > image.len) return error.BadSegment;
-        const ph = image[off..][0..56];
+        // All arithmetic on values from the file is overflow checked.
+        const off = add(phoff, @as(u64, i) * phentsize) orelse return error.BadSegment;
+        if (off > image.len or image.len - off < 56) return error.BadSegment;
+        const ph = image[@intCast(off)..][0..56];
         if (r32(ph, 0) != 1) continue; // only PT_LOAD
 
         const flags = r32(ph, 4); // 1 = X, 2 = W, 4 = R
@@ -56,8 +65,10 @@ pub fn load(root: u64, image: []const u8) Error!u64 {
         const memsz = r64(ph, 40);
 
         // Never trust the file: everything must stay inside it and inside user space.
-        if (vaddr % pmm.PAGE_SIZE != 0 or filesz > memsz or file_off + filesz > image.len or
-            vaddr + memsz < vaddr or vaddr + memsz > vmm.USER_END) return error.BadSegment;
+        const file_end = add(file_off, filesz) orelse return error.BadSegment;
+        const mem_end = add(vaddr, memsz) orelse return error.BadSegment;
+        if (vaddr % pmm.PAGE_SIZE != 0 or filesz > memsz or file_end > image.len or
+            mem_end > vmm.USER_END) return error.BadSegment;
 
         var pte: u64 = vmm.USER;
         if (flags & 2 != 0) pte |= vmm.WRITABLE;

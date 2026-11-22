@@ -6,7 +6,7 @@ change or add a subsystem.
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
 | Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF symbol lookup, log formatting), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, VFS on the initrd, symbolization, fw_cfg. |
+| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, scheduler and processes, syscalls from ring 3, tarfs, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests and all QEMU scenarios. Add
@@ -56,6 +56,20 @@ test:
    callback in `src/main.zig`, and pass it in `runTestScenario`.
 2. Write `fn myTest(api: Api) TestError!void` using `check(...)`.
 3. Add it to the `cases` list in `run`.
+
+## User-mode test programs
+
+Programs in `tests/user/` run in ring 3 and test the kernel from the outside
+(syscall validation, user/kernel isolation). The build installs each as
+`zig-out/bin/test-<name>.elf`, and `scripts/build.sh --package-test` puts them
+in the test initrd as `/test/<name>`. In-kernel tests run them with
+`api.run_program("/test/<name>")`, which returns the exit code (255 if the
+kernel killed the process for a fault).
+
+To add one: create `tests/user/<name>.zig` (import the runtime with
+`@import("lib")`, export `_start`), add `<name>` to the list in `build.zig`,
+and call it from a test in `tests/kernel/main.zig`. Report failures through
+the exit code, e.g. the number of the first failing check.
 
 ## Adding host tests
 

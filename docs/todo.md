@@ -6,9 +6,9 @@ A dependency-ordered roadmap for building a small x86-64 operating system in Zig
 
 Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/TSS, physical and virtual memory management, kernel heap, APIC timer, preemptive threading, ring 3, syscalls, ELF64 loading, basic processes, read-only tarfs/VFS, PCI, basic NVMe reads, PS/2 keyboard, and a userspace shell.
 
-## 1. Tests, debugging, and CI (ongoing)
+## 1. Tests, debugging, and CI
 
-**Goal:** Every subsystem has automated tests; establish the test harness before changing critical kernel code, then expand it alongside every subsequent milestone.
+**Goal:** Establish the test harness, CI and baseline test suites for the existing kernel before changing critical code. From milestone 2 on, every section lists its own test items: a feature is done when its tests are (see `docs/testing.md` for where tests go).
 
 ### 1.1 Test infrastructure
 - [x] Separate hardware-independent code for host-side Zig unit tests.
@@ -17,21 +17,15 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [x] Write a script to build, boot QEMU, capture serial output, assert results, and enforce timeouts.
 - [x] Save relevant logs and failure diagnostics.
 
-### 1.2 Test suites
+### 1.2 Baseline test suites
+Tests for the kernel as it existed at milestone 1. Tests for unfinished functionality live with that functionality (noted below).
 - [x] Test physical memory allocation and basic accounting.
 - [x] Test kernel heap allocation and memory read/write.
-- [ ] Test virtual memory mapping, permissions, unmapping, and exhaustion.
-  - [x] Test address-space creation and destruction.
-  - [x] Test page mapping and translation (`vmm.translate`), including unmapped neighbours.
-- [ ] Test ELF parsing, failed loading, and rollback.
-  - [x] Test rejection of invalid ELF magic.
-- [ ] Test valid/invalid syscall buffers and kernel/user isolation.
-- [ ] Test scheduler transitions, process lifecycle, waits, and cleanup.
-- [ ] Test VFS and filesystem behavior; later add storage write tests.
-  - [x] Test VFS lookup, file contents, offsets, and EOF.
-  - [x] Test VFS using an injected fake filesystem.
-  - [ ] Test malformed filesystem data and boundary conditions.
-  - [ ] Add storage write tests when NVMe writes are implemented.
+- [x] Test virtual memory mapping and permissions (address-space create/destroy, map and translate, user/writable/NX bits from ELF segment flags). Unmapping and exhaustion tests: 2.6.
+- [x] Test ELF parsing, failed loading, and rollback (valid image contents and `.bss`, 14 malformed/truncated images, no leaked pages, spawn rollback after partial loads).
+- [x] Test valid/invalid syscall buffers and kernel/user isolation (`/test/syscalls` checks 37 cases from ring 3; reading kernel memory, `cli` and writing own code kill only the process). Unmapped user buffers are covered by 2.1.
+- [x] Test scheduler transitions, process lifecycle, waits, and cleanup (FIFO round robin, wake-before-block, exit codes, no page/heap leaks after normal and crashed processes).
+- [x] Test VFS and filesystem behavior (lookup, contents, offsets and EOF on the initrd; an injected fake filesystem on the host; malformed tarfs archives and boundary conditions). Storage write tests: 4.2.
 
 ### 1.3 CI and debugging
 - [x] Add GitHub Actions kernel/app builds (`.github/workflows/ci.yml`; pinned Zig, checksum-verified Limine and font).
@@ -44,10 +38,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [x] Add QEMU/GDB debugging instructions (`docs/debugging.md`, `scripts/run-qemu.sh --gdb`, `scripts/kernel.gdb`).
 - [x] Add symbolized kernel faults and backtraces (kernel `.symtab` via Limine, frame-pointer walk; tested by in-kernel tests and the `panic`/`fault` scenarios).
 - [x] Add log levels, subsystem assertions, and optional allocation diagnostics (`std.log` with `-Dlog-level`, `kernel/debug/assert.zig` with `-Dassertions`, heap stats and `-Dalloc-debug`).
-- [ ] Track host-code coverage and explicit integration-test scenarios where practical.
-  - [x] Explicit QEMU scenarios (`tests`, `panic`, `fault`) selected via fw_cfg; documented in `docs/testing.md`.
-  - [x] `zig build coverage` (kcov) and an informational CI coverage job.
-  - [ ] Confirm a coverage report is produced in CI (kcov is built from source by `scripts/install-kcov.sh`, since Ubuntu 24.04 has no kcov package).
+- [x] Track host-code coverage and explicit integration-test scenarios where practical (`zig build coverage` with kcov, uploaded by CI as `host-coverage`; QEMU scenarios `tests`, `panic`, `fault`).
 
 **Milestone 1 done when:** A clean checkout can automatically build and run regression tests, with clear failure reporting.
 
@@ -89,15 +80,15 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 
 ### 2.4 Harden ELF loading
 - [ ] Validate ELF class, endianness, machine type, type, version, and header sizes.
-- [ ] Validate program-header offset, count, entry size, and full table bounds.
-- [ ] Use overflow-safe arithmetic for file offsets, address ranges, and segment sizes.
+- [x] Validate program-header offset, count, entry size, and full table bounds.
+- [x] Use overflow-safe arithmetic for file offsets, address ranges, and segment sizes.
 - [ ] Validate segment alignment and enforce user-only mapping ranges.
 - [ ] Reject overlapping or conflicting load segments unless intentionally supported.
 - [ ] Prevent mapping page zero and reserved user regions.
 - [ ] Verify the entry point is inside an executable loaded segment.
 - [ ] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages.
-- [ ] Roll back every allocated page and table on loading failure.
-- [ ] Add malformed and truncated ELF tests.
+- [x] Roll back every allocated page and table on loading failure.
+- [x] Add malformed and truncated ELF tests.
 
 ### 2.5 Syscall and context-switch correctness
 - [ ] Audit `syscall` entry and exit assembly for register preservation and ABI stack alignment.
@@ -105,6 +96,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Verify interrupt masking and preemption across syscall entry, blocking, and return.
 - [ ] Verify stack and address-space switches during timer interrupts and syscalls.
 - [ ] Document the userspace syscall ABI, argument registers, clobbers, and return conventions.
+- [ ] Test from ring 3 that syscalls preserve callee-saved registers and RFLAGS, keep the stack aligned, and survive preemption mid-syscall.
 
 ### 2.6 Memory-management correctness
 - [ ] Reject invalid, misaligned, and double page frees in the physical allocator.
@@ -114,6 +106,8 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Handle page-table allocation failure without a partially corrupted mapping.
 - [ ] Free all user mappings and page tables on process teardown.
 - [ ] Test memory exhaustion, mapping conflicts, repeated allocation/free, and failed allocations.
+- [ ] Test unmapping: the translation disappears, freed pages and empty page tables return to the PMM, and a stale TLB entry is never used (moved from 1.2).
+- [ ] Test mapping exhaustion: `map` reports out-of-memory when page tables can't be allocated and leaves existing mappings intact (moved from 1.2).
 
 ### 2.7 Process and scheduler lifecycle
 - [ ] Define ownership rules for processes, threads, stacks, page tables, and open files.
@@ -147,6 +141,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Normalize paths and handle `.` and `..`.
 - [ ] Add mount-point traversal so multiple filesystems can coexist.
 - [ ] Define consistent VFS error codes.
+- [ ] Test directory lookup, `readdir`, `stat`, `.`/`..` normalization, mount traversal and error codes (host tests with fake filesystems, plus initrd tests in QEMU).
 
 ### 3.3 Descriptors and I/O
 - [ ] Reserve FDs 0/1/2 for stdin/stdout/stderr.
@@ -163,6 +158,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Implement basic input/output redirection once descriptors are ready.
 - [ ] Implement pipelines once pipes are available.
 - [ ] Add `mkdir` and removal commands after writable filesystems exist.
+- [ ] Test commands, paths, redirection and pipelines with scripted shell sessions in QEMU (input via serial, output checked in the log).
 
 ### 3.5 User memory and process control
 - [ ] Define user virtual-memory regions.
@@ -173,6 +169,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Support Ctrl+C termination of foreground jobs.
 - [ ] Add monotonic timekeeping and a sleep syscall.
 - [ ] Implement a basic `ps` command.
+- [ ] Test map/unmap and out-of-memory from ring 3, PID and parent tracking, waiting on exited children, sleep accuracy, and Ctrl+C termination.
 
 **Milestone 3 done when:** Commands such as `ls /bin`, `cat /etc/motd`, and `echo hello` work, and programs accept arguments.
 
@@ -186,6 +183,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Define a generic block-device interface for read/write/capacity/block size.
 - [ ] Add device registration and consistent I/O error reporting.
 - [ ] Validate LBA ranges, buffer sizes, and alignment.
+- [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, and error propagation.
 
 ### 4.2 NVMe
 - [ ] Implement NVMe write operations.
@@ -193,7 +191,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Validate namespace geometry and bounds.
 - [ ] Handle command errors, timeouts, and controller failures.
 - [ ] Audit DMA allocation, synchronization, and queue handling.
-- [ ] Test repeated and boundary-crossing reads/writes using disposable images.
+- [ ] Test repeated and boundary-crossing reads/writes using disposable images, including write-then-read-back and persistence across a reboot (storage write tests, moved from 1.2).
 
 ### 4.3 Partition discovery
 - [ ] Parse GPT headers and partition entries.
@@ -209,6 +207,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Support 8.3 names, then long filename entries.
 - [ ] Detect invalid clusters, loops, and malformed metadata.
 - [ ] Mount FAT32 through the VFS.
+- [ ] Test reads against generated fixture images (4.6), including corrupted boot sectors, cluster loops and bad directory entries.
 
 ### 4.5 FAT32 write support
 - [ ] Allocate/free clusters safely.
@@ -243,6 +242,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Move current-thread, scheduler, syscall-stack, and interrupt state to per-CPU storage.
 - [ ] Configure GS-based CPU-local addressing and correct `swapgs` transitions.
 - [ ] Initialize separate GDT/TSS and guarded stacks for each CPU.
+- [ ] Test per-CPU state and `swapgs` transitions (syscalls, interrupts from ring 0 and ring 3) with one and several CPUs.
 
 ### 5.3 Bring up application processors
 - [ ] Request SMP information through Limine.
@@ -282,6 +282,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Implement TCP handshake, data exchange, close, retransmission, and timeouts.
 - [ ] Implement packet buffers and basic flow control.
 - [ ] Add DNS resolution.
+- [ ] Test protocol parsing, checksums and state machines on the host with recorded and malformed packets.
 
 ### 6.3 Sockets and programs
 - [ ] Define socket create/bind/listen/accept/connect/send/receive/close syscalls.
@@ -311,6 +312,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Compile and run statically linked C hello-world.
 - [ ] Port a few small command-line utilities.
 - [ ] Consider dynamic linking later; do not require it for initial success.
+- [ ] Run the C programs and utilities as QEMU tests and check their output.
 
 **Milestone 7 done when:** A statically linked C program runs without the custom Zig userspace runtime.
 
@@ -325,12 +327,14 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Implement pixel, rectangle, image, and text rendering.
 - [ ] Add back-buffering and a display update mechanism.
 - [ ] Implement a basic software renderer.
+- [ ] Test rendering on the host against reference images.
 
 ### 8.2 Input
 - [ ] Expose generic keyboard and pointer events to userspace.
 - [ ] Add mouse support (PS/2 or USB).
 - [ ] Track pointer coordinates and button states.
 - [ ] Implement focus and event routing.
+- [ ] Test event delivery and focus with injected input events.
 
 ### 8.3 Window system
 - [ ] Implement a basic userspace compositor/window manager.
@@ -339,6 +343,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 - [ ] Add IPC for graphical clients.
 - [ ] Build a graphical terminal and minimal desktop/launcher.
 - [ ] Add a simple editor or file viewer.
+- [ ] Test window management and graphical IPC with scripted clients, checking framebuffer output.
 
 **Milestone 8 done when:** Multiple user applications can display and interact through windows.
 
@@ -367,7 +372,7 @@ Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/
 
 ## Development rules
 
-- Establish **milestone 1 (tests and CI)** first, then keep expanding the test suites alongside all later milestones.
+- Establish **milestone 1 (tests and CI)** first; after that, every section carries its own test items and is not done until they are.
 - Deliver small, independently testable changes.
 - Add regression tests alongside every subsystem or critical fix.
 - Keep x86-64-specific implementation separate from architecture-neutral interfaces.
