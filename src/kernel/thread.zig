@@ -5,9 +5,13 @@
 //! preempt a thread once its time slice runs out. Exited threads are parked on
 //! a zombie list and freed by the next thread that runs, since a thread cannot
 //! free the stack it is still running on.
+//!
+//! Every thread runs on a guarded kernel stack from `kstack.zig`, including
+//! the boot thread once `adoptBootStack` has been called.
 
 const root = @import("root");
 const heap = @import("heap.zig");
+const kstack = @import("kstack.zig");
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
@@ -19,7 +23,6 @@ const Process = proc.Process; // the struct: for fields and parameters
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;
-const STACK_SIZE = 16 * 1024;
 
 var boot_thread: Thread = .{ .id = 0, .stack = null, .state = .running };
 var current_thread: *Thread = &boot_thread;
@@ -52,13 +55,14 @@ fn dequeue() ?*Thread {
 }
 
 /// Free every thread on the zombie list, together with its process (if any)
-/// and its stack. Called after a context switch, when the dead threads are
+/// and its stack, after recording how much of the stack it used. Called after a context switch, when the dead threads are
 /// guaranteed not to be running.
 fn reap() void {
     while (zombies) |z| {
         zombies = z.next;
         if (z.process) |p| proc.destroy(p);
-        heap.allocator.free(z.stack.?);
+        if (kstack.used(z.stack.?)) |bytes| kstack.record(z.id, bytes); // -Dstack-usage
+        kstack.free(z.stack.?);
         heap.allocator.destroy(z);
     }
 }
@@ -81,7 +85,8 @@ pub const Thread = struct {
     id: usize,
     /// Saved stack pointer while the thread is not running.
     rsp: usize = 0,
-    /// Kernel stack, owned by the thread. Null only for the boot thread.
+    /// Kernel stack (from `kstack`), owned by the thread. Null only for the
+    /// boot thread until `adoptBootStack`.
     stack: ?[]u8,
     state: State,
     /// Link in the ready queue or the zombie list.
@@ -123,12 +128,13 @@ pub fn wake(t: *Thread) void {
 /// Create a thread that runs `entry` and put it in the ready queue.
 ///
 /// `process` is the user process the thread belongs to, or null for a kernel
-/// thread. The thread gets a 16 KiB kernel stack from the heap; when `entry`
-/// returns the thread exits. Returns `error.OutOfMemory` if the allocation fails.
+/// thread. The thread gets a guarded kernel stack from `kstack`; when `entry`
+/// returns the thread exits. Returns `error.OutOfMemory` if an allocation
+/// fails or all kernel stacks are in use.
 pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
     const t = try heap.allocator.create(Thread);
     errdefer heap.allocator.destroy(t);
-    const stack = try heap.allocator.alloc(u8, STACK_SIZE);
+    const stack = kstack.alloc() orelse return error.OutOfMemory;
 
     t.* = .{
         .id = next_id,
@@ -144,6 +150,14 @@ pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
     next_id += 1;
     enqueue(t);
     return t;
+}
+
+/// Record `stack` as the boot thread's kernel stack. Called once by `kmain`
+/// right before it moves off the bootloader's stack, so that the boot thread
+/// has a guard page like every other thread and fault reports know its stack.
+pub fn adoptBootStack(stack: []u8) void {
+    assert.check(.thread, current_thread == &boot_thread and boot_thread.stack == null, "adoptBootStack called twice or too late", .{});
+    boot_thread.stack = stack;
 }
 
 /// Switch to the next ready thread, if there is one.
@@ -200,6 +214,17 @@ pub fn exit() noreturn {
     zombies = current_thread;
     yield();
     root.halt();
+}
+
+/// Record how much of its kernel stack the current thread has used so far
+/// (see `kstack.record`) and return it; null if usage is not measured or the
+/// thread has no stack of its own yet. Exited threads are recorded when they
+/// are reaped; this is for threads that never exit, like the boot thread.
+pub fn recordStackUsage() ?usize {
+    const stack = current_thread.stack orelse return null;
+    const bytes = kstack.used(stack) orelse return null;
+    kstack.record(current_thread.id, bytes);
+    return bytes;
 }
 
 /// Return the thread that is currently running.

@@ -18,6 +18,7 @@ Choose how much is printed at build time:
 | --- | --- |
 | `-Dlog-level=err\|warn\|info\|debug` | Messages above the level are compiled out. Default: `debug` for Debug builds, `info` otherwise. |
 | `-Dalloc-debug=true` | Log every kernel heap allocation and free (`debug(heap): ...`). Needs `-Dlog-level=debug`. |
+| `-Dstack-usage=true\|false` | Measure how much of each kernel stack gets used and warn (`warn(kstack): thread N used ...`) when a thread went past 12 of its 16 KiB. Default: on in Debug builds, off otherwise. |
 | `-Dassertions=false` | Compile out the subsystem assertions (`kernel/debug/assert.zig`). Default: on, in every build mode. |
 
 In code, use a scoped logger: `const log = std.log.scoped(.my_subsystem);`,
@@ -35,7 +36,7 @@ backtrace:
   #0 0xffffffff800112ea main.scenarioPanicInner+0x4a
   #1 0xffffffff8001115e main.scenarioPanic+0xe
   #2 0xffffffff80000666 main.run+0x106
-  #3 0xffffffff80000480 kmain+0x3e0
+  #3 0xffffffff80000480 kmainOnStack+0x2f0
 ```
 
 ```
@@ -66,14 +67,45 @@ stack (as are NMIs), with the stack of the thread that was running:
 RIP=0xffffffff8001d0b3 CS=0x8 RFLAGS=0x86
 RSP=0xffffb00000001000 RAX=0x286 RBX=0xffffffff8001d0a0
 CR2=0xffffb00000000ff8 (last page-fault address)
-thread 1 kernel stack 0xffff900000000040-0xffff900000004040; RSP is outside it: corrupt stack pointer
+thread 1 kernel stack 0xffffc00000006000-0xffffc0000000a000; RSP is outside it: corrupt stack pointer
 backtrace:
   #0 0xffffffff8001d0b3 helpers.doubleFaultThread+0x13
 ```
 
-RSP just below the thread's stack reads "stack overflow" instead. Until
-kernel stacks have guard pages (todo 2.3), an overflow runs into heap memory
-and does not fault at all.
+A kernel stack overflow shows up the same way. Every kernel stack has an
+unmapped guard page below it (`kernel/kstack.zig`); the fault on that page
+cannot be delivered on the full stack, so it becomes a double fault:
+
+```
+*** Double fault (vector 8, error 0x0)
+RIP=0xffffffff8001fddb CS=0x8 RFLAGS=0x86
+RSP=0xffffc00000005fa0 RAX=0x0 RBX=0xffffffff8001fd70
+CR2=0xffffc00000005f98 (last page-fault address)
+CR2 is in a kernel stack guard page: kernel stack overflow
+thread 1 kernel stack 0xffffc00000006000-0xffffc0000000a000; RSP is below it: stack overflow
+backtrace:
+  #0 0xffffffff8001fddb helpers.recurseForever+0xb
+  #1 0xffffffff8001fee5 helpers.recurseForever+0x115
+```
+
+The backtrace shows what used the stack up. No frame is large enough to step
+over the guard page: the build checks that (see
+[stack frame check](testing.md#stack-frame-check)).
+
+To see how close the stacks are to that, build with `-Dstack-usage` (the
+default in Debug builds). New stacks are then filled with a pattern, and when
+a thread exits the kernel looks for the lowest word that was overwritten. A
+thread that used more than three quarters of its stack gets a warning:
+
+```
+warn(kstack): thread 7 used 12840 of 16384 bytes of its kernel stack
+```
+
+The boot thread, which never exits, logs its usage once at the end of boot
+(`debug(boot): boot used ...`).
+
+Panic and assertion messages are cut off after 256 bytes, since they are
+formatted on the stack.
 
 How it works: the kernel is built with frame pointers, `kernel/debug/backtrace.zig`
 walks the RBP chain (checking each frame against the page tables first), and

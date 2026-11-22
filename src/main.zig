@@ -48,6 +48,7 @@ pub const kernel = struct {
     pub const console = @import("kernel/console.zig");
     pub const elf = @import("kernel/elf.zig");
     pub const heap = @import("kernel/heap.zig");
+    pub const kstack = @import("kernel/kstack.zig");
     pub const pmm = @import("kernel/pmm.zig");
     pub const process = @import("kernel/process.zig");
     pub const syscall = @import("kernel/syscall.zig");
@@ -61,6 +62,7 @@ pub const kernel = struct {
         pub const assert = @import("kernel/debug/assert.zig");
         pub const backtrace = @import("kernel/debug/backtrace.zig");
         pub const log_format = @import("kernel/debug/log_format.zig");
+        pub const panic = @import("kernel/debug/panic.zig");
         pub const symbols = @import("kernel/debug/symbols.zig");
     };
 
@@ -79,6 +81,7 @@ const idt = arch.x86_64.idt;
 const pmm = kernel.pmm;
 const vmm = arch.x86_64.vmm;
 const heap = kernel.heap;
+const kstack = kernel.kstack;
 const acpi = firmware.acpi;
 const apic = arch.x86_64.apic;
 const cpu = arch.x86_64.cpu;
@@ -121,7 +124,9 @@ export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
 export var exec_file_request linksection(".limine_requests") = limine.ExecutableFileRequest{};
 
 /// Kernel panic handler, used for `@panic` and safety checks anywhere in the kernel.
-pub const panic = std.debug.FullPanic(kernelPanic);
+/// Messages are formatted in a small buffer (`kernel/debug/panic.zig`), not
+/// the 4 KiB one of `std.debug.FullPanic`, to keep stack frames small.
+pub const panic = kernel.debug.panic.Handler(kernelPanic);
 
 /// Return the contents of the first boot module whose path ends with `name`,
 /// or null if there is none. Panics if Limine did not answer the module request.
@@ -223,11 +228,10 @@ pub fn halt() noreturn {
     while (true) asm volatile ("cli; hlt");
 }
 
-/// Kernel entry point, jumped to by Limine.
+/// Kernel entry point, jumped to by Limine on the bootloader's stack.
 ///
-/// Initializes the subsystems in dependency order, mounts the initrd as the
-/// root filesystem, then either runs the kernel test suite (test builds) or
-/// starts `/bin/sh` and becomes the idle thread. Never returns.
+/// Brings up the CPU tables, the console and memory management, then moves
+/// to a guarded kernel stack and continues in `kmainOnStack`. Never returns.
 export fn kmain() callconv(.c) noreturn {
     serial.init();
     gdt.init();
@@ -243,6 +247,20 @@ export fn kmain() callconv(.c) noreturn {
     vmm.init(mm, response(&kaddr_request), hhdm);
     arch.x86_64.usercopy.init(); // SMEP/SMAP: from here on, user memory only through kernel.uaccess
     log.info("memory: {d} MiB free", .{pmm.free_pages * pmm.PAGE_SIZE / (1024 * 1024)});
+
+    // The bootloader's stack has no guard page; leave it as early as possible.
+    const stack = kstack.alloc() orelse @panic("no memory for the boot thread's stack");
+    thread.adoptBootStack(stack);
+    context.runOnStack(@intFromPtr(stack.ptr) + stack.len, &kmainOnStack);
+}
+
+/// Second half of boot, on the boot thread's own kernel stack.
+///
+/// Initializes the remaining subsystems in dependency order, mounts the
+/// initrd as the root filesystem, then either runs the kernel test suite
+/// (test builds) or starts `/bin/sh` and becomes the idle thread. Never returns.
+fn kmainOnStack() callconv(.c) noreturn {
+    const hhdm = response(&hhdm_request).offset;
 
     const exec_file: *volatile @TypeOf(exec_file_request) = &exec_file_request;
     if (exec_file.response) |r| {
@@ -277,5 +295,6 @@ export fn kmain() callconv(.c) noreturn {
     keyboard.init();
     _ = process.spawnPath("/bin/sh", null) catch |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
     print("Boot complete.\n", .{});
+    if (thread.recordStackUsage()) |bytes| log.debug("boot used {d} of {d} bytes of kernel stack", .{ bytes, kstack.STACK_SIZE });
     idle();
 }

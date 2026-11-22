@@ -13,6 +13,8 @@
 #   smep   execute user memory from the kernel; must page-fault
 #   double_fault  fault with an unusable kernel stack; must print a
 #          double-fault report instead of triple-faulting
+#   stack_overflow  recurse until a kernel stack is used up; must hit the
+#          guard page and be reported as a kernel stack overflow
 #
 # Logs: zig-out/test/<scenario>/serial.log (raw) and serial-clean.log.
 #
@@ -102,6 +104,10 @@ run_scenario() {
             expect_line '^MYOS_TEST_PASS$'
             expect_line '^MYOS_TEST_SUMMARY passed=[1-9][0-9]* failed=0$'
             if grep -q '^\[FAIL\]' "$log"; then fail "failing test cases: $(grep '^\[FAIL\]' "$log" | tr '\n' ' ')"; fi
+            # The deepest kernel stack use of the run is reported and under the warning level.
+            expect_line '^MYOS_STACK_PEAK bytes=[1-9][0-9]* of=16384 limit=12288$'
+            expect_line '^\[PASS\] kernel stack usage below the warning level$'
+            if grep -q 'of its kernel stack' "$log"; then fail "a thread came close to filling its kernel stack: $(grep 'of its kernel stack' "$log" | tr '\n' ' ')"; fi
             # User-fault diagnostics: process, fault, vector, error code, then RIP/RSP, and CR2 for page faults.
             expect_line '^\*\*\* thread [0-9]+ \(/test/kernel_read\): Page fault in user mode \(vector 14, error 0x5\), killed$'
             expect_line '^CR2=0xffffffff80000000 \(faulting address\)$'
@@ -152,6 +158,17 @@ run_scenario() {
             expect_line '^  #0 0x[0-9a-f]{16} [^ ]*doubleFaultThread\+0x'
             if grep -q 'no double fault' "$log"; then fail "the kernel survived losing its stack"; fi
             ;;
+        stack_overflow)
+            # The fault on the guard page cannot be delivered on the full stack,
+            # so it arrives as a double fault on the emergency stack.
+            expect_status 3
+            expect_line '^\*\*\* Double fault \(vector 8, error 0x0\)$'
+            expect_line '^CR2=0xffffc[0-9a-f]{11} \(last page-fault address\)$'
+            expect_line '^CR2 is in a kernel stack guard page: kernel stack overflow$'
+            expect_line '^thread [0-9]+ kernel stack 0xffffc[0-9a-f]{11}-0xffffc[0-9a-f]{11}; RSP is below it: stack overflow$'
+            expect_line '^  #[0-9]+ 0x[0-9a-f]{16} [^ ]*recurseForever\+0x'
+            if grep -q 'was not caught' "$log"; then fail "the kernel survived a stack overflow"; fi
+            ;;
         *)
             echo "unknown scenario: $scenario" >&2
             exit 2
@@ -168,7 +185,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests panic fault smap smep double_fault)
+((${#scenarios[@]})) || scenarios=(tests panic fault smap smep double_fault stack_overflow)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 if [[ "${MYOS_SIMULATE_FAILURE:-}" == true ]]; then

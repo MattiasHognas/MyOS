@@ -43,18 +43,23 @@ jobs:
           scripts/install-zig.sh "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      # What is worth caching is what does not change between commits:
+      # compiler-rt, the build runner and unchanged programs (about 80 s when
+      # built from nothing). The kernel is recompiled on every change anyway,
+      # in seconds. So the key is only the Zig version and build.zig: one
+      # cache per job, saved once, built from an empty directory (no fallback
+      # key), so it never accumulates old objects. Zig's cache is
+      # content-addressed, so a restored cache cannot give stale results.
       - name: Cache Zig build cache
         uses: actions/cache@v6
         with:
           path: .zig-cache
-          key: zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ matrix.optimize }}-${{ hashFiles('build.zig', 'src/**', 'app/**', 'tests/**') }}
-          restore-keys: |
-            zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ matrix.optimize }}-
+          key: zig-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ matrix.optimize }}-${{ hashFiles('build.zig') }}
 
-      - name: Install QEMU and xorriso
+      - name: Install QEMU, xorriso and binutils
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso binutils
 
       - name: Install Limine
         run: |
@@ -75,6 +80,13 @@ jobs:
         if: matrix.optimize == 'Debug'
         run: scripts/test-next-version.sh
 
+      - name: Stack frame check script tests
+        if: matrix.optimize == 'Debug'
+        run: scripts/test-check-frames.sh
+
+      - name: Kernel stack frame sizes
+        run: zig build check-frames -Doptimize=${{ matrix.optimize }}
+
       - name: QEMU integration tests
         run: zig build test-qemu -Doptimize=${{ matrix.optimize }}
         env:
@@ -91,14 +103,6 @@ jobs:
           name: serial-logs-${{ matrix.optimize }}
           path: zig-out/test/*/serial*.log
           if-no-files-found: ignore
-
-      # The build cache only grows; start over once it passes 1 GiB.
-      - name: Limit Zig build cache size
-        if: always()
-        run: |
-          if [ -d .zig-cache ] && [ "$(du -sm .zig-cache | cut -f1)" -gt 1024 ]; then
-            rm -rf .zig-cache
-          fi
 
   # Every push to main that passes all three build-and-test jobs becomes a
   # GitHub release: tag v<major>.<minor>.<patch>, with the bootable ISO, the
@@ -163,6 +167,8 @@ jobs:
         if: steps.version.outputs.skip != 'true'
         run: scripts/fetch-font.sh
 
+      # No Zig build cache in this job, on purpose: the published image is
+      # built from nothing, which also checks that a clean build works.
       - name: Build release image
         if: steps.version.outputs.skip != 'true'
         run: scripts/build.sh --release "${{ steps.version.outputs.version }}"
@@ -218,15 +224,22 @@ jobs:
           scripts/install-zig.sh "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      # Keyed like the build cache of the build-and-test jobs (see there).
       - name: Cache Zig build cache
         uses: actions/cache@v6
         with:
           path: .zig-cache
-          key: zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-coverage-${{ hashFiles('build.zig', 'src/**', 'app/**', 'tests/**') }}
-          restore-keys: |
-            zig-cache-${{ runner.os }}-${{ env.ZIG_VERSION }}-coverage-
+          key: zig-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-coverage-${{ hashFiles('build.zig') }}
 
-      # Ubuntu 24.04 has no kcov package, so build a pinned release.
+      - name: Cache kcov
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/kcov
+          key: kcov-ubuntu-24.04-${{ hashFiles('scripts/install-kcov.sh') }}
+
+      # Ubuntu 24.04 has no kcov package, so build a pinned release, unless
+      # the cache already has it. The packages are installed either way: the
+      # cached binary needs their shared libraries.
       - name: Install kcov
         run: |
           sudo apt-get update
@@ -243,11 +256,3 @@ jobs:
         with:
           name: host-coverage
           path: zig-out/coverage
-
-      # The build cache only grows; start over once it passes 1 GiB.
-      - name: Limit Zig build cache size
-        if: always()
-        run: |
-          if [ -d .zig-cache ] && [ "$(du -sm .zig-cache | cut -f1)" -gt 1024 ]; then
-            rm -rf .zig-cache
-          fi

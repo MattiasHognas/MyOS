@@ -6,10 +6,10 @@ change or add a subsystem.
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
 | Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF symbol lookup, log formatting, user address-range checks), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, ELF loading, scheduler and processes, syscalls from ring 3, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
+| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, kernel stacks, ELF loading, scheduler and processes, syscalls from ring 3, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
-`zig build test` runs the host tests and all QEMU scenarios. Add
+`zig build test` runs the host tests, the [stack frame check](#stack-frame-check) and all QEMU scenarios. Add
 `-Doptimize=ReleaseSafe` or `-Doptimize=ReleaseFast` to run the QEMU tests
 against an optimized kernel. CI runs all three build modes.
 
@@ -22,12 +22,13 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 
 | Scenario | What the kernel does | What the script checks (kernel exit code; QEMU reports `code*2+1`) |
 | --- | --- | --- |
-| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, and the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2) |
+| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, the peak kernel stack usage (`MYOS_STACK_PEAK`) under the warning level, and the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2) |
 | `panic` | Fails a subsystem assertion two calls deep | Exit code 1, the panic message, a symbolized backtrace through `scenarioPanicInner` and `scenarioPanic` |
 | `fault` | Writes to an unmapped kernel address | Exit code 1, `Page fault`, the right CR2, backtrace frame `#0` in `scenarioFault` |
 | `smap` | Reads a mapped user page from kernel code outside a user copy | Exit code 1, `Page fault` with error 0x1 and CR2 = the user page, frame `#0` in `scenarioSmap` (SMAP is enforced) |
 | `smep` | Calls code in a mapped user page from ring 0 | Exit code 1, `Page fault` with error 0x11, RIP and CR2 = the user page (SMEP is enforced) |
 | `double_fault` | A kernel thread points RSP at unmapped memory and pushes | Exit code 1, `Double fault` with the bad RSP, CR2, the thread's stack bounds and frame `#0` in `doubleFaultThread` (a triple fault would end QEMU with status 0 and no report) |
+| `stack_overflow` | A kernel thread recurses until its stack is used up | Exit code 1, `Double fault` with CR2 in a kernel stack guard page, `kernel stack overflow`, RSP below the thread's stack, backtrace frames in `recurseForever` |
 
 Run a subset with `scripts/test-qemu.sh tests panic` (after `zig build test-kernel`
 and `zig build`). The timeout per boot is 45 s, or `MYOS_QEMU_TIMEOUT` seconds.
@@ -47,6 +48,36 @@ In the test kernel, `root.halt()` and the panic handler exit QEMU with status
    status (`expect_status`) and output (`expect_line`), and add it to the
    default list.
 3. Document it in the table above.
+
+## Stack frame check
+
+A kernel stack is 16 KiB with one unmapped guard page below it. A function
+whose stack frame is smaller than a page cannot move the stack pointer past
+the guard without touching it, so `zig build check-frames` (run by
+`zig build test` and by CI in every build mode) makes sure all of them are:
+
+- `scripts/check-frames.sh` disassembles `kernel.elf` and `kernel-test.elf`
+  with `objdump` and reads each function's frame size from its prologue.
+- A frame over 4088 bytes fails the build. A frame over 2048 bytes prints a
+  warning: fix it before it grows.
+- A function over the limit that nothing in the disassembly refers to is
+  only noted. These are library routines the linker kept in Debug builds
+  (compiler-rt's big-integer division); calling one makes the check fail.
+
+If it fails, move the large local to the heap or to static storage, or pass
+large structs by pointer. Typical causes: a buffer declared as a local (the
+tests share `page_buf` in `tests/kernel/main.zig` for this), an `inline for`
+with many iterations in a Debug build, and standard-library helpers with big
+internal buffers (`std.debug.panic`; use `kernel.debug.panic.panicFmt`).
+
+The frame check bounds one function; total stack depth is measured at run
+time. The test kernel records the high-water mark of every kernel stack
+(`-Dstack-usage`, see [debugging](debugging.md)) and the `tests` scenario
+fails if any thread used more than 12 of its 16 KiB.
+
+`scripts/test-check-frames.sh` tests the script itself against hand-written
+disassembly. The limits can be changed with `MYOS_FRAME_HARD_LIMIT` and
+`MYOS_FRAME_SOFT_LIMIT`.
 
 ## Adding in-kernel tests
 
@@ -103,7 +134,7 @@ cannot read the debug info of Zig's self-hosted x86 backend (used by
 `.github/workflows/ci.yml` runs on every push and pull request:
 
 - **Build and test** (Debug, ReleaseSafe, ReleaseFast): builds the kernel and
-  apps, runs the host tests and all QEMU scenarios, builds the docs (Debug only),
+  apps, runs the host tests, the stack frame check and all QEMU scenarios, builds the docs (Debug only),
   and uploads the serial logs if anything fails.
 - **Release** (pushes to `main` only, after all three build-and-test jobs
   pass): tags the commit and publishes a GitHub release. See
@@ -121,9 +152,14 @@ and gets Limine from its release tarball (`scripts/install-limine.sh`, checksum
 verified), kcov from source (`scripts/install-kcov.sh`), and the console font
 with `scripts/fetch-font.sh`.
 
-Each job caches the Zig toolchain (keyed on the Zig version) and its Zig build
-cache `.zig-cache` (keyed on job, build mode and a hash of the sources, falling
-back to the newest cache of the same job). The build cache is dropped once it
-passes 1 GiB, so it is rebuilt from scratch now and then. To change the Zig
+The jobs cache the Zig toolchain (keyed on the Zig version), the kcov build
+(keyed on `scripts/install-kcov.sh`) and, except for the release job, the Zig
+build cache `.zig-cache`. The build cache is keyed on job, build mode, Zig
+version and `build.zig` only, not on the sources: what it saves is compiler-rt,
+the build runner and unchanged programs (about 80 s from nothing), while the
+kernel is recompiled on every change anyway. A commit that changes `build.zig`
+therefore builds from an empty cache once per job. Zig's cache is
+content-addressed, so a restored cache never gives stale results. The release
+job builds from an empty cache on purpose. To change the Zig
 version, update both `ZIG_VERSION` in the workflow and the version and
 checksum in `scripts/install-zig.sh`.

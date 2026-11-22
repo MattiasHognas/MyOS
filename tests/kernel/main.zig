@@ -15,6 +15,7 @@ const fw_cfg = @import("fw_cfg.zig");
 const pmm = root.kernel.pmm;
 const serial = root.drivers.serial;
 const assert = root.kernel.debug.assert;
+const panicFmt = root.kernel.debug.panic.panicFmt;
 const log = std.log.scoped(.tests);
 
 /// x86-64 page-table entry bits, for checking `ElfProbe.pte`.
@@ -142,6 +143,11 @@ fn fwCfgScenario() TestError!void {
 /// Scratch buffer for ELF images built by the tests (kept off the stack).
 var elf_buf: [0x3000]u8 align(8) = undefined;
 
+// One page of scratch space for tests that read a whole page or sector run.
+// Static, not a local: a 4 KiB stack frame would not fit the frame limit
+// (scripts/check-frames.sh). The tests run one at a time.
+var page_buf: [4096]u8 = undefined;
+
 /// Options for `buildElf`. Defaults give a valid executable with one
 /// read+execute segment of 16 bytes (0xAA) at 0x400000 and 0x2000 bytes of memory.
 const ElfSpec = struct {
@@ -239,8 +245,8 @@ fn elfLoadPermissions() TestError!void {
 /// mapped for user mode with exactly the permissions its flags ask for
 /// (writable only if W, non-executable unless X), and page 0 stays unmapped.
 fn elfLoadHelloPermissions() TestError!void {
-    var hdr: [4096]u8 = undefined;
-    const n = helpers.readFileAt("/bin/hello", 0, &hdr) orelse return error.Failed;
+    const hdr = &page_buf;
+    const n = helpers.readFileAt("/bin/hello", 0, hdr) orelse return error.Failed;
     try check(n >= 64);
     const phoff = std.mem.readInt(u64, hdr[32..40], .little);
     const phnum = std.mem.readInt(u16, hdr[56..58], .little);
@@ -399,6 +405,26 @@ fn emergencyStacks() TestError!void {
     try check(failed == 0);
 }
 
+/// Kernel stacks come from the guarded allocator and are fully released.
+fn kernelStacks() TestError!void {
+    const failed = helpers.kernelStacks();
+    if (failed != 0) {
+        var buf: [64]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&buf, "  kernel stack check {d} failed\n", .{failed}) catch "");
+    }
+    try check(failed == 0);
+}
+
+/// The stack high-water mark measures what threads really use.
+fn stackUsage() TestError!void {
+    const failed = helpers.stackUsage();
+    if (failed != 0) {
+        var buf: [64]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&buf, "  stack usage check {d} failed\n", .{failed}) catch "");
+    }
+    try check(failed == 0);
+}
+
 /// Spawn, run, wait and exit: exit codes reach the parent, and a finished or
 /// crashed process leaves no pages or heap memory behind.
 fn processLifecycle() TestError!void {
@@ -540,14 +566,15 @@ fn tarfsMalformed() TestError!void {
 /// start of the test disk; the rest of the sector and the next one are zero.
 fn nvmeRead() TestError!void {
     const marker = "Hello from the NVMe test disk!";
-    var buf: [4096]u8 = @splat(0xAA);
-    const first = helpers.nvmeRead(0, &buf) orelse return error.Failed;
+    const buf = &page_buf;
+    @memset(buf, 0xAA);
+    const first = helpers.nvmeRead(0, buf) orelse return error.Failed;
     try check(first.len >= 512 and std.mem.startsWith(u8, first, marker));
     try check(std.mem.allEqual(u8, first[marker.len..], 0));
-    const second = helpers.nvmeRead(1, &buf) orelse return error.Failed;
+    const second = helpers.nvmeRead(1, buf) orelse return error.Failed;
     try check(std.mem.allEqual(u8, second, 0));
     // Reading past the end of the 64 MiB disk fails instead of returning data.
-    try check(helpers.nvmeRead(1 << 40, &buf) == null);
+    try check(helpers.nvmeRead(1 << 40, buf) == null);
 }
 
 /// Known initrd files are found and missing ones are not.
@@ -646,7 +673,7 @@ noinline fn scenarioSmap() void {
     if (!helpers.enterUserPageSpace()) @panic("smap scenario: out of memory");
     const p: *const volatile u8 = @ptrFromInt(helpers.USER_PAGE);
     const byte = p.*;
-    std.debug.panic("SMAP not enforced: the kernel read 0x{x} from user memory", .{byte});
+    panicFmt("SMAP not enforced: the kernel read 0x{x} from user memory", .{byte});
 }
 
 /// Integration-test scenario "smep": call code in a user page from ring 0.
@@ -668,6 +695,14 @@ noinline fn scenarioDoubleFault() void {
     @panic("double_fault scenario: no double fault was raised");
 }
 
+/// Integration-test scenario "stack_overflow": a kernel thread recurses until
+/// its stack is used up. It must hit the guard page and be reported as a
+/// kernel stack overflow, instead of overwriting other memory.
+noinline fn scenarioStackOverflow() void {
+    helpers.overflowStackInThread();
+    @panic("stack_overflow scenario: the overflow was not caught");
+}
+
 /// Entry point of the test kernel, called by `kmain` after boot: run the
 /// scenario the host passed through fw_cfg (`opt/myos/scenario`, default
 /// "tests"). Never returns; every scenario ends by exiting QEMU.
@@ -680,7 +715,8 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "smap")) scenarioSmap();
     if (std.mem.eql(u8, scenario, "smep")) scenarioSmep();
     if (std.mem.eql(u8, scenario, "double_fault")) scenarioDoubleFault();
-    if (!std.mem.eql(u8, scenario, "tests")) std.debug.panic("unknown test scenario '{s}'", .{scenario});
+    if (std.mem.eql(u8, scenario, "stack_overflow")) scenarioStackOverflow();
+    if (!std.mem.eql(u8, scenario, "tests")) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
 }
 
@@ -751,6 +787,8 @@ fn runCases() noreturn {
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
         .{ .name = "user faults kill only the process (ring 3 exceptions)", .func = userFaults },
         .{ .name = "double-fault and NMI emergency stacks", .func = emergencyStacks },
+        .{ .name = "guarded kernel stacks (alloc, guard page, free, reuse)", .func = kernelStacks },
+        .{ .name = "kernel stack high-water mark", .func = stackUsage },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },
         .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin },
         .{ .name = "wake before block", .func = wakeBeforeBlock },
@@ -780,6 +818,17 @@ fn runCases() noreturn {
             serial.puts("[FAIL] " ++ case.name ++ "\n");
         }
     }
+
+    // The deepest any kernel stack got in this run (every thread that exited,
+    // and this one). Past the warning level the run fails: the stack is too
+    // tight, even though nothing overflowed.
+    const peak = helpers.stackPeak();
+    var peak_line: [96]u8 = undefined;
+    serial.puts(std.fmt.bufPrint(&peak_line, "MYOS_STACK_PEAK bytes={d} of={d} limit={d}\n", .{ peak, helpers.STACK_SIZE, helpers.STACK_WARN_BYTES }) catch unreachable);
+    if (peak > helpers.STACK_WARN_BYTES) {
+        failed += 1;
+        serial.puts("[FAIL] kernel stack usage below the warning level\n");
+    } else serial.puts("[PASS] kernel stack usage below the warning level\n");
 
     var summary: [128]u8 = undefined;
 

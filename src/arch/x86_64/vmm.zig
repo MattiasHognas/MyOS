@@ -133,6 +133,31 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
     t[idx] = (phys & ADDR_MASK) | flags | PRESENT | (if (huge) HUGE else 0);
 }
 
+/// Remove the 4 KiB mapping of `virt` from the address space whose PML4 is
+/// `root` and flush it from this CPU's TLB. Returns the physical address the
+/// page was mapped to (the caller decides whether to free it), or null if
+/// `virt` was not mapped by a 4 KiB page. Page tables are kept.
+///
+/// With several CPUs the other ones need a TLB shootdown too (milestone 5).
+pub fn unmap(root: u64, virt: u64) ?u64 {
+    var t = table(root);
+    var level: u6 = 3;
+    while (level > 0) : (level -= 1) {
+        const e = t[@intCast((virt >> (12 + 9 * level)) & 0x1FF)];
+        if (e & PRESENT == 0 or e & HUGE != 0) return null;
+        t = table(e & ADDR_MASK);
+    }
+    const idx: usize = @intCast((virt >> 12) & 0x1FF);
+    const e = t[idx];
+    if (e & PRESENT == 0) return null;
+    t[idx] = 0;
+    asm volatile ("invlpg (%[v])"
+        :
+        : [v] "r" (virt),
+        : .{ .memory = true });
+    return e & ADDR_MASK;
+}
+
 /// Return the leaf page-table entry (PT entry, or PD entry of a 2 MiB page)
 /// that maps `virt` in the address space whose PML4 is `root`, or null if
 /// `virt` is not mapped. Only reads the page tables, so it is safe to call

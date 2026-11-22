@@ -7,12 +7,14 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const panic = @import("panic.zig");
 
 /// True if assertions are compiled in (`-Dassertions`, default true).
 pub const enabled = build_options.assertions;
 
 /// Panic with `<subsystem>: assertion failed: <message>` if `ok` is false.
 /// `fmt` and `args` format the message; they are only evaluated on failure.
+/// The message is cut off after `panic.max_message` bytes.
 pub inline fn check(
     comptime subsystem: @EnumLiteral(),
     ok: bool,
@@ -20,5 +22,5 @@ pub inline fn check(
     args: anytype,
 ) void {
     if (!enabled) return;
-    if (!ok) std.debug.panic(@tagName(subsystem) ++ ": assertion failed: " ++ fmt, args);
+    if (!ok) panic.panicFmt(@tagName(subsystem) ++ ": assertion failed: " ++ fmt, args);
 }

@@ -16,6 +16,7 @@ const uaccess = kernel_root.kernel.uaccess;
 const nvme = kernel_root.drivers.nvme;
 const elf = kernel_root.kernel.elf;
 const heap = kernel_root.kernel.heap;
+const kstack = kernel_root.kernel.kstack;
 const pmm = kernel_root.kernel.pmm;
 const process = kernel_root.kernel.process;
 const thread = kernel_root.kernel.thread;
@@ -194,6 +195,8 @@ fn schedWorkerB() void {
 /// Both are done, and that their stacks and thread structs are freed.
 pub fn schedulerRoundRobin() bool {
     const in_use = heap.stats().bytes_in_use;
+    const stacks = kstack.inUse();
+    const pages = pmm.free_pages;
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     sched_len = 0;
@@ -205,7 +208,8 @@ pub fn schedulerRoundRobin() bool {
     while (sched_done < 2) thread.block();
     return sched_len == 6 and
         std.mem.eql(u8, sched_log[0..6], "ABABAB") and
-        heap.stats().bytes_in_use == in_use; // both threads reaped
+        heap.stats().bytes_in_use == in_use and // both threads reaped,
+        kstack.inUse() == stacks and pmm.free_pages == pages; // with their stacks
 }
 
 /// A wake that arrives before `block` must make `block`
@@ -501,6 +505,182 @@ pub fn emergencyStacks() u32 {
     here = 1;
     if (onIstStack(gdt.IST_DOUBLE_FAULT, here_addr) or onIstStack(gdt.IST_NMI, here_addr)) return 13;
     return 0;
+}
+
+/// True if `addr` is mapped in the kernel's page tables.
+fn kernelMapped(addr: u64) bool {
+    return vmm.translate(vmm.kernel_root, addr) != null;
+}
+
+/// Check the kernel stack allocator: a stack is `STACK_SIZE` bytes of
+/// writable, non-executable pages with an unmapped guard page right below
+/// it; two stacks never touch; freeing unmaps the pages, returns them to the
+/// PMM and releases the slot for reuse; and the current thread (the boot
+/// thread included) runs on such a stack. Returns 0, or the number of the
+/// first failing check.
+pub fn kernelStacks() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+
+    // The page tables of the first slots exist by now, so pages balance exactly.
+    const pages = pmm.free_pages;
+    const in_use = kstack.inUse();
+
+    const a = kstack.alloc() orelse return 1;
+    const b = kstack.alloc() orelse return 2;
+    const a_low = @intFromPtr(a.ptr);
+    const b_low = @intFromPtr(b.ptr);
+    if (a.len != kstack.STACK_SIZE or a_low % pmm.PAGE_SIZE != 0) return 3;
+    if (!kstack.owns(a) or !kstack.owns(b)) return 4;
+    if (kstack.inUse() != in_use + 2) return 5;
+    if (pmm.free_pages != pages - 2 * kstack.STACK_PAGES) return 6;
+
+    // Guard pages: unmapped below each stack, and recognized as guards.
+    if (kernelMapped(a_low - 1) or kernelMapped(b_low - 1)) return 7;
+    if (!kstack.isGuard(a_low - 1) or !kstack.isGuard(a_low - pmm.PAGE_SIZE)) return 8;
+    if (kstack.isGuard(a_low) or kstack.isGuard(a_low + a.len - 1)) return 9;
+    if (kstack.isGuard(@intFromPtr(&kernelStacks)) or kstack.isGuard(0)) return 10;
+    // The stacks do not overlap and a guard page lies between them.
+    const lower = @min(a_low, b_low);
+    const upper = @max(a_low, b_low);
+    if (upper < lower + kstack.STACK_SIZE + pmm.PAGE_SIZE) return 11;
+
+    // Every page is mapped writable and not executable, to distinct frames.
+    var frames: [kstack.STACK_PAGES]u64 = undefined;
+    for (0..kstack.STACK_PAGES) |i| {
+        const virt = a_low + i * pmm.PAGE_SIZE;
+        const e = vmm.leafEntry(vmm.kernel_root, virt) orelse return 12;
+        if (e & vmm.WRITABLE == 0 or e & vmm.NX == 0 or e & vmm.USER != 0) return 13;
+        frames[i] = vmm.translate(vmm.kernel_root, virt).?;
+        for (frames[0..i]) |other| if (other == frames[i]) return 14;
+    }
+    @memset(a, 0xA5); // the whole stack is usable
+    @memset(b, 0x5A);
+    if (a[0] != 0xA5 or a[a.len - 1] != 0xA5 or b[0] != 0x5A) return 15;
+
+    // Freeing unmaps everything and gives pages and slot back.
+    kstack.free(a);
+    if (kernelMapped(a_low) or kernelMapped(a_low + a.len - 1)) return 16;
+    if (kstack.inUse() != in_use + 1 or pmm.free_pages != pages - kstack.STACK_PAGES) return 17;
+    const again = kstack.alloc() orelse return 18;
+    if (@intFromPtr(again.ptr) != a_low) return 19; // the slot is reused
+    again[0] = 1; // and its new pages are reachable (no stale TLB entry)
+    kstack.free(again);
+    kstack.free(b);
+    if (kstack.inUse() != in_use or pmm.free_pages != pages) return 20;
+
+    // This thread runs on a kernel stack from the allocator.
+    const mine = thread.current().stack orelse return 21;
+    if (!kstack.owns(mine)) return 22;
+    var here: u8 = 0;
+    const here_addr = @intFromPtr(&here);
+    here = 1;
+    if (here_addr < @intFromPtr(mine.ptr) or here_addr >= @intFromPtr(mine.ptr) + mine.len) return 23;
+    return 0;
+}
+
+/// Use at least `bytes` of stack and write to all of it. The buffer's
+/// address escapes, so the optimizer has to keep it on the stack.
+noinline fn touchStack(comptime bytes: usize) void {
+    var pad: [bytes]u8 = undefined;
+    @memset(&pad, 0xEE);
+    std.mem.doNotOptimizeAway(&pad);
+}
+
+// State of the stack usage test's worker thread.
+var usage_before: ?usize = null;
+var usage_after: ?usize = null;
+var usage_waiter: ?*thread.Thread = null;
+
+/// Stack usage test worker: measure, use 1 KiB more stack, measure again.
+fn stackUsageWorker() void {
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    const mine = thread.current().stack.?;
+    usage_before = kstack.used(mine);
+    touchStack(1024);
+    usage_after = kstack.used(mine);
+    thread.wake(usage_waiter.?);
+}
+
+/// Check the stack high-water mark: a fresh stack counts as unused, writing
+/// to it is measured from the top, a thread's deeper call shows up as more
+/// usage, exited threads are recorded when reaped, and nothing in this test
+/// run has come close to filling its stack. Returns 0, or the number of the
+/// first failing check.
+pub fn stackUsage() u32 {
+    if (!kstack.track_usage) return 1; // the test kernel always measures
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+
+    // A fresh stack is unused; usage is the distance from the top to the lowest write.
+    const s = kstack.alloc() orelse return 2;
+    if (kstack.used(s) != 0) return 3;
+    s[s.len - 8] = 0;
+    if (kstack.used(s) != 8) return 4;
+    s[s.len - 1000] = 0;
+    if (kstack.used(s) != 1000) return 5;
+    s[0] = 0;
+    if (kstack.used(s) != kstack.STACK_SIZE) return 6;
+    kstack.free(s);
+    const again = kstack.alloc() orelse return 7; // a reused slot starts clean
+    if (kstack.used(again) != 0) return 8;
+    kstack.free(again);
+
+    // A thread that calls deeper has used more, by about what it asked for.
+    usage_before = null;
+    usage_after = null;
+    usage_waiter = thread.current();
+    const peak_before = kstack.peak();
+    _ = thread.spawn(stackUsageWorker, null) catch return 9;
+    thread.block();
+    const before = usage_before orelse return 10;
+    const after = usage_after orelse return 11;
+    // Not exactly 1024 more: the first measurement includes the frames of
+    // the measuring call itself, and the buffer's frame has some overhead.
+    if (before == 0 or after < before + 768 or after > before + 2048) return 12;
+    // The worker is reaped by the next thread that is switched to; by now
+    // (we were switched to after it exited) its usage has been recorded.
+    thread.yield();
+    if (kstack.peak() < after or kstack.peak() < peak_before) return 13;
+
+    // This thread's own usage is plausible and can be recorded.
+    const mine = thread.recordStackUsage() orelse return 14;
+    if (mine == 0 or mine > kstack.STACK_SIZE) return 15;
+    if (kstack.peak() < mine) return 16;
+    return 0;
+}
+
+/// Record the current (boot) thread's stack usage and return the largest
+/// usage any thread has had in this run, for the end-of-run report.
+pub fn stackPeak() usize {
+    _ = thread.recordStackUsage();
+    return kstack.peak();
+}
+
+/// Bytes in a kernel stack, and the usage above which the run should fail.
+pub const STACK_SIZE = kstack.STACK_SIZE;
+pub const STACK_WARN_BYTES = kstack.WARN_BYTES;
+
+/// Recurse without end, using some stack in every call. `noinline` and the
+/// volatile buffer keep the optimizer from turning it into a loop.
+noinline fn recurseForever(depth: usize) usize {
+    var pad: [128]u8 = undefined;
+    const p: *volatile [128]u8 = &pad;
+    p[depth % pad.len] = @truncate(depth);
+    return recurseForever(depth + 1) + p[0];
+}
+
+/// Thread body for the `stack_overflow` scenario.
+fn stackOverflowThread() void {
+    _ = cpu.saveAndDisableInterrupts();
+    _ = recurseForever(0);
+}
+
+/// For the `stack_overflow` scenario: overflow the kernel stack of a thread
+/// with unbounded recursion. Returns only if the thread could not be started.
+pub fn overflowStackInThread() void {
+    _ = thread.spawn(stackOverflowThread, null) catch return;
+    for (0..100) |_| thread.yield();
 }
 
 /// Thread body for the `double_fault` scenario: point RSP at unmapped kernel

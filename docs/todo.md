@@ -80,17 +80,23 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Print the same details for user faults, with the thread and program name (checked from the serial log of the `tests` scenario).
 - [x] Test deliberate user faults, kernel faults, and double-fault diagnostics (`/test/div_zero` and `/test/invalid_opcode` besides the isolation programs; scenarios `fault` and `double_fault`).
 - [x] A fault with an unusable kernel stack no longer ends in a triple fault: the `double_fault` scenario gets a report with RIP, RSP, CR2, the thread's stack bounds and a backtrace.
-  - A real stack overflow still does not fault: thread stacks are heap allocations, so it runs into heap memory. The guard pages of 2.3 turn it into a page fault, which this stack then reports.
+  - A real stack overflow is caught since 2.3: it hits the guard page, and this stack reports it.
 
 **Done when:** User faults terminate only their process, and emergency faults produce useful diagnostics where possible.
 
 ### 2.3 Guarded kernel stacks
-- [ ] Introduce a dedicated virtual-memory-backed kernel-stack allocator.
-- [ ] Map stack pages with an unmapped guard page underneath.
-- [ ] Migrate kernel-thread stacks away from ordinary heap allocations.
-- [ ] Update context switches, TSS.RSP0, and syscall stack selection accordingly.
-- [ ] Release mapped stack pages and reserved virtual ranges on thread cleanup.
-- [ ] Verify stack overflow triggers a page fault rather than heap corruption.
+- [x] Introduce a dedicated virtual-memory-backed kernel-stack allocator (`kernel/kstack.zig`: slots in their own region at `0xFFFF_C000_0000_0000`, up to 4096 stacks).
+- [x] Map stack pages with an unmapped guard page underneath (16 KiB of writable, non-executable pages per stack, the same as Linux on x86-64).
+- [x] Migrate kernel-thread stacks away from ordinary heap allocations (`thread.spawn`; the boot thread also leaves the bootloader's stack for a guarded one early in `kmain`).
+- [x] Update context switches, TSS.RSP0, and syscall stack selection accordingly (they take the stack top from `Thread.stack`, which now comes from `kstack`; the boot thread has one too).
+- [x] Release mapped stack pages and reserved virtual ranges on thread cleanup (`kstack.free` from `reap`, using the new `vmm.unmap`; in-kernel tests check pages and slots balance).
+- [x] Verify stack overflow triggers a page fault rather than heap corruption (QEMU scenario `stack_overflow`: the fault on the guard page arrives as a double fault on the emergency stack and is reported as a kernel stack overflow).
+- [x] The guard is a single page, so a stack frame larger than 4 KiB could step over it into the neighbouring stack. No kernel function may have one: `scripts/check-frames.sh` (`zig build check-frames`, part of `zig build test` and CI in all three build modes) fails on a frame over 4088 bytes and warns over 2 KiB, the same limit Linux warns at. The largest frame is about 1 KiB.
+  - Panic messages are formatted in a 256-byte buffer (`kernel/debug/panic.zig`) instead of the standard library's 4 KiB one.
+  - Not covered: a function reached only through a pointer stored in a data table, and assembly that moves RSP by a computed amount. Stack probes (`stack_check`) are the fallback if a function ever needs a larger frame.
+- [x] Kernel stacks stay at 16 KiB, the same as Linux (decided; not larger, and going smaller is not a goal). The high-water mark of every stack is measured in Debug builds and in the test kernel (`-Dstack-usage`): the kernel warns when a thread used more than 12 KiB, and the `tests` scenario reports the peak (`MYOS_STACK_PEAK`) and fails above that level. The suite peaks at about 5 KiB in Debug and under 4 KiB in release builds.
+
+**Done when:** A kernel stack overflow is caught and reported instead of corrupting memory, and no stack pages or slots leak when threads exit.
 
 ### 2.4 Harden ELF loading
 - [ ] Validate ELF class, endianness, machine type, type, version, and header sizes.

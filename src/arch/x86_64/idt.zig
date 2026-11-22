@@ -19,6 +19,7 @@ const thread = @import("../../kernel/thread.zig");
 const process = @import("../../kernel/process.zig");
 const backtrace = @import("../../kernel/debug/backtrace.zig");
 const usercopy = @import("usercopy.zig");
+const kstack = @import("../../kernel/kstack.zig");
 
 var idt = std.mem.zeroes([256]Entry);
 var handlers: [256]?Handler = @splat(null);
@@ -219,7 +220,11 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
     root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });
     root.print("RSP=0x{x} RAX=0x{x} RBX=0x{x}\n", .{ f.rsp, f.rax, f.rbx });
     switch (f.vector) {
-        VECTOR_PAGE_FAULT => root.print("CR2=0x{x} (faulting address)\n", .{readCr2()}),
+        VECTOR_PAGE_FAULT => {
+            const addr = readCr2();
+            root.print("CR2=0x{x} (faulting address)\n", .{addr});
+            if (!from_user and kstack.isGuard(addr)) root.print("CR2 is in a kernel stack guard page: kernel stack overflow\n", .{});
+        },
         VECTOR_DOUBLE_FAULT => reportDoubleFault(f),
         else => {},
     }
@@ -232,12 +237,15 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
 /// Extra diagnostics for a double fault: the CPU could not deliver an
 /// exception, nearly always because the kernel stack it had to push the
 /// exception frame on is not writable. CR2 still holds the address of the
-/// page fault that failed (if it was one), and comparing the interrupted RSP
-/// with the current thread's stack tells an overflow from a wild stack pointer.
+/// page fault that failed (if it was one): in a stack guard page, it was a
+/// kernel stack overflow. Comparing the interrupted RSP with the current
+/// thread's stack tells an overflow from a wild stack pointer too.
 fn reportDoubleFault(f: *const Frame) void {
-    root.print("CR2=0x{x} (last page-fault address)\n", .{readCr2()});
+    const addr = readCr2();
+    root.print("CR2=0x{x} (last page-fault address)\n", .{addr});
+    if (kstack.isGuard(addr)) root.print("CR2 is in a kernel stack guard page: kernel stack overflow\n", .{});
     const t = thread.current();
-    const stack = t.stack orelse return; // the boot thread runs on the bootloader's stack
+    const stack = t.stack orelse return; // early boot, still on the bootloader's stack
     const low = @intFromPtr(stack.ptr);
     const high = low + stack.len;
     const verdict = if (f.rsp >= low and f.rsp <= high)
@@ -292,7 +300,15 @@ pub const Frame = extern struct {
 /// Requires `gdt.init` to have run, since the gates use the kernel code
 /// selector and the emergency stacks in the TSS.
 pub fn init() void {
-    inline for (0..256) |i| setGate(i, @intFromPtr(stub(i)), istFor(i));
+    // A table built at compile time and a runtime loop: an `inline for` here
+    // gives every iteration its own stack slots in Debug builds (over 4 KiB).
+    const stubs = comptime blk: {
+        @setEvalBranchQuota(100_000); // 256 stubs, each formatting its vector number
+        var table: [256]*const fn () callconv(.naked) void = undefined;
+        for (&table, 0..) |*entry, i| entry.* = stub(i);
+        break :blk table;
+    };
+    for (stubs, 0..) |entry, i| setGate(i, @intFromPtr(entry), istFor(i));
     const ptr = IdtPtr{ .limit = @sizeOf(@TypeOf(idt)) - 1, .base = @intFromPtr(&idt) };
     asm volatile ("lidt (%[p])"
         :

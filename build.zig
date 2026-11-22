@@ -38,6 +38,11 @@ pub fn build(b: *std.Build) void {
             "alloc-debug",
             "Log every kernel heap allocation and free (default: false)",
         ) orelse false,
+        .stack_usage = b.option(
+            bool,
+            "stack-usage",
+            "Measure how much of each kernel stack is used (default: true in Debug builds, false otherwise; always on in the test kernel)",
+        ) orelse (optimize == .debug),
         .version = b.option(
             []const u8,
             "version",
@@ -141,8 +146,17 @@ pub fn build(b: *std.Build) void {
     const qemu_step = b.step("test-qemu", "Run real kernel tests under QEMU");
     qemu_step.dependOn(&run_qemu.step);
 
-    const all = b.step("test", "Run host tests and QEMU kernel tests");
+    // No kernel function may have a stack frame that could step over a kernel
+    // stack's guard page. Checks the installed kernels, like the QEMU tests.
+    const run_frames = b.addSystemCommand(&.{ "bash", "scripts/check-frames.sh", "zig-out/bin/kernel.elf", "zig-out/bin/kernel-test.elf" });
+    run_frames.step.dependOn(&install_test_kernel.step);
+    run_frames.step.dependOn(b.getInstallStep());
+    const frames_step = b.step("check-frames", "Check the stack frame sizes of the kernel and the test kernel");
+    frames_step.dependOn(&run_frames.step);
+
+    const all = b.step("test", "Run host tests, the stack frame check and QEMU kernel tests");
     all.dependOn(&run_host_tests.step);
+    all.dependOn(&run_frames.step);
     all.dependOn(&run_qemu.step);
 }
 
@@ -178,6 +192,7 @@ const KernelOptions = struct {
     log_level: std.log.Level,
     assertions: bool,
     alloc_debug: bool,
+    stack_usage: bool,
     version: []const u8,
 };
 
@@ -212,6 +227,8 @@ fn kernelArtifact(
     options.addOption(std.log.Level, "log_level", kopts.log_level);
     options.addOption(bool, "assertions", kopts.assertions);
     options.addOption(bool, "alloc_debug", kopts.alloc_debug);
+    // The test kernel always measures, so the tests cover it in every build mode.
+    options.addOption(bool, "stack_usage", kopts.stack_usage or is_test);
     options.addOption([]const u8, "version", kopts.version);
     kernel.root_module.addOptions("build_options", options);
     return kernel;

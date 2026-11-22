@@ -11,6 +11,7 @@ Everything needed to build, run and work on MyOS. See also
 | [Limine](https://github.com/Limine-Bootloader/Limine) | 12.x (CI uses 12.10.0) | the bootable ISO |
 | xorriso | any | the bootable ISO |
 | QEMU (x86-64) | any recent | running and testing |
+| binutils (`objdump`) | any | the stack frame check in `zig build test` |
 | OVMF (edk2) | any | UEFI boot in `scripts/run-qemu.sh` (optional, `--bios` works without) |
 | GDB | any | debugging (optional) |
 | kcov | any | `zig build coverage` (optional) |
@@ -18,14 +19,14 @@ Everything needed to build, run and work on MyOS. See also
 Arch Linux:
 
 ```bash
-sudo pacman -S zig zls limine xorriso qemu-desktop edk2-ovmf gdb kcov
+sudo pacman -S zig zls limine xorriso qemu-desktop edk2-ovmf binutils gdb kcov
 ```
 
 Debian/Ubuntu (Zig and Limine are not packaged in the right versions; install
 them with the scripts, as CI does):
 
 ```bash
-sudo apt install qemu-system-x86 xorriso ovmf gdb
+sudo apt install qemu-system-x86 xorriso ovmf binutils gdb
 scripts/install-zig.sh ~/.local/zig              # checksum-verified 0.17.1
 export PATH=~/.local/zig:$PATH
 scripts/install-limine.sh ~/.local/limine        # checksum-verified 12.10.0
@@ -65,8 +66,9 @@ scripts/run-qemu.sh   # boots into the shell; type "hello", or "exit"
 | `zig build docs` | Generate API docs from `//!` and `///` comments into `zig-out/docs/`. |
 | `zig build test-host` | Native host unit tests. |
 | `zig build test-kernel` | Compile the test kernel only (no QEMU). |
-| `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (`tests`, `panic`, `fault`, `smap`, `smep`, `double_fault`). |
-| `zig build test` | Host tests and QEMU scenarios. |
+| `zig build check-frames` | Check that no kernel function has a stack frame near the size of a stack guard page (see [testing](testing.md#stack-frame-check)). |
+| `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (`tests`, `panic`, `fault`, `smap`, `smep`, `double_fault`, `stack_overflow`). |
+| `zig build test` | Host tests, the stack frame check and QEMU scenarios. |
 | `zig build coverage` | Host tests under kcov; report in `zig-out/coverage/`. |
 
 Build options (they apply to the test commands too):
@@ -77,6 +79,7 @@ Build options (they apply to the test commands too):
 | `-Dlog-level` | `err`, `warn`, `info`, `debug` | `debug` in Debug, `info` otherwise |
 | `-Dassertions` | `true`, `false` | `true` |
 | `-Dalloc-debug` | `true`, `false` (log every heap allocation) | `false` |
+| `-Dstack-usage` | `true`, `false` (measure kernel stack high-water marks) | `true` for Debug, else `false` |
 | `-Dtest-filter` | name filter for `test-host` | none |
 
 `scripts/build.sh` always builds with the defaults. For an optimized ISO, run
@@ -133,9 +136,9 @@ the terminal.
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
-| `src/kernel/` | Physical memory (`pmm`), heap, threads/scheduler, processes, ELF loader, syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
+| `src/kernel/` | Physical memory (`pmm`), heap, guarded kernel stacks (`kstack`), threads/scheduler, processes, ELF loader, syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
 | `src/kernel/fs/` | Filesystems (`tarfs` for the initrd) |
-| `src/kernel/debug/` | Assertions, backtraces, ELF symbol lookup, log formatting |
+| `src/kernel/debug/` | Assertions, small-buffer panic formatting, backtraces, ELF symbol lookup, log formatting |
 | `src/assets/` | Console font (fetched, not committed) |
 | `app/` | User programs (`sh`, `hello`) and their runtime `lib.zig`; linked by `app/linker.ld`, each at its own address set in `build.zig` |
 | `tests/host/` | Host unit tests |

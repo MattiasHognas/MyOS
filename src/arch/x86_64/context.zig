@@ -70,6 +70,21 @@ pub fn initStack(top: usize, start: usize, arg: usize) usize {
     return t - 7 * 8;
 }
 
+/// Abandon the current stack and call `entry` on the stack whose highest
+/// address is `top` (16-byte aligned). The frame-pointer chain starts afresh,
+/// so backtraces end at `entry`. Never returns.
+pub fn runOnStack(top: usize, entry: *const fn () callconv(.c) noreturn) noreturn {
+    asm volatile (
+        \\ mov %%rdi, %%rsp
+        \\ xor %%ebp, %%ebp
+        \\ call *%%rsi
+        :
+        : [top] "{rdi}" (top),
+          [entry] "{rsi}" (entry),
+    );
+    unreachable;
+}
+
 /// Drop to ring 3 and start executing at `rip` with stack pointer `rsp`.
 ///
 /// Builds the frame `iretq` expects (SS, RSP, RFLAGS, CS, RIP) using the user
