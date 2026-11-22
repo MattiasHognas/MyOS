@@ -199,8 +199,12 @@ test image).
 
 ## Editor setup
 
-VS Code with the Zig extension and ZLS works out of the box
-(`.vscode/settings.json`). `.vscode/tasks.json` has tasks for the host tests,
+VS Code with the Zig extension and ZLS works out of the box: open the
+repository folder (`.vscode/settings.json`) or the workspace file
+`MyOS.code-workspace`, which repeats the same settings because VS Code ignores
+the folder's Zig settings in a workspace window. Avoid an "Untitled
+(Workspace)" window: its settings live outside the repository and override
+these. `.vscode/tasks.json` has tasks for the host tests,
 the QEMU tests and all tests ("Run Test Task"); the test explorer runs single
 host tests through `zig build test-host -Dtest-filter=<name>`. "Debug Test"
 builds them with `zig build debug-test-host -Dtest-filter=<name>`, which puts the
