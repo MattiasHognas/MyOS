@@ -2,6 +2,15 @@
 
 A dependency-ordered roadmap for building a small x86-64 operating system in Zig. Establish automated tests and CI first, then improve kernel safety and build out features.
 
+## Primary goal
+
+**Run an unmodified .NET executable safely and fast, on several cores, on top of a minimal kernel core.** That is milestone 8, and it is the first point at which the project counts as having reached its goal.
+
+- **On the critical path:** 2 (safety), 3 (process startup, descriptors, user memory, time), 5 (SMP), 7.1 (SSE/FPU state and TLS) and 8 (Linux binary compatibility).
+- **Not required for the goal:** 4 (persistent storage; programs can ship in the initrd), 6 (networking; only needed for network programs) and 7.2 (porting a libc; a statically linked foreign binary brings its own, though a small C program is a useful stepping stone).
+- **After the goal:** 9 (graphical environment) is planned and will be done; it just does not gate the primary goal.
+- **Minimal core:** when a feature is only needed off the critical path, prefer leaving it out or keeping it in user space over growing the kernel.
+
 ## Current foundation
 
 Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/TSS, physical and virtual memory management, kernel heap, APIC timer, preemptive threading, ring 3, syscalls, ELF64 loading, basic processes, read-only tarfs/VFS, PCI, basic NVMe reads, PS/2 keyboard, and a userspace shell.
@@ -98,6 +107,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Verify interrupt masking and preemption across syscall entry, blocking, and return.
 - [ ] Verify stack and address-space switches during timer interrupts and syscalls.
 - [ ] Define errno-style syscall error codes and return them from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig`. Do this before milestone 3 adds syscalls.
+- [ ] Decide now whether the syscall numbers, error values and struct layouts follow Linux (see 8.1): choosing Linux-compatible values here avoids renumbering everything later.
 - [ ] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions.
 - [ ] Test from ring 3 that syscalls preserve callee-saved registers and RFLAGS, keep the stack aligned, and survive preemption mid-syscall.
 - [ ] Test that each failure case in `/test/syscalls` returns its specific error code.
@@ -168,7 +178,7 @@ Moved up from 5.1: pipes, blocking I/O, sleep and interrupt-driven drivers in mi
 - [ ] Support generic open/read/write/close plus `seek` where applicable.
 - [ ] Define file-offset, ownership, and descriptor inheritance rules.
 - [ ] Add descriptor duplication and pipes.
-- [ ] Add a `poll`-style syscall to wait on several descriptors at once (needed by network servers in 6.3 and the compositor in 8.3).
+- [ ] Add a `poll`-style syscall to wait on several descriptors at once (needed by network servers in 6.3 and the compositor in 9.3).
 - [ ] Test EOF, partial I/O, invalid descriptors, and cleanup.
 - [ ] Test terminal line editing and `poll` (ready, blocking, and timeout cases) with input injected over serial.
 
@@ -340,46 +350,109 @@ The primitives themselves come from 2.8; this section makes them and their users
 - [ ] Implement required thread-local-storage initialization.
 - [ ] Compile and run statically linked C hello-world.
 - [ ] Port a few small command-line utilities.
-- [ ] Consider dynamic linking later; do not require it for initial success.
+- [ ] Do not require dynamic linking for initial success; it comes with the ELF interpreter in 8.2.
 - [ ] Run the C programs and utilities as QEMU tests and check their output.
 
 **Milestone 7 done when:** A statically linked C program runs without the custom Zig userspace runtime.
 
 ---
 
-## 8. Graphical environment
+## 8. Linux binary compatibility
+
+**Goal:** Run unmodified Linux x86-64 executables built by other toolchains: first statically linked C, Go or Rust programs, then a managed runtime such as .NET Native AOT. A binary targets an OS ABI, not just the CPU, so this milestone is about speaking Linux's ABI.
+
+### 8.1 Linux syscall ABI
+- [ ] Choose the model: make the native syscall ABI Linux-compatible, or give foreign processes a Linux "personality" that translates to native calls (decision prepared in 2.5).
+- [ ] Use Linux syscall numbers, six argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`) and negative-errno return values.
+- [ ] Match Linux struct layouts wherever user memory is read or written (`stat`, `timespec`, `iovec`, `dirent64`, `sigaction`, `pollfd`, ...).
+- [ ] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs.
+- [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `getdents64`, `readlink`, `readv`/`writev`, `pread`/`pwrite`, `fstat`/`newfstatat`.
+- [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `clock_gettime`, `nanosleep`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.
+- [ ] Add `epoll` and `eventfd` on top of `poll` (3.3).
+- [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents.
+- [ ] Test each syscall from ring 3 against Linux's documented results and error codes, including the struct layouts.
+
+### 8.2 ELF loading and process startup
+- [ ] Load position-independent executables (`ET_DYN`) at a chosen load bias.
+- [ ] Set up the initial thread's TLS block from `PT_TLS`.
+- [ ] Pass the auxiliary vector after `envp` (`AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`, `AT_PAGESZ`, `AT_RANDOM`, ...), extending the stack layout from 3.1.
+- [ ] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes).
+- [ ] Load the ELF interpreter named by `PT_INTERP` so dynamically linked programs can run with a ported `ld.so` and shared libraries on disk (moved from 7.2).
+- [ ] Test static, static-PIE and dynamically linked hello-world binaries built on Linux, plus malformed `PT_TLS`/`PT_INTERP` headers.
+
+### 8.3 Threads and futexes
+- [ ] Support multiple threads per process (moved from 10), with shared address space and descriptor table; revisit the single-thread assumptions documented in 2.7.
+- [ ] Implement `clone` for threads (`CLONE_VM`, `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_CLEARTID`), `set_tid_address`, and `exit` versus `exit_group`.
+- [ ] Give each thread its own FS base: `arch_prctl(ARCH_SET_FS)`, saved and restored on context switch; enable FSGSBASE when the CPU has it.
+- [ ] Implement `futex` wait and wake with timeouts (timers from 2.8), including the wake on thread exit that `pthread_join` relies on.
+- [ ] Test thread creation and join, TLS isolation between threads, futex wake-before-wait and timeouts, and many threads under preemption (and on several CPUs once 5 is done).
+
+### 8.4 Memory management for runtimes
+- [ ] Complete `mmap`: `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader).
+- [ ] Implement `mprotect`, `munmap` of partial ranges, and `madvise(MADV_DONTNEED)`.
+- [ ] Add demand paging and overcommit (moved from 10): garbage collectors reserve huge virtual ranges and commit them piece by piece.
+- [ ] Save and restore extended CPU state with XSAVE and enable AVX where supported (7.1 covers only FPU/SSE).
+- [ ] Test reserve-then-commit of a multi-gigabyte range, permission changes, partial unmaps, faults on `PROT_NONE` pages, and AVX registers surviving preemption.
+
+### 8.5 Signals
+- [ ] Implement `rt_sigaction`, `rt_sigprocmask`, `sigaltstack` and `rt_sigreturn`, delivering signals on the return to user mode.
+- [ ] Turn user faults into `SIGSEGV`, `SIGBUS`, `SIGFPE` and `SIGILL` with `siginfo` and a register context, instead of always killing the process (2.2); runtimes use this for null checks and stack probes.
+- [ ] Implement `kill`/`tgkill` and default actions; deliver Ctrl+C (3.5) as `SIGINT`.
+- [ ] Interrupt blocking syscalls with `EINTR` or restart them.
+- [ ] Test handlers that return, handlers that modify the saved context, nested and masked signals, the alternate stack, and signals sent to another thread.
+
+### 8.6 Foreign programs
+- [ ] Run an unmodified statically linked musl C program built on Linux.
+- [ ] Run a statically linked Go or Rust program (threads, futexes and signals in earnest).
+- [ ] Run a .NET Native AOT hello-world (built for linux-musl, statically linked, invariant globalization), then one that allocates enough to exercise the GC.
+- [ ] Run a dynamically linked program through the ELF interpreter.
+- [ ] Keep prebuilt fixture binaries (with the commands that built them) and run them as QEMU tests, checking their output.
+
+### 8.7 Fast and multicore
+"Fast" is part of the goal, so it is measured rather than assumed.
+- [ ] Run foreign multi-threaded programs on all CPUs (needs milestone 5): threads of one process on different cores, cross-CPU futex wakeups and TLB shootdowns on `munmap`/`mprotect`.
+- [ ] Add a benchmark suite run in QEMU with KVM and on real hardware: syscall round trip, context switch, page fault, thread create/join, futex ping-pong, and `mmap`/`munmap` churn.
+- [ ] Benchmark a multi-threaded .NET workload (allocation-heavy and CPU-bound) for throughput and scaling from 1 to N cores, and compare with the same binary on Linux on the same machine.
+- [ ] Profile and remove the hot spots the benchmarks show (the profiling items in 10 move up when this starts); candidates are per-CPU run queues, lock contention in the PMM and VMM, PCID to avoid TLB flushes, and 2 MiB pages for large anonymous mappings.
+- [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
+
+**Milestone 8 done when:** An unmodified .NET Native AOT program runs on MyOS without being rebuilt for it, uses several cores, cannot crash or corrupt the kernel, and its measured performance is recorded against Linux on the same hardware.
+
+---
+
+## 9. Graphical environment
 
 **Goal:** Display multiple interactive windows and run a graphical terminal.
 
-### 8.1 Graphics
+### 9.1 Graphics
 - [ ] Expose framebuffer information through a safe userspace API.
 - [ ] Implement pixel, rectangle, image, and text rendering.
 - [ ] Add back-buffering and a display update mechanism.
 - [ ] Implement a basic software renderer.
 - [ ] Test rendering on the host against reference images.
 
-### 8.2 Input
+### 9.2 Input
 - [ ] Expose generic keyboard and pointer events to userspace.
 - [ ] Add mouse support (PS/2 or USB).
 - [ ] Track pointer coordinates and button states.
 - [ ] Implement focus and event routing.
 - [ ] Test event delivery and focus with injected input events.
 
-### 8.3 Window system
+### 9.3 Window system
 - [ ] Implement a basic userspace compositor/window manager.
 - [ ] Create/destroy windows and draw decorations.
 - [ ] Support movement, resizing, overlap, and focus.
-- [ ] Add shared memory mappings between processes (moved from 9; window buffers need them).
+- [ ] Add shared memory mappings between processes (moved from 10; window buffers need them).
 - [ ] Add IPC for graphical clients, with the compositor waiting on input and clients through `poll` (3.3).
 - [ ] Build a graphical terminal and minimal desktop/launcher.
 - [ ] Add a simple editor or file viewer.
 - [ ] Test window management and graphical IPC with scripted clients, checking framebuffer output.
 
-**Milestone 8 done when:** Multiple user applications can display and interact through windows.
+**Milestone 9 done when:** Multiple user applications can display and interact through windows.
 
 ---
 
-## 9. Long-term / optional
+## 10. Long-term / optional
 
 ### Hardware and platform
 - [ ] USB xHCI and USB HID devices.
@@ -389,9 +462,8 @@ The primitives themselves come from 2.8; this section makes them and their users
 - [ ] CPU feature discovery and more QEMU/real-hardware testing.
 
 ### Advanced processes and memory
-- [ ] Copy-on-write, demand paging, and file-backed mappings.
+- [ ] Copy-on-write and shared file-backed mappings (demand paging and private file mappings: 8.4).
 - [ ] `fork`/`exec` semantics if desired.
-- [ ] Multiple threads per process.
 - [ ] User/group permissions.
 
 ### Performance and observability
