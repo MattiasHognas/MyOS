@@ -65,6 +65,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Enable SMAP when CPU-supported, using `stac`/`clac` only in controlled user-access sections (only around the copy instruction in `user_copy`; interrupt entry runs `clac` and `syscall` entry masks AC).
 - [x] Test null pointers, kernel pointers, overflow, invalid pages, and boundary crossings (host tests for the range check, in-kernel "user copy routines" test, `/test/user_pointers` with 27 checks from ring 3).
 - [x] Test that SMEP and SMAP are really on: the kernel faults when it executes or touches user memory outside a user-access section (QEMU scenarios `smap` and `smep`, plus an in-kernel check of CR0/CR4; QEMU runs with `-cpu max`, which has both).
+- [x] Test that RFLAGS.AC cannot leak into the kernel: an interrupt taken with AC set runs its handler with AC clear, and the `syscall` flag mask clears AC (in-kernel test; found in the review before 2.2).
 
 **Done when:** Every syscall rejects invalid user addresses without crashing the kernel.
 
@@ -77,6 +78,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Print vector, error code, RIP, RSP, and CR2 (for page faults) in kernel fault diagnostics (checked by the `fault` scenario).
 - [ ] Print the same details for user faults; the message currently shows only the fault name and RIP.
 - [ ] Test deliberate user faults, kernel faults, and double-fault diagnostics.
+- [ ] Until the emergency stack exists, a kernel stack overflow or a fault while handling a fault ends in a triple fault (silent reset) with no diagnostics; test that this no longer happens.
 
 **Done when:** User faults terminate only their process, and emergency faults produce useful diagnostics where possible.
 
@@ -94,7 +96,10 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Use overflow-safe arithmetic for file offsets, address ranges, and segment sizes.
 - [ ] Validate segment alignment and enforce user-only mapping ranges.
 - [ ] Reject overlapping or conflicting load segments unless intentionally supported.
+  - Today a second segment (or the user stack) mapped over an existing page silently replaces it and the old page is never freed: a permanent leak a crafted ELF can repeat.
 - [ ] Prevent mapping page zero and reserved user regions.
+  - [x] The last user page is never mapped (`vmm.USER_MAP_END`; see the `sysretq` item in 2.5).
+- [ ] Cap segment sizes (`memsz`) against a per-process memory limit, so one ELF cannot ask for all physical memory.
 - [ ] Verify the entry point is inside an executable loaded segment.
 - [ ] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages.
 - [x] Roll back every allocated page and table on loading failure.
@@ -104,6 +109,8 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 ### 2.5 Syscall and context-switch correctness
 - [ ] Audit `syscall` entry and exit assembly for register preservation and ABI stack alignment.
 - [ ] Validate return RIP/RSP and avoid unsafe `sysretq` for noncanonical or invalid return states.
+  - [x] Close the known case: a `syscall` instruction at the very end of user space returns to a non-canonical address, and `sysretq` then faults in ring 0 on the user's stack pointer (Intel). The ELF loader now refuses to map the last user page or put the entry point there (tested with segments at, across and just below it).
+  - [ ] Still to do: check the saved return address in the exit path itself (needed once `mmap` or signals can put code or return addresses anywhere), and fall back to `iretq` when it is not safe.
 - [ ] Verify interrupt masking and preemption across syscall entry, blocking, and return.
 - [ ] Verify stack and address-space switches during timer interrupts and syscalls.
 - [ ] Define errno-style syscall error codes and return them from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig`. Do this before milestone 3 adds syscalls.
@@ -111,15 +118,21 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [ ] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions.
 - [ ] Test from ring 3 that syscalls preserve callee-saved registers and RFLAGS, keep the stack aligned, and survive preemption mid-syscall.
 - [ ] Test that each failure case in `/test/syscalls` returns its specific error code.
+- [x] Clear all general-purpose registers on the first entry to user mode, so no kernel value leaks to the program (`context.enterUser`; tested from ring 3 by `/test/entry_regs`).
 
 ### 2.6 Memory-management correctness
 - [ ] Reject invalid, misaligned, and double page frees in the physical allocator.
 - [ ] Verify free-page counts and bitmap consistency under stress.
+  - [x] Make `pmm.alloc`/`pmm.free` safe against preemption (interrupts off around the bitmap update); before, two preemptible threads could be handed the same page.
+  - [x] Stress test with two preempted kernel threads allocating and freeing concurrently. It checks for shared pages and the free count, but the race window is a few instructions wide: it passed even with the locking removed, so it does not prove the lock. A deterministic test needs a hook that forces a switch inside `alloc`.
 - [ ] Make page mapping report errors rather than silently replacing mappings.
 - [ ] Implement page unmapping and appropriate local TLB invalidation.
 - [ ] Handle page-table allocation failure without a partially corrupted mapping.
+  - Today `vmm.allocTable` panics, so a user program can take the kernel down by exhausting memory, for example by running itself recursively (each `run` keeps its parent alive).
 - [ ] Free all user mappings and page tables on process teardown.
 - [ ] Test memory exhaustion, mapping conflicts, repeated allocation/free, and failed allocations.
+- [ ] Test from ring 3 that a program spawning itself recursively until memory runs out gets an error from `run` and the kernel survives with no leak.
+- [ ] Add per-process resource limits (memory, descendants, open files) so one program cannot starve the rest.
 - [ ] Test unmapping: the translation disappears, freed pages and empty page tables return to the PMM, and a stale TLB entry is never used (moved from 1.2).
 - [ ] Test mapping exhaustion: `map` reports out-of-memory when page tables can't be allocated and leaves existing mappings intact (moved from 1.2).
 
@@ -141,6 +154,16 @@ Moved up from 5.1: pipes, blocking I/O, sleep and interrupt-driven drivers in mi
 - [ ] Add mutexes for code that may block while holding a lock.
 - [ ] Add kernel timers: a timeout queue driven by the timer tick, for sleep, driver timeouts and later TCP.
 - [ ] Test several waiters on one queue, wake-before-block, timer ordering and expiry, and mutex hand-off under preemption.
+
+### 2.9 Further hardening
+From the code review before 2.2. None of these fix a known hole; they shrink what a future bug can do. Do them after 2.2 to 2.8, in roughly this order.
+- [x] Enable UMIP when CPU-supported, so ring 3 cannot read kernel table addresses with `sgdt`/`sidt` (`usercopy.init`; tested by `/test/umip`).
+- [ ] Build the kernel with stack protectors and test that a smashed kernel stack is detected.
+- [ ] Add a speculation barrier after the user range check in the user-copy path, and audit other user-controlled indexes (syscall number, file descriptor) for Spectre v1.
+- [ ] Decide on kernel page-table isolation: detect CPUs that need it (Meltdown) and either implement it or refuse to run untrusted code on them.
+- [ ] Randomize the kernel's load address and the user stack and program base (KASLR/ASLR); needs the PIE loading of 8.2 for programs.
+- [ ] Poison freed heap memory and freed pages in debug builds to catch use-after-free.
+- [ ] Zero pages when they are freed or before they reach another process, as a rule in one place instead of at each call site.
 
 **Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources.
 
@@ -414,6 +437,13 @@ The primitives themselves come from 2.8; this section makes them and their users
 - [ ] Add a benchmark suite run in QEMU with KVM and on real hardware: syscall round trip, context switch, page fault, thread create/join, futex ping-pong, and `mmap`/`munmap` churn.
 - [ ] Benchmark a multi-threaded .NET workload (allocation-heavy and CPU-bound) for throughput and scaling from 1 to N cores, and compare with the same binary on Linux on the same machine.
 - [ ] Profile and remove the hot spots the benchmarks show (the profiling items in 10 move up when this starts); candidates are per-CPU run queues, lock contention in the PMM and VMM, PCID to avoid TLB flushes, and 2 MiB pages for large anonymous mappings.
+- [ ] Known slow paths from the code review before 2.2, to measure first and fix where the benchmarks say so:
+  - `read`/`write` bounce every 256 bytes through a kernel stack buffer, and `write` goes through the formatter as well.
+  - Spawning a program copies the whole file to the heap and then into pages, although the initrd is already in memory (Debug builds: about 1.1 MiB per spawn, debug info included).
+  - `print` keeps interrupts off while it writes to the polled serial port: about 22 ms for 256 bytes at 115200 baud, more than two timer ticks.
+  - The kernel heap is first-fit over an address-sorted list with interrupts off; allocation and free are linear in the number of free chunks.
+  - The page allocator scans its bitmap one bit at a time, now with interrupts off.
+  - Every process switch reloads CR3 without PCID and flushes the TLB.
 - [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
 
 **Milestone 8 done when:** An unmodified .NET Native AOT program runs on MyOS without being rebuilt for it, uses several cores, cannot crash or corrupt the kernel, and its measured performance is recorded against Linux on the same hardware.

@@ -2,7 +2,8 @@
 //!
 //! Copies each `PT_LOAD` segment into freshly allocated pages of a user address
 //! space. The image is treated as untrusted: every offset and address is
-//! checked against the file size and the user half of the address space.
+//! checked against the file size and the mappable part of user space
+//! (`vmm.USER_MAP_END`).
 
 const std = @import("std");
 const pmm = @import("pmm.zig");
@@ -68,7 +69,7 @@ pub fn load(root: u64, image: []const u8) Error!u64 {
         const file_end = add(file_off, filesz) orelse return error.BadSegment;
         const mem_end = add(vaddr, memsz) orelse return error.BadSegment;
         if (vaddr % pmm.PAGE_SIZE != 0 or filesz > memsz or file_end > image.len or
-            mem_end > vmm.USER_END) return error.BadSegment;
+            mem_end > vmm.USER_MAP_END) return error.BadSegment; // the last user page is never mapped
 
         var pte: u64 = vmm.USER;
         if (flags & 2 != 0) pte |= vmm.WRITABLE;
@@ -86,6 +87,6 @@ pub fn load(root: u64, image: []const u8) Error!u64 {
             vmm.map(root, vaddr + page, phys, pte, false);
         }
     }
-    if (entry >= vmm.USER_END) return error.NotExecutable;
+    if (entry >= vmm.USER_MAP_END) return error.NotExecutable;
     return entry;
 }

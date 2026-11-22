@@ -10,6 +10,7 @@ const kernel_root = @import("root");
 const cpu = kernel_root.arch.x86_64.cpu;
 const vmm = kernel_root.arch.x86_64.vmm;
 const usercopy = kernel_root.arch.x86_64.usercopy;
+const idt = kernel_root.arch.x86_64.idt;
 const uaccess = kernel_root.kernel.uaccess;
 const nvme = kernel_root.drivers.nvme;
 const elf = kernel_root.kernel.elf;
@@ -390,13 +391,105 @@ fn userCopyChecksIn(p0: ?u64, p1: ?u64, ro: ?u64) u32 {
     return 0;
 }
 
-/// True if write protection in ring 0, SMEP and SMAP are all switched on,
-/// both in the kernel's bookkeeping and in the control registers.
+/// True if write protection in ring 0, UMIP, SMEP and SMAP are all switched
+/// on, both in the kernel's bookkeeping and in the control registers.
 pub fn userProtectionOn() bool {
     const cr4 = cpu.readCr4();
-    return usercopy.smep_enabled and usercopy.smapEnabled() and
-        cr4 & (1 << 20) != 0 and cr4 & (1 << 21) != 0 and
+    return usercopy.umip_enabled and usercopy.smep_enabled and usercopy.smapEnabled() and
+        cr4 & (1 << 11) != 0 and cr4 & (1 << 20) != 0 and cr4 & (1 << 21) != 0 and
         cpu.readCr0() & (1 << 16) != 0;
+}
+
+const RFLAGS_AC: u64 = 1 << 18;
+/// A vector no device uses, for `acClearedOnKernelEntry`.
+const AC_TEST_VECTOR = 0xF0;
+var ac_seen_in_handler: ?bool = null;
+
+/// Interrupt handler for `acClearedOnKernelEntry`: record RFLAGS.AC.
+fn acProbe(_: *idt.Frame) void {
+    ac_seen_in_handler = cpu.readFlags() & RFLAGS_AC != 0;
+}
+
+/// Check that SMAP's user-access override (RFLAGS.AC) cannot leak into the
+/// kernel: an interrupt taken while AC is set runs its handler with AC clear
+/// and gives the interrupted code its AC back, and the `syscall` flag mask
+/// clears AC on entry. Returns 0, or the number of the first failing check.
+pub fn acClearedOnKernelEntry() u32 {
+    if (!usercopy.smapEnabled()) return 1; // `stac` would be an invalid opcode
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    ac_seen_in_handler = null;
+    idt.register(AC_TEST_VECTOR, acProbe);
+    asm volatile (
+        \\ .byte 0x0f, 0x01, 0xcb   # stac
+        \\ int $0xF0
+    );
+    const ac_after = cpu.readFlags() & RFLAGS_AC != 0;
+    asm volatile (".byte 0x0f, 0x01, 0xca"); // clac
+    const seen = ac_seen_in_handler orelse return 2; // the handler never ran
+    if (seen) return 3; // the handler ran with user access allowed
+    if (!ac_after) return 4; // the interrupted code lost its AC
+    if (cpu.readFlags() & RFLAGS_AC != 0) return 5;
+    if (cpu.rdmsr(0xC0000084) & RFLAGS_AC == 0) return 6; // SFMASK must clear AC on syscall
+    return 0;
+}
+
+// State shared by the PMM stress workers.
+var pmm_stress_done: usize = 0;
+var pmm_stress_errors: usize = 0;
+var pmm_stress_waiter: ?*thread.Thread = null;
+var pmm_stress_next_tag: u64 = 1;
+
+/// PMM stress worker: with interrupts on (so the timer preempts it), keep
+/// allocating a batch of pages, stamping each with this worker's tag, and
+/// checking that every stamp is still there before freeing the batch. A page
+/// handed to both workers shows up as a foreign stamp or a duplicate.
+fn pmmStressWorker() void {
+    const irq = cpu.saveAndDisableInterrupts();
+    const tag = pmm_stress_next_tag;
+    pmm_stress_next_tag += 1;
+    cpu.restoreInterrupts(irq);
+
+    var pages: [32]u64 = undefined;
+    var errors: usize = 0;
+    for (0..1500) |round| {
+        var n: usize = 0;
+        while (n < pages.len) : (n += 1) {
+            const p = pmm.alloc() orelse break;
+            for (pages[0..n]) |other| {
+                if (other == p) errors += 1;
+            }
+            const word: *volatile u64 = @ptrCast(@alignCast(pmm.physToVirt(p)));
+            word.* = (tag << 32) | round;
+            pages[n] = p;
+        }
+        for (pages[0..n]) |p| {
+            const word: *volatile u64 = @ptrCast(@alignCast(pmm.physToVirt(p)));
+            if (word.* != (tag << 32) | round) errors += 1;
+            pmm.free(p);
+        }
+    }
+
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    pmm_stress_errors += errors;
+    pmm_stress_done += 1;
+    if (pmm_stress_done == 2) thread.wake(pmm_stress_waiter.?);
+}
+
+/// Run two preemptible kernel threads that allocate and free pages at the
+/// same time. Returns true if no page was ever handed out twice and the free
+/// count is back where it started.
+pub fn pmmConcurrentStress() bool {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = pmm.free_pages;
+    pmm_stress_done = 0;
+    pmm_stress_errors = 0;
+    pmm_stress_waiter = thread.current();
+    _ = thread.spawn(pmmStressWorker, null) catch return false;
+    _ = thread.spawn(pmmStressWorker, null) catch return false;
+    while (pmm_stress_done < 2) thread.block();
+    return pmm_stress_errors == 0 and pmm.free_pages == before;
 }
 
 /// For the `smap` and `smep` scenarios: switch to a new address space with

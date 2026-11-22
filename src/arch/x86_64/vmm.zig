@@ -42,6 +42,11 @@ extern const __data_end: u8;
 
 /// First address above the user half of the address space.
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
+/// End of the part of user space that may be mapped. The last page stays
+/// unmapped for good: a `syscall` instruction at its very end would return
+/// to `USER_END`, which is not a canonical address, and `sysretq` to such an
+/// address faults in ring 0 on Intel CPUs, on the user's stack pointer.
+pub const USER_MAP_END: u64 = USER_END - 4096;
 
 /// Return the 512-entry page table at physical address `phys`, via the HHDM.
 fn table(phys: u64) *[512]u64 {

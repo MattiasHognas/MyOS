@@ -7,6 +7,7 @@
 
 const limine = @import("../boot/limine.zig");
 const assert = @import("debug/assert.zig");
+const cpu = @import("../arch/x86_64/cpu.zig");
 
 var bitmap: []u8 = &.{}; // 1 bit per page, 1 = used
 var total_pages: usize = 0;
@@ -96,6 +97,10 @@ pub fn init(mm: *const limine.MemmapResponse, hhdm_offset: u64) void {
 /// memory is exhausted. The page is not zeroed. Not interrupt safe: callers
 /// that may race with other allocations must disable interrupts.
 pub fn alloc() ?u64 {
+    // Callers may be preemptible (syscalls); a thread switch between finding
+    // a free page and marking it used would hand the page out twice.
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
     for (0..total_pages) |n| {
         const p = (hint + n) % total_pages;
         if (!isUsed(p)) {
@@ -114,6 +119,8 @@ pub fn free(phys: u64) void {
     assert.check(.pmm, phys % PAGE_SIZE == 0, "freeing unaligned address 0x{x}", .{phys});
     assert.check(.pmm, phys != 0 and phys / PAGE_SIZE < total_pages, "freeing address 0x{x} outside managed memory", .{phys});
     const p = phys / PAGE_SIZE;
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
     if (!isUsed(p)) @panic("PMM: double free");
     setFree(p);
     free_pages += 1;

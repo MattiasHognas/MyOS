@@ -129,7 +129,7 @@ the terminal.
 | Path | Contents |
 | --- | --- |
 | `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
-| `src/arch/x86_64/` | GDT/TSS, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, fault-tolerant user copies and SMEP/SMAP (`usercopy`), port I/O |
+| `src/arch/x86_64/` | GDT/TSS, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |

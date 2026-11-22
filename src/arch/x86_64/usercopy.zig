@@ -1,6 +1,8 @@
 //! Fault-tolerant copies between kernel and user memory, and the CPU features
 //! that keep the kernel away from user memory everywhere else.
 //!
+//! - **UMIP** makes `sgdt`, `sidt`, `sldt`, `smsw` and `str` fault in ring 3,
+//!   so user programs cannot read the addresses of kernel tables.
 //! - **SMEP** makes the kernel fault when it executes code in a user page.
 //! - **SMAP** makes the kernel fault when it reads or writes a user page
 //!   while RFLAGS.AC is clear. `user_copy` is the one user-access section: it
@@ -21,6 +23,7 @@ const user_range = @import("../../kernel/user_range.zig");
 const log = std.log.scoped(.usercopy);
 
 const CR0_WP: u64 = 1 << 16;
+const CR4_UMIP: u64 = 1 << 11;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
 
@@ -30,6 +33,9 @@ export var smap_enabled: u8 = 0;
 
 /// True once SMEP is on.
 pub var smep_enabled = false;
+
+/// True once UMIP is on.
+pub var umip_enabled = false;
 
 // user_copy(dst: rdi, src: rsi, len: rdx) -> rax: 0 = copied, 1 = faulted.
 // stac/clac are written as bytes so the assembler needs no SMAP feature flag.
@@ -91,20 +97,28 @@ pub fn smapEnabled() bool {
 }
 
 /// Turn on write protection for ring 0 (so `copyToUser` faults on read-only
-/// user pages) and SMEP and SMAP where the CPU has them. Called once during
+/// user pages) and UMIP, SMEP and SMAP where the CPU has them. Called once during
 /// boot, after the kernel's own page tables are loaded.
 pub fn init() void {
     cpu.writeCr0(cpu.readCr0() | CR0_WP);
 
-    var features: u32 = 0;
-    if (cpu.cpuid(0, 0).eax >= 7) features = cpu.cpuid(7, 0).ebx;
+    var features: u32 = 0; // CPUID leaf 7 EBX
+    var features_ecx: u32 = 0;
+    if (cpu.cpuid(0, 0).eax >= 7) {
+        const leaf7 = cpu.cpuid(7, 0);
+        features = leaf7.ebx;
+        features_ecx = leaf7.ecx;
+    }
     var cr4 = cpu.readCr4();
+    if (features_ecx & (1 << 2) != 0) cr4 |= CR4_UMIP;
     if (features & (1 << 7) != 0) cr4 |= CR4_SMEP;
     if (features & (1 << 20) != 0) cr4 |= CR4_SMAP;
     cpu.writeCr4(cr4);
     smep_enabled = cr4 & CR4_SMEP != 0;
+    umip_enabled = cr4 & CR4_UMIP != 0;
     smap_enabled = @intFromBool(cr4 & CR4_SMAP != 0);
-    log.info("SMEP {s}, SMAP {s}", .{
+    log.info("UMIP {s}, SMEP {s}, SMAP {s}", .{
+        if (umip_enabled) "on" else "not supported",
         if (smep_enabled) "on" else "not supported",
         if (smapEnabled()) "on" else "not supported",
     });

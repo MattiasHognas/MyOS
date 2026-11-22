@@ -214,6 +214,10 @@ fn elfLoadValid() TestError!void {
     _ = helpers.elfProbe(buildElf(.{}), 0x40_1000, &out) orelse return error.Failed;
     try check(std.mem.allEqual(u8, &out, 0)); // second page: all .bss
 
+    // The highest loadable segment ends right below the last user page.
+    const top = helpers.elfProbe(buildElf(.{ .vaddr = 0x7FFF_FFFF_D000 }), 0x7FFF_FFFF_E000, &out) orelse return error.Failed;
+    try check(top.pte & PTE_PRESENT != 0);
+
     try check(pmm.free_pages == before);
 }
 
@@ -277,6 +281,9 @@ fn elfRejectMalformed() TestError!void {
         .{ .phnum = 200 }, // program header table runs past the end
         .{ .vaddr = 0xFFFF_8000_0000_0000 }, // kernel half
         .{ .vaddr = 0x7FFF_FFFF_F000 }, // ends past the user half
+        .{ .vaddr = 0x7FFF_FFFF_E000 }, // fits, but covers the last user page (never mapped: sysret)
+        .{ .vaddr = 0x7FFF_FFFF_F000, .memsz = 0x1000 }, // exactly the last user page
+        .{ .entry = 0x7FFF_FFFF_F000 }, // entry point in the last user page
         .{ .vaddr = 0xFFFF_FFFF_FFFF_F000 }, // vaddr + memsz wraps around
         .{ .vaddr = 0x40_0100 }, // not page aligned
         .{ .filesz = 0x3000 }, // filesz > memsz
@@ -335,17 +342,38 @@ fn userCopy() TestError!void {
     try check(failed == 0);
 }
 
-/// Ring 0 write protection, SMEP and SMAP are on (QEMU's `-cpu max` has both).
+/// Ring 0 write protection, UMIP, SMEP and SMAP are on (QEMU's `-cpu max` has them all).
 fn userProtectionOn() TestError!void {
     try check(helpers.userProtectionOn());
 }
 
-/// Ring 3 cannot read kernel memory, run privileged instructions, or write
-/// its own code: each attempt kills only that process (exit code 255).
+/// RFLAGS.AC is cleared on interrupt entry and masked on syscall entry.
+fn acClearedOnKernelEntry() TestError!void {
+    const failed = helpers.acClearedOnKernelEntry();
+    if (failed != 0) {
+        var buf: [64]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&buf, "  AC check {d} failed\n", .{failed}) catch "");
+    }
+    try check(failed == 0);
+}
+
+/// A new process starts with all general-purpose registers zeroed.
+fn userEntryRegisters() TestError!void {
+    try check(helpers.runProgram("/test/entry_regs") == 0);
+}
+
+/// Two preemptible threads allocating and freeing pages never share a page.
+fn pmmConcurrentStress() TestError!void {
+    try check(helpers.pmmConcurrentStress());
+}
+
+/// Ring 3 cannot read kernel memory, run privileged instructions, write its
+/// own code, or read the kernel's descriptor-table addresses: each attempt kills only that process (exit code 255).
 fn userIsolation() TestError!void {
     try check(helpers.runProgram("/test/kernel_read") == 255);
     try check(helpers.runProgram("/test/privileged") == 255);
     try check(helpers.runProgram("/test/write_text") == 255);
+    try check(helpers.runProgram("/test/umip") == 255); // sgdt
 }
 
 /// Spawn, run, wait and exit: exit codes reach the parent, and a finished or
@@ -683,7 +711,10 @@ fn runCases() noreturn {
         .{ .name = "syscall buffer and fd validation (ring 3)", .func = userSyscalls },
         .{ .name = "user copy routines (bad, partial and read-only ranges)", .func = userCopy },
         .{ .name = "bad user pointers in syscalls (ring 3)", .func = userPointers },
-        .{ .name = "SMEP, SMAP and ring 0 write protection enabled", .func = userProtectionOn },
+        .{ .name = "UMIP, SMEP, SMAP and ring 0 write protection enabled", .func = userProtectionOn },
+        .{ .name = "RFLAGS.AC cleared on interrupt and syscall entry", .func = acClearedOnKernelEntry },
+        .{ .name = "registers cleared on entry to user mode", .func = userEntryRegisters },
+        .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },
         .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin },
