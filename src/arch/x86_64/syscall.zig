@@ -1,10 +1,23 @@
+//! `syscall`/`sysretq` entry path.
+//!
+//! Configures the syscall MSRs and provides the assembly entry point, which
+//! switches to the current thread's kernel stack, builds a `Frame` and calls the
+//! handler registered with `init`. The kernel-side dispatcher lives in
+//! `kernel/syscall.zig`.
+
 const cpu = @import("cpu.zig");
 
-export var syscall_kernel_rsp: u64 = 0; // current thread's kernel stack top
-export var syscall_user_rsp: u64 = 0; // scratch, only used with interrupts off
+/// Top of the current thread's kernel stack. Loaded into RSP on syscall entry.
+export var syscall_kernel_rsp: u64 = 0;
+/// Scratch slot for the user RSP during entry. Only touched with interrupts off.
+export var syscall_user_rsp: u64 = 0;
 
 var handler: *const fn (*Frame) void = undefined;
 
+/// User register state saved on syscall entry, lowest address first.
+///
+/// `rax` holds the syscall number on entry and the return value on exit;
+/// `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` hold the arguments.
 pub const Frame = extern struct {
     r9: u64,
     r8: u64,
@@ -12,10 +25,14 @@ pub const Frame = extern struct {
     rdx: u64,
     rsi: u64,
     rdi: u64,
-    rax: u64, // syscall number in, return value out
-    rip: u64, // user RIP (CPU put it in RCX)
-    rflags: u64, // user RFLAGS (CPU put it in R11)
-    rsp: u64, // user RSP
+    /// Syscall number in, return value out.
+    rax: u64,
+    /// User RIP (the CPU put it in RCX).
+    rip: u64,
+    /// User RFLAGS (the CPU put it in R11).
+    rflags: u64,
+    /// User RSP.
+    rsp: u64,
 };
 
 // Entry: the CPU has cleared IF (via SFMASK), so the scratch global is safe.
@@ -52,21 +69,31 @@ comptime {
     );
 }
 
+/// Assembly entry point defined above; its address is written to LSTAR.
 extern fn syscall_entry() callconv(.c) void;
 
-// The CPU calls this when a syscall occurs. It may switch threads, so it must not return.
+/// Called from `syscall_entry` on the kernel stack with the saved user registers.
+///
+/// Enables interrupts while the handler runs, so long syscalls can be
+/// preempted, and disables them again before the return path touches the
+/// scratch globals.
 export fn syscall_handler_c(f: *Frame) callconv(.c) void {
     asm volatile ("sti"); // long syscalls may be preempted
     handler(f);
     asm volatile ("cli"); // the exit path must not be interrupted
 }
 
-// Set the kernel stack pointer for the current thread. This is used when a syscall or interrupt occurs.
+/// Set the kernel stack that `syscall_entry` switches to. Called by the
+/// scheduler on every thread switch with the new thread's stack top.
 pub fn setKernelStack(top: u64) void {
     syscall_kernel_rsp = top;
 }
 
-// Initialize the syscall handler. The handler is called with a pointer to a Frame struct, which contains the syscall number and arguments. The handler must set f->rax to the return value.
+/// Enable the `syscall` instruction and route it to `h`.
+///
+/// Sets EFER.SCE, the segment selectors in STAR, the entry point in LSTAR and
+/// masks TF, IF and DF in SFMASK. `h` receives the saved user registers and
+/// returns its result by writing `f.rax`.
 pub fn init(h: *const fn (*Frame) void) void {
     handler = h;
     cpu.wrmsr(0xC0000080, cpu.rdmsr(0xC0000080) | 1); // EFER.SCE: enable syscall

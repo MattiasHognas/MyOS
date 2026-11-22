@@ -1,6 +1,13 @@
+//! In-kernel integration tests, run inside QEMU by the test kernel.
+//!
+//! The kernel passes an `Api` of callbacks so the tests use the kernel's own
+//! module instances. Results are logged to serial as `[PASS]`/`[FAIL]` lines
+//! followed by `MYOS_TEST_PASS` or `MYOS_TEST_FAIL`, then QEMU is exited.
+
 const std = @import("std");
 const qemu_exit = @import("qemu_exit");
 
+/// Kernel services the tests may use, provided by `src/main.zig`.
 pub const Api = struct {
     log: *const fn ([]const u8) void,
 
@@ -20,10 +27,12 @@ pub const Api = struct {
 
 const TestError = error{ Failed, OutOfMemory };
 
+/// Turn a boolean condition into `error.Failed`.
 fn check(ok: bool) TestError!void {
     if (!ok) return error.Failed;
 }
 
+/// Allocating a page returns an aligned, non-zero, usable page and decrements the free count.
 fn pageAccounting(api: Api) TestError!void {
     const before = api.free_pages();
     const page = api.alloc_page() orelse
@@ -35,6 +44,7 @@ fn pageAccounting(api: Api) TestError!void {
     try check(api.page_rw(page));
 }
 
+/// Consecutive allocations return distinct pages and are all accounted for.
 fn multiplePages(api: Api) TestError!void {
     const before = api.free_pages();
 
@@ -63,24 +73,29 @@ fn multiplePages(api: Api) TestError!void {
     try check(api.free_pages() + pages.len == before);
 }
 
+/// The kernel heap can allocate, fill and free a block.
 fn heapTest(api: Api) TestError!void {
     try check(api.heap_roundtrip());
 }
 
+/// Creating and destroying an address space does not leak pages.
 fn addressSpaceTest(api: Api) TestError!void {
     try check(api.address_space_roundtrip());
 }
 
+/// Spawning a process from a non-ELF image fails.
 fn invalidElf(api: Api) TestError!void {
     try check(api.invalid_elf_rejected());
 }
 
+/// Known initrd files are found and missing ones are not.
 fn vfsLookup(api: Api) TestError!void {
     try check(api.has_file("/etc/motd"));
     try check(api.has_file("/bin/sh"));
     try check(!api.has_file("/does-not-exist"));
 }
 
+/// `/etc/motd` has the expected size and contents.
 fn vfsContents(api: Api) TestError!void {
     const size = api.file_size("/etc/motd") orelse
         return error.Failed;
@@ -102,6 +117,7 @@ fn vfsContents(api: Api) TestError!void {
     ));
 }
 
+/// Reads honour the offset and return 0 at or past end of file.
 fn vfsOffsets(api: Api) TestError!void {
     var buf: [8]u8 = undefined;
 
@@ -132,6 +148,7 @@ fn vfsOffsets(api: Api) TestError!void {
     );
 }
 
+/// Size and read queries for a missing file return null.
 fn missingFile(api: Api) TestError!void {
     var buf: [32]u8 = undefined;
 
@@ -141,6 +158,7 @@ fn missingFile(api: Api) TestError!void {
     try check(api.file_size("/missing") == null);
 }
 
+/// Run every test case, log the results and exit QEMU with 0 if all passed, 1 otherwise.
 pub fn run(api: Api) noreturn {
     api.log("MYOS_TEST_BEGIN\n");
 

@@ -1,3 +1,8 @@
+//! Text console on the bootloader's framebuffer.
+//!
+//! Renders characters with a PSF1/PSF2 bitmap font embedded at compile time,
+//! wraps at the right edge and scrolls when the cursor passes the last row.
+
 const std = @import("std");
 const limine = @import("../boot/limine.zig");
 
@@ -9,9 +14,11 @@ var col: usize = 0;
 var row: usize = 0;
 const fg: u32 = 0xE0E0E0;
 const bg: u32 = 0x101820;
+
+/// Glyph size in pixels, bytes per glyph and the glyph bitmaps.
 const Font = struct { w: usize, h: usize, bpg: usize, glyphs: []const u8 };
 
-// Parsed at compile time; a bad font file is a compile error.
+/// The console font, parsed at compile time; a bad font file is a compile error.
 const font: Font = blk: {
     const d = @embedFile("../assets/font.psf");
     if (d[0] == 0x36 and d[1] == 0x04) { // PSF1
@@ -28,9 +35,10 @@ const font: Font = blk: {
     @compileError("font.psf is not a PSF font");
 };
 
+/// True once `init` has run and `putc` may be called.
 pub var ready = false;
 
-// Draw a glyph at the given character coordinates (not pixel coordinates).
+/// Draw character `c` at character cell (`cx`, `cy`), overwriting the whole cell.
 fn drawGlyph(c: u8, cx: usize, cy: usize) void {
     const glyph = font.glyphs[@as(usize, c) * font.bpg ..][0..font.bpg];
     const bytes_per_row = (font.w + 7) / 8;
@@ -44,7 +52,7 @@ fn drawGlyph(c: u8, cx: usize, cy: usize) void {
     }
 }
 
-// Scroll the framebuffer up by one line. The caller must ensure that the framebuffer is ready.
+/// Move every text row up by one and clear the bottom row.
 fn scroll() void {
     const line_px = stride * font.h;
     const total = line_px * rows;
@@ -52,7 +60,11 @@ fn scroll() void {
     @memset(fb[total - line_px .. total], bg);
 }
 
-// Write a character to the framebuffer. The caller must ensure that the framebuffer is ready.
+/// Write one character at the cursor and advance it.
+///
+/// `\n` moves to the start of the next line and backspace (0x08) moves the
+/// cursor one cell left without erasing. Lines wrap at the right edge and the
+/// screen scrolls at the bottom. Requires `init` (check `ready`).
 pub fn putc(c: u8) void {
     if (c == 0x08) {
         if (col > 0) col -= 1;
@@ -75,7 +87,8 @@ pub fn putc(c: u8) void {
     }
 }
 
-// Initialize the framebuffer.
+/// Set up the console on framebuffer `f`, clear the screen and set `ready`.
+/// Panics if the framebuffer is not 32 bits per pixel.
 pub fn init(f: *const limine.Framebuffer) void {
     if (f.bpp != 32) @panic("framebuffer is not 32 bpp");
     fb = @ptrCast(@alignCast(f.address));

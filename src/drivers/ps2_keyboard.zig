@@ -1,3 +1,9 @@
+//! PS/2 keyboard driver.
+//!
+//! The IRQ 1 handler translates scancode set 1 (US layout) into ASCII,
+//! tracking Shift, Ctrl and Caps Lock, and pushes characters into a lock-free
+//! single-producer/single-consumer ring buffer read by `getChar`.
+
 const std = @import("std");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
@@ -14,14 +20,17 @@ var ctrl = false;
 var caps = false;
 var extended = false; // previous byte was the 0xE0 prefix
 
-// Ring buffer: written by the IRQ handler, read by the main loop
+// Ring buffer: written by the IRQ handler, read by getChar.
 var buf: [256]u8 = undefined;
 var head: u8 = 0; // next write (u8 wraps at 256 by itself)
 var tail: u8 = 0; // next read
 
-pub var waiter: ?*thread.Thread = null; // set by the getchar syscall
+/// Thread to wake when a key arrives. Set by the getchar syscall before it
+/// blocks; cleared by the IRQ handler when it wakes the thread.
+pub var waiter: ?*thread.Thread = null;
 
-// Push a character into the ring buffer. If the buffer is full, the character is dropped.
+/// Append `c` to the ring buffer. Drops the character if the buffer is full.
+/// Only called from the IRQ handler (the single producer).
 fn push(c: u8) void {
     const h = head;
     if (h +% 1 == @atomicLoad(u8, &tail, .acquire)) return; // full: drop the key
@@ -29,7 +38,10 @@ fn push(c: u8) void {
     @atomicStore(u8, &head, h +% 1, .release);
 }
 
-// IRQ handler for the PS/2 keyboard. Reads a scancode from the keyboard controller, translates it to a character, and pushes it into the ring buffer. Wakes any thread waiting for a character.
+/// IRQ 1 handler: read one scancode from the controller, update the modifier
+/// state, translate key presses to ASCII, queue the character and wake
+/// `waiter` if set. Extended (0xE0-prefixed) keys and key releases produce no
+/// characters.
 fn onIrq(_: *idt.Frame) void {
     const sc = cpu.inb(0x60);
     if (sc == 0xE0) {
@@ -69,7 +81,8 @@ fn onIrq(_: *idt.Frame) void {
     }
 }
 
-// Get a character from the keyboard. Blocks until a character is available. Returns the character, or null if the thread was woken by another thread.
+/// Take the next character from the ring buffer, or return null if it is
+/// empty. Never blocks; callers that want to wait set `waiter` and block.
 pub fn getChar() ?u8 {
     const t = tail;
     if (t == @atomicLoad(u8, &head, .acquire)) return null;
@@ -78,7 +91,8 @@ pub fn getChar() ?u8 {
     return c;
 }
 
-// Initialize the PS/2 keyboard driver. Registers the IRQ handler and discards any stale bytes in the keyboard controller's output buffer.
+/// Discard any stale bytes in the controller's output buffer, install the IRQ
+/// handler and route IRQ 1 through the I/O APIC. Requires `apic.init`.
 pub fn init() void {
     while ((cpu.inb(0x64) & 1) != 0) _ = cpu.inb(0x60); // discard stale bytes
     idt.register(apic.IRQ_BASE + 1, onIrq);

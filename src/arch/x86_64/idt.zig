@@ -1,3 +1,12 @@
+//! Interrupt Descriptor Table and the common interrupt entry path.
+//!
+//! Every one of the 256 vectors gets a small generated stub that pushes the
+//! vector number (and a dummy error code where the CPU doesn't push one) and
+//! jumps to `isr_common`, which saves all registers and calls
+//! `interruptHandler`. Hardware interrupts (vector >= 32) are dispatched to
+//! handlers installed with `register`; CPU exceptions are reported and either
+//! kill the faulting user process or halt the kernel.
+
 const std = @import("std");
 const root = @import("root");
 const gdt = @import("gdt.zig");
@@ -8,18 +17,19 @@ const process = @import("../../kernel/process.zig");
 var idt = std.mem.zeroes([256]Entry);
 var handlers: [256]?Handler = @splat(null);
 
-// IDT table
+/// One 16-byte IDT gate descriptor.
 const Entry = extern struct {
     offset_low: u16,
     selector: u16,
     ist: u8,
-    type_attr: u8, // 0x8E = present | ring 0 | 64-bit interrupt gate
+    /// 0x8E = present | ring 0 | 64-bit interrupt gate.
+    type_attr: u8,
     offset_mid: u16,
     offset_high: u32,
     reserved: u32,
 };
 
-// The CPU pushes an error code.
+/// Human-readable names of the 32 CPU exception vectors.
 const names = [32][]const u8{
     "Divide error",         "Debug",               "NMI",            "Breakpoint",
     "Overflow",             "Bound range",         "Invalid opcode", "Device not available",
@@ -31,14 +41,16 @@ const names = [32][]const u8{
     "Hypervisor injection", "VMM communication",   "Security",       "Reserved",
 };
 
+/// Operand for `lidt`: size and linear address of the IDT.
 const IdtPtr = extern struct {
     limit: u16,
     base: u64 align(1),
 };
 
+/// An interrupt handler. Receives the saved register state of the interrupted code.
 pub const Handler = *const fn (*Frame) void;
 
-// Set an IDT entry to point to a given handler.
+/// Point IDT entry `vec` at the code address `handler` as a ring 0 interrupt gate.
 fn setGate(vec: usize, handler: usize) void {
     idt[vec] = .{
         .offset_low = @truncate(handler),
@@ -51,9 +63,11 @@ fn setGate(vec: usize, handler: usize) void {
     };
 }
 
-// Stubs, generated at compile time.
-// The CPU pushes an error code only for some vectors. The stub pushes a
-// dummy 0 for the others, so every frame has the same layout.
+/// Generate the entry stub for vector `vec` at compile time.
+///
+/// The CPU pushes an error code only for some vectors. The stub pushes a dummy
+/// 0 for the others, so every `Frame` has the same layout, then pushes the
+/// vector number and jumps to `isr_common`.
 fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
     const has_err = switch (vec) {
         8, 10...14, 17, 21, 29, 30 => true,
@@ -68,7 +82,8 @@ fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
     }.h;
 }
 
-// Common path: save registers, call Zig, restore, iretq
+// Common path for all stubs: save registers, call interruptHandler, restore,
+// drop the vector and error code, iretq.
 comptime {
     asm (
         \\.section .text
@@ -112,14 +127,22 @@ comptime {
     );
 }
 
-// Read the CR2 register, which contains the faulting address for a page fault.
+/// Read CR2, which holds the faulting linear address after a page fault.
 fn readCr2() u64 {
     return asm volatile ("mov %%cr2, %[ret]"
         : [ret] "=r" (-> u64),
     );
 }
 
-// The CPU calls this when an interrupt or exception occurs. It may switch threads, so it must not return.
+/// Dispatch an interrupt or exception. Called from `isr_common` with the saved frame.
+///
+/// - Spurious LAPIC interrupts are ignored (no EOI).
+/// - Hardware interrupts (vector >= 32) are acknowledged first, then passed to
+///   the handler installed with `register`. The handler may switch threads, so
+///   the EOI must already have been sent.
+/// - Exceptions from ring 3 terminate the current process with exit code 255.
+/// - Exceptions from ring 0 print the register state and halt, except
+///   breakpoints (`int3`), which resume.
 export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
     if (f.vector >= 32) {
@@ -141,12 +164,17 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
     root.halt();
 }
 
-// Register a handler for a given vector. The handler is called with a pointer to the stack frame. The handler may switch threads, so it must not return.
+/// Install `h` as the handler for hardware interrupt `vector` (32-255).
+///
+/// The handler runs with interrupts disabled after the EOI has been sent, so it
+/// may switch threads (e.g. the timer handler calling `thread.tick`).
 pub fn register(vector: u8, h: Handler) void {
     handlers[vector] = h;
 }
 
-// The stack as isr_common leaves it, lowest address first.
+/// The stack as `isr_common` leaves it, lowest address first: the registers it
+/// saved, then the vector and error code from the stub, then the interrupt
+/// frame pushed by the CPU.
 pub const Frame = extern struct {
     r15: u64,
     r14: u64,
@@ -163,16 +191,20 @@ pub const Frame = extern struct {
     rcx: u64,
     rbx: u64,
     rax: u64,
+    /// Pushed by the stub.
     vector: u64,
-    error_code: u64, // pushed by the stub
+    /// Pushed by the CPU, or a dummy 0 pushed by the stub.
+    error_code: u64,
+    /// Pushed by the CPU from here on.
     rip: u64,
     cs: u64,
-    rflags: u64, // pushed by the CPU
+    rflags: u64,
     rsp: u64,
     ss: u64,
 };
 
-// Initialize the IDT. Sets up stubs for all vectors, then loads the IDT register.
+/// Fill all 256 IDT entries with their stubs and load the IDT with `lidt`.
+/// Requires `gdt.init` to have run, since the gates use the kernel code selector.
 pub fn init() void {
     inline for (0..256) |i| setGate(i, @intFromPtr(stub(i)));
     const ptr = IdtPtr{ .limit = @sizeOf(@TypeOf(idt)) - 1, .base = @intFromPtr(&idt) };

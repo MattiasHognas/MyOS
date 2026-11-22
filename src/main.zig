@@ -1,38 +1,106 @@
+//! MyOS kernel entry point.
+//!
+//! Declares the Limine boot requests, brings up every subsystem in order in
+//! `kmain` (CPU tables, memory, ACPI/APIC/timers, PCI, syscalls, the initrd)
+//! and finally starts `/bin/sh` as the first user process. Also provides the
+//! kernel-wide `print`, `halt` and panic handler that other modules reach via
+//! `@import("root")`, plus the callbacks used by the in-kernel test suite.
+
 const std = @import("std");
 const build_options = @import("build_options");
-const limine = @import("boot/limine.zig");
-const serial = @import("drivers/serial.zig");
-const console = @import("kernel/console.zig");
-const gdt = @import("arch/x86_64/gdt.zig");
-const idt = @import("arch/x86_64/idt.zig");
-const pmm = @import("kernel/pmm.zig");
-const vmm = @import("arch/x86_64/vmm.zig");
-const heap = @import("kernel/heap.zig");
-const acpi = @import("firmware/acpi.zig");
-const apic = @import("arch/x86_64/apic.zig");
-const cpu = @import("arch/x86_64/cpu.zig");
-const hpet = @import("drivers/hpet.zig");
-const keyboard = @import("drivers/ps2_keyboard.zig");
-const thread = @import("kernel/thread.zig");
-const context = @import("arch/x86_64/context.zig");
-const syscall = @import("kernel/syscall.zig");
-const process = @import("kernel/process.zig");
-const vfs = @import("kernel/vfs.zig");
-const tarfs = @import("kernel/fs/tarfs.zig");
-const pci = @import("drivers/pci.zig");
-const nvme = @import("drivers/nvme.zig");
+/// CPU-architecture specific code.
+pub const arch = struct {
+    /// x86-64: descriptor tables, interrupts, paging, context switching and the syscall entry path.
+    pub const x86_64 = struct {
+        pub const apic = @import("arch/x86_64/apic.zig");
+        pub const context = @import("arch/x86_64/context.zig");
+        pub const cpu = @import("arch/x86_64/cpu.zig");
+        pub const gdt = @import("arch/x86_64/gdt.zig");
+        pub const idt = @import("arch/x86_64/idt.zig");
+        pub const syscall = @import("arch/x86_64/syscall.zig");
+        pub const vmm = @import("arch/x86_64/vmm.zig");
+    };
+};
 
+/// Bootloader interface.
+pub const boot = struct {
+    pub const limine = @import("boot/limine.zig");
+};
+
+/// Hardware device drivers.
+pub const drivers = struct {
+    pub const hpet = @import("drivers/hpet.zig");
+    pub const nvme = @import("drivers/nvme.zig");
+    pub const pci = @import("drivers/pci.zig");
+    pub const ps2_keyboard = @import("drivers/ps2_keyboard.zig");
+    pub const serial = @import("drivers/serial.zig");
+};
+
+/// Firmware tables provided by the platform.
+pub const firmware = struct {
+    pub const acpi = @import("firmware/acpi.zig");
+};
+
+/// Architecture-independent kernel core: memory, threads, processes, syscalls and files.
+pub const kernel = struct {
+    pub const console = @import("kernel/console.zig");
+    pub const elf = @import("kernel/elf.zig");
+    pub const heap = @import("kernel/heap.zig");
+    pub const pmm = @import("kernel/pmm.zig");
+    pub const process = @import("kernel/process.zig");
+    pub const syscall = @import("kernel/syscall.zig");
+    pub const thread = @import("kernel/thread.zig");
+    pub const vfs = @import("kernel/vfs.zig");
+
+    /// Filesystem implementations.
+    pub const fs = struct {
+        pub const tarfs = @import("kernel/fs/tarfs.zig");
+    };
+};
+
+// Short names used in this file.
+const limine = boot.limine;
+const serial = drivers.serial;
+const console = kernel.console;
+const gdt = arch.x86_64.gdt;
+const idt = arch.x86_64.idt;
+const pmm = kernel.pmm;
+const vmm = arch.x86_64.vmm;
+const heap = kernel.heap;
+const acpi = firmware.acpi;
+const apic = arch.x86_64.apic;
+const cpu = arch.x86_64.cpu;
+const hpet = drivers.hpet;
+const keyboard = drivers.ps2_keyboard;
+const thread = kernel.thread;
+const context = arch.x86_64.context;
+const syscall = kernel.syscall;
+const process = kernel.process;
+const vfs = kernel.vfs;
+const tarfs = kernel.fs.tarfs;
+const pci = drivers.pci;
+const nvme = drivers.nvme;
+
+/// Limine request for boot modules (the initrd).
 export var module_request linksection(".limine_requests") = limine.ModuleRequest{};
+/// Limine base revision tag: the protocol revision (3) this kernel expects.
 export var limine_base_revision linksection(".limine_requests") = [3]u64{ 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3 };
+/// Limine request for the framebuffer used by the console.
 export var fb_request linksection(".limine_requests") = limine.FramebufferRequest{};
+/// Limine request for the physical memory map.
 export var memmap_request linksection(".limine_requests") = limine.MemmapRequest{};
+/// Limine request for the higher-half direct map offset.
 export var hhdm_request linksection(".limine_requests") = limine.HhdmRequest{};
+/// Limine request for the kernel's physical and virtual load address.
 export var kaddr_request linksection(".limine_requests") = limine.KernelAddressRequest{};
+/// Limine request for the ACPI RSDP address.
 export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
 
+/// Timer interrupts received since the APIC timer was started (100 Hz).
 var ticks: u64 = 0;
 
-// write("Hello from ring 3!\n") and yield, three times, then exit(0).
+// Built-in ring 3 test program: write("Hello from ring 3!\n") and yield,
+// three times, then exit(0).
 comptime {
     asm (
         \\.section .rodata
@@ -60,15 +128,19 @@ comptime {
     );
 }
 
+/// Start of the built-in ring 3 test program.
 extern const user_prog_start: u8;
+/// End of the built-in ring 3 test program.
 extern const user_prog_end: u8;
 
+/// Kernel panic handler, used for `@panic` and safety checks anywhere in the kernel.
 pub const panic = std.debug.FullPanic(kernelPanic);
 
 const USER_CODE: u64 = 0x40_0000; // 4 MiB
 const USER_STACK: u64 = 0x80_0000; // top of the user stack (8 MiB)
 
-/// Test the NVMe driver by reading the first sector of the disk and printing it to the console.
+/// Initialize the NVMe controller `dev` and print the start of LBA 0 as a
+/// string (up to the first NUL byte). Errors are printed, not propagated.
 fn diskTest(dev: pci.Device) void {
     nvme.init(dev) catch |e| return print("nvme init failed: {s}\n", .{@errorName(e)});
     var sector: [4096]u8 = undefined;
@@ -77,7 +149,8 @@ fn diskTest(dev: pci.Device) void {
     print("disk LBA 0: \"{s}\"\n", .{sector[0..end]});
 }
 
-/// Return the GSI for an IRQ, taking into account any overrides in the MADT.
+/// Return the contents of the first boot module whose path ends with `name`,
+/// or null if there is none. Panics if Limine did not answer the module request.
 fn findModule(name: []const u8) ?[]const u8 {
     const mods = response(&module_request);
     for (mods.modules[0..mods.module_count]) |m| {
@@ -87,19 +160,23 @@ fn findModule(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Return the number of milliseconds since boot.
+/// Timer interrupt handler: count the tick and let the scheduler preempt the
+/// current thread when its time slice is used up.
 fn onTick(_: *idt.Frame) void {
     ticks += 1;
     thread.tick();
 }
 
-/// Return the Limine response for a request, or panic if the request was not answered.
+/// Return the response pointer of the Limine request `req`, panicking if the
+/// bootloader did not answer it. The field is read through a volatile pointer
+/// because the bootloader writes it behind the compiler's back.
 fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
     const v: *volatile @TypeOf(req.*) = req;
     return v.response orelse @panic("Limine request not answered");
 }
 
-/// Convert a Limine physical address to a virtual address, using the HHDM offset.
+/// Panic handler behind `panic`: print the message and halt. In the test
+/// kernel, report failure and exit QEMU instead.
 fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
     print("PANIC: {s}\n", .{msg});
     if (comptime build_options.is_test) {
@@ -109,7 +186,8 @@ fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
     halt();
 }
 
-/// The idle thread runs when no other threads are ready. It yields to any ready threads, then sleeps until the next interrupt.
+/// Idle loop run by the boot thread after initialization: yield to any ready
+/// thread, otherwise sleep until the next interrupt. Never returns.
 fn idle() noreturn {
     while (true) {
         thread.yield(); // let anything that's ready run
@@ -117,7 +195,8 @@ fn idle() noreturn {
     }
 }
 
-/// A simple shell that reads lines from the keyboard and echoes them back.
+/// Built-in kernel-mode shell that reads lines from the keyboard and echoes
+/// them back. Superseded by the user-space `/bin/sh`; kept for debugging.
 fn shell() noreturn {
     var line: [128]u8 = undefined;
     var len: usize = 0;
@@ -150,7 +229,10 @@ fn shell() noreturn {
     }
 }
 
-/// Print to both the serial port and the framebuffer console. The framebuffer console is not ready until after the kernel has initialized it, so we check `console.ready` before printing to it.
+/// Format `args` with `fmt` and write the result to the serial port and, once
+/// it is initialized, the framebuffer console. Interrupts are disabled while
+/// writing so messages are not interleaved. Output longer than 512 bytes is
+/// replaced by `<print overflow>`. Other modules call this as `root.print`.
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
@@ -160,38 +242,45 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     if (console.ready) for (s) |c| console.putc(c);
 }
 
-/// The kernel's main entry point. Called by the bootloader.
+/// Stop the CPU for good: disable interrupts and halt forever.
 pub fn halt() noreturn {
     while (true) asm volatile ("cli; hlt");
 }
 
-/// Read a file into a buffer, for the test module. Returns null if the file doesn't exist.
+/// Read the start of file `path` into `buf` and return the number of bytes
+/// read, or null if the file doesn't exist.
 fn testReadFile(path: []const u8, buf: []u8) ?usize {
     const node = vfs.lookup(path) orelse return null;
     return vfs.read(&node, 0, buf);
 }
 
-/// Test-only service callbacks. Using callbacks avoids importing a second copy
-/// of PMM/VFS into the test module (which would duplicate module global state).
+// Test-only service callbacks passed to the kernel test suite. Using callbacks
+// avoids importing a second copy of PMM/VFS into the test module (which would
+// duplicate module global state).
+
+/// Test callback: write `s` to the serial port.
 fn testLog(s: []const u8) void {
     serial.puts(s);
 }
 
-/// Return the number of free pages, for the test module.
+/// Test callback: return the number of free physical pages.
 fn testFreePages() usize {
     return pmm.free_pages;
 }
 
-/// Return true if the file exists, for the test module.
+/// Test callback: return true if a file exists at `path`.
 fn testHasFile(path: []const u8) bool {
     return vfs.lookup(path) != null;
 }
 
+/// Test callback: return the size of the file at `path`, or null if it doesn't exist.
 fn testFileSize(path: []const u8) ?u64 {
     const node = vfs.lookup(path) orelse return null;
     return node.size;
 }
 
+/// Test callback: read from the file at `path` starting at `offset` into
+/// `buf`. Returns the number of bytes read, or null if the file doesn't exist.
 fn testReadFileAt(
     path: []const u8,
     offset: u64,
@@ -201,6 +290,8 @@ fn testReadFileAt(
     return vfs.read(&node, offset, buf);
 }
 
+/// Test callback: write a pattern to both ends of physical page `page` through
+/// the HHDM and return true if it reads back correctly.
 fn testPageRw(page: u64) bool {
     const memory =
         pmm.physToVirt(page)[0..pmm.PAGE_SIZE];
@@ -212,6 +303,8 @@ fn testPageRw(page: u64) bool {
         memory[pmm.PAGE_SIZE - 1] == 0x5A;
 }
 
+/// Test callback: allocate 257 bytes from the kernel heap, fill and verify
+/// them, then free them. Returns false on allocation failure or mismatch.
 fn testHeapRoundtrip() bool {
     const memory = heap.allocator.alloc(
         u8,
@@ -229,6 +322,8 @@ fn testHeapRoundtrip() bool {
     return true;
 }
 
+/// Test callback: create and destroy an address space and return true if
+/// exactly one page was used and all pages were given back.
 fn testAddressSpaceRoundtrip() bool {
     const before = pmm.free_pages;
     const address_space =
@@ -244,6 +339,7 @@ fn testAddressSpaceRoundtrip() bool {
     return pmm.free_pages == before;
 }
 
+/// Test callback: return true if spawning a process from a non-ELF image fails.
 fn testInvalidElfRejected() bool {
     const invalid = "not an ELF";
 
@@ -257,7 +353,11 @@ fn testInvalidElfRejected() bool {
     return false;
 }
 
-/// The kernel's main entry point.
+/// Kernel entry point, jumped to by Limine.
+///
+/// Initializes the subsystems in dependency order, mounts the initrd as the
+/// root filesystem, then either runs the kernel test suite (test builds) or
+/// starts `/bin/sh` and becomes the idle thread. Never returns.
 export fn kmain() callconv(.c) noreturn {
     serial.init();
     gdt.init();

@@ -1,26 +1,38 @@
+//! Loader for static x86-64 ELF executables.
+//!
+//! Copies each `PT_LOAD` segment into freshly allocated pages of a user address
+//! space. The image is treated as untrusted: every offset and address is
+//! checked against the file size and the user half of the address space.
+
 const std = @import("std");
 const pmm = @import("pmm.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 
+/// Ways `load` can fail.
 pub const Error = error{ BadMagic, NotX86_64, NotExecutable, BadSegment, OutOfMemory };
 
-// Read a little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
+/// Read a little-endian u16 from `b` at byte offset `o`.
 fn r16(b: []const u8, o: usize) u16 {
     return std.mem.readInt(u16, b[o..][0..2], .little);
 }
 
-// Read a little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
+/// Read a little-endian u32 from `b` at byte offset `o`.
 fn r32(b: []const u8, o: usize) u32 {
     return std.mem.readInt(u32, b[o..][0..4], .little);
 }
 
-// Read a little-endian integer from a byte slice. The caller must ensure that the slice is large enough.
+/// Read a little-endian u64 from `b` at byte offset `o`.
 fn r64(b: []const u8, o: usize) u64 {
     return std.mem.readInt(u64, b[o..][0..8], .little);
 }
 
-// Load `image` into address space `root`. Returns the entry point.
-// On error the caller destroys the address space (it may be partly filled).
+/// Load the ELF executable `image` into the address space `root` and return
+/// its entry point.
+///
+/// Segments must be page aligned. Each page gets user access, plus write
+/// access and/or NX according to the segment flags; memory past the file data
+/// (`.bss`) is zeroed. `image` is copied, so it may be freed afterwards. On
+/// error the address space may be partly filled; the caller destroys it.
 pub fn load(root: u64, image: []const u8) Error!u64 {
     if (image.len < 64 or !std.mem.eql(u8, image[0..4], "\x7fELF")) return error.BadMagic;
     if (image[4] != 2 or image[5] != 1 or r16(image, 18) != 0x3E) return error.NotX86_64; // 64-bit, little endian, x86-64

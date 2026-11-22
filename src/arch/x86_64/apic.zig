@@ -1,12 +1,23 @@
+//! Local APIC and I/O APIC driver.
+//!
+//! Replaces the legacy 8259 PIC: `init` masks the PIC, enables this CPU's local
+//! APIC and masks every I/O APIC input. `route` then unmasks individual legacy
+//! IRQs, and `timerInit` calibrates the LAPIC timer against the HPET and starts
+//! it in periodic mode.
+
 const cpu = @import("cpu.zig");
 const vmm = @import("vmm.zig");
 const acpi = @import("../../firmware/acpi.zig");
 const hpet = @import("../../drivers/hpet.zig");
 
-pub const IRQ_BASE: u8 = 32; // legacy IRQ n -> vector 32 + n
+/// First interrupt vector used for legacy IRQs: IRQ n is delivered as vector `IRQ_BASE + n`.
+pub const IRQ_BASE: u8 = 32;
+/// Vector the local APIC raises for spurious interrupts. These must not be acknowledged with an EOI.
 pub const SPURIOUS: u8 = 0xFF;
-pub const TIMER_VECTOR: u8 = 48; // just past the legacy IRQ range (32-47)
+/// Vector used by the LAPIC timer, just past the legacy IRQ range (32-47).
+pub const TIMER_VECTOR: u8 = 48;
 
+/// LAPIC timer ticks per millisecond, measured by `timerInit`. Zero until then.
 pub var ticks_per_ms: u32 = 0;
 
 var lapic: usize = 0;
@@ -14,24 +25,26 @@ var ioapic: usize = 0;
 var ioapic_gsi_base: u32 = 0;
 var ioapic_entries: u32 = 0;
 
-// Local APIC
+/// Return a pointer to the local APIC register at byte offset `off`.
 fn lapicReg(off: usize) *volatile u32 {
     return @ptrFromInt(lapic + off);
 }
 
-// I/O APIC: select a register at +0x00, access it at +0x10
+/// Read I/O APIC register `reg`. The register index is selected through
+/// IOREGSEL (+0x00) and the value is read from IOWIN (+0x10).
 fn ioRead(reg: u32) u32 {
     @as(*volatile u32, @ptrFromInt(ioapic)).* = reg;
     return @as(*volatile u32, @ptrFromInt(ioapic + 0x10)).*;
 }
 
-// Write a register to the I/O APIC.
+/// Write `val` to I/O APIC register `reg`, using the same IOREGSEL/IOWIN pair as `ioRead`.
 fn ioWrite(reg: u32, val: u32) void {
     @as(*volatile u32, @ptrFromInt(ioapic)).* = reg;
     @as(*volatile u32, @ptrFromInt(ioapic + 0x10)).* = val;
 }
 
-// Legacy PIC: move it off the exception vectors, then mask everything
+/// Reprogram the legacy 8259 PICs so their vectors no longer overlap the CPU
+/// exception vectors, then mask every line so they never fire.
 fn disablePic() void {
     const seq = [_][2]u16{
         .{ 0x20, 0x11 }, .{ 0xA0, 0x11 }, // start init
@@ -46,17 +59,21 @@ fn disablePic() void {
     }
 }
 
-// Send an EOI to the local APIC.
+/// Signal end-of-interrupt to the local APIC so it can deliver the next interrupt.
 pub fn eoi() void {
     lapicReg(0xB0).* = 0;
 }
 
-// Return the local APIC ID of this CPU.
+/// Return the local APIC ID of the calling CPU.
 pub fn id() u8 {
     return @truncate(lapicReg(0x20).* >> 24);
 }
 
-// Initialize the APIC subsystem. Disables the legacy PIC, enables the local APIC, and sets up the I/O APIC. Panics if no I/O APIC is found.
+/// Initialize the interrupt controllers.
+///
+/// Disables the legacy PIC (if ACPI reports one), enables and maps the local
+/// APIC, maps the first I/O APIC and masks all of its inputs. Requires
+/// `acpi.init` and `vmm.init` to have run. Panics if no I/O APIC is present.
 pub fn init() void {
     if (acpi.has_8259) disablePic();
 
@@ -80,7 +97,10 @@ pub fn init() void {
     }
 }
 
-// Deliver legacy IRQ `irq` as `vector` to this CPU.
+/// Route legacy IRQ `irq` to interrupt `vector` on this CPU and unmask it.
+///
+/// Applies any MADT interrupt source override (GSI, polarity, trigger mode).
+/// Panics if the resulting GSI is not handled by the first I/O APIC.
 pub fn route(irq: u8, vector: u8) void {
     const gsi = acpi.irqToGsi(irq);
     if (gsi < ioapic_gsi_base or gsi >= ioapic_gsi_base + ioapic_entries)
@@ -96,7 +116,11 @@ pub fn route(irq: u8, vector: u8) void {
     ioWrite(0x10 + 2 * idx, low); // write low last: unmasks it
 }
 
-// Initialize the APIC subsystem. Disables the legacy PIC, enables the local APIC, and sets up the I/O APIC. Panics if no I/O APIC is found.
+/// Calibrate the LAPIC timer and start it firing `TIMER_VECTOR` `hz` times per second.
+///
+/// Measures the timer rate by letting it count down for 10 ms of HPET time,
+/// stores the result in `ticks_per_ms`, then switches it to periodic mode.
+/// Requires `init` and `hpet.init` to have run.
 pub fn timerInit(hz: u32) void {
     lapicReg(0x3E0).* = 0x3; // divide the bus clock by 16
     lapicReg(0x320).* = 1 << 16; // masked, one-shot: measure only

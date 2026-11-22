@@ -1,3 +1,12 @@
+//! Kernel heap: a first-fit free-list allocator exposed as a `std.mem.Allocator`.
+//!
+//! The heap lives in its own 1 GiB virtual region and grows on demand by
+//! mapping pages from the PMM. Free chunks are kept in an address-sorted list
+//! and merged with their neighbours when freed. All sizes are rounded up to 16
+//! bytes, which is also the maximum supported alignment; use the PMM directly
+//! for page-aligned memory. Every operation disables interrupts, so the heap
+//! is safe to use from threads and interrupt handlers.
+
 const std = @import("std");
 const pmm = @import("../kernel/pmm.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
@@ -8,7 +17,8 @@ const HEAP_START: usize = 0xFFFF_9000_0000_0000;
 const HEAP_MAX: usize = 1 << 30; // 1 GiB of virtual space
 const MIN = 16; // granularity + max supported alignment
 
-const Chunk = struct { size: usize, next: ?*Chunk }; // lives inside free memory
+/// Header of a free chunk, stored inside the free memory itself.
+const Chunk = struct { size: usize, next: ?*Chunk };
 
 const vtable = std.mem.Allocator.VTable{
     .alloc = alloc,
@@ -17,17 +27,20 @@ const vtable = std.mem.Allocator.VTable{
     .free = free,
 };
 
+/// The kernel heap allocator.
 pub const allocator = std.mem.Allocator{ .ptr = undefined, .vtable = &vtable };
 
 var free_list: ?*Chunk = null; // sorted by address
 var heap_end: usize = HEAP_START;
 
-// Round up to the next multiple of MIN, or MIN if smaller. The caller must ensure that the result does not overflow usize.
+/// Round `n` up to a multiple of `MIN` (and at least `MIN`), so every chunk can hold a `Chunk` header.
 fn round(n: usize) usize {
     return std.mem.alignForward(usize, @max(n, MIN), MIN);
 }
 
-// Insert a free chunk at the given address and size into the free list, merging with adjacent chunks if possible. The caller must ensure that the chunk does not overlap any existing free chunk, and must disable interrupts to avoid races with alloc() and free().
+/// Return `size` bytes at `addr` to the free list, keeping it sorted by
+/// address and merging with adjacent free chunks. The range must not overlap
+/// any free chunk. Callers must have interrupts disabled.
 fn insertFree(addr: usize, size: usize) void {
     var prev: ?*Chunk = null;
     var cur = free_list;
@@ -53,7 +66,9 @@ fn insertFree(addr: usize, size: usize) void {
     } else free_list = new;
 }
 
-// Map at least `min_bytes` more (minimum 64 KiB) at the end of the heap.
+/// Map at least `min_bytes` more (minimum 64 KiB) at the end of the heap and
+/// add it to the free list. Returns false if the heap region is exhausted or
+/// fewer than `min_bytes` could be mapped. Callers must have interrupts disabled.
 fn grow(min_bytes: usize) bool {
     const want = std.mem.alignForward(usize, @max(min_bytes, 16 * pmm.PAGE_SIZE), pmm.PAGE_SIZE);
     if (heap_end + want > HEAP_START + HEAP_MAX) return false;
@@ -69,7 +84,9 @@ fn grow(min_bytes: usize) bool {
     return got >= min_bytes;
 }
 
-// Allocate a block of memory of at least `len` bytes, aligned to `alignment`. Returns null if no memory is available. The caller must disable interrupts to avoid races with free().
+/// `Allocator.alloc` implementation: take the first free chunk that fits,
+/// splitting off the remainder, and grow the heap if none does. Returns null
+/// when out of memory. Panics if `alignment` is larger than 16 bytes.
 fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -98,7 +115,9 @@ fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]
     }
 }
 
-// Resize a block of memory in place. Returns true if the block was shrunk, false if it was grown (the caller reallocates). The caller must disable interrupts to avoid races with alloc() and free().
+/// `Allocator.resize` implementation: shrink `memory` in place to `new_len`,
+/// returning the tail to the free list. Returns false if `new_len` needs more
+/// space, since blocks never grow in place; the caller then reallocates.
 fn resize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -109,12 +128,14 @@ fn resize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: 
     return true;
 }
 
-// Remap a block of memory to a new address. Returns the new slice, or null if the remap failed. The caller must disable interrupts to avoid races with alloc() and free().
+/// `Allocator.remap` implementation: same as `resize`, returning the
+/// unchanged pointer on success or null if the block would have to move.
 fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
     return if (resize(ctx, memory, a, new_len, ra)) memory.ptr else null;
 }
 
-// Free a block of memory. The caller must disable interrupts to avoid races with alloc() and free().
+/// `Allocator.free` implementation: return `memory` to the free list.
+/// Heap pages are never unmapped or given back to the PMM.
 fn free(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);

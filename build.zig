@@ -27,9 +27,13 @@ pub fn build(b: *std.Build) void {
     userProgram(b, "hello", target, optimize);
     userProgram(b, "sh", target, optimize);
 
-    // Generate API documentation
+    // Generate API documentation. Autodoc uses `<artifact name>.zig` (or the
+    // first file it sees) as the module root, so the docs come from a copy of
+    // the kernel named "main" to make src/main.zig the entry page. Only built
+    // by `zig build docs`.
+    const docs_kernel = kernelArtifact(b, "main", target, optimize, false);
     const install_docs = b.addInstallDirectory(.{
-        .source_dir = kernel.getEmittedDocs(),
+        .source_dir = docs_kernel.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });

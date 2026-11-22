@@ -1,12 +1,16 @@
+//! Host unit tests for `src/kernel/vfs.zig`, using an in-memory fake filesystem.
+
 const std = @import("std");
 const vfs = @import("vfs");
 
+/// Fake filesystem with a single file, `/hello`, that records how it is called.
 const FakeFs = struct {
     data: []const u8,
     lookups: usize = 0,
     reads: usize = 0,
     last_offset: u64 = 0,
 
+    /// `vfs.Fs.lookup` implementation: only `/hello` exists. Counts calls.
     fn lookup(
         ctx: *anyopaque,
         path: []const u8,
@@ -27,6 +31,7 @@ const FakeFs = struct {
         };
     }
 
+    /// `vfs.Ops.read` implementation over `data`. Counts calls and records the offset.
     fn read(
         node: *const vfs.Node,
         offset: u64,
@@ -57,6 +62,7 @@ const FakeFs = struct {
         .read = read,
     };
 
+    /// Mount this fake as the VFS root filesystem.
     fn mount(self: *FakeFs) void {
         vfs.mountRoot(.{
             .ctx = self,

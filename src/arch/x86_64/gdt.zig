@@ -1,3 +1,9 @@
+//! Global Descriptor Table and Task State Segment.
+//!
+//! In long mode segmentation is mostly unused, but the CPU still needs code and
+//! data descriptors for ring 0 and ring 3, plus a TSS whose `rsp0` field tells
+//! the CPU which kernel stack to switch to when an interrupt arrives from ring 3.
+
 const std = @import("std");
 
 var gdt = [_]u64{
@@ -13,40 +19,53 @@ var tss: Tss = .{};
 
 const TSS_SEL = 0x28;
 
-// 64-bit TSS: 104 bytes, packed with 4-byte alignment.
+/// 64-bit TSS: 104 bytes, packed with 4-byte alignment.
 const Tss = extern struct {
     reserved0: u32 = 0,
-    rsp0: u64 align(4) = 0, // kernel stack used when an interrupt arrives from ring 3
+    /// Kernel stack used when an interrupt arrives from ring 3.
+    rsp0: u64 align(4) = 0,
     rsp1: u64 align(4) = 0,
     rsp2: u64 align(4) = 0,
     reserved1: u64 align(4) = 0,
-    ist: [7]u64 align(4) = @splat(0), // extra emergency stacks (double fault, later)
+    /// Interrupt stack table: extra emergency stacks (e.g. for double faults, not used yet).
+    ist: [7]u64 align(4) = @splat(0),
     reserved2: u64 align(4) = 0,
     reserved3: u16 = 0,
-    iopb: u16 = 104, // I/O bitmap past the end: all ports denied to ring 3
+    /// I/O bitmap offset. Pointing past the end denies all ports to ring 3.
+    iopb: u16 = 104,
 };
 
+/// Operand for `lgdt`: size and linear address of the GDT.
 const GdtPtr = extern struct {
     limit: u16,
     base: u64 align(1),
 };
 
+/// Selector for the ring 0 code segment.
 pub const KERNEL_CODE = 0x08;
+/// Selector for the ring 0 data segment.
 pub const KERNEL_DATA = 0x10;
-pub const USER_DATA = 0x18 | 3; // | 3 = requested privilege level 3
+/// Selector for the ring 3 data segment (RPL 3).
+pub const USER_DATA = 0x18 | 3;
+/// Selector for the ring 3 code segment (RPL 3).
 pub const USER_CODE = 0x20 | 3;
 
-// The GDT is loaded with `lgdt`, and the TSS is loaded with `ltr`. The TSS is used to switch to a kernel stack when an interrupt arrives from ring 3. The I/O bitmap in the TSS prevents ring 3 code from accessing I/O ports.
+// The CPU requires the TSS to be exactly 104 bytes.
 comptime {
     std.debug.assert(@sizeOf(Tss) == 104);
 }
 
-// Set the kernel stack pointer in the TSS. This is used when an interrupt arrives from ring 3.
+/// Set the stack the CPU switches to when an interrupt or exception arrives
+/// while running in ring 3. `top` is the highest address of that kernel stack.
 pub fn setKernelStack(top: u64) void {
     tss.rsp0 = top;
 }
 
-// Initialize the GDT and TSS. Loads the GDT and sets up segment registers. Panics if the CPU does not support 64-bit mode.
+/// Install the GDT and TSS.
+///
+/// Fills in the TSS descriptor, loads the GDT with `lgdt`, reloads CS with a
+/// far return and the data segment registers with the kernel data selector,
+/// then loads the task register with `ltr`. Must run before `idt.init`.
 pub fn init() void {
     // TSS descriptor: 16 bytes spread over two GDT slots.
     const base: u64 = @intFromPtr(&tss);
@@ -85,7 +104,7 @@ pub fn init() void {
     );
 }
 
-// Return the current value of the CS register.
+/// Return the current code segment selector (CS). The low two bits are the current privilege level.
 pub fn readCs() u16 {
     return asm volatile ("movw %%cs, %[ret]"
         : [ret] "=r" (-> u16),

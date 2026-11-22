@@ -1,3 +1,10 @@
+//! Minimal polling NVMe driver.
+//!
+//! Sets up one admin queue pair and one I/O queue pair, identifies namespace 1
+//! and reads sectors from it. Commands are submitted one at a time and
+//! completed by polling (no interrupts). All transfers go through a single
+//! page-sized DMA bounce buffer.
+
 const std = @import("std");
 const root = @import("root");
 const pci = @import("pci.zig");
@@ -5,13 +12,15 @@ const hpet = @import("hpet.zig");
 const pmm = @import("../kernel/pmm.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 
-// 64-byte submission entry and 16-byte completion entry, as the spec defines them.
+/// 64-byte submission queue entry, as defined by the NVMe specification.
 const Sqe = extern struct {
-    cdw0: u32, // opcode (bits 0-7), command id (bits 16-31)
+    /// Opcode (bits 0-7) and command ID (bits 16-31).
+    cdw0: u32,
     nsid: u32,
     rsvd: u64 = 0,
     mptr: u64 = 0,
-    prp1: u64, // physical address of the data page
+    /// Physical address of the data page.
+    prp1: u64,
     prp2: u64 = 0,
     cdw10: u32 = 0,
     cdw11: u32 = 0,
@@ -20,30 +29,38 @@ const Sqe = extern struct {
     cdw14: u32 = 0,
     cdw15: u32 = 0,
 };
+/// 16-byte completion queue entry, as defined by the NVMe specification.
 const Cqe = extern struct {
     dw0: u32,
     dw1: u32,
     sq_head: u16,
     sq_id: u16,
     cid: u16,
-    status: u16, // bit 0 = phase tag, bits 1-15 = status code
+    /// Bit 0 = phase tag, bits 1-15 = status code.
+    status: u16,
 };
 comptime {
     std.debug.assert(@sizeOf(Sqe) == 64 and @sizeOf(Cqe) == 16);
 }
 
+/// Number of entries in every submission and completion queue.
 const QSIZE = 64;
 
+/// A submission/completion queue pair and the driver's position in it.
 const Queue = struct {
     sq: [*]volatile Sqe,
     cq: [*]volatile Cqe,
     sq_phys: u64,
     cq_phys: u64,
-    sq_db: *volatile u32, // doorbell: tell the controller about new commands
-    cq_db: *volatile u32, // doorbell: tell the controller we consumed completions
+    /// Doorbell: tell the controller about new commands.
+    sq_db: *volatile u32,
+    /// Doorbell: tell the controller we consumed completions.
+    cq_db: *volatile u32,
     tail: u16 = 0,
     head: u16 = 0,
-    phase: u16 = 1, // flips each time the completion queue wraps around
+    /// Expected phase tag; flips each time the completion queue wraps around.
+    phase: u16 = 1,
+    /// Next command ID.
     cid: u16 = 0,
 };
 
@@ -53,27 +70,31 @@ var admin: Queue = undefined;
 var io: Queue = undefined;
 var bounce: u64 = 0; // one DMA page for all transfers
 
+/// Logical block size of namespace 1, in bytes. Valid after `init`.
 pub var sector_size: u32 = 512;
+/// Number of logical blocks in namespace 1. Valid after `init`.
 pub var sector_count: u64 = 0;
 
-// Read a 32-bit register at offset `off` from the NVMe controller's MMIO region.
+/// Return a pointer to the 32-bit controller register at byte offset `off`.
 fn reg32(off: usize) *volatile u32 {
     return @ptrFromInt(regs + off);
 }
 
-// Read a 64-bit register at offset `off` from the NVMe controller's MMIO region.
+/// Return a pointer to the 64-bit controller register at byte offset `off`.
 fn reg64(off: usize) *volatile u64 {
     return @ptrFromInt(regs + off);
 }
 
-// Allocate a page of physical memory and zero it. Returns the physical address.
+/// Allocate a zeroed physical page and return its physical address.
+/// Panics if physical memory is exhausted.
 fn zeroedPage() u64 {
     const p = pmm.alloc() orelse @panic("nvme: out of memory");
     @memset(pmm.physToVirt(p)[0..pmm.PAGE_SIZE], 0);
     return p;
 }
 
-// Create a submission/completion queue pair. Returns the queues, which are mapped into the HHDM.
+/// Allocate memory for queue pair `qid` (0 = admin) and locate its doorbells.
+/// The controller is not told about the queues; that is up to the caller.
 fn makeQueue(qid: usize) Queue {
     const sq = zeroedPage();
     const cq = zeroedPage();
@@ -87,7 +108,12 @@ fn makeQueue(qid: usize) Queue {
     };
 }
 
-// Submit a command to the queue and wait for its completion. Returns an error if the command failed or timed out.
+/// Submit `cmd_in` on queue `q` and poll until it completes.
+///
+/// Assigns the command ID, rings the submission doorbell, waits up to one
+/// second for the matching completion and acknowledges it. Returns
+/// `error.Timeout` if no completion arrives, or `error.CommandFailed` if the
+/// controller reports a non-zero status.
 fn submit(q: *Queue, cmd_in: Sqe) !void {
     var cmd = cmd_in;
     cmd.cdw0 |= @as(u32, q.cid) << 16;
@@ -111,7 +137,9 @@ fn submit(q: *Queue, cmd_in: Sqe) !void {
     if (status != 0) return error.CommandFailed;
 }
 
-// Wait for the controller to reach the desired ready state. Returns an error if the controller reports a fatal error or times out.
+/// Wait up to two seconds for CSTS.RDY to equal `want`. Returns
+/// `error.ControllerFatal` if the controller reports a fatal status, or
+/// `error.Timeout`.
 fn waitReady(want: bool) !void {
     const deadline = hpet.nanos() + 2_000_000_000;
     while (((reg32(0x1C).* & 1) != 0) != want) { // CSTS.RDY
@@ -120,7 +148,11 @@ fn waitReady(want: bool) !void {
     }
 }
 
-// Initialize the NVMe driver. Finds the first NVMe device on the PCI bus, enables it, and sets up the admin and I/O queues. Returns an error if the device is not found or fails to initialize.
+/// Initialize the NVMe controller `dev` (found by the caller with `pci.find`).
+///
+/// Enables bus mastering, maps the registers, resets the controller, sets up
+/// the admin queues, identifies namespace 1 (filling in `sector_count` and
+/// `sector_size`) and creates I/O queue pair 1. Requires `hpet.init`.
 pub fn init(dev: pci.Device) !void {
     pci.enableBusMaster(dev);
     regs = vmm.mapMmio(pci.bar(dev, 0), 0x4000);
@@ -157,7 +189,11 @@ pub fn init(dev: pci.Device) !void {
     root.print("nvme: {d} sectors of {d} bytes ({d} MiB)\n", .{ sector_count, sector_size, sector_count * sector_size / (1024 * 1024) });
 }
 
-// Read `count` sectors starting at `lba` into `buf`. At most one page per call.
+/// Read `count` sectors starting at `lba` from namespace 1 into `buf`.
+///
+/// At most one page (4 KiB) can be read per call. Returns `error.BadRequest`
+/// if `count` is 0, the transfer is larger than a page or `buf` is too small,
+/// or any error from the command itself.
 pub fn read(lba: u64, count: u32, buf: []u8) !void {
     const bytes = count * sector_size;
     if (count == 0 or bytes > pmm.PAGE_SIZE or buf.len < bytes) return error.BadRequest;

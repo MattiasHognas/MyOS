@@ -1,8 +1,13 @@
+//! `/bin/sh`: a tiny shell. Runs each entered name as `/bin/<name>` (or as a
+//! path if it contains a slash) and waits for it; `exit` leaves the shell.
+
 const std = @import("std");
 const lib = @import("lib.zig");
 
 pub const panic = lib.panic;
 
+/// Read one line from the keyboard into `buf`, echoing it and handling
+/// backspace. Ctrl+C discards the line. Returns the line without the newline.
 fn readLine(buf: []u8) []u8 {
     var len: usize = 0;
     while (true) {
@@ -29,6 +34,7 @@ fn readLine(buf: []u8) []u8 {
     }
 }
 
+/// Program entry point: the read-run loop.
 export fn _start() callconv(.c) noreturn {
     lib.write("MyOS shell. Type a program name (e.g. hello), or exit.\n");
     var line: [128]u8 = undefined;

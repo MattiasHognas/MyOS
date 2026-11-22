@@ -1,4 +1,7 @@
-// Write a byte to an I/O port.
+//! Thin wrappers around x86-64 instructions: port I/O, model-specific
+//! registers (MSRs) and the interrupt flag.
+
+/// Write the byte `val` to I/O port `port`.
 pub fn outb(port: u16, val: u8) void {
     asm volatile ("outb %[val], %[port]"
         :
@@ -6,7 +9,8 @@ pub fn outb(port: u16, val: u8) void {
           [port] "N{dx}" (port),
     );
 }
-// Write a 32-bit value to an I/O port.
+
+/// Write the 32-bit value `val` to I/O port `port`.
 pub fn outl(port: u16, val: u32) void {
     asm volatile ("outl %[val], %[port]"
         :
@@ -15,7 +19,7 @@ pub fn outl(port: u16, val: u32) void {
     );
 }
 
-// Read a 32-bit value from an I/O port.
+/// Read a 32-bit value from I/O port `port`.
 pub fn inl(port: u16) u32 {
     return asm volatile ("inl %[port], %[ret]"
         : [ret] "={eax}" (-> u32),
@@ -23,7 +27,7 @@ pub fn inl(port: u16) u32 {
     );
 }
 
-// Read a byte from an I/O port.
+/// Read a byte from I/O port `port`.
 pub fn inb(port: u16) u8 {
     return asm volatile ("inb %[port], %[ret]"
         : [ret] "={al}" (-> u8),
@@ -31,7 +35,7 @@ pub fn inb(port: u16) u8 {
     );
 }
 
-// Read a 64-bit value from an I/O port.
+/// Read the 64-bit model-specific register `msr`.
 pub fn rdmsr(msr: u32) u64 {
     return asm volatile (
         \\ rdmsr
@@ -42,7 +46,7 @@ pub fn rdmsr(msr: u32) u64 {
         : .{ .rdx = true });
 }
 
-// Write a 64-bit value to an MSR.
+/// Write the 64-bit value `val` to model-specific register `msr`.
 pub fn wrmsr(msr: u32, val: u64) void {
     asm volatile ("wrmsr"
         :
@@ -51,7 +55,11 @@ pub fn wrmsr(msr: u32, val: u64) void {
           [msr] "{ecx}" (msr),
     );
 }
-// Read the current value of the RFLAGS register.
+
+/// Disable interrupts and return the previous RFLAGS value.
+///
+/// Pass the result to `restoreInterrupts` to undo it. Calls nest correctly:
+/// interrupts are only re-enabled by the outermost restore.
 pub fn saveAndDisableInterrupts() u64 {
     return asm volatile (
         \\ pushfq
@@ -62,7 +70,8 @@ pub fn saveAndDisableInterrupts() u64 {
         : .{ .memory = true });
 }
 
-// Restore the RFLAGS register, which may re-enable interrupts.
+/// Re-enable interrupts if they were enabled in `flags`, as returned by
+/// `saveAndDisableInterrupts`. Does nothing if they were already disabled.
 pub fn restoreInterrupts(flags: u64) void {
     if ((flags & (1 << 9)) != 0) asm volatile ("sti" ::: .{ .memory = true }); // bit 9 = IF
 }

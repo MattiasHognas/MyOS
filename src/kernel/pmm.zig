@@ -1,3 +1,10 @@
+//! Physical memory manager: a bitmap of 4 KiB pages.
+//!
+//! One bit per page of physical memory (1 = used), built from the Limine
+//! memory map. The bitmap itself is stored in the first usable region that is
+//! large enough. Physical page 0 is never handed out, so 0 can mean "none".
+//! Physical memory is accessed through the HHDM with `physToVirt`.
+
 const limine = @import("../boot/limine.zig");
 
 var bitmap: []u8 = &.{}; // 1 bit per page, 1 = used
@@ -5,25 +12,28 @@ var total_pages: usize = 0;
 var hint: usize = 0; // where the next search starts
 var hhdm: u64 = 0;
 
+/// Size of a physical page in bytes.
 pub const PAGE_SIZE = 4096;
+/// Number of pages currently free.
 pub var free_pages: usize = 0;
 
-// Return the number of free pages in the system. This is a rough estimate, as it may change between calls.
+/// Return true if page number `p` is marked as used.
 fn isUsed(p: usize) bool {
     return (bitmap[p / 8] & (@as(u8, 1) << @intCast(p % 8))) != 0;
 }
 
-// Mark a page as used or free. The caller must ensure the page is not already in that state, and must disable interrupts to avoid races with alloc() and free().
+/// Mark page number `p` as used. Does not update `free_pages`.
 fn setUsed(p: usize) void {
     bitmap[p / 8] |= @as(u8, 1) << @intCast(p % 8);
 }
 
-// Mark a page as free. The caller must ensure the page is not already free, and must disable interrupts to avoid races with alloc() and free().
+/// Mark page number `p` as free. Does not update `free_pages`.
 fn setFree(p: usize) void {
     bitmap[p / 8] &= ~(@as(u8, 1) << @intCast(p % 8));
 }
 
-// Mark a page as reserved, so it will never be allocated. This is used for pages that are in use by the kernel or other critical structures. The caller must ensure the page is not already reserved, and must disable interrupts to avoid races with alloc() and free().
+/// Mark page number `p` as used so it is never allocated, adjusting
+/// `free_pages` if it was free. Used for the bitmap's own pages and page 0.
 fn reserve(p: usize) void {
     if (!isUsed(p)) {
         setUsed(p);
@@ -31,12 +41,17 @@ fn reserve(p: usize) void {
     }
 }
 
-// Convert a physical address to a virtual address in the HHDM. The caller must ensure the physical address is valid and mapped in the HHDM.
+/// Return a pointer to physical address `phys` through the HHDM. Requires `init`.
 pub fn physToVirt(phys: u64) [*]u8 {
     return @ptrFromInt(phys + hhdm);
 }
 
-// Convert a virtual address in the HHDM to a physical address. The caller must ensure the virtual address is valid and mapped in the HHDM.
+/// Build the page bitmap from the memory map `mm`.
+///
+/// `hhdm_offset` is the HHDM offset from Limine. Sizes the bitmap to cover the
+/// highest usable address, marks only the usable regions as free, then
+/// reserves the bitmap's own pages and page 0. Panics if no usable region can
+/// hold the bitmap.
 pub fn init(mm: *const limine.MemmapResponse, hhdm_offset: u64) void {
     hhdm = hhdm_offset;
     const entries = mm.entries[0..mm.entry_count];
@@ -76,7 +91,9 @@ pub fn init(mm: *const limine.MemmapResponse, hhdm_offset: u64) void {
     reserve(0);
 }
 
-// Allocate a single page of physical memory. Returns the physical address of the page, or null if no pages are available. The caller must disable interrupts to avoid races with free().
+/// Allocate one physical page and return its physical address, or null if
+/// memory is exhausted. The page is not zeroed. Not interrupt safe: callers
+/// that may race with other allocations must disable interrupts.
 pub fn alloc() ?u64 {
     for (0..total_pages) |n| {
         const p = (hint + n) % total_pages;
@@ -90,7 +107,8 @@ pub fn alloc() ?u64 {
     return null;
 }
 
-// Free a page of physical memory. The caller must ensure the page was previously allocated and not already freed, and must disable interrupts to avoid races with alloc().
+/// Free the physical page at `phys`, which must have come from `alloc`.
+/// Panics on a double free. Not interrupt safe, like `alloc`.
 pub fn free(phys: u64) void {
     const p = phys / PAGE_SIZE;
     if (!isUsed(p)) @panic("PMM: double free");

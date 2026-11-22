@@ -1,3 +1,11 @@
+//! Kernel threads and the round-robin scheduler.
+//!
+//! Ready threads wait in a FIFO queue. `yield` switches to the next one,
+//! loading its address space and kernel stack, and the timer calls `tick` to
+//! preempt a thread once its time slice runs out. Exited threads are parked on
+//! a zombie list and freed by the next thread that runs, since a thread cannot
+//! free the stack it is still running on.
+
 const root = @import("root");
 const heap = @import("heap.zig");
 const context = @import("../arch/x86_64/context.zig");
@@ -24,14 +32,15 @@ var ready_tail: ?*Thread = null;
 
 var zombies: ?*Thread = null;
 
-// Add a thread to the ready queue. The caller must disable interrupts to avoid a race with dequeue().
+/// Append `t` to the tail of the ready queue. Callers must have interrupts disabled.
 fn enqueue(t: *Thread) void {
     t.next = null;
     if (ready_tail) |tail| tail.next = t else ready_head = t;
     ready_tail = t;
 }
 
-// Dequeue the next ready thread, or return null if none are ready. The caller must disable interrupts to avoid a race with enqueue().
+/// Remove and return the thread at the head of the ready queue, or null if it
+/// is empty. Callers must have interrupts disabled.
 fn dequeue() ?*Thread {
     const t = ready_head orelse return null;
     ready_head = t.next;
@@ -39,7 +48,9 @@ fn dequeue() ?*Thread {
     return t;
 }
 
-// Free any threads that have exited. This is called after a context switch, so that the current thread is not freed while it is still running.
+/// Free every thread on the zombie list, together with its process (if any)
+/// and its stack. Called after a context switch, when the dead threads are
+/// guaranteed not to be running.
 fn reap() void {
     while (zombies) |z| {
         zombies = z.next;
@@ -49,22 +60,41 @@ fn reap() void {
     }
 }
 
-// The idle thread runs when no other threads are ready. It yields to any ready threads, then sleeps until the next interrupt.
-pub const State = enum { ready, running, blocked, dead };
-
-// A thread is a single execution context, with its own stack and CPU registers. It may be part of a process, or it may be a kernel thread with no process.
-pub const Thread = struct {
-    id: usize,
-    rsp: usize = 0,
-    stack: ?[]u8,
-    state: State,
-    next: ?*Thread = null,
-    process: ?*Process = null,
-    wake_pending: bool = false, // a wake() arrived before block()
-    wake_value: u64 = 0, // passed from waker to sleeper (e.g. exit code)
+/// Scheduling state of a thread.
+pub const State = enum {
+    /// In the ready queue, waiting for the CPU.
+    ready,
+    /// Currently on the CPU.
+    running,
+    /// Waiting for `wake`.
+    blocked,
+    /// Exited; waiting to be reaped.
+    dead,
 };
 
-// Block the current thread until another thread wakes it. If a wake() already happened, return immediately. Otherwise, yield to other threads until woken.
+/// A kernel thread: a stack, saved registers and scheduling state. A thread
+/// either belongs to a user process or is a pure kernel thread (`process == null`).
+pub const Thread = struct {
+    id: usize,
+    /// Saved stack pointer while the thread is not running.
+    rsp: usize = 0,
+    /// Kernel stack, owned by the thread. Null only for the boot thread.
+    stack: ?[]u8,
+    state: State,
+    /// Link in the ready queue or the zombie list.
+    next: ?*Thread = null,
+    /// Process this thread runs, if any.
+    process: ?*Process = null,
+    /// A `wake` arrived before `block`, so the next `block` returns at once.
+    wake_pending: bool = false,
+    /// Value passed from waker to sleeper (e.g. a child's exit code).
+    wake_value: u64 = 0,
+};
+
+/// Block the current thread until another thread or interrupt handler calls
+/// `wake` on it. Returns immediately if a wake is already pending. Callers
+/// must disable interrupts between checking their wait condition and calling
+/// `block`, so a wake cannot slip in between.
 pub fn block() void {
     const me = current_thread;
     if (me.wake_pending) { // the event already happened
@@ -76,7 +106,9 @@ pub fn block() void {
     me.wake_pending = false;
 }
 
-// Wake a blocked thread. If the thread is not blocked, set a flag so that the next block() returns immediately.
+/// Wake thread `t`: if it is blocked, make it ready and queue it; otherwise
+/// remember the wake so its next `block` returns immediately. Callers must
+/// have interrupts disabled.
 pub fn wake(t: *Thread) void {
     t.wake_pending = true;
     if (t.state == .blocked) {
@@ -85,7 +117,11 @@ pub fn wake(t: *Thread) void {
     }
 }
 
-// Create a new thread that starts executing at `entry`. The thread is added to the ready queue, but does not run until the scheduler picks it. The thread's stack is allocated from the heap and freed when the thread exits.
+/// Create a thread that runs `entry` and put it in the ready queue.
+///
+/// `process` is the user process the thread belongs to, or null for a kernel
+/// thread. The thread gets a 16 KiB kernel stack from the heap; when `entry`
+/// returns the thread exits. Returns `error.OutOfMemory` if the allocation fails.
 pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
     const t = try heap.allocator.create(Thread);
     errdefer heap.allocator.destroy(t);
@@ -107,7 +143,12 @@ pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
     return t;
 }
 
-// Yield to another thread. If no other threads are ready, return immediately.
+/// Switch to the next ready thread, if there is one.
+///
+/// A running thread goes back to the tail of the ready queue; a blocked or
+/// dead one does not. Loads the next thread's address space and kernel stack,
+/// resets the time slice and switches context. When this thread is scheduled
+/// again, frees any zombie threads and returns.
 pub fn yield() void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -140,13 +181,15 @@ pub fn yield() void {
     reap(); // we're running again; any zombie is now some *other* thread
 }
 
-// Called by the timer interrupt handler to implement preemptive multitasking. Decrements the current thread's time slice, and yields if it reaches zero.
+/// Timer tick: count down the current thread's time slice and preempt it with
+/// `yield` once the slice is used up. Called from the timer interrupt handler.
 pub fn tick() void {
     if (slice_left > 0) slice_left -= 1;
     if (slice_left == 0) yield();
 }
 
-// Exit the current thread. The thread is marked as dead and added to the zombie list, so that its resources can be freed later. The thread's process is destroyed if it has one.
+/// Terminate the current thread. It is marked dead and put on the zombie list;
+/// the next thread to run frees its stack and its process (if any). Never returns.
 pub fn exit() noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: this thread is done
     current_thread.state = .dead;
@@ -156,17 +199,19 @@ pub fn exit() noreturn {
     root.halt();
 }
 
-// Return the currently running thread.
+/// Return the thread that is currently running.
 pub fn current() *Thread {
     return current_thread;
 }
 
-// Return the ID of the currently running thread.
+/// Return the ID of the thread that is currently running. The boot thread has ID 0.
 pub fn id() usize {
     return current_thread.id;
 }
 
-// The entry point for new threads. This function is called by the thread's stack, which was set up by initStack(). It calls the thread's start function, then exits the thread when it returns.
+/// First code a new thread runs, reached through `thread_trampoline` (see
+/// `context.initStack`). Enables interrupts, calls the thread's entry
+/// function and exits the thread when it returns.
 fn start(entry: usize) callconv(.c) noreturn {
     asm volatile ("sti"); // new threads begin inside yield, with interrupts off
     const f: *const fn () void = @ptrFromInt(entry);
