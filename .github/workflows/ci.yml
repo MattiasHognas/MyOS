@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.17.1
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.optimize }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install QEMU and xorriso
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso
+
+      - name: Install Limine
+        run: |
+          scripts/install-limine.sh "$RUNNER_TEMP/limine"
+          echo "LIMINE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/limine" >> "$GITHUB_PATH"
+
+      - name: Fetch console font
+        run: scripts/fetch-font.sh
+
+      - name: Build kernel and apps
+        run: zig build -Doptimize=${{ matrix.optimize }}
+
+      - name: Host unit tests
+        run: zig build test-host --summary all
+
+      - name: QEMU integration tests
+        run: zig build test-qemu -Doptimize=${{ matrix.optimize }}
+
+      - name: Build documentation
+        if: matrix.optimize == 'Debug'
+        run: zig build docs
+
+      - name: Upload serial logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: serial-logs-${{ matrix.optimize }}
+          path: zig-out/test/*/serial*.log
+          if-no-files-found: ignore
+
+  coverage:
+    name: Host test coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Coverage is informational; a kcov problem must not block merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install kcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends kcov
+
+      - name: Run host tests under kcov
+        run: zig build coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: host-coverage
+          path: zig-out/coverage

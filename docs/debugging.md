@@ -1,0 +1,114 @@
+# Debugging MyOS
+
+## Reading kernel output
+
+Everything the kernel prints goes to the serial port. `./run-qemu.sh` connects
+it to your terminal; the test runs save it to `zig-out/test/<scenario>/serial.log`.
+
+Kernel messages go through `std.log` and look like `level(scope): message`:
+
+```
+info(pci): 00:03.0 1b36:0010 class 01.08.02
+debug(acpi): IRQ 0 -> GSI 2 (flags 0x0)
+```
+
+Choose how much is printed at build time:
+
+| Option | Effect |
+| --- | --- |
+| `-Dlog-level=err\|warn\|info\|debug` | Messages above the level are compiled out. Default: `debug` for Debug builds, `info` otherwise. |
+| `-Dalloc-debug=true` | Log every kernel heap allocation and free (`debug(heap): ...`). Needs `-Dlog-level=debug`. |
+| `-Dassertions=false` | Compile out the subsystem assertions (`kernel/debug/assert.zig`). Default: on, in every build mode. |
+
+In code, use a scoped logger: `const log = std.log.scoped(.my_subsystem);`,
+then `log.info("...", .{...})`. Use `root.print` only for output that is not a
+diagnostic (e.g. the console output of user programs).
+
+## Panics, faults and backtraces
+
+A kernel panic (`@panic`, a failed safety check, or a failed `assert.check`)
+and a CPU exception in kernel mode both print a symbolized backtrace:
+
+```
+PANIC: scenario: assertion failed: deliberate test panic
+backtrace:
+  #0 0xffffffff800112ea main.scenarioPanicInner+0x4a
+  #1 0xffffffff8001115e main.scenarioPanic+0xe
+  #2 0xffffffff80000666 main.runTestScenario+0x106
+  #3 0xffffffff80000480 kmain+0x3e0
+```
+
+```
+*** Page fault (vector 14, error 0x2)
+RIP=0xffffffff80010fad CS=0x8 RFLAGS=0x10002
+RSP=0xffff80000ff78d08 RAX=0xffffb00000000000 RBX=0x0
+CR2=0xffffb00000000000 (faulting address)
+backtrace:
+  #0 0xffffffff80010fad main.scenarioFault+0x1d
+  #1 0xffffffff80000699 main.runTestScenario+0x139
+```
+
+How it works: the kernel is built with frame pointers, `kernel/debug/backtrace.zig`
+walks the RBP chain (checking each frame against the page tables first), and
+the names come from the kernel's own `.symtab`, which Limine passes to the kernel
+through the executable-file request. Frame `#0` is the faulting instruction (for
+faults) or the code that called the panic (for panics).
+
+In optimized builds, inlined functions do not get their own frame, so a frame
+may show the function it was inlined into (e.g. a large offset into `kmain`).
+To get file and line numbers for an address, symbolize it on the host:
+
+```bash
+addr2line -f -i -e zig-out/bin/kernel.elf 0xffffffff800112ea
+# or
+llvm-symbolizer --obj=zig-out/bin/kernel.elf 0xffffffff800112ea
+```
+
+Use the ELF that was booted: `zig-out/bin/kernel.elf` for `./build.sh`,
+`zig-out/bin/kernel-test.elf` for the QEMU tests.
+
+## Debugging with QEMU and GDB
+
+1. Build a Debug kernel and the ISO: `./build.sh`
+2. Start QEMU paused, with a GDB server on `localhost:1234`:
+
+   ```bash
+   ./run-qemu.sh --gdb          # add --bios for legacy BIOS boot, --no-kvm for TCG
+   ```
+
+3. In another terminal, attach GDB. `scripts/kernel.gdb` loads the kernel
+   symbols, connects, and stops at `kmain`:
+
+   ```bash
+   gdb -x scripts/kernel.gdb
+   ```
+
+Useful commands once stopped:
+
+```gdb
+hbreak kernel.pmm.alloc        # functions are named after their namespace path
+hbreak src/kernel/heap.zig:120 # or file:line
+bt                             # backtrace (uses the same frame pointers)
+info registers rip rsp cr3
+x/8i $rip                      # disassemble at the current instruction
+p kernel.pmm.free_pages        # read a global
+```
+
+Notes:
+
+- Use `hbreak` (hardware breakpoints) for breakpoints set before the kernel is
+  loaded. Software breakpoints (`break`) only work once the code is mapped,
+  e.g. after you have stopped in `kmain`.
+- QEMU starts in real mode. GDB shows `0x000000000000fff0 in ?? ()` until the
+  kernel runs; that is expected.
+- With KVM, use hardware breakpoints only. With `--no-kvm` (TCG) both kinds work.
+- To debug a user program, add its symbols: `add-symbol-file zig-out/bin/sh.elf`
+  (user programs are linked at fixed addresses).
+
+## Other QEMU tools
+
+- `-d int,cpu_reset -D qemu.log` logs every interrupt and CPU reset, which helps
+  with triple faults (the machine reboots, or stops with `-no-reboot`). Pass it
+  after `--`: `./run-qemu.sh --no-kvm -- -d int,cpu_reset -D qemu.log`
+- `-monitor stdio` instead of `-serial stdio` gives the QEMU monitor:
+  `info registers`, `info mem` (page table mappings), `info tlb`, `x /10i $pc`.

@@ -22,7 +22,25 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false);
+    const kopts: KernelOptions = .{
+        .log_level = b.option(
+            std.log.Level,
+            "log-level",
+            "Kernel log level: err, warn, info or debug (default: debug in Debug builds, info otherwise)",
+        ) orelse if (optimize == .debug) .debug else .info,
+        .assertions = b.option(
+            bool,
+            "assertions",
+            "Enable kernel subsystem assertions (default: true)",
+        ) orelse true,
+        .alloc_debug = b.option(
+            bool,
+            "alloc-debug",
+            "Log every kernel heap allocation and free (default: false)",
+        ) orelse false,
+    };
+
+    const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false, kopts);
     b.installArtifact(kernel);
     userProgram(b, "hello", target, optimize);
     userProgram(b, "sh", target, optimize);
@@ -31,7 +49,7 @@ pub fn build(b: *std.Build) void {
     // first file it sees) as the module root, so the docs come from a copy of
     // the kernel named "main" to make src/main.zig the entry page. Only built
     // by `zig build docs`.
-    const docs_kernel = kernelArtifact(b, "main", target, optimize, false);
+    const docs_kernel = kernelArtifact(b, "main", target, optimize, false, kopts);
     const install_docs = b.addInstallDirectory(.{
         .source_dir = docs_kernel.getEmittedDocs(),
         .install_dir = .prefix,
@@ -45,17 +63,19 @@ pub fn build(b: *std.Build) void {
 
     docs_step.dependOn(&install_docs.step);
 
-    const test_kernel = kernelArtifact(b, "kernel-test.elf", target, .Debug, true);
+    // The test kernel follows -Doptimize so CI can run the QEMU tests against
+    // both debug and optimized builds.
+    const test_kernel = kernelArtifact(b, "kernel-test.elf", target, optimize, true, kopts);
     // Both consumers must share one module instance.
     const qemu_exit = b.createModule(.{
         .root_source_file = b.path("tests/support/qemu_exit.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = optimize,
     });
     const kernel_tests = b.createModule(.{
         .root_source_file = b.path("tests/kernel/main.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = optimize,
     });
     kernel_tests.addImport("qemu_exit", qemu_exit);
     test_kernel.root_module.addImport("kernel_tests", kernel_tests);
@@ -73,14 +93,34 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    host_tests.root_module.addImport("vfs", b.createModule(.{
-        .root_source_file = b.path("src/kernel/vfs.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-    }));
+    // Hardware-independent kernel modules, compiled natively for the host tests.
+    inline for (.{
+        .{ "vfs", "src/kernel/vfs.zig" },
+        .{ "symbols", "src/kernel/debug/symbols.zig" },
+        .{ "log_format", "src/kernel/debug/log_format.zig" },
+    }) |m| {
+        host_tests.root_module.addImport(m[0], b.createModule(.{
+            .root_source_file = b.path(m[1]),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }));
+    }
     const run_host_tests = b.addRunArtifact(host_tests);
     const host_step = b.step("test-host", "Run native unit tests with fakes");
     host_step.dependOn(&run_host_tests.step);
+
+    // Host-code coverage with kcov (must be installed). Report: zig-out/coverage/index.html
+    const run_coverage = b.addSystemCommand(&.{ "kcov", "--clean" });
+    run_coverage.addPrefixedDirectoryArg("--include-path=", b.path("src"));
+    const coverage_dir = run_coverage.addOutputDirectoryArg("coverage");
+    run_coverage.addArtifactArg(host_tests);
+    const install_coverage = b.addInstallDirectory(.{
+        .source_dir = coverage_dir,
+        .install_dir = .prefix,
+        .install_subdir = "coverage",
+    });
+    const coverage_step = b.step("coverage", "Run host tests under kcov and write zig-out/coverage");
+    coverage_step.dependOn(&install_coverage.step);
 
     // test-qemu.sh packages already installed binaries; it never calls zig build.
     const run_qemu = b.addSystemCommand(&.{ "bash", "test-qemu.sh" });
@@ -94,12 +134,20 @@ pub fn build(b: *std.Build) void {
     all.dependOn(&run_qemu.step);
 }
 
+/// Kernel configuration exposed to the kernel as `build_options`.
+const KernelOptions = struct {
+    log_level: std.log.Level,
+    assertions: bool,
+    alloc_debug: bool,
+};
+
 fn kernelArtifact(
     b: *std.Build,
     name: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     is_test: bool,
+    kopts: KernelOptions,
 ) *std.Build.Step.Compile {
     const kernel = b.addExecutable(.{
         .name = name,
@@ -111,6 +159,8 @@ fn kernelArtifact(
             .red_zone = false,
             .pic = false,
             .sanitize_c = .off,
+            // Keep RBP frame chains so panics and faults can print backtraces.
+            .omit_frame_pointer = false,
         }),
         .use_llvm = true,
         .use_lld = true,
@@ -119,6 +169,9 @@ fn kernelArtifact(
     kernel.setLinkerScript(b.path("linker.ld"));
     const options = b.addOptions();
     options.addOption(bool, "is_test", is_test);
+    options.addOption(std.log.Level, "log_level", kopts.log_level);
+    options.addOption(bool, "assertions", kopts.assertions);
+    options.addOption(bool, "alloc_debug", kopts.alloc_debug);
     kernel.root_module.addOptions("build_options", options);
     return kernel;
 }

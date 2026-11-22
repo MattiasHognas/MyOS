@@ -3,8 +3,9 @@
 //! Uses the legacy I/O port mechanism (0xCF8 address / 0xCFC data). `scan`
 //! records up to 64 devices at boot; drivers then look them up with `find`.
 
-const root = @import("root");
+const std = @import("std");
 const cpu = @import("../arch/x86_64/cpu.zig");
+const log = std.log.scoped(.pci);
 
 var devices: [64]Device = undefined;
 var count: usize = 0;
@@ -69,7 +70,7 @@ pub fn scan() void {
                 .progif = @truncate(class >> 8),
             };
             const x = devices[count];
-            root.print("pci {x:0>2}:{x:0>2}.{d} {x:0>4}:{x:0>4} class {x:0>2}.{x:0>2}.{x:0>2}\n", .{ bus, dev, func, x.vendor, x.device, x.class, x.subclass, x.progif });
+            log.info("{x:0>2}:{x:0>2}.{d} {x:0>4}:{x:0>4} class {x:0>2}.{x:0>2}.{x:0>2}", .{ bus, dev, func, x.vendor, x.device, x.class, x.subclass, x.progif });
             count += 1;
         }
         // Function 0 says whether functions 1-7 exist (header type bit 7).

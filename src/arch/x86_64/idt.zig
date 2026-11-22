@@ -13,6 +13,7 @@ const gdt = @import("gdt.zig");
 const apic = @import("../../arch/x86_64/apic.zig");
 const thread = @import("../../kernel/thread.zig");
 const process = @import("../../kernel/process.zig");
+const backtrace = @import("../../kernel/debug/backtrace.zig");
 
 var idt = std.mem.zeroes([256]Entry);
 var handlers: [256]?Handler = @splat(null);
@@ -141,8 +142,8 @@ fn readCr2() u64 {
 ///   the handler installed with `register`. The handler may switch threads, so
 ///   the EOI must already have been sent.
 /// - Exceptions from ring 3 terminate the current process with exit code 255.
-/// - Exceptions from ring 0 print the register state and halt, except
-///   breakpoints (`int3`), which resume.
+/// - Exceptions from ring 0 print the register state and a symbolized
+///   backtrace, then halt, except breakpoints (`int3`), which resume.
 export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
     if (f.vector >= 32) {
@@ -159,6 +160,7 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
     root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });
     root.print("RSP=0x{x} RAX=0x{x} RBX=0x{x}\n", .{ f.rsp, f.rax, f.rbx });
     if (f.vector == 14) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
+    backtrace.print(.{ .pc = f.rip }, f.rbp);
 
     if (f.vector == 3) return; // breakpoint: resume after int3
     root.halt();

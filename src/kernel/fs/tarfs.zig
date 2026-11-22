@@ -4,8 +4,8 @@
 //! file data is served directly from the archive without copying.
 
 const std = @import("std");
-const root = @import("root");
 const vfs = @import("../vfs.zig");
+const log = std.log.scoped(.tarfs);
 
 var archive: []const u8 = &.{};
 
@@ -89,7 +89,7 @@ pub fn init(image: []const u8) vfs.Fs {
     archive = image;
     var off: usize = 0;
     while (next(&off)) |e| {
-        if (isFile(e)) root.print("initrd: /{s} ({d} bytes)\n", .{ e.name, e.data.len });
+        if (isFile(e)) log.info("/{s} ({d} bytes)", .{ e.name, e.data.len });
     }
     return .{ .ctx = undefined, .lookup = lookup };
 }

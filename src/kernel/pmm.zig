@@ -6,6 +6,7 @@
 //! Physical memory is accessed through the HHDM with `physToVirt`.
 
 const limine = @import("../boot/limine.zig");
+const assert = @import("debug/assert.zig");
 
 var bitmap: []u8 = &.{}; // 1 bit per page, 1 = used
 var total_pages: usize = 0;
@@ -110,6 +111,8 @@ pub fn alloc() ?u64 {
 /// Free the physical page at `phys`, which must have come from `alloc`.
 /// Panics on a double free. Not interrupt safe, like `alloc`.
 pub fn free(phys: u64) void {
+    assert.check(.pmm, phys % PAGE_SIZE == 0, "freeing unaligned address 0x{x}", .{phys});
+    assert.check(.pmm, phys != 0 and phys / PAGE_SIZE < total_pages, "freeing address 0x{x} outside managed memory", .{phys});
     const p = phys / PAGE_SIZE;
     if (!isUsed(p)) @panic("PMM: double free");
     setFree(p);

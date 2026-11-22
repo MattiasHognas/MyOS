@@ -5,8 +5,8 @@
 //! overrides. Other drivers look up their own tables with `findTable`.
 
 const std = @import("std");
-const root = @import("root");
 const pmm = @import("../kernel/pmm.zig");
+const log = std.log.scoped(.acpi);
 
 var root_table: []const u8 = &.{}; // XSDT (8-byte entries) or RSDT (4-byte)
 var entry_size: usize = 8;
@@ -132,21 +132,19 @@ pub fn init(rsdp_addr: u64, hhdm: u64) void {
     }
     if (!checksumOk(root_table)) @panic("ACPI: bad root table checksum");
 
-    root.print("ACPI {s}:", .{root_table[0..4]});
     var off: usize = 36;
     while (off + entry_size <= root_table.len) : (off += entry_size) {
         const p = if (entry_size == 8) r64(root_table, off) else r32(root_table, off);
-        root.print(" {s}", .{tableAt(p)[0..4]});
+        log.debug("{s} lists table {s}", .{ root_table[0..4], tableAt(p)[0..4] });
     }
-    root.print("\n", .{});
 
     parseMadt(findTable("APIC") orelse @panic("ACPI: no MADT"));
 
-    root.print("CPUs: {d}, LAPIC at 0x{x}, legacy PIC: {}\n", .{ cpu_count, lapic_addr, has_8259 });
+    log.info("CPUs: {d}, LAPIC at 0x{x}, legacy PIC: {}", .{ cpu_count, lapic_addr, has_8259 });
     for (ioapics[0..ioapic_count]) |io| {
-        root.print("I/O APIC {d} at 0x{x}, GSI base {d}\n", .{ io.id, io.addr, io.gsi_base });
+        log.info("I/O APIC {d} at 0x{x}, GSI base {d}", .{ io.id, io.addr, io.gsi_base });
     }
     for (irq_overrides, 0..) |o, irq| {
-        if (o) |ov| root.print("IRQ {d} -> GSI {d} (flags 0x{x})\n", .{ irq, ov.gsi, ov.flags });
+        if (o) |ov| log.debug("IRQ {d} -> GSI {d} (flags 0x{x})", .{ irq, ov.gsi, ov.flags });
     }
 }

@@ -13,6 +13,7 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
 const arch_syscall = @import("../arch/x86_64/syscall.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
+const assert = @import("debug/assert.zig");
 const proc = @import("process.zig"); // the file: for proc.destroy
 const Process = proc.Process; // the struct: for fields and parameters
 
@@ -34,6 +35,8 @@ var zombies: ?*Thread = null;
 
 /// Append `t` to the tail of the ready queue. Callers must have interrupts disabled.
 fn enqueue(t: *Thread) void {
+    assert.check(.thread, t.state == .ready, "enqueueing thread {d} in state {t}", .{ t.id, t.state });
+    assert.check(.thread, ready_tail != t, "thread {d} is already at the tail of the ready queue", .{t.id});
     t.next = null;
     if (ready_tail) |tail| tail.next = t else ready_head = t;
     ready_tail = t;

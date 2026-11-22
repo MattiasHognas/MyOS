@@ -17,8 +17,17 @@ pub const Api = struct {
     page_rw: *const fn (u64) bool,
 
     heap_roundtrip: *const fn () bool,
+    heap_stats: *const fn () bool,
     address_space_roundtrip: *const fn () bool,
+    vmm_map_translate: *const fn () bool,
     invalid_elf_rejected: *const fn () bool,
+
+    /// Name of the function containing a code address, or null.
+    symbolize: *const fn (u64) ?[]const u8,
+    /// Return addresses of the caller's frame chain, innermost first.
+    capture_backtrace: *const fn ([]u64) usize,
+    /// Read a QEMU fw_cfg file into the buffer.
+    fw_cfg_read: *const fn ([]const u8, []u8) ?[]u8,
 
     has_file: *const fn ([]const u8) bool,
     file_size: *const fn ([]const u8) ?u64,
@@ -84,6 +93,61 @@ fn addressSpaceTest(api: Api) TestError!void {
 }
 
 /// Spawning a process from a non-ELF image fails.
+/// Heap usage counters follow allocations, shrinks and frees.
+fn heapStats(api: Api) TestError!void {
+    try check(api.heap_stats());
+}
+
+/// A mapped page translates back to its physical address; unmapped pages don't.
+fn vmmMapTranslate(api: Api) TestError!void {
+    try check(api.vmm_map_translate());
+}
+
+/// The kernel's own functions are symbolized from its ELF symbol table.
+fn symbolizeKnownFunctions(api: Api) TestError!void {
+    const name = api.symbolize(@intFromPtr(&symbolTarget)) orelse return error.Failed;
+    try check(std.mem.endsWith(u8, name, "symbolTarget"));
+    const run_name = api.symbolize(@intFromPtr(&run) + 1) orelse return error.Failed;
+    try check(std.mem.endsWith(u8, run_name, "run"));
+    try check(api.symbolize(0) == null);
+}
+
+/// Target for the symbolization test; never called.
+noinline fn symbolTarget() callconv(.c) void {
+    asm volatile ("");
+}
+
+/// Backtraces follow the frame chain through named functions.
+fn backtraceThroughFrames(api: Api) TestError!void {
+    try backtraceOuter(api);
+}
+
+/// Outer frame of the backtrace test.
+noinline fn backtraceOuter(api: Api) TestError!void {
+    try backtraceInner(api);
+    asm volatile (""); // keep this from being a tail call
+}
+
+/// Inner frame of the backtrace test: capture and check the chain.
+noinline fn backtraceInner(api: Api) TestError!void {
+    var frames: [16]u64 = undefined;
+    const n = api.capture_backtrace(&frames);
+    try check(n >= 3);
+    const inner = api.symbolize(frames[0] - 1) orelse return error.Failed;
+    const outer = api.symbolize(frames[1] - 1) orelse return error.Failed;
+    try check(std.mem.endsWith(u8, inner, "backtraceInner"));
+    try check(std.mem.endsWith(u8, outer, "backtraceOuter"));
+    asm volatile ("");
+}
+
+/// The host passed the scenario name through QEMU's fw_cfg device.
+fn fwCfgScenario(api: Api) TestError!void {
+    var buf: [32]u8 = undefined;
+    const scenario = api.fw_cfg_read("opt/myos/scenario", &buf) orelse return error.Failed;
+    try check(std.mem.eql(u8, scenario, "tests"));
+    try check(api.fw_cfg_read("opt/myos/does-not-exist", &buf) == null);
+}
+
 fn invalidElf(api: Api) TestError!void {
     try check(api.invalid_elf_rejected());
 }
@@ -179,8 +243,16 @@ pub fn run(api: Api) noreturn {
             .func = heapTest,
         },
         .{
+            .name = "kernel heap usage statistics",
+            .func = heapStats,
+        },
+        .{
             .name = "VMM address-space create/destroy",
             .func = addressSpaceTest,
+        },
+        .{
+            .name = "VMM map and translate",
+            .func = vmmMapTranslate,
         },
         .{
             .name = "reject invalid ELF magic",
@@ -201,6 +273,18 @@ pub fn run(api: Api) noreturn {
         .{
             .name = "VFS missing file",
             .func = missingFile,
+        },
+        .{
+            .name = "symbolize kernel functions",
+            .func = symbolizeKnownFunctions,
+        },
+        .{
+            .name = "backtrace through frame chain",
+            .func = backtraceThroughFrames,
+        },
+        .{
+            .name = "fw_cfg scenario selection",
+            .func = fwCfgScenario,
         },
     };
 

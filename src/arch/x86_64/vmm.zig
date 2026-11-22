@@ -7,6 +7,7 @@
 
 const limine = @import("../../boot/limine.zig");
 const pmm = @import("../../kernel/pmm.zig");
+const assert = @import("../../kernel/debug/assert.zig");
 
 /// Page table entry flag: the mapping is valid.
 pub const PRESENT: u64 = 1 << 0;
@@ -114,6 +115,8 @@ fn wrmsr(msr: u32, val: u64) void {
 /// always added to `flags`. Any existing mapping is overwritten; the TLB is
 /// not flushed.
 pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
+    const align_mask: u64 = if (huge) MIB2 - 1 else pmm.PAGE_SIZE - 1;
+    assert.check(.vmm, virt & align_mask == 0 and phys & align_mask == 0, "misaligned mapping 0x{x} -> 0x{x}", .{ virt, phys });
     const last: u6 = if (huge) 1 else 0;
     var t = table(root);
     var level: u6 = 3; // 3 = PML4, 2 = PDPT, 1 = PD, 0 = PT
@@ -123,6 +126,24 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
     }
     const idx: usize = @intCast((virt >> (12 + 9 * last)) & 0x1FF);
     t[idx] = (phys & ADDR_MASK) | flags | PRESENT | (if (huge) HUGE else 0);
+}
+
+/// Translate `virt` in the address space whose PML4 is `root` to a physical
+/// address. Returns null if it is not mapped. Handles 2 MiB pages. Only reads
+/// the page tables, so it is safe to call from fault handlers.
+pub fn translate(root: u64, virt: u64) ?u64 {
+    var t = table(root);
+    var level: u6 = 3;
+    while (true) : (level -= 1) {
+        const e = t[@intCast((virt >> (12 + 9 * level)) & 0x1FF)];
+        if (e & PRESENT == 0) return null;
+        const page_bits: u6 = 12 + 9 * level;
+        if (level == 0 or (level == 1 and e & HUGE != 0)) {
+            const mask = (@as(u64, 1) << page_bits) - 1;
+            return ((e & ADDR_MASK) & ~mask) | (virt & mask);
+        }
+        t = table(e & ADDR_MASK);
+    }
 }
 
 /// Create a new address space and return the physical address of its PML4.

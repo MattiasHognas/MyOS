@@ -10,6 +10,15 @@ pub fn outb(port: u16, val: u8) void {
     );
 }
 
+/// Write the 16-bit value `val` to I/O port `port`.
+pub fn outw(port: u16, val: u16) void {
+    asm volatile ("outw %[val], %[port]"
+        :
+        : [val] "{ax}" (val),
+          [port] "N{dx}" (port),
+    );
+}
+
 /// Write the 32-bit value `val` to I/O port `port`.
 pub fn outl(port: u16, val: u32) void {
     asm volatile ("outl %[val], %[port]"

@@ -6,11 +6,11 @@
 //! page-sized DMA bounce buffer.
 
 const std = @import("std");
-const root = @import("root");
 const pci = @import("pci.zig");
 const hpet = @import("hpet.zig");
 const pmm = @import("../kernel/pmm.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
+const log = std.log.scoped(.nvme);
 
 /// 64-byte submission queue entry, as defined by the NVMe specification.
 const Sqe = extern struct {
@@ -186,7 +186,7 @@ pub fn init(dev: pci.Device) !void {
     try submit(&admin, .{ .cdw0 = 0x05, .nsid = 0, .prp1 = io.cq_phys, .cdw10 = ((QSIZE - 1) << 16) | 1, .cdw11 = 1 });
     try submit(&admin, .{ .cdw0 = 0x01, .nsid = 0, .prp1 = io.sq_phys, .cdw10 = ((QSIZE - 1) << 16) | 1, .cdw11 = (1 << 16) | 1 });
 
-    root.print("nvme: {d} sectors of {d} bytes ({d} MiB)\n", .{ sector_count, sector_size, sector_count * sector_size / (1024 * 1024) });
+    log.info("{d} sectors of {d} bytes ({d} MiB)", .{ sector_count, sector_size, sector_count * sector_size / (1024 * 1024) });
 }
 
 /// Read `count` sectors starting at `lba` from namespace 1 into `buf`.

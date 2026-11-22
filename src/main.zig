@@ -29,6 +29,7 @@ pub const boot = struct {
 
 /// Hardware device drivers.
 pub const drivers = struct {
+    pub const fw_cfg = @import("drivers/fw_cfg.zig");
     pub const hpet = @import("drivers/hpet.zig");
     pub const nvme = @import("drivers/nvme.zig");
     pub const pci = @import("drivers/pci.zig");
@@ -51,6 +52,14 @@ pub const kernel = struct {
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
     pub const vfs = @import("kernel/vfs.zig");
+
+    /// Debugging aids: assertions, backtraces, symbol lookup and log formatting.
+    pub const debug = struct {
+        pub const assert = @import("kernel/debug/assert.zig");
+        pub const backtrace = @import("kernel/debug/backtrace.zig");
+        pub const log_format = @import("kernel/debug/log_format.zig");
+        pub const symbols = @import("kernel/debug/symbols.zig");
+    };
 
     /// Filesystem implementations.
     pub const fs = struct {
@@ -80,6 +89,17 @@ const vfs = kernel.vfs;
 const tarfs = kernel.fs.tarfs;
 const pci = drivers.pci;
 const nvme = drivers.nvme;
+const fw_cfg = drivers.fw_cfg;
+const assert = kernel.debug.assert;
+const backtrace = kernel.debug.backtrace;
+const log_format = kernel.debug.log_format;
+const log = std.log.scoped(.boot);
+
+/// Route `std.log` through `logFn`, at the level chosen with `-Dlog-level`.
+pub const std_options: std.Options = .{
+    .log_level = @field(std.log.Level, @tagName(build_options.log_level)),
+    .logFn = logFn,
+};
 
 /// Limine request for boot modules (the initrd).
 export var module_request linksection(".limine_requests") = limine.ModuleRequest{};
@@ -95,6 +115,8 @@ export var hhdm_request linksection(".limine_requests") = limine.HhdmRequest{};
 export var kaddr_request linksection(".limine_requests") = limine.KernelAddressRequest{};
 /// Limine request for the ACPI RSDP address.
 export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
+/// Limine request for the kernel's own ELF file, used to symbolize backtraces.
+export var exec_file_request linksection(".limine_requests") = limine.ExecutableFileRequest{};
 
 /// Timer interrupts received since the APIC timer was started (100 Hz).
 var ticks: u64 = 0;
@@ -142,11 +164,11 @@ const USER_STACK: u64 = 0x80_0000; // top of the user stack (8 MiB)
 /// Initialize the NVMe controller `dev` and print the start of LBA 0 as a
 /// string (up to the first NUL byte). Errors are printed, not propagated.
 fn diskTest(dev: pci.Device) void {
-    nvme.init(dev) catch |e| return print("nvme init failed: {s}\n", .{@errorName(e)});
+    nvme.init(dev) catch |e| return log.err("nvme init failed: {s}", .{@errorName(e)});
     var sector: [4096]u8 = undefined;
-    nvme.read(0, 1, &sector) catch |e| return print("nvme read failed: {s}\n", .{@errorName(e)});
+    nvme.read(0, 1, &sector) catch |e| return log.err("nvme read failed: {s}", .{@errorName(e)});
     const end = std.mem.indexOfScalar(u8, &sector, 0) orelse 64;
-    print("disk LBA 0: \"{s}\"\n", .{sector[0..end]});
+    log.info("disk LBA 0: \"{s}\"", .{sector[0..end]});
 }
 
 /// Return the contents of the first boot module whose path ends with `name`,
@@ -175,14 +197,22 @@ fn response(req: anytype) @typeInfo(@TypeOf(req.response)).optional.child {
     return v.response orelse @panic("Limine request not answered");
 }
 
-/// Panic handler behind `panic`: print the message and halt. In the test
-/// kernel, report failure and exit QEMU instead.
-fn kernelPanic(msg: []const u8, _: ?usize) noreturn {
-    print("PANIC: {s}\n", .{msg});
-    if (comptime build_options.is_test) {
-        serial.puts("MYOS_TEST_FAIL\n");
-        @import("qemu_exit").exit(1);
+/// Set while a panic is being reported, so a panic inside the panic handler
+/// (e.g. while printing the backtrace) halts instead of recursing.
+var panicking = false;
+
+/// Panic handler behind `panic`: print the message and a symbolized
+/// backtrace, then halt. In the test kernel, report failure and exit QEMU.
+fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
+    _ = cpu.saveAndDisableInterrupts();
+    if (panicking) {
+        serial.puts("PANIC while panicking\n");
+        halt();
     }
+    panicking = true;
+    print("PANIC: {s}\n", .{msg});
+    backtrace.print(.{ .return_address = ret_addr orelse @returnAddress() }, @frameAddress());
+    if (comptime build_options.is_test) serial.puts("MYOS_TEST_FAIL\n");
     halt();
 }
 
@@ -235,23 +265,39 @@ fn shell() noreturn {
 /// replaced by `<print overflow>`. Other modules call this as `root.print`.
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n";
-    const flags = cpu.saveAndDisableInterrupts(); // whole message at once
+    write(std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n");
+}
+
+/// Write `s` to the serial port and (once initialized) the console, with
+/// interrupts disabled so the whole message comes out in one piece.
+fn write(s: []const u8) void {
+    const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     serial.puts(s);
     if (console.ready) for (s) |c| console.putc(c);
 }
 
-/// Stop the CPU for good: disable interrupts and halt forever.
-pub fn halt() noreturn {
-    while (true) asm volatile ("cli; hlt");
+/// `std.log` handler: format the message as `level(scope): message` and
+/// write it like `print`. Messages above `-Dlog-level` are compiled out.
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    var buf: [512]u8 = undefined;
+    write(log_format.format(&buf, level, scope, fmt, args));
 }
 
-/// Read the start of file `path` into `buf` and return the number of bytes
-/// read, or null if the file doesn't exist.
-fn testReadFile(path: []const u8, buf: []u8) ?usize {
-    const node = vfs.lookup(path) orelse return null;
-    return vfs.read(&node, 0, buf);
+/// Stop the CPU for good: disable interrupts and halt forever. In the test
+/// kernel, exit QEMU with a failure status instead, so a halted test run
+/// ends immediately rather than timing out.
+pub fn halt() noreturn {
+    if (comptime build_options.is_test) {
+        serial.puts("MYOS_HALT\n");
+        @import("qemu_exit").exit(1);
+    }
+    while (true) asm volatile ("cli; hlt");
 }
 
 // Test-only service callbacks passed to the kernel test suite. Using callbacks
@@ -353,6 +399,115 @@ fn testInvalidElfRejected() bool {
     return false;
 }
 
+/// Test callback: return the name of the function containing code address
+/// `addr`, or null if it can't be symbolized.
+fn testSymbolize(addr: u64) ?[]const u8 {
+    const sym = backtrace.symbolize(addr) orelse return null;
+    return sym.name;
+}
+
+/// Test callback: store the return addresses of the caller's frame chain in
+/// `out`, innermost first (the first one points into the caller).
+noinline fn testCaptureBacktrace(out: []u64) usize {
+    return backtrace.capture(@frameAddress(), out);
+}
+
+/// Test callback: in a fresh address space, map one user page, check that
+/// `vmm.translate` finds it (including an offset into the page) and that
+/// neighbouring pages are unmapped, then destroy the address space and check
+/// that no physical pages leaked.
+fn testVmmMapTranslate() bool {
+    const before = pmm.free_pages;
+    const root = vmm.createAddressSpace();
+    const virt: u64 = 0x40_0000;
+    const phys = pmm.alloc() orelse {
+        vmm.destroyAddressSpace(root);
+        return false;
+    };
+    vmm.map(root, virt, phys, vmm.USER | vmm.WRITABLE, false);
+    const ok = vmm.translate(root, virt) == phys and
+        vmm.translate(root, virt + 0x123) == phys + 0x123 and
+        vmm.translate(root, virt + pmm.PAGE_SIZE) == null and
+        vmm.translate(root, virt - pmm.PAGE_SIZE) == null and
+        vmm.translate(root, 0x7FFF_0000_0000) == null;
+    vmm.destroyAddressSpace(root); // frees the mapped page and its tables too
+    return ok and pmm.free_pages == before;
+}
+
+/// Test callback: check that the heap usage counters track an allocation,
+/// a shrink and a free, and return to their starting value.
+fn testHeapStats() bool {
+    const s0 = heap.stats();
+    const mem = heap.allocator.alloc(u8, 100) catch return false;
+    const s1 = heap.stats();
+    const shrunk = heap.allocator.resize(mem, 20);
+    const s2 = heap.stats();
+    heap.allocator.free(mem[0..20]);
+    const s3 = heap.stats();
+    return s1.allocs == s0.allocs + 1 and
+        s1.bytes_in_use == s0.bytes_in_use + 112 and // 100 rounded up to 16
+        s1.peak_bytes >= s1.bytes_in_use and
+        shrunk and s2.bytes_in_use == s0.bytes_in_use + 32 and
+        s3.frees == s0.frees + 1 and
+        s3.bytes_in_use == s0.bytes_in_use and
+        s3.bytes_mapped >= s3.bytes_in_use;
+}
+
+/// Test callback: read the fw_cfg file `name` into `buf`.
+fn testFwCfgRead(name: []const u8, buf: []u8) ?[]u8 {
+    return fw_cfg.readFile(name, buf);
+}
+
+/// Integration-test scenario "panic": fail a subsystem assertion two calls
+/// deep, so the panic output must contain a symbolized backtrace through
+/// these functions.
+noinline fn scenarioPanic() void {
+    scenarioPanicInner(true);
+}
+
+/// Inner frame of `scenarioPanic`.
+noinline fn scenarioPanicInner(fail: bool) void {
+    assert.check(.scenario, !fail, "deliberate test panic", .{});
+}
+
+/// Integration-test scenario "fault": write to an unmapped kernel address, so
+/// the page-fault report must show CR2 and a symbolized backtrace.
+noinline fn scenarioFault() void {
+    const p: *volatile u64 = @ptrFromInt(0xFFFF_B000_0000_0000);
+    p.* = 0xDEAD;
+}
+
+/// Run the test kernel: pick the scenario passed by the host through fw_cfg
+/// (`opt/myos/scenario`, default "tests") and run it. Never returns; every
+/// scenario ends by exiting QEMU.
+fn runTestScenario() noreturn {
+    var buf: [32]u8 = undefined;
+    const scenario = fw_cfg.readFile("opt/myos/scenario", &buf) orelse "tests";
+    log.info("test scenario: {s}", .{scenario});
+    if (std.mem.eql(u8, scenario, "panic")) scenarioPanic();
+    if (std.mem.eql(u8, scenario, "fault")) scenarioFault();
+    if (!std.mem.eql(u8, scenario, "tests")) std.debug.panic("unknown test scenario '{s}'", .{scenario});
+
+    @import("kernel_tests").run(.{
+        .log = testLog,
+        .alloc_page = pmm.alloc,
+        .free_page = pmm.free,
+        .free_pages = testFreePages,
+        .has_file = testHasFile,
+        .file_size = testFileSize,
+        .read_file_at = testReadFileAt,
+        .page_rw = testPageRw,
+        .heap_roundtrip = testHeapRoundtrip,
+        .heap_stats = testHeapStats,
+        .address_space_roundtrip = testAddressSpaceRoundtrip,
+        .vmm_map_translate = testVmmMapTranslate,
+        .invalid_elf_rejected = testInvalidElfRejected,
+        .symbolize = testSymbolize,
+        .capture_backtrace = testCaptureBacktrace,
+        .fw_cfg_read = testFwCfgRead,
+    });
+}
+
 /// Kernel entry point, jumped to by Limine.
 ///
 /// Initializes the subsystems in dependency order, mounts the initrd as the
@@ -371,43 +526,36 @@ export fn kmain() callconv(.c) noreturn {
     const hhdm = response(&hhdm_request).offset;
     pmm.init(mm, hhdm);
     vmm.init(mm, response(&kaddr_request), hhdm);
-    print("Memory: {d} MiB free\n", .{pmm.free_pages * pmm.PAGE_SIZE / (1024 * 1024)});
+    log.info("memory: {d} MiB free", .{pmm.free_pages * pmm.PAGE_SIZE / (1024 * 1024)});
+
+    const exec_file: *volatile @TypeOf(exec_file_request) = &exec_file_request;
+    if (exec_file.response) |r| {
+        const f = r.executable_file;
+        const elf_image = @as([*]const u8, @ptrFromInt(f.address))[0..f.size];
+        if (backtrace.init(elf_image)) log.debug("kernel symbols loaded", .{}) else log.warn("kernel ELF has no symbol table", .{});
+    } else log.warn("no kernel executable file from bootloader; backtraces will not be symbolized", .{});
 
     acpi.init(response(&rsdp_request).address, hhdm);
     apic.init();
     hpet.init();
 
     pci.scan();
-    if (pci.find(0x01, 0x08, 0x02)) |dev| diskTest(dev) else print("no NVMe controller\n", .{});
+    if (pci.find(0x01, 0x08, 0x02)) |dev| diskTest(dev) else log.warn("no NVMe controller", .{});
 
     idt.register(apic.TIMER_VECTOR, onTick);
     apic.timerInit(100);
-    print("APIC timer: {d} ticks/ms, running at 100 Hz\n", .{apic.ticks_per_ms});
+    log.info("APIC timer: {d} ticks/ms, running at 100 Hz", .{apic.ticks_per_ms});
 
     syscall.init();
 
     const initrd = findModule("initrd.tar") orelse @panic("no initrd.tar module");
     vfs.mountRoot(tarfs.init(initrd));
 
-    // Execute real kernel integration tests without launching an interactive shell.
-    if (comptime build_options.is_test) {
-        @import("kernel_tests").run(.{
-            .log = testLog,
-            .alloc_page = pmm.alloc,
-            .free_page = pmm.free,
-            .free_pages = testFreePages,
-            .has_file = testHasFile,
-            .file_size = testFileSize,
-            .read_file_at = testReadFileAt,
-            .page_rw = testPageRw,
-            .heap_roundtrip = testHeapRoundtrip,
-            .address_space_roundtrip = testAddressSpaceRoundtrip,
-            .invalid_elf_rejected = testInvalidElfRejected,
-        });
-    }
+    // The test kernel runs an integration-test scenario instead of the shell.
+    if (comptime build_options.is_test) runTestScenario();
 
     keyboard.init();
-    _ = process.spawnPath("/bin/sh", null) catch |e| print("failed to start /bin/sh: {s}\n", .{@errorName(e)});
+    _ = process.spawnPath("/bin/sh", null) catch |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
     print("Boot complete.\n", .{});
     idle();
 }

@@ -78,6 +78,14 @@ pub const RsdpRequest = Request(0xc5e77b6b397e7b43, 0x27637845accdcf3c, RsdpResp
 /// either physical or an HHDM pointer (see `acpi.init`).
 pub const RsdpResponse = extern struct { revision: u64, address: u64 };
 
+/// Ask for the kernel's own ELF file, as loaded from disk (used for symbol lookup).
+pub const ExecutableFileRequest = Request(0xad97e90e83f1ed67, 0x31eb5d1c5ff23b69, ExecutableFileResponse);
+/// Response to `ExecutableFileRequest`.
+pub const ExecutableFileResponse = extern struct {
+    revision: u64,
+    executable_file: *File,
+};
+
 /// Ask for the modules (extra files, such as the initrd) listed in the bootloader config.
 pub const ModuleRequest = Request(0x3e7e279702be32af, 0xca1c4f3bd1280cee, ModuleResponse);
 /// Response to `ModuleRequest`: the loaded modules.
