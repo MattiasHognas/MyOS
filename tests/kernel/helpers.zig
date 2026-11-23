@@ -34,8 +34,16 @@ const timer = kernel_root.kernel.timer;
 const SpinLock = kernel_root.kernel.sync.spinlock.SpinLock;
 const WaitQueue = kernel_root.kernel.sync.wait_queue.WaitQueue;
 const Mutex = kernel_root.kernel.sync.mutex.Mutex;
+const random = kernel_root.kernel.random;
+const nospec = kernel_root.arch.x86_64.nospec;
+const meltdown = kernel_root.arch.x86_64.meltdown;
 /// Where program images may be loaded and how large they may be.
 pub const image_limits = process.image_limits;
+/// Whether the helpers below start processes with a randomized layout.
+/// Off for the tests that need two runs of a program to use exactly the
+/// same memory.
+pub var randomize_layout = true;
+
 /// The limits a process gets by default.
 pub const Limits = process.Limits;
 /// Bytes in a kernel stack, and the usage above which the run should fail.
@@ -181,7 +189,7 @@ pub fn runProgram(path: []const u8) ?u64 {
 /// `runProgram` with `limits` on the new process (and, by inheritance, on
 /// everything it starts).
 pub fn runProgramLimited(path: []const u8, limits: Limits) ?u64 {
-    const p = process.spawnPath(path, .{ .limits = limits }) catch return null;
+    const p = process.spawnPath(path, .{ .limits = limits, .randomize = randomize_layout }) catch return null;
     return process.wait(p);
 }
 
@@ -189,7 +197,7 @@ pub fn runProgramLimited(path: []const u8, limits: Limits) ?u64 {
 /// that stopped it. Null means it started (and now runs on its own, with
 /// nobody waiting for it).
 pub fn spawnError(path: []const u8, limits: Limits) ?anyerror {
-    const p = process.spawnPath(path, .{ .limits = limits }) catch |e| return e;
+    const p = process.spawnPath(path, .{ .limits = limits, .randomize = randomize_layout }) catch |e| return e;
     process.release(p);
     return null;
 }
@@ -1685,7 +1693,7 @@ pub fn chargedPages(path: []const u8) ?u64 {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const before = footprint();
-    const p = process.spawnPath(path, .{}) catch return null;
+    const p = process.spawnPath(path, .{ .randomize = randomize_layout }) catch return null;
     const taken = before.pages - footprint().pages; // it has not run yet
     const charged = p.pages;
     _ = process.wait(p); // until it exits; `p` is gone after this
@@ -2291,4 +2299,260 @@ pub fn enableInterrupts() u64 {
 /// Put the interrupt state back as `enableInterrupts` found it.
 pub fn restoreInterrupts(flags: u64) void {
     if (flags & RFLAGS_IF == 0) asm volatile ("cli");
+}
+
+// ---------------------------------------------------------------------------
+// Further hardening (roadmap 2.9)
+
+var random_buf: [64 * 1024]u8 = undefined;
+
+/// Check the kernel's random-number generator: it is seeded (from the CPU
+/// where there is one), its output does not repeat and is balanced, bounded
+/// values are in bounds and cover their range, and a seed from timing alone
+/// still differs between two takes. Returns 0, or the number of the first
+/// failing check.
+pub fn randomChecks() u32 {
+    if (!random.isReady()) return 1;
+    // QEMU's `max` CPU has RDRAND and RDSEED; the boot log names the source.
+    const leaf1 = cpu.cpuid(1, 0);
+    if (random.hardwareSeeded() != (leaf1.ecx & (1 << 30) != 0 or cpu.cpuid(7, 0).ebx & (1 << 18) != 0)) return 2;
+
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    random.bytes(&a);
+    random.bytes(&b);
+    if (std.mem.eql(u8, &a, &b) or std.mem.allEqual(u8, &a, a[0])) return 3;
+
+    // 524 288 bits: half of them set, give or take (standard deviation 362).
+    random.bytes(&random_buf);
+    var ones: usize = 0;
+    var seen: [256]bool = @splat(false);
+    for (&random_buf) |byte| { // by reference: a copy would be 64 KiB of stack
+        ones += @popCount(byte);
+        seen[byte] = true;
+    }
+    if (ones < 262_144 - 3000 or ones > 262_144 + 3000) return 4;
+    if (!std.mem.allEqual(bool, &seen, true)) return 5;
+
+    // Bounded values: always below the bound, and every value of a small
+    // range turns up.
+    if (random.below(1) != 0) return 6;
+    var hit: [10]bool = @splat(false);
+    for (0..2000) |_| {
+        const v = random.below(10);
+        if (v >= 10) return 7;
+        hit[v] = true;
+    }
+    if (!std.mem.allEqual(bool, &hit, true)) return 8;
+    for ([_]u64{ 2, 3, 1 << 22, (1 << 63) + 12345, std.math.maxInt(u64) }) |bound| {
+        for (0..50) |_| {
+            if (random.below(bound) >= bound) return 9;
+        }
+    }
+    if (random.int(u64) == random.int(u64)) return 10;
+
+    // More than a megabyte has been produced by now, so the generator has
+    // gone back to the hardware at least once; it must simply keep working.
+    for (0..20) |_| random.bytes(&random_buf);
+    random.addEntropy("anything at all");
+    random.bytes(&a);
+    random.bytes(&b);
+    if (std.mem.eql(u8, &a, &b)) return 11;
+
+    // Without RDSEED and RDRAND the seed rests on timing; two takes differ.
+    const t1 = random.timingOnlyOutput();
+    const t2 = random.timingOnlyOutput();
+    if (std.mem.eql(u8, &t1, &t2)) return 12;
+    return 0;
+}
+
+/// Check that freed memory is poisoned and that memory for user programs
+/// is zeroed: a freed heap block and a freed page hold the poison bytes,
+/// and `allocZeroed` hands out zeroes even for a page that was just full
+/// of something else. Returns 0, or the number of the first failing check.
+pub fn poisonAndZero() u32 {
+    if (!heap.poison or !pmm.poison) return 1; // always on in the test kernel
+    const flags = cpu.saveAndDisableInterrupts(); // nothing else may allocate in between
+    defer cpu.restoreInterrupts(flags);
+
+    // Heap: after the 16 bytes the free list uses, a freed block is poison.
+    const block = heap.allocator.alloc(u8, 256) catch return 2;
+    @memset(block, 0x77);
+    const where = block.ptr;
+    heap.allocator.free(block);
+    for (where[16..256]) |byte| {
+        if (byte != heap.POISON) return 3;
+    }
+    // Taking it again finds the poison intact (no panic) and gives the same block.
+    const again = heap.allocator.alloc(u8, 256) catch return 4;
+    if (again.ptr != where) return 5;
+    heap.allocator.free(again);
+
+    // Pages: a freed page is poison from end to end.
+    const page = pmm.alloc() orelse return 6;
+    const bytes = pmm.physToVirt(page)[0..pmm.PAGE_SIZE];
+    @memset(bytes, 0x77);
+    pmm.free(page);
+    if (!std.mem.allEqual(u8, bytes, pmm.POISON)) return 7;
+    // A poisoned pointer is not a canonical address: following it faults.
+    const as_pointer = std.mem.readInt(u64, bytes[0..8], .little);
+    if (as_pointer >> 47 == 0 or as_pointer >> 47 == 0x1FFFF) return 8;
+
+    // The same page again, for a user: all zero.
+    const zeroed = pmm.allocZeroed() orelse return 9;
+    if (zeroed != page) return 10; // the allocator starts at the lowest free page
+    if (!std.mem.allEqual(u8, bytes, 0)) return 11;
+    pmm.free(zeroed);
+    return 0;
+}
+
+/// Fill every free page with a pattern (by taking them all and giving them
+/// back), so a page that reaches a program without being cleared is noticed.
+pub fn dirtyFreeMemory() void {
+    _ = drainMemory(0);
+    var page = drained_head;
+    while (page != 0) {
+        const bytes = pmm.physToVirt(page)[0..pmm.PAGE_SIZE];
+        const next = std.mem.readInt(u64, bytes[0..8], .little);
+        @memset(bytes[8..], 0xA5);
+        page = next;
+    }
+    releaseDrained(); // with poisoning on, freeing fills them again; either way, not zero
+}
+
+// The first instruction of the kernel's user-copy routine.
+extern fn user_copy() callconv(.c) void;
+
+/// Check the speculation guards: the branch-free index clamp gives the
+/// index inside the bounds and 0 outside, for every boundary; and the
+/// user-copy routine starts with `lfence`. Returns 0, or the number of the
+/// first failing check.
+pub fn speculationGuards() u32 {
+    const cases = [_]struct { i: usize, len: usize, want: usize }{
+        .{ .i = 0, .len = 16, .want = 0 },
+        .{ .i = 1, .len = 16, .want = 1 },
+        .{ .i = 15, .len = 16, .want = 15 },
+        .{ .i = 16, .len = 16, .want = 0 }, // one past the end
+        .{ .i = 17, .len = 16, .want = 0 },
+        .{ .i = std.math.maxInt(usize), .len = 16, .want = 0 },
+        .{ .i = 1 << 63, .len = 16, .want = 0 }, // "negative"
+        .{ .i = 0, .len = 0, .want = 0 },
+        .{ .i = 5, .len = 0, .want = 0 },
+        .{ .i = 0, .len = 1, .want = 0 },
+        .{ .i = std.math.maxInt(usize) - 1, .len = std.math.maxInt(usize), .want = std.math.maxInt(usize) - 1 },
+        .{ .i = std.math.maxInt(usize), .len = std.math.maxInt(usize), .want = 0 },
+    };
+    for (cases, 1..) |c, n| {
+        // Through a volatile load, so the compiler cannot work the answer out itself.
+        var i = c.i;
+        var len = c.len;
+        const pi: *volatile usize = &i;
+        const pl: *volatile usize = &len;
+        if (nospec.index(pi.*, pl.*) != c.want) return @intCast(n);
+    }
+    // lfence is 0F AE E8.
+    const code: [*]const u8 = @ptrCast(&user_copy);
+    if (!std.mem.eql(u8, code[0..3], &.{ 0x0F, 0xAE, 0xE8 })) return 20;
+    return 0;
+}
+
+/// Check the Meltdown decision made at boot against this CPU: the kernel
+/// is running, so either the CPU is not affected or the build allows it.
+/// Returns 0, or the number of the first failing check.
+pub fn meltdownDecision() u32 {
+    const info = meltdown.thisCpu();
+    if (meltdown.cpuAffected() != meltdown.affected(info)) return 1;
+    // The test runs under QEMU's emulated CPU or a current host CPU;
+    // neither is affected. (An affected one would not have booted.)
+    if (meltdown.cpuAffected()) return 2;
+    const fm = meltdown.familyModel(cpu.cpuid(1, 0).eax);
+    if (fm.family != info.family or fm.model != info.model) return 3;
+    return 0;
+}
+
+/// Check address randomization of user stacks: each new process gets a
+/// page-aligned stack top somewhere in the 16 GiB range, a different one
+/// nearly every time, and starts with a stack pointer that is 8 below a
+/// 16-byte boundary within the top half page; with randomization off, the
+/// stack is at the fixed top. Returns 0, or the number of the first
+/// failing check.
+pub fn stackRandomization() u32 {
+    const flags = cpu.saveAndDisableInterrupts(); // read each process before it runs
+    defer cpu.restoreInterrupts(flags);
+    var tops: [24]u64 = undefined;
+    var offsets_differ = false;
+    var first_offset: u64 = 0;
+    for (&tops, 0..) |*top, n| {
+        const p = process.spawnPath("/test/entry_regs", .{}) catch return 1;
+        top.* = p.stack_top;
+        const offset = p.stack_top - p.entry_rsp;
+        const range = process.STACK_RANDOM_PAGES * pmm.PAGE_SIZE;
+        const ok = p.stack_top % pmm.PAGE_SIZE == 0 and
+            p.stack_top <= process.STACK_TOP_MAX and p.stack_top > process.STACK_TOP_MAX - range and
+            p.entry_rsp % 16 == 8 and offset >= 8 and offset <= 2048 and
+            vmm.translate(p.root, p.stack_top - 1) != null and vmm.translate(p.root, p.stack_top) == null;
+        if (n == 0) first_offset = offset else if (offset != first_offset) offsets_differ = true;
+        if (process.wait(p) != 0) return 2; // the program runs with that stack
+        if (!ok) return 3;
+    }
+    // 24 draws from four million positions: any repeat is a broken generator.
+    for (tops, 0..) |a, i| {
+        for (tops[0..i]) |b| {
+            if (a == b) return 4;
+        }
+    }
+    if (!offsets_differ) return 5;
+    // They are spread over the range, not bunched at one end.
+    var low: u64 = std.math.maxInt(u64);
+    var high: u64 = 0;
+    for (tops) |t| {
+        low = @min(low, t);
+        high = @max(high, t);
+    }
+    if (high - low < 1 << 30) return 6; // 24 draws spanning under 1 GiB of 16
+
+    const fixed = process.spawnPath("/test/entry_regs", .{ .randomize = false }) catch return 7;
+    const fixed_ok = fixed.stack_top == process.STACK_TOP_MAX and fixed.entry_rsp == process.STACK_TOP_MAX - 8;
+    if (process.wait(fixed) != 0) return 8;
+    return if (fixed_ok) 0 else 9;
+}
+
+/// How far the kernel was loaded from its link address.
+pub fn kernelSlide() u64 {
+    return backtrace.slide();
+}
+
+/// Check that the kernel runs correctly wherever it was loaded: the slide
+/// is a whole number of pages inside the top 2 GiB, code and data are where
+/// the slide says, and symbol lookup takes it into account. Returns 0, or
+/// the number of the first failing check.
+pub fn kernelRelocation() u32 {
+    const slide = backtrace.slide();
+    if (slide % pmm.PAGE_SIZE != 0) return 1;
+    if (slide >= 0x8000_0000) return 2; // beyond the top 2 GiB
+    const here = @intFromPtr(&kernelRelocation);
+    if (here < backtrace.LINK_BASE + slide or here >= backtrace.LINK_BASE + slide + 64 * 1024 * 1024) return 3;
+    // A function's own address is found under its own name.
+    const sym = backtrace.symbolize(here) orelse return 4;
+    if (sym.offset != 0 or !std.mem.endsWith(u8, sym.name, "kernelRelocation")) return 5;
+    // Pointers stored in data (relocated by the bootloader) agree with
+    // addresses computed by code (relative to the instruction pointer).
+    const stored: *const volatile *const fn () u32 = &relocated_pointer;
+    if (@intFromPtr(stored.*) != here) return 6;
+    return 0;
+}
+
+/// A pointer in initialized data: the linker cannot know its final value,
+/// so the bootloader has to fix it up when it moves the kernel.
+var relocated_pointer: *const fn () u32 = &kernelRelocation;
+
+/// For the `use_after_free` scenario: write to a heap block after freeing
+/// it, then allocate again. The allocator must notice and panic.
+pub noinline fn writeAfterFree() void {
+    const block = heap.allocator.alloc(u8, 128) catch return;
+    const stale = block.ptr;
+    heap.allocator.free(block);
+    stale[64] = 0x42; // the bug
+    const again = heap.allocator.alloc(u8, 128) catch return;
+    heap.allocator.free(again);
 }

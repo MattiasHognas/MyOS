@@ -46,6 +46,16 @@ pub fn build(b: *std.Build) void {
             "alloc-debug",
             "Log every kernel heap allocation and free (default: false)",
         ) orelse false,
+        .allow_meltdown = b.option(
+            bool,
+            "allow-meltdown",
+            "Boot on CPUs affected by Meltdown, where user programs can read kernel memory, instead of refusing (default: false)",
+        ) orelse false,
+        .poison = b.option(
+            bool,
+            "poison",
+            "Fill freed heap memory and freed pages with a pattern, and check it on reuse (default: true in Debug builds, false otherwise; always on in the test kernel)",
+        ) orelse (optimize == .debug),
         .stack_usage = b.option(
             bool,
             "stack-usage",
@@ -85,7 +95,7 @@ pub fn build(b: *std.Build) void {
         "entry_regs", "umip",        "div_zero",   "invalid_opcode", "syscall_abi",
         "preempt",    "gs_base",     "fpu",        "fpu_clean",      "fuzz",
         "bad_return", "single_step", "recurse",    "open_count",     "run_many",
-        "getchar",
+        "getchar",    "zero_pages",
     }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, user_target, optimize);
         exe.root_module.addImport("lib", user_lib);
@@ -145,6 +155,13 @@ pub fn build(b: *std.Build) void {
     const install_debug_tests = b.addInstallArtifact(llvm_host_tests, .{ .dest_sub_path = "debug-unit-tests" });
     const debug_tests_step = b.step("debug-test-host", "Build the host tests for a debugger (zig-out/bin/debug-unit-tests)");
     debug_tests_step.dependOn(&install_debug_tests.step);
+
+    // Coverage-guided fuzzing of the host tests that call `std.testing.fuzz`:
+    // `zig build fuzz-host --fuzz` (docs/testing.md). The instrumentation
+    // needs the LLVM backend, so it runs the LLVM build of the tests.
+    const run_fuzz_tests = b.addRunArtifact(llvm_host_tests);
+    const fuzz_step = b.step("fuzz-host", "Run the host tests for fuzzing: add --fuzz, or --fuzz=<iterations>");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
 
     // Host-code coverage with kcov (scripts/coverage.sh explains how to install
     // it if it is missing). Report: zig-out/coverage/index.html
@@ -207,6 +224,8 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "fpu", "src/arch/x86_64/fpu.zig" },
         .{ "page_bitmap", "src/kernel/page_bitmap.zig" },
         .{ "raw_spinlock", "src/kernel/sync/raw_spinlock.zig" },
+        .{ "random_core", "src/kernel/random_core.zig" },
+        .{ "meltdown_rule", "src/arch/x86_64/meltdown_rule.zig" },
         .{ "timer_queue", "src/kernel/sync/timer_queue.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
@@ -224,6 +243,8 @@ const KernelOptions = struct {
     assertions: bool,
     alloc_debug: bool,
     stack_usage: bool,
+    poison: bool,
+    allow_meltdown: bool,
     version: []const u8,
 };
 
@@ -241,9 +262,11 @@ fn kernelArtifact(
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .code_model = .kernel,
+            // Position independent, so the bootloader can load the kernel at
+            // a random address (KASLR): every reference inside the image is
+            // relative to the instruction pointer.
             .red_zone = false,
-            .pic = false,
+            .pic = true,
             .sanitize_c = .off,
             // Keep RBP frame chains so panics and faults can print backtraces.
             .omit_frame_pointer = false,
@@ -251,6 +274,7 @@ fn kernelArtifact(
         .use_llvm = true,
         .use_lld = true,
     });
+    kernel.pie = true;
     kernel.entry = .{ .symbol_name = "kmain" };
     kernel.setLinkerScript(b.path("linker.ld"));
     const options = b.addOptions();
@@ -260,6 +284,8 @@ fn kernelArtifact(
     options.addOption(bool, "alloc_debug", kopts.alloc_debug);
     // The test kernel always measures, so the tests cover it in every build mode.
     options.addOption(bool, "stack_usage", kopts.stack_usage or is_test);
+    options.addOption(bool, "poison", kopts.poison or is_test);
+    options.addOption(bool, "allow_meltdown", kopts.allow_meltdown);
     options.addOption([]const u8, "version", kopts.version);
     kernel.root_module.addOptions("build_options", options);
     return kernel;

@@ -151,3 +151,34 @@ test "symbols: bad name offsets are skipped, not followed" {
     try std.testing.expect(t.lookup(0x1000) == null);
     try expectSym(t, 0x1100, "beta", 0);
 }
+
+/// One coverage-guided fuzz case: a valid ELF file with a symbol table,
+/// with bytes overwritten as the fuzzer chooses and possibly cut short.
+/// Building the table and looking addresses up must not crash or read out
+/// of bounds, whatever the file claims about its own layout.
+fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    const valid = buildElf(&buf, &default_syms);
+    var len = valid.len;
+    while (!smith.eosWeightedSimple(4, 1)) {
+        const at = smith.index(valid.len);
+        if (smith.boolWeighted(1, 1)) {
+            buf[at] = smith.value(u8);
+        } else if (at + 8 <= valid.len) {
+            std.mem.writeInt(u64, buf[at..][0..8], smith.value(u64), .little);
+        }
+    }
+    if (smith.boolWeighted(8, 1)) len = smith.index(valid.len + 1);
+    const table = symbols.Table.init(buf[0..len]) orelse return;
+    for (0..8) |_| {
+        const addr = smith.value(u64);
+        if (table.lookup(addr)) |sym| {
+            try std.testing.expect(sym.offset <= addr);
+            try std.testing.expect(sym.name.len <= len); // the name lies inside the file
+        }
+    }
+}
+
+test "symbols: coverage-guided fuzz" {
+    try std.testing.fuzz({}, fuzzOne, .{});
+}

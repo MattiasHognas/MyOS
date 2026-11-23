@@ -17,6 +17,11 @@
 #          double-fault report instead of triple-faulting
 #   stack_overflow  recurse until a kernel stack is used up; must hit the
 #          guard page and be reported as a kernel stack overflow
+#   use_after_free  write to freed heap memory; the next allocation must
+#          panic, naming the address
+#
+# After the scenarios, the addresses the kernel was loaded at are compared:
+# with KASLR they must not be the same in every boot.
 #
 # Logs: zig-out/test/<scenario>/serial.log (raw) and serial-clean.log.
 #
@@ -123,21 +128,21 @@ run_scenario() {
             if grep -q 'of its kernel stack' "$log"; then fail "a thread came close to filling its kernel stack: $(grep 'of its kernel stack' "$log" | tr '\n' ' ')"; fi
             # User-fault diagnostics: process, fault, vector, error code, then RIP/RSP, and CR2 for page faults.
             expect_line '^\*\*\* thread [0-9]+ \(/test/kernel_read\): Page fault in user mode \(vector 14, error 0x5\), killed$'
-            expect_line '^CR2=0xffffffff80000000 \(faulting address\)$'
+            expect_line '^CR2=0xffff800000100000 \(faulting address\)$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/privileged\): General protection in user mode \(vector 13, error 0x0\), killed$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/div_zero\): Divide error in user mode \(vector 0, error 0x0\), killed$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/single_step\): Debug in user mode \(vector 1, error 0x0\), killed$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/invalid_opcode\): Invalid opcode in user mode \(vector 6, error 0x0\), killed$'
-            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+$'
+            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+$'
             # The user's GS base is its own: reading through it faults on a user address.
             expect_line '^\*\*\* thread [0-9]+ \(/test/gs_base\): Page fault in user mode \(vector 14, error 0x4\), killed$'
             expect_line '^CR2=0x5a5000 \(faulting address\)$'
             # Syscall returns to states the CPU cannot return to kill the process.
             expect_line '^\*\*\* thread [0-9]+ \(/test/bad_return\): invalid return state after syscall, killed$'
-            expect_line '^RIP=0x800000000000 RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x1b$'
-            expect_line '^RIP=0xffffffff8[0-9a-f]{7} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x1b$'
-            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x8 SS=0x1b$'
-            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x10$'
+            expect_line '^RIP=0x800000000000 RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x1b$'
+            expect_line '^RIP=0xffffffff[89a-f][0-9a-f]{7} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x1b$'
+            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x8 SS=0x1b$'
+            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x10$'
             expect_line '^fuzz done$'
             ;;
         panic)
@@ -193,6 +198,13 @@ run_scenario() {
             expect_line '^  #[0-9]+ 0x[0-9a-f]{16} [^ ]*recurseForever\+0x'
             if grep -q 'was not caught' "$log"; then fail "the kernel survived a stack overflow"; fi
             ;;
+        use_after_free)
+            expect_status 3
+            expect_line '^PANIC: heap: freed memory at 0x[0-9a-f]+ was written to \(0x42 at offset 64 of a 128-byte block\)$'
+            expect_line '^backtrace:$'
+            expect_line ' [^ ]*writeAfterFree\+0x'
+            if grep -q 'was not caught' "$log"; then fail "the kernel did not notice a write to freed memory"; fi
+            ;;
         *)
             echo "unknown scenario: $scenario" >&2
             exit 2
@@ -209,8 +221,20 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow)
+((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow use_after_free)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
+
+# KASLR: the kernel reports where it was loaded in every boot. Seeing the
+# same address in all of several boots means it is not being randomized.
+if ((${#scenarios[@]} >= 4)); then
+    scenario="kaslr"
+    slides=$(for s in "${scenarios[@]}"; do grep -a -m1 '^MYOS_KERNEL_SLIDE ' "$out/$s/serial-clean.log" || true; done | sort -u | wc -l)
+    if ((slides < 2)); then
+        fail "the kernel was loaded at the same address in all ${#scenarios[@]} boots"
+    else
+        echo "PASS [kaslr]: $slides different kernel addresses in ${#scenarios[@]} boots"
+    fi
+fi
 
 if [[ "${MYOS_SIMULATE_FAILURE:-}" == true ]]; then
     scenario="all"

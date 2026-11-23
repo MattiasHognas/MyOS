@@ -48,8 +48,9 @@ export fn _start() callconv(.c) noreturn {
     expect(lib.syscall(Sys.write, 0, bufp, 4) == err(.BADF)); // 5: stdin
     expect(lib.syscall(Sys.write, 99, bufp, 4) == err(.BADF)); // 6
     expect(lib.syscall(Sys.write, ~@as(u64, 0), bufp, 4) == err(.BADF)); // 7
-    // A count over the 2 GiB limit is shortened first, then the range is checked.
-    expect(lib.syscall(Sys.write, 1, bufp, ~@as(u64, 0)) == err(.FAULT)); // 8
+    // A count over the 2 GiB limit is shortened to it; here the shortened
+    // range still runs off the end of user space, from an unmapped address.
+    expect(lib.syscall(Sys.write, 1, NEAR_USER_END - 0x8000, ~@as(u64, 0)) == err(.FAULT)); // 8
 
     // open: kernel pointer, path too long, empty path, missing file, write access.
     expect(lib.syscall(Sys.open, KERNEL_PTR, 0, 0) == err(.FAULT)); // 9

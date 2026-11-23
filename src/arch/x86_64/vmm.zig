@@ -77,9 +77,7 @@ pub const MapError = error{
 
 /// Allocate and zero a page for a new page table. Returns its physical address.
 fn allocTable() error{OutOfMemory}!u64 {
-    const p = pmm.alloc() orelse return error.OutOfMemory;
-    @memset(pmm.physToVirt(p)[0..pmm.PAGE_SIZE], 0);
-    return p;
+    return pmm.allocZeroed() orelse error.OutOfMemory;
 }
 
 /// Index into the table of `level` (3 = PML4 ... 0 = PT) for `virt`.

@@ -5,8 +5,8 @@ change or add a subsystem.
 
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
-| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection, the physical allocator's page bookkeeping against a model, the timer queue against a model, the spinlock under real multi-threaded contention), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes), memory exhaustion and failed allocations, heap, kernel stacks, process limits, spinlocks, wait queues, mutexes, timers and sleeping, the process lifecycle (late waits, orphans, a stress run), ELF loading, scheduler and processes, syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
+| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection, the physical allocator's page bookkeeping against a model, the timer queue against a model, the spinlock under real multi-threaded contention, the random generator's core, the Meltdown rule; two coverage-guided fuzz tests, see [fuzzing](#fuzzing)), compiled natively with fakes. Fast; covered by `zig build coverage`. |
+| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes), memory exhaustion and failed allocations, heap, kernel stacks, process limits, spinlocks, wait queues, mutexes, timers and sleeping, the random-number generator, poisoning and zeroing of memory, speculation guards, address randomization, the process lifecycle (late waits, orphans, a stress run), ELF loading, scheduler and processes, syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests, the [stack frame check](#stack-frame-check) and all QEMU scenarios. Add
@@ -30,6 +30,11 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 | `smep` | Calls code in a mapped user page from ring 0 | Exit code 1, `Page fault` with error 0x11, RIP and CR2 = the user page (SMEP is enforced) |
 | `double_fault` | A kernel thread points RSP at unmapped memory and pushes | Exit code 1, `Double fault` with the bad RSP, CR2, the thread's stack bounds and frame `#0` in `doubleFaultThread` (a triple fault would end QEMU with status 0 and no report) |
 | `stack_overflow` | A kernel thread recurses until its stack is used up | Exit code 1, `Double fault` with CR2 in a kernel stack guard page, `kernel stack overflow`, RSP below the thread's stack, backtrace frames in `recurseForever` |
+| `use_after_free` | Writes to a heap block after freeing it, then allocates again | Exit code 1, a panic naming the address, the byte written and its offset, a backtrace through `writeAfterFree` |
+
+After the scenarios the script compares where the kernel was loaded in each
+boot (the test kernel prints `MYOS_KERNEL_SLIDE`): with KASLR the addresses
+must not all be the same.
 
 Run a subset with `scripts/test-qemu.sh tests panic` (after `zig build test-kernel`
 and `zig build`). The timeout per boot is 45 s, or `MYOS_QEMU_TIMEOUT` seconds.
@@ -124,6 +129,7 @@ kernel killed the process for a fault), or two copies at once with
 | `recurse` | A program that starts itself until the kernel refuses: `ENOMEM` when memory runs out, `EAGAIN` at the descendant limit |
 | `open_count`, `run_many` | The descriptor limit; children that have exited no longer count against the descendant limit |
 | `getchar` | Waits for one key; the kernel test starts several and feeds them keys with `keyboard.inject` |
+| `zero_pages` | Memory the program has not written (`.bss`, the unused stack) is zero, after the kernel test has filled all free memory with a pattern |
 | `entry_regs` | General-purpose registers are zero at program start |
 | `kernel_read`, `privileged`, `write_text`, `umip`, `div_zero`, `invalid_opcode` | Each fault kills only the process |
 
@@ -171,6 +177,36 @@ time something large is allocated.
 2. Register it as a module for the host tests in `build.zig` (the list next to
    `vfs`, `symbols` and `log_format`).
 3. Add `tests/host/<name>_test.zig` and reference it from `tests/host/main.zig`.
+
+## Fuzzing
+
+Two kinds of fuzz tests run on the host:
+
+- **Fixed-seed** tests are ordinary tests that feed thousands of generated
+  inputs to the code (the ELF validator, the page bitmap and the timer
+  queue against models). The same inputs every run, so they run in
+  `zig build test-host` and CI.
+- **Coverage-guided** tests call `std.testing.fuzz`. In an ordinary run
+  each executes once. Under the fuzzer they run for as long as they are
+  left to, and the fuzzer keeps the inputs that reach new code:
+
+  ```bash
+  zig build fuzz-host --fuzz=5M                           # five million cases, then a report
+  zig build fuzz-host --fuzz=5M -Dtest-filter="elf image"   # one test
+  zig build fuzz-host --fuzz                              # until stopped, with a web page showing coverage
+  ```
+
+  Today: the ELF validator and the ELF symbol table. `fuzz-host` is the
+  host tests built with LLVM, which the instrumentation needs
+  (`zig build test-host --fuzz` finds nothing to instrument). What the
+  fuzzer has learned is kept in `.zig-cache`. A failure is reported like
+  a failing test.
+
+To add one, write `fn fuzzOne(_: void, smith: *std.testing.Smith) !void`,
+which builds an input from the choices `smith` hands out and checks the
+result, and a test that calls `std.testing.fuzz({}, fuzzOne, .{})`. Start
+from a valid input and let the fuzzer overwrite parts of it: from pure
+noise it rarely gets past the first check.
 
 ## Coverage
 

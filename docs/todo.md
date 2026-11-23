@@ -237,18 +237,32 @@ Pipes, blocking I/O, sleep and interrupt-driven drivers need these, and SMP (mil
   - In the kernel: spinlock interrupt state and nesting; wait queue order, rechecked conditions, wake-ups with nobody waiting, timeouts, and being woken and timing out on the same tick; timers firing on their exact tick, cancellation, sleep length against the HPET; a mutex whose holder is preempted, yields and sleeps; keyboard readers.
 
 ### 2.9 Further hardening
-From the code review before 2.2. None of these fix a known hole; they shrink what a future bug can do. Do them after 2.2 to 2.8, in roughly this order. The random-number generator, stack protectors and page zeroing are wanted before the primary goal; page-table isolation and address randomization can wait until after it.
+From the code review before 2.2. None of these fix a known hole; they shrink what a future bug can do.
 - [x] Enable UMIP when CPU-supported, so ring 3 cannot read kernel table addresses with `sgdt`/`sidt` (`usercopy.init`; tested by `/test/umip`).
-- [ ] Add a kernel random-number generator: a CSPRNG seeded from RDSEED/RDRAND where present, plus timing jitter. Stack-protector canaries, address randomization, `AT_RANDOM` (4.1) and `getrandom` (6.4) all draw from it.
-- [ ] Build the kernel with stack protectors and test that a smashed kernel stack is detected.
-- [ ] Add a speculation barrier after the user range check in the user-copy path, and audit other user-controlled indexes (syscall number, file descriptor) for Spectre v1.
-- [ ] Decide on kernel page-table isolation: detect CPUs that need it (Meltdown) and either implement it or refuse to run untrusted code on them.
-- [ ] Randomize the kernel's load address and the user stack and program base (KASLR/ASLR); needs the PIE loading of 4.1 for programs.
-- [ ] Poison freed heap memory and freed pages in debug builds to catch use-after-free.
-- [ ] Set up coverage-guided fuzzing next to the fixed-seed runs: the ELF validator (2.4) and the other host-tested parsers with `zig build test --fuzz`, and the syscall interface (2.5) with a fuzzer that is steered by kernel coverage instead of a fixed random sequence. The fixed-seed runs stay in CI; these run longer, on demand.
-- [ ] Zero pages when they are freed or before they reach another process, as a rule in one place instead of at each call site.
+- [x] Add a kernel random-number generator: a CSPRNG seeded from RDSEED/RDRAND where present, plus timing jitter (`src/kernel/random.zig`; the deterministic part, ChaCha with fast key erasure, is `random_core.zig` and tested on the host). Address randomization draws from it; `AT_RANDOM` (4.1) and `getrandom` (6.4) will.
+  - It is reseeded from the hardware source after every megabyte of output.
+  - On a CPU with neither instruction the seed rests on timer jitter alone, which is weak; boot says so in the log. Interrupt timing is not mixed in yet (`random.addEntropy` exists for it): do that with the input drivers of 6.2.
+- Stack protectors: moved to 13. The compiler cannot build them for the kernel yet (see there), so they are not part of this milestone.
+- [x] Add a speculation barrier after the user range check in the user-copy path, and audit other user-controlled indexes (syscall number, file descriptor) for Spectre v1 (`src/arch/x86_64/nospec.zig`).
+  - `user_copy` starts with `lfence`, so it cannot begin copying before the range check on the user address is decided.
+  - File descriptors index the descriptor table through `nospec.index`, which clamps without a branch.
+  - The syscall number is not an index: the dispatcher is a `switch` over scattered numbers, compiled to comparisons. Check again if it becomes a table.
+  - Not done: the other Spectre variants (branch target injection and later ones) and their mitigations (retpolines, IBRS/IBPB, STIBP). See 13.
+- [x] Decide on kernel page-table isolation: detect CPUs that need it (Meltdown) and either implement it or refuse to run untrusted code on them. Decided: not implemented. The kernel checks the CPU at boot (`src/arch/x86_64/meltdown.zig`, rule tested on the host) and refuses to boot on an affected one, since any program could read all memory there; `-Dallow-meltdown` turns that into a warning. Processors made since about 2019, and all AMD ones, are not affected.
+- [x] Randomize the kernel's load address and the user stack (KASLR/ASLR).
+  - The kernel is a position-independent executable, and `kaslr: yes` in `limine.conf` has the bootloader load it at a random address in the top 2 GiB. Backtraces take the offset into account and print it. `MYOS_KASLR=no scripts/build.sh` turns it off for debuggers.
+  - Each process's stack ends at a random page in a 16 GiB range, and its initial stack pointer is at a random 16-byte step within the last half page.
+  - Moved to 4.1: the program's own load address, which needs position-independent programs.
+  - Not randomized: the kernel's direct map of physical memory, its heap, its stacks and the device window, which are at fixed addresses (`randomise_hhdm_base: no`, because a random direct map could land on the fixed regions). See 13.
+- [x] Poison freed heap memory and freed pages in debug builds to catch use-after-free (`-Dpoison`, on in Debug builds and the test kernel).
+  - A freed heap block is filled with 0xDD and checked when it is handed out again: a write after free is a panic naming the address, the byte and its offset (the `use_after_free` scenario).
+  - A freed page is filled with 0xDF. Pages are not checked on reuse, so a write to a freed page is not noticed; a read gives poison, which as a pointer is not a valid address.
+- [x] Set up coverage-guided fuzzing next to the fixed-seed runs, for the host-tested parsers: `zig build fuzz-host --fuzz` (`docs/testing.md`), today for the ELF validator and the ELF symbol table, 3 million cases each without a finding. The fixed-seed runs stay in CI; these run on demand.
+  - Moved to 13: a syscall fuzzer steered by kernel coverage, which needs coverage instrumentation in the kernel.
+- [x] Zero pages before they reach another process, as a rule in one place instead of at each call site: `pmm.allocZeroed` is the only source of pages for user address spaces and page tables. Tested from ring 3 (`/test/zero_pages`) after filling all free memory with a pattern.
+  - Kernel stacks and heap pages are not zeroed: only the kernel sees them.
 
-**Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources.
+**Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources. Reached: 2.1 to 2.9 are done.
 
 ---
 
@@ -309,6 +323,7 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 - [ ] Update the Zig user startup code to read arguments/environment.
 - [ ] Parse command lines with arguments and basic quoting.
 - [ ] Load position-independent executables (`ET_DYN`) at a chosen load bias.
+- [ ] Choose that load bias at random for each process (moved from 2.9, which randomized the stack and the kernel), with `process.SpawnOptions.randomize` turning it off as it does for the stack. Fixed-address executables (`ET_EXEC`) cannot be moved. Test that two runs of a PIE get different bases.
 - [ ] Give each thread its own FS base: `arch_prctl(ARCH_SET_FS)`, saved and restored on context switch; enable FSGSBASE when the CPU has it.
   - The kernel does not set up the TLS block from `PT_TLS`: on Linux the C library does that itself, from the program headers it finds through `AT_PHDR`.
 - [ ] Extend the syscall ABI document from 2.5 with the startup stack, the auxiliary vector and TLS.
@@ -627,6 +642,15 @@ Off the critical path (only network programs need it). It can be taken any time 
 - [ ] `fork`/`exec` semantics if desired. A static busybox would then supply the standard utilities and a broad compatibility test.
 - [ ] User/group permissions.
 - [ ] Divide memory between unrelated programs: accounting per user or per group of processes, with a share each cannot exceed. The limits of 2.6 bound one program and what it starts; they do not stop it from using up memory other programs need.
+- [ ] Build the kernel with stack protectors and test that a smashed kernel stack is detected (moved from 2.9).
+  - What it is: the compiler puts a secret value (a canary) between each function's local variables and its return address, and checks it before the function returns. A buffer overflow that reaches the return address has overwritten the canary first, so the kernel panics instead of jumping where the overflow says.
+  - Waiting for Zig: version 0.17 refuses the option (`stack_protector` in `build.zig`, `-fstack-protector`) for a target without a C library, with "enabling stack protection requires libc", and it has no C library for a freestanding target such as the kernel. Zig has to allow stack protection without libc, or we need another way to pass the option to its LLVM backend. Try again whenever the Zig version is raised.
+  - What is ready: the canary would come from `src/kernel/random.zig`, and the compiler's runtime already provides `__stack_chk_guard` and `__stack_chk_fail`, so it should be the build option, setting the canary early in boot, and one crash scenario in `scripts/test-qemu.sh`.
+  - Until then: the guard page below each kernel stack (2.3) catches a stack that grows too far, but not an overflow that overwrites a return address inside the stack.
+- [ ] Fuzz the syscall interface with a fuzzer steered by kernel coverage (the fixed-sequence fuzzer of 2.5 stays in CI). Needs coverage instrumentation in the kernel and a way to get it out to the fuzzer.
+- [ ] Mitigate the Spectre variants beyond bounds-check bypass (2.9): branch target injection (retpolines or IBRS, IBPB on process switch, STIBP), return stack underflow, and the newer ones, decided per CPU from its capability bits as for Meltdown.
+- [ ] Randomize the kernel's fixed regions as well as its image (2.9): the direct map of physical memory, the heap, the kernel stacks and the device window. They are at fixed addresses today, so a leaked pointer into one of them is as good as before KASLR.
+- [ ] Decide whether to implement kernel page-table isolation after all, so that CPUs affected by Meltdown can run untrusted programs (2.9 refuses to boot on them).
 - [ ] Charge a process for the kernel memory it causes beyond its pages: its process and thread structures, saved x87/SSE/AVX state, open-file records, and later pipe buffers and socket buffers.
 
 ### Other ABIs

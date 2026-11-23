@@ -53,7 +53,13 @@ tar --format=ustar -cf "$iso_root/boot/initrd.tar" -C "$initrd" .
 
 # Limine config always refers to /boot/kernel.elf.
 cp "$kernel" "$iso_root/boot/kernel.elf"
-cp limine.conf "$iso_root/boot/limine/limine.conf"
+# MYOS_KASLR=no loads the kernel at its link address, for debuggers, which
+# read symbol addresses from the ELF file (docs/debugging.md).
+if [[ "${MYOS_KASLR:-yes}" == no ]]; then
+    sed 's/kaslr: yes/kaslr: no/' limine.conf >"$iso_root/boot/limine/limine.conf"
+else
+    cp limine.conf "$iso_root/boot/limine/limine.conf"
+fi
 cp "$LIMINE"/limine-{bios.sys,bios-cd.bin,uefi-cd.bin} "$iso_root/boot/limine/"
 cp "$LIMINE/BOOTX64.EFI" "$iso_root/EFI/BOOT/"
 

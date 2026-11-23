@@ -18,6 +18,7 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const pmm = @import("../kernel/pmm.zig");
 const assert = @import("debug/assert.zig");
+const panicFmt = @import("debug/panic.zig").panicFmt;
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 
 const log = std.log.scoped(.heap);
@@ -85,9 +86,35 @@ fn round(n: usize) usize {
     return std.mem.alignForward(usize, @max(n, MIN), MIN);
 }
 
+/// True if free heap memory is filled with `POISON` and checked when it is
+/// handed out again (`-Dpoison`).
+pub const poison = build_options.poison;
+/// The byte free heap memory is filled with.
+pub const POISON: u8 = 0xDD;
+
+/// Fill `len` bytes at `addr` with the poison byte.
+fn poisonRange(addr: usize, len: usize) void {
+    @memset(@as([*]u8, @ptrFromInt(addr))[0..len], POISON);
+}
+
+/// With poisoning on, check that the `size` bytes of free memory at `addr`
+/// still hold the poison byte after their `Chunk` header. If not, something
+/// wrote to the memory after it was freed: panic, naming the first byte.
+fn checkPoison(addr: usize, size: usize) void {
+    if (!poison) return;
+    const bytes = @as([*]const u8, @ptrFromInt(addr))[0..size];
+    for (bytes[@sizeOf(Chunk)..], @sizeOf(Chunk)..) |b, i| {
+        if (b != POISON) panicFmt("heap: freed memory at 0x{x} was written to (0x{x} at offset {d} of a {d}-byte block)", .{ addr + i, b, i, size });
+    }
+}
+
 /// Return `size` bytes at `addr` to the free list, keeping it sorted by
 /// address and merging with adjacent free chunks. The range must not overlap
 /// any free chunk. Callers must have interrupts disabled.
+///
+/// With poisoning on, everything in a free chunk after its header holds the
+/// poison byte: the range is filled here, and so are the headers that
+/// disappear when chunks merge.
 fn insertFree(addr: usize, size: usize) void {
     assert.check(.heap, addr % MIN == 0 and size % MIN == 0 and size >= MIN, "bad free range 0x{x}+{d}", .{ addr, size });
     assert.check(.heap, addr >= HEAP_START and addr + size <= heap_end, "free range 0x{x}+{d} outside the heap", .{ addr, size });
@@ -101,6 +128,7 @@ fn insertFree(addr: usize, size: usize) void {
     if (cur) |c| assert.check(.heap, addr + size <= @intFromPtr(c), "free range 0x{x}+{d} overlaps a free chunk (double free?)", .{ addr, size });
     if (prev) |p| assert.check(.heap, @intFromPtr(p) + p.size <= addr, "free range 0x{x}+{d} overlaps a free chunk (double free?)", .{ addr, size });
 
+    if (poison) poisonRange(addr, size);
     const new: *Chunk = @ptrFromInt(addr);
     new.* = .{ .size = size, .next = cur };
 
@@ -108,12 +136,14 @@ fn insertFree(addr: usize, size: usize) void {
         if (addr + size == @intFromPtr(c)) {
             new.size += c.size;
             new.next = c.next;
+            if (poison) poisonRange(@intFromPtr(c), @sizeOf(Chunk)); // its header is inside the chunk now
         }
     }
     if (prev) |p| { // merge with the preceding chunk
         if (@intFromPtr(p) + p.size == addr) {
             p.size += new.size;
             p.next = new.next;
+            if (poison) poisonRange(addr, @sizeOf(Chunk));
         } else p.next = new;
     } else free_list = new;
 }
@@ -158,6 +188,7 @@ fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]
             cur = c.next;
         }) {
             if (c.size < n) continue;
+            checkPoison(@intFromPtr(c), n); // the part about to be handed out
             const rest = c.size - n; // always 0 or a multiple of 16
             const next: ?*Chunk = if (rest > 0) blk: {
                 const r: *Chunk = @ptrFromInt(@intFromPtr(c) + n);

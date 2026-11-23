@@ -10,6 +10,12 @@
 //!   again with `clac`. Interrupt entry and `syscall` entry clear AC too, so
 //!   it never leaks into other kernel code.
 //!
+//! `user_copy` starts with `lfence`. Its caller has just checked that the
+//! user range lies in user space, and that check is a branch the CPU may
+//! guess wrong; without the barrier it could start copying from a kernel
+//! address in the meantime and leave traces of what it read in the cache
+//! (Spectre variant 1, see `nospec.zig`).
+//!
 //! A page fault at the copy instruction (between the `user_copy_start` and
 //! `user_copy_end` labels) on a user address is expected: the user passed a
 //! bad pointer. The page-fault handler asks `fixup` and resumes at
@@ -47,6 +53,7 @@ comptime {
         \\.global user_copy
         \\.type user_copy, @function
         \\user_copy:
+        \\  lfence                   # nothing below runs until the caller's range check is decided
         \\  mov %rdx, %rcx
         \\  cmpb $0, smap_enabled(%rip)
         \\  je user_copy_start

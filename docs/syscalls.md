@@ -114,9 +114,12 @@ Every other number returns `ENOSYS`.
 A program is entered at its ELF entry point in ring 3 with:
 
 - all general-purpose registers zero, RFLAGS `0x202` (interrupts on);
-- `rsp` 8 below the top of a 16 KiB stack, as if the entry point had been
-  called. Linux's initial stack (`argc`, `argv`, the environment and the
-  auxiliary vector) comes with milestone 4;
+- a 16 KiB stack whose top is at a random page in a 16 GiB range below
+  `0x7fffffff0000`, different for every process. `rsp` is 8 below a
+  16-byte boundary in the stack's last page, as if the entry point had
+  been called. Linux's initial stack (`argc`, `argv`, the environment and
+  the auxiliary vector) comes with milestone 4;
+- memory that holds nothing from before: `.bss` and the stack are zero;
 - clean extended state: x87 control word `0x37f`, MXCSR `0x1f80`, all x87,
   SSE and AVX registers zero.
 

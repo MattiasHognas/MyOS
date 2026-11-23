@@ -12,6 +12,7 @@ const abi = @import("../abi/linux.zig");
 const Sys = abi.Sys;
 const err = abi.err;
 const cpu = @import("../arch/x86_64/cpu.zig");
+const nospec = @import("../arch/x86_64/nospec.zig");
 const arch = @import("../arch/x86_64/syscall.zig");
 const keyboard = @import("../drivers/ps2_keyboard.zig");
 const heap = @import("heap.zig");
@@ -96,7 +97,7 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
 fn fileOf(fd: u64) ?*vfs.OpenFile {
     const p = thread.current().process orelse return null;
     if (fd >= p.files.len) return null;
-    return p.files[fd];
+    return p.files[nospec.index(fd, p.files.len)];
 }
 
 /// `open`: look up the user path `ptr` and store an `OpenFile` for it in the
@@ -162,7 +163,8 @@ fn sysClose(fd: u64) u64 {
     if (fd < FIRST_FILE_FD) return 0;
     const of = fileOf(fd) orelse return err(.BADF);
     heap.allocator.destroy(of);
-    thread.current().process.?.files[fd] = null;
+    const files = &thread.current().process.?.files;
+    files[nospec.index(fd, files.len)] = null;
     return 0;
 }
 

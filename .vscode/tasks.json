@@ -22,7 +22,7 @@
       // kernel is loaded; under KVM only hardware breakpoints do.
       "label": "MyOS: QEMU (wait for debugger)",
       "type": "shell",
-      "command": "scripts/build.sh && scripts/run-qemu.sh --gdb --no-kvm -- -pidfile zig-out/qemu-debug.pid",
+      "command": "MYOS_KASLR=no scripts/build.sh && scripts/run-qemu.sh --gdb --no-kvm -- -pidfile zig-out/qemu-debug.pid",
       "isBackground": true,
       "problemMatcher": {
         "pattern": {

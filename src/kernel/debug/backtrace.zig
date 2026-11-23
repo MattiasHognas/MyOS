@@ -5,6 +5,12 @@
 //! Limine hands over through the executable-file request. Every frame pointer
 //! is checked against the kernel page tables before it is dereferenced, so a
 //! corrupt stack ends the walk instead of causing a nested fault.
+//!
+//! The kernel may be loaded at a random address (KASLR), while the symbol
+//! table holds the addresses it was linked at. `slide` is the difference;
+//! addresses are printed as they are at run time, and looked up with the
+//! slide taken off. A backtrace also prints the slide, so its addresses
+//! can be matched against the kernel image afterwards.
 
 const std = @import("std");
 const root = @import("root");
@@ -20,6 +26,16 @@ const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
 
 var table: ?symbols.Table = null;
 
+/// Address the kernel is linked at (`linker.ld`).
+pub const LINK_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+extern const __text_start: u8;
+
+/// How far the kernel was moved from the address it was linked at: 0
+/// without KASLR.
+pub fn slide() u64 {
+    return @intFromPtr(&__text_start) -% LINK_BASE;
+}
+
 /// Load the symbol table from the kernel's ELF image `elf`. Without this (or
 /// if the image is stripped), backtraces show bare addresses. Returns true if
 /// symbols were found.
@@ -28,10 +44,11 @@ pub fn init(elf: []const u8) bool {
     return table != null;
 }
 
-/// Return the function containing code address `addr`, or null if it is unknown.
+/// Return the function containing the run-time code address `addr`, or
+/// null if it is unknown.
 pub fn symbolize(addr: u64) ?symbols.Symbol {
     const t = table orelse return null;
-    return t.lookup(addr);
+    return t.lookup(addr -% slide());
 }
 
 /// Return true if the 16-byte frame record at `rbp` is mapped in the kernel half.
@@ -93,6 +110,7 @@ pub const Start = union(enum) {
 /// to and including it are skipped, so the panic machinery is not shown.
 pub fn print(start: Start, rbp: u64) void {
     root.print("backtrace:\n", .{});
+    if (slide() != 0) root.print("  (kernel loaded 0x{x} above its link address)\n", .{slide()});
     var index: usize = 0;
     switch (start) {
         .pc => |pc| printFrame(index, pc, false),

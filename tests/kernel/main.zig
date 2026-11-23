@@ -163,6 +163,10 @@ fn processLimits() TestError!void {
     // The charge is everything the process takes: program, stack, page
     // tables and kernel stack. It is what the allocator really handed out,
     // and the limit is exact: that many pages are enough, one less is not.
+    // (With the stack at a fixed address: at a random one it sometimes
+    // crosses into another page table, which is one page more.)
+    helpers.randomize_layout = false;
+    defer helpers.randomize_layout = true;
     const charged = helpers.chargedPages("/bin/hello") orelse return error.Failed;
     try check(charged > 4 + 4 + 7); // more than the two stacks and the smallest set of page tables
     try check(helpers.runProgramLimited("/bin/hello", .{ .max_pages = charged }) == 0);
@@ -278,6 +282,56 @@ fn lifecycleStress() TestError!void {
     defer helpers.restoreInterrupts(irq);
     try expectChecks("lifecycle stress warm-up", helpers.lifecycleStress(1));
     try expectChecks("lifecycle stress", helpers.lifecycleStress(40));
+}
+
+/// The random-number generator is seeded, balanced and does not repeat.
+fn randomNumbers() TestError!void {
+    try expectChecks("random", helpers.randomChecks());
+}
+
+/// Freed heap blocks and pages are poisoned; pages for users are zeroed.
+fn poisonAndZero() TestError!void {
+    try expectChecks("poison and zero", helpers.poisonAndZero());
+}
+
+/// A new process finds only zeroes in memory it has not written, even
+/// when every free page was full of something else beforehand.
+fn userMemoryIsZeroed() TestError!void {
+    helpers.dirtyFreeMemory();
+    const code = helpers.runProgram("/test/zero_pages") orelse return error.Failed;
+    if (code != 0) report("/test/zero_pages found leftovers in area", code);
+    try check(code == 0);
+    // The same with the stack at its fixed address, which reuses other pages.
+    helpers.dirtyFreeMemory();
+    helpers.randomize_layout = false;
+    defer helpers.randomize_layout = true;
+    try check(helpers.runProgram("/test/zero_pages") == 0);
+}
+
+/// Index clamping without a branch, and `lfence` in the user-copy routine.
+fn speculationGuards() TestError!void {
+    try expectChecks("speculation guard", helpers.speculationGuards());
+}
+
+/// The CPU is not one that lets programs read kernel memory (Meltdown).
+fn meltdownDecision() TestError!void {
+    try expectChecks("Meltdown", helpers.meltdownDecision());
+}
+
+/// Every process gets its stack at a different random address.
+fn stackRandomization() TestError!void {
+    try expectChecks("stack randomization", helpers.stackRandomization());
+}
+
+/// The kernel works at the address the bootloader chose for it.
+fn kernelRelocation() TestError!void {
+    try expectChecks("kernel relocation", helpers.kernelRelocation());
+}
+
+/// Write to freed heap memory: the next allocation must panic.
+noinline fn scenarioUseAfterFree() void {
+    helpers.writeAfterFree();
+    serial.puts("use after free was not caught\n");
 }
 
 /// The kernel heap can allocate, fill and free a block.
@@ -1146,12 +1200,17 @@ pub fn run() noreturn {
     var buf: [32]u8 = undefined;
     const scenario = fw_cfg.readFile("opt/myos/scenario", &buf) orelse "tests";
     log.info("test scenario: {s}", .{scenario});
+    // Where the kernel was loaded this time. The host script compares the
+    // boots of one run: with KASLR they must not all be the same.
+    var slide_line: [64]u8 = undefined;
+    serial.puts(std.fmt.bufPrint(&slide_line, "MYOS_KERNEL_SLIDE 0x{x}\n", .{helpers.kernelSlide()}) catch unreachable);
     if (std.mem.eql(u8, scenario, "panic")) scenarioPanic();
     if (std.mem.eql(u8, scenario, "fault")) scenarioFault();
     if (std.mem.eql(u8, scenario, "smap")) scenarioSmap();
     if (std.mem.eql(u8, scenario, "smep")) scenarioSmep();
     if (std.mem.eql(u8, scenario, "double_fault")) scenarioDoubleFault();
     if (std.mem.eql(u8, scenario, "stack_overflow")) scenarioStackOverflow();
+    if (std.mem.eql(u8, scenario, "use_after_free")) scenarioUseAfterFree();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
     if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
@@ -1246,6 +1305,13 @@ fn runCases() noreturn {
         .{ .name = "guarded kernel stacks (alloc, guard page, free, reuse)", .func = kernelStacks },
         .{ .name = "kernel stack high-water mark", .func = stackUsage },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },
+        .{ .name = "random-number generator (seeding, balance, bounds)", .func = randomNumbers },
+        .{ .name = "freed memory is poisoned, user pages are zeroed", .func = poisonAndZero },
+        .{ .name = "a new process sees only zeroes (ring 3)", .func = userMemoryIsZeroed },
+        .{ .name = "speculation guards (index clamp, lfence in user copy)", .func = speculationGuards },
+        .{ .name = "Meltdown: CPU checked at boot", .func = meltdownDecision },
+        .{ .name = "user stack address randomization", .func = stackRandomization },
+        .{ .name = "kernel runs at a randomized address", .func = kernelRelocation },
         .{ .name = "spinlocks (interrupt state, nesting, exclusion under preemption)", .func = spinlocks },
         .{ .name = "wait queues (several waiters, order, timeouts)", .func = waitQueues },
         .{ .name = "kernel timers (order, expiry, cancel, sleep)", .func = timers },

@@ -16,9 +16,11 @@ const Sys = lib.Sys;
 const EFAULT = lib.err(.FAULT);
 /// Nothing is mapped here: programs are linked far below, the stack is far above.
 const UNMAPPED: u64 = 0x1000_0000;
-/// First byte above the user stack (`STACK_TOP` in src/kernel/process.zig).
+/// First byte above the user stack: its position is random, so it is worked
+/// out from the stack pointer the program starts with, which is in the
+/// stack's last page.
 /// The page below it is mapped, the page starting here is not.
-const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
+var STACK_TOP: u64 = 0;
 const PAGE = 4096;
 const motd = "Welcome to MyOS!\n";
 
@@ -38,6 +40,7 @@ fn expect(ok: bool) void {
 /// below it (and 16-byte aligned for the call).
 export fn _start() callconv(.naked) noreturn {
     asm volatile (
+        \\ mov %%rsp, %%rdi
         \\ sub $4104, %%rsp
         \\ call userPointersMain
         \\ ud2
@@ -45,7 +48,8 @@ export fn _start() callconv(.naked) noreturn {
 }
 
 /// Run the checks in order.
-export fn userPointersMain() callconv(.c) noreturn {
+export fn userPointersMain(entry_rsp: u64) callconv(.c) noreturn {
+    STACK_TOP = std.mem.alignForward(u64, entry_rsp, PAGE);
     const path = "/etc/motd";
 
     // write: null, unmapped, starting mapped but running into an unmapped page.

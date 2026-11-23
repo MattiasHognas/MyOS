@@ -341,3 +341,29 @@ test "elf image: fuzz with mutated and random images" {
     // Both outcomes must be common, or the fuzzer is not testing much.
     try expect(accepted > 1000 and rejected > 1000);
 }
+
+/// One coverage-guided fuzz case: a valid three-segment image with fields
+/// of its headers overwritten as the fuzzer chooses, possibly cut short.
+fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [0x2000]u8 = undefined;
+    @memcpy(&buf, build(.{ .phdrs = &.{ .{}, data(0x40_2000), .{ .flags = 4, .vaddr = 0x50_0000 } } }));
+    const header_bytes = 64 + 3 * 56;
+    while (!smith.eosWeightedSimple(4, 1)) {
+        const at = smith.index(header_bytes);
+        if (smith.boolWeighted(1, 1)) {
+            buf[at] = smith.value(u8);
+        } else {
+            std.mem.writeInt(u64, buf[at / 8 * 8 ..][0..8], smith.value(u64), .little);
+        }
+    }
+    const len = if (smith.boolWeighted(8, 1)) smith.index(buf.len + 1) else buf.len;
+    const image = buf[0..len];
+    if (parse(image, limits)) |img| try expectSound(&img, image) else |_| {}
+}
+
+// In an ordinary test run this executes once. `zig build test-host --fuzz`
+// runs it for as long as it is left to, steering the changes by which code
+// they reach (docs/testing.md).
+test "elf image: coverage-guided fuzz" {
+    try std.testing.fuzz({}, fuzzOne, .{});
+}

@@ -80,9 +80,13 @@ Build options (they apply to the test commands too):
 | `-Dassertions` | `true`, `false` | `true` |
 | `-Dalloc-debug` | `true`, `false` (log every heap allocation) | `false` |
 | `-Dstack-usage` | `true`, `false` (measure kernel stack high-water marks) | `true` for Debug, else `false` |
+| `-Dpoison` | `true`, `false` (fill freed heap memory and pages with a pattern, and check it when heap memory is reused) | `true` for Debug, else `false` |
+| `-Dallow-meltdown` | `true`, `false` (boot on CPUs where user programs can read kernel memory, instead of refusing) | `false` |
 | `-Dtest-filter` | name filter for `test-host` | none |
 
-`scripts/build.sh` always builds with the defaults. For an optimized ISO, run
+`scripts/build.sh` always builds with the defaults. `MYOS_KASLR=no
+scripts/build.sh` makes an ISO that loads the kernel at its link address
+instead of a random one (for debuggers). For an optimized ISO, run
 `zig build -Doptimize=ReleaseSafe` and then repackage; `build.sh` packages
 whatever is in `zig-out/bin`.
 
@@ -133,11 +137,11 @@ the terminal.
 | --- | --- |
 | `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
 | `src/abi/linux.zig` | The user/kernel ABI (Linux's syscall numbers, error values and flags), imported by the kernel and by user programs (see [syscalls](syscalls.md)) |
-| `src/arch/x86_64/` | GDT/TSS with the double-fault, NMI and debug emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry and the `sysretq`/`iretq` choice (`syscall`, `sysret`), per-CPU data behind the GS base (`percpu`), x87/SSE/AVX state (`fpu`), fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), port I/O |
+| `src/arch/x86_64/` | GDT/TSS with the double-fault, NMI and debug emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry and the `sysretq`/`iretq` choice (`syscall`, `sysret`), per-CPU data behind the GS base (`percpu`), x87/SSE/AVX state (`fpu`), fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), speculation guards (`nospec`), the Meltdown check (`meltdown`), port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
-| `src/kernel/` | Physical memory (`pmm`, with its bookkeeping in `page_bitmap`), heap, guarded kernel stacks (`kstack`), threads/scheduler, processes and their limits, ELF image validation (`elf_image`) and loader (`elf`), syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
+| `src/kernel/` | Physical memory (`pmm`, with its bookkeeping in `page_bitmap`), heap, guarded kernel stacks (`kstack`), threads/scheduler, processes and their limits, the random-number generator (`random`), ELF image validation (`elf_image`) and loader (`elf`), syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
 | `src/kernel/sync/` | Spinlocks, wait queues, mutexes and the timer queue; `src/kernel/timer.zig` drives the timers and provides sleep |
 | `src/kernel/fs/` | Filesystems (`tarfs` for the initrd) |
 | `src/kernel/debug/` | Assertions, small-buffer panic formatting, backtraces, ELF symbol lookup, log formatting |
@@ -149,7 +153,7 @@ the terminal.
 | `tests/support/` | QEMU exit device helper for the test kernel |
 | `scripts/` | Build, run, test, release, CI install scripts and the GDB setup |
 | `VERSION` | `<major>.<minor>` of the next release (see [releases](#releases)) |
-| `linker.ld`, `limine.conf` | Kernel link layout (higher half at 0xffffffff80000000) and boot menu |
+| `linker.ld`, `limine.conf` | Kernel link layout (a position-independent executable linked at 0xffffffff80000000) and boot menu, which turns on KASLR |
 | `.github/workflows/ci.yml` | CI (see [testing](testing.md#ci)) |
 
 ### Boot flow

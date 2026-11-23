@@ -126,9 +126,26 @@ llvm-symbolizer --obj=zig-out/bin/kernel.elf 0xffffffff800112ea
 Use the ELF that was booted: `zig-out/bin/kernel.elf` for `scripts/build.sh`,
 `zig-out/bin/kernel-test.elf` for the QEMU tests.
 
+The kernel is loaded at a random address on every boot (KASLR), while the
+ELF file holds the addresses it was linked at. A backtrace says how far it
+was moved:
+
+```
+backtrace:
+  (kernel loaded 0x14cb4000 above its link address)
+  #0 0xffffffff94d20304 ...
+```
+
+Subtract that from an address before giving it to `addr2line`
+(`0xffffffff94d20304 - 0x14cb4000 = 0xffffffff8006c304`). The names in the
+backtrace are already right.
+
 ## Debugging with QEMU and GDB
 
-1. Build a Debug kernel and the ISO: `scripts/build.sh`
+1. Build a Debug kernel and the ISO with the kernel at its link address,
+   so the debugger's symbols match: `MYOS_KASLR=no scripts/build.sh`
+   (the VS Code task does this). User programs' stacks are still at random
+   addresses; their code is not.
 2. Start QEMU paused, with a GDB server on `localhost:1234`:
 
    ```bash

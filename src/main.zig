@@ -23,6 +23,8 @@ pub const arch = struct {
         pub const fpu = @import("arch/x86_64/fpu.zig");
         pub const gdt = @import("arch/x86_64/gdt.zig");
         pub const idt = @import("arch/x86_64/idt.zig");
+        pub const meltdown = @import("arch/x86_64/meltdown.zig");
+        pub const nospec = @import("arch/x86_64/nospec.zig");
         pub const percpu = @import("arch/x86_64/percpu.zig");
         pub const syscall = @import("arch/x86_64/syscall.zig");
         pub const sysret = @import("arch/x86_64/sysret.zig");
@@ -59,6 +61,8 @@ pub const kernel = struct {
     pub const kstack = @import("kernel/kstack.zig");
     pub const pmm = @import("kernel/pmm.zig");
     pub const process = @import("kernel/process.zig");
+    pub const random = @import("kernel/random.zig");
+    pub const random_core = @import("kernel/random_core.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
     pub const timer = @import("kernel/timer.zig");
@@ -266,7 +270,9 @@ export fn kmain() callconv(.c) noreturn {
     pmm.init(mm, hhdm);
     vmm.init(mm, response(&kaddr_request), hhdm);
     arch.x86_64.usercopy.init(); // SMEP/SMAP: from here on, user memory only through kernel.uaccess
+    arch.x86_64.meltdown.init(); // refuses CPUs on which user programs can read kernel memory
     arch.x86_64.fpu.init(); // SSE/AVX for user code, and how their state is saved
+    kernel.random.init(); // before anything that wants a secret: canaries, address randomization
     log.info("memory: {d} MiB free", .{pmm.free_pages * pmm.PAGE_SIZE / (1024 * 1024)});
 
     // The bootloader's stack has no guard page; leave it as early as possible.

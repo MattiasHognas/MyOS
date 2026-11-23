@@ -48,9 +48,8 @@ pub fn load(root: u64, image: []const u8, limits: elf_image.Limits) Error!Loaded
         const data_end = seg.vaddr + seg.filesz;
         var va = seg.start();
         while (va < seg.end()) : (va += pmm.PAGE_SIZE) {
-            const phys = pmm.alloc() orelse return error.OutOfMemory;
+            const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
             const dst = pmm.physToVirt(phys)[0..pmm.PAGE_SIZE];
-            @memset(dst, 0);
             // The part of the file data that falls inside this page.
             const lo = @max(va, seg.vaddr);
             const hi = @min(va + pmm.PAGE_SIZE, data_end);

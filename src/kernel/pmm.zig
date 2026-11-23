@@ -8,6 +8,17 @@
 //! so 0 can mean "none". Physical memory is accessed through the HHDM with
 //! `physToVirt`.
 //!
+//! **Zeroing.** `allocZeroed` is the one place memory is cleared before it
+//! reaches a user program or becomes a page table: everything that maps a
+//! page into an address space gets the page from it. `alloc` (contents
+//! undefined) is for memory only the kernel sees, such as its heap and
+//! stacks. So a process can never read what a page held before.
+//!
+//! **Poisoning** (`-Dpoison`, on in Debug builds and the test kernel): a
+//! freed page is filled with `POISON` bytes, so code that keeps using it
+//! reads 0xDFDF... instead of plausible old data. As a pointer that is not
+//! a canonical address, so following it faults at once.
+//!
 //! A page that is freed must be one `alloc` returned and that has not been
 //! freed since. Anything else (a misaligned address, memory the allocator
 //! does not manage, a double free) is refused and leaves the allocator
@@ -44,6 +55,11 @@ inline fn inCriticalSection() void {
 var lock: SpinLock = .{};
 var pages: page_bitmap.PageBitmap = .{ .used = &.{}, .managed = &.{}, .total = 0 };
 var hhdm: u64 = 0;
+
+/// True if freed pages are filled with `POISON` (`-Dpoison`).
+pub const poison = build_options.poison;
+/// The byte freed pages are filled with.
+pub const POISON: u8 = 0xDF;
 
 /// Size of a physical page in bytes.
 pub const PAGE_SIZE = 4096;
@@ -123,6 +139,15 @@ pub fn alloc() ?u64 {
     return @as(u64, page) * PAGE_SIZE;
 }
 
+/// Allocate one physical page filled with zeroes, or null if memory is
+/// exhausted. Every page that is mapped into a user address space, and
+/// every page table, comes from here.
+pub fn allocZeroed() ?u64 {
+    const phys = alloc() orelse return null;
+    @memset(physToVirt(phys)[0..PAGE_SIZE], 0);
+    return phys;
+}
+
 /// Free the physical page at `phys`, or say why it cannot be freed. On an
 /// error nothing has changed. As safe to call as `alloc`.
 pub fn tryFree(phys: u64) FreeError!void {
@@ -132,6 +157,8 @@ pub fn tryFree(phys: u64) FreeError!void {
     inCriticalSection();
     try pages.free(phys / PAGE_SIZE);
     free_pages = pages.free_count;
+    // Under the lock: nobody can be handed the page while it is filled.
+    if (poison) @memset(physToVirt(phys)[0..PAGE_SIZE], POISON);
 }
 
 /// Free the physical page at `phys`, which must have come from `alloc` and

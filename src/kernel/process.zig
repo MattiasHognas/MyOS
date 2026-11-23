@@ -59,11 +59,21 @@ const pmm = @import("pmm.zig");
 const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
 const thread = @import("thread.zig");
 const vfs = @import("vfs.zig");
+const random = @import("random.zig");
 
-/// Initial user stack pointer; the stack grows down from here.
-pub const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
+/// Highest address a user stack can end at. Each process's stack ends at
+/// a random page up to `STACK_RANDOM_PAGES` below this (`Process.stack_top`).
+pub const STACK_TOP_MAX: u64 = 0x0000_7FFF_FFFF_0000;
+/// Number of positions the top of a stack can have: 2^22 pages, a range of
+/// 16 GiB, as on Linux. A program that needs the address of something on
+/// the stack (to overwrite a return address, say) has to guess among them.
+pub const STACK_RANDOM_PAGES: u64 = 1 << 22;
+/// The initial stack pointer is moved down by a random multiple of 16
+/// bytes below this many, so data at the very top is not at a fixed
+/// offset within its page either.
+const STACK_RANDOM_OFFSET: u64 = 2048;
 const STACK_PAGES = 4; // 16 KiB
-/// Address space below `STACK_TOP` kept for the user stack: 8 MiB, Linux's
+/// Address space below the top of the stack kept for the user stack: 8 MiB, Linux's
 /// default stack limit. Only `STACK_PAGES` of it are mapped; a program image
 /// may not be loaded into any of it.
 pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
@@ -97,7 +107,7 @@ pub const Limits = struct {
 pub fn imageLimits(limits: Limits) elf_image.Limits {
     return .{
         .min_addr = IMAGE_MIN,
-        .max_addr = STACK_TOP - STACK_RESERVE,
+        .max_addr = STACK_TOP_MAX - STACK_RANDOM_PAGES * pmm.PAGE_SIZE - STACK_RESERVE,
         .max_bytes = (limits.max_pages -| (STACK_PAGES + kstack.STACK_PAGES)) * pmm.PAGE_SIZE,
     };
 }
@@ -116,6 +126,10 @@ pub const Process = struct {
     root: u64,
     /// User-space entry point from the ELF header.
     entry: u64,
+    /// First address above the user stack; page aligned, chosen at random.
+    stack_top: u64 = STACK_TOP_MAX,
+    /// Stack pointer the program starts with.
+    entry_rsp: u64 = STACK_TOP_MAX - 8,
     /// Heap-allocated copy of the name the process was spawned with.
     name: []const u8,
     /// File descriptor table, indexed by fd. Slots 0-2 are the standard
@@ -150,6 +164,9 @@ pub const SpawnOptions = struct {
     /// Limits for the new process; by default the parent's, or the default
     /// limits for a process the kernel starts.
     limits: ?Limits = null,
+    /// Put the stack at a random address. Off only where a test or a
+    /// debugging session needs the same layout every time.
+    randomize: bool = true,
 };
 
 /// Count a new process against every ancestor from `parent` up. Fails,
@@ -320,10 +337,14 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
 
     const loaded = try elf.load(root, image, imageLimits(limits));
 
+    // Where the stack goes, and where in its top page the program starts:
+    // 8 below a 16-byte boundary, as if the entry point had been called.
+    const stack_top = if (options.randomize) STACK_TOP_MAX - random.below(STACK_RANDOM_PAGES) * pmm.PAGE_SIZE else STACK_TOP_MAX;
+    const entry_rsp = stack_top - 8 - (if (options.randomize) random.below(STACK_RANDOM_OFFSET / 16) * 16 else 0);
+
     for (1..STACK_PAGES + 1) |i| {
-        const phys = pmm.alloc() orelse return error.OutOfMemory;
-        @memset(pmm.physToVirt(phys)[0..pmm.PAGE_SIZE], 0);
-        vmm.map(root, STACK_TOP - i * pmm.PAGE_SIZE, phys, vmm.USER | vmm.WRITABLE | vmm.NX, false) catch |e| {
+        const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
+        vmm.map(root, stack_top - i * pmm.PAGE_SIZE, phys, vmm.USER | vmm.WRITABLE | vmm.NX, false) catch |e| {
             pmm.free(phys); // not mapped, so destroying the address space would not free it
             return e;
         };
@@ -340,6 +361,8 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     p.* = .{
         .root = root,
         .entry = loaded.entry,
+        .stack_top = stack_top,
+        .entry_rsp = entry_rsp,
         .name = name_copy,
         .limits = limits,
         .pages = pages,
@@ -367,5 +390,5 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
 /// address space. Never returns.
 fn userStart() void {
     const p = thread.current().process.?;
-    context.enterUser(p.entry, STACK_TOP - 8); // -8: as if _start had been called
+    context.enterUser(p.entry, p.entry_rsp);
 }
