@@ -24,13 +24,14 @@
 
 const std = @import("std");
 const root = @import("root");
-const gdt = @import("gdt.zig");
+
 const apic = @import("../../arch/x86_64/apic.zig");
-const thread = @import("../../kernel/thread.zig");
-const process = @import("../../kernel/process.zig");
 const backtrace = @import("../../kernel/debug/backtrace.zig");
-const usercopy = @import("usercopy.zig");
 const kstack = @import("../../kernel/kstack.zig");
+const process = @import("../../kernel/process.zig");
+const thread = @import("../../kernel/thread.zig");
+const gdt = @import("gdt.zig");
+const usercopy = @import("usercopy.zig");
 
 var idt = std.mem.zeroes([256]Entry);
 var handlers: [256]?Handler = @splat(null);

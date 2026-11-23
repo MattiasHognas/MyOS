@@ -7,12 +7,11 @@
 //! first failing check.
 
 const lib = @import("lib");
-const checked = @import("checked.zig");
-
 pub const panic = lib.panic;
-
 const Sys = lib.Sys;
 const err = lib.err;
+
+const checked = @import("checked.zig");
 
 var check_no: u64 = 0;
 

@@ -11,17 +11,21 @@
 
 const std = @import("std");
 const root = @import("root");
-const heap = @import("heap.zig");
-const kstack = @import("kstack.zig");
+
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
+const fpu = @import("../arch/x86_64/fpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
-const fpu = @import("../arch/x86_64/fpu.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const assert = @import("debug/assert.zig");
-const proc = @import("process.zig"); // the file: for proc.destroy
-const Process = proc.Process; // the struct: for fields and parameters
+const heap = @import("heap.zig");
+const kstack = @import("kstack.zig");
+const proc = @import("process.zig");
+const Process = proc.Process;
+
+// the file: for proc.destroy
+// the struct: for fields and parameters
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;

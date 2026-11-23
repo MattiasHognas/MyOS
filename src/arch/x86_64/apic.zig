@@ -5,10 +5,10 @@
 //! IRQs, and `timerInit` calibrates the LAPIC timer against the HPET and starts
 //! it in periodic mode.
 
+const hpet = @import("../../drivers/hpet.zig");
+const acpi = @import("../../firmware/acpi.zig");
 const cpu = @import("cpu.zig");
 const vmm = @import("vmm.zig");
-const acpi = @import("../../firmware/acpi.zig");
-const hpet = @import("../../drivers/hpet.zig");
 
 /// First interrupt vector used for legacy IRQs: IRQ n is delivered as vector `IRQ_BASE + n`.
 pub const IRQ_BASE: u8 = 32;

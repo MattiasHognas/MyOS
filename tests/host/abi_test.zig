@@ -2,6 +2,7 @@
 //! the values must be Linux's, and results must encode errors as Linux does.
 
 const std = @import("std");
+
 const abi = @import("abi");
 
 test "syscall numbers are Linux's x86-64 numbers" {
@@ -37,6 +38,12 @@ test "error numbers are Linux's" {
     inline for (comptime std.meta.tags(abi.E)) |e| {
         try std.testing.expectEqual(@backingInt(@field(E, @tagName(e))), @backingInt(e));
     }
+}
+
+test "the errors MyOS returns" {
+    try std.testing.expectEqual(11, @backingInt(abi.E.AGAIN));
+    try std.testing.expectEqual(12, @backingInt(abi.E.NOMEM));
+    try std.testing.expectEqual(24, @backingInt(abi.E.MFILE));
 }
 
 test "errors are returned as negative numbers" {

@@ -32,10 +32,11 @@
 
 const std = @import("std");
 const root = @import("root");
+
+const assert = @import("../../kernel/debug/assert.zig");
 const cpu = @import("cpu.zig");
 const gdt = @import("gdt.zig");
 const sysret = @import("sysret.zig");
-const assert = @import("../../kernel/debug/assert.zig");
 
 /// RFLAGS bits the CPU clears on `syscall` entry: TF, IF, DF, IOPL, NT, AC.
 pub const SFMASK: u64 = 0x100 | 0x200 | 0x400 | 0x3000 | 0x4000 | 0x40000;

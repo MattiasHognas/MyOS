@@ -8,10 +8,11 @@
 //! yields, 2 for one in a round that spins.
 
 const std = @import("std");
-const lib = @import("lib");
-const regs = @import("fpu_regs.zig");
 
+const lib = @import("lib");
 pub const panic = lib.panic;
+
+const regs = @import("fpu_regs.zig");
 
 /// Rounds that switch threads with `sched_yield`.
 const YIELD_ROUNDS = 300;

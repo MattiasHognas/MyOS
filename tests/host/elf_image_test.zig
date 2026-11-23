@@ -2,12 +2,12 @@
 //! using ELF images built in memory.
 
 const std = @import("std");
-const elf_image = @import("elf_image");
-
-const parse = elf_image.parse;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
+
+const elf_image = @import("elf_image");
+const parse = elf_image.parse;
 
 /// The limits the kernel uses: from 64 KiB up to the stack's reserved region.
 const limits: elf_image.Limits = .{

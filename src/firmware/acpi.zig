@@ -5,7 +5,9 @@
 //! overrides. Other drivers look up their own tables with `findTable`.
 
 const std = @import("std");
+
 const pmm = @import("../kernel/pmm.zig");
+
 const log = std.log.scoped(.acpi);
 
 var root_table: []const u8 = &.{}; // XSDT (8-byte entries) or RSDT (4-byte)

@@ -7,10 +7,10 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const panic = @import("panic.zig");
-
 /// True if assertions are compiled in (`-Dassertions`, default true).
 pub const enabled = build_options.assertions;
+
+const panic = @import("panic.zig");
 
 /// Panic with `<subsystem>: assertion failed: <message>` if `ok` is false.
 /// `fmt` and `args` format the message; they are only evaluated on failure.

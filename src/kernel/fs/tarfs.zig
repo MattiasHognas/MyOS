@@ -4,7 +4,9 @@
 //! file data is served directly from the archive without copying.
 
 const std = @import("std");
+
 const vfs = @import("../vfs.zig");
+
 const log = std.log.scoped(.tarfs);
 
 var archive: []const u8 = &.{};

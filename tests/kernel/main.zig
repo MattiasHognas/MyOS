@@ -8,14 +8,17 @@
 //! then QEMU is exited.
 
 const std = @import("std");
-const qemu_exit = @import("qemu_exit");
 const root = @import("root");
-const helpers = @import("helpers.zig");
-const fw_cfg = @import("fw_cfg.zig");
 const pmm = root.kernel.pmm;
 const serial = root.drivers.serial;
 const assert = root.kernel.debug.assert;
 const panicFmt = root.kernel.debug.panic.panicFmt;
+
+const qemu_exit = @import("qemu_exit");
+
+const fw_cfg = @import("fw_cfg.zig");
+const helpers = @import("helpers.zig");
+
 const log = std.log.scoped(.tests);
 
 /// x86-64 page-table entry bits, for checking `ElfProbe.pte`.
@@ -70,6 +73,132 @@ fn multiplePages() TestError!void {
     }
 
     try check(pmm.free_pages + pages.len == before);
+}
+
+/// Frees of addresses that are not allocated pages are refused and change nothing.
+fn pmmBadFrees() TestError!void {
+    const failed = helpers.pmmRejectsBadFrees();
+    if (failed != 0) report("PMM free check", failed);
+    try check(failed == 0);
+    try check(pmm.consistent());
+}
+
+/// Mapping over an existing mapping is an error, for both page sizes.
+fn vmmMapConflicts() TestError!void {
+    const failed = helpers.vmmMapConflicts();
+    if (failed != 0) report("map conflict check", failed);
+    try check(failed == 0);
+}
+
+/// Unmapping removes the translation and frees page tables that became empty.
+fn vmmUnmap() TestError!void {
+    const failed = helpers.vmmUnmap();
+    if (failed != 0) report("unmap check", failed);
+    try check(failed == 0);
+}
+
+/// An unmapped or remapped page is never reached through a stale TLB entry.
+fn vmmTlbFlush() TestError!void {
+    const failed = helpers.vmmTlbFlush();
+    if (failed != 0) report("TLB check", failed);
+    try check(failed == 0);
+}
+
+/// With physical memory used up, every allocation fails with an error,
+/// half-built page tables are taken down again, and nothing is lost.
+fn memoryExhaustion() TestError!void {
+    const failed = helpers.memoryExhaustion();
+    if (failed != 0) report("memory exhaustion check", failed);
+    try check(failed == 0);
+    try expectProgram("/bin/hello"); // the kernel is fine afterwards
+}
+
+/// True if `e` is `error.TooLarge`.
+fn tooLarge(e: ?anyerror) bool {
+    return if (e) |err| err == error.TooLarge else false;
+}
+
+/// Starting a process fails cleanly at every single allocation it makes,
+/// and so do allocating a kernel stack and growing the heap.
+fn spawnAllocationFailures() TestError!void {
+    try expectProgram("/bin/hello"); // warm up: the heap may grow
+    var failures: usize = 0;
+    const failed = helpers.spawnAllocationFailures(&failures);
+    if (failed != 0) {
+        report("allocation failure check", failed);
+        report("after failing allocation number", failures);
+    }
+    try check(failed == 0);
+    try check(pmm.consistent());
+    const stack_failed = helpers.kstackAllocationFailures();
+    if (stack_failed != 0) report("kernel stack allocation failure check", stack_failed);
+    try check(stack_failed == 0);
+    const heap_failed = helpers.heapGrowthFailures();
+    if (heap_failed != 0) report("heap growth failure check", heap_failed);
+    try check(heap_failed == 0);
+}
+
+/// Per-process limits: a program larger than its memory limit is not
+/// started, descriptors stop at the limit, and a chain of processes stops
+/// at the descendant limit; in each case with an error, not a crash, and
+/// with nothing left behind.
+fn processLimits() TestError!void {
+    try expectProgram("/bin/hello"); // warm up: the heap may grow
+    const before = helpers.footprint();
+
+    // Memory: 4 pages are the stack alone, so no program fits; with room
+    // for one page of program, a real one still does not.
+    try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = 4 })));
+    try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = 0 })));
+    try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = 5 })));
+    try check(helpers.runProgramLimited("/bin/hello", .{ .max_pages = 4096 }) == 0);
+
+    // Open files: 13 by default, fewer with a lower limit, none at 3.
+    try check(helpers.runProgram("/test/open_count") == 13);
+    try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 5 }) == 2);
+    try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 3 }) == 0);
+    try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 0 }) == 0);
+    try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 1000 }) == 13); // the table is the cap
+
+    // Descendants: the chain stops exactly at the limit, with EAGAIN (100
+    // plus the depth reached; see tests/user/recurse.zig).
+    inline for (.{ 0, 1, 5, 12 }) |limit| {
+        const code = helpers.runProgramLimited("/test/recurse", .{ .max_descendants = limit }) orelse return error.Failed;
+        if (code != 100 + limit) report("/test/recurse exit status", code);
+        try check(code == 100 + limit);
+    }
+    // The counts were given back: the same limit works again.
+    try check(helpers.runProgramLimited("/test/recurse", .{ .max_descendants = 5 }) == 105);
+    // A child that has exited no longer counts: eight in a row with a limit of one.
+    try check(helpers.runProgramLimited("/test/run_many", .{ .max_descendants = 1 }) == 8);
+    try check(helpers.runProgramLimited("/test/run_many", .{ .max_descendants = 0 }) == 0);
+
+    const after = helpers.footprint();
+    try check(after.eql(before));
+    try check(pmm.consistent());
+}
+
+/// A program that starts itself again and again until memory runs out gets
+/// `ENOMEM` from `run`; every process in the chain exits normally, the
+/// kernel keeps working and no memory is lost.
+fn recursionUntilOutOfMemory() TestError!void {
+    try expectProgram("/bin/hello"); // warm up: the heap may grow
+    const before = helpers.footprint();
+    // Leave 4 MiB, so the chain is dozens of processes rather than thousands.
+    if (helpers.drainMemory(1024) != 1024) return error.Failed;
+    const code = helpers.runProgram("/test/recurse");
+    const low_water = pmm.free_pages;
+    helpers.releaseDrained();
+    const status = code orelse return error.Failed;
+    // 200 + depth: stopped by ENOMEM, at least a few processes deep.
+    if (status < 203 or status > 290) report("/test/recurse exit status", status);
+    try check(status >= 203 and status <= 290);
+    try check(low_water == 1024); // every process of the chain is gone again
+    const after = helpers.footprint();
+    if (!after.eql(before)) report("pages lost:", before.pages -% after.pages);
+    try check(after.eql(before));
+    try check(pmm.consistent());
+    try expectProgram("/bin/hello");
 }
 
 /// The kernel heap can allocate, fill and free a block.
@@ -965,6 +1094,7 @@ fn runCases() noreturn {
             .name = "PMM distinct pages",
             .func = multiplePages,
         },
+        .{ .name = "PMM rejects misaligned, unmanaged and double frees", .func = pmmBadFrees },
         .{
             .name = "kernel heap roundtrip",
             .func = heapTest,
@@ -981,6 +1111,9 @@ fn runCases() noreturn {
             .name = "VMM map and translate",
             .func = vmmMapTranslate,
         },
+        .{ .name = "VMM refuses to replace a mapping", .func = vmmMapConflicts },
+        .{ .name = "VMM unmap frees empty page tables", .func = vmmUnmap },
+        .{ .name = "VMM unmap and remap flush the TLB", .func = vmmTlbFlush },
         .{
             .name = "NVMe sector reads",
             .func = nvmeRead,
@@ -1023,6 +1156,10 @@ fn runCases() noreturn {
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },
         .{ .name = "syscall fuzzing from ring 3", .func = syscallFuzz },
         .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
+        .{ .name = "memory exhaustion fails cleanly (page tables, stacks, heap, processes)", .func = memoryExhaustion },
+        .{ .name = "process, kernel stack and heap growth fail cleanly at every allocation", .func = spawnAllocationFailures },
+        .{ .name = "per-process limits (memory, open files, descendants)", .func = processLimits },
+        .{ .name = "recursive spawning until memory runs out (ring 3)", .func = recursionUntilOutOfMemory },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
         .{ .name = "user faults kill only the process (ring 3 exceptions)", .func = userFaults },
         .{ .name = "double-fault, NMI and debug emergency stacks", .func = emergencyStacks },

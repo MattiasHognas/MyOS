@@ -9,7 +9,6 @@
 //! Exits with 0 if no trap arrives at all.
 
 const lib = @import("lib");
-
 pub const panic = lib.panic;
 
 /// Program entry point.

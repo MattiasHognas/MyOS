@@ -7,7 +7,6 @@
 //! kernel address, or as a successful read (exit status 0).
 
 const lib = @import("lib");
-
 pub const panic = lib.panic;
 
 /// Program entry point.

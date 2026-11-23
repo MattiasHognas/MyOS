@@ -2,10 +2,11 @@
 //! (`src/arch/x86_64/sysret.zig`).
 
 const std = @import("std");
-const sysret = @import("sysret");
 
+const sysret = @import("sysret");
 const CS = sysret.USER_CS;
 const SS = sysret.USER_SS;
+
 const FLAGS: u64 = 0x202; // interrupts on, nothing else
 
 test "an ordinary return uses sysretq" {

@@ -6,10 +6,12 @@
 //! page-sized DMA bounce buffer.
 
 const std = @import("std");
-const pci = @import("pci.zig");
-const hpet = @import("hpet.zig");
-const pmm = @import("../kernel/pmm.zig");
+
 const vmm = @import("../arch/x86_64/vmm.zig");
+const pmm = @import("../kernel/pmm.zig");
+const hpet = @import("hpet.zig");
+const pci = @import("pci.zig");
+
 const log = std.log.scoped(.nvme);
 
 /// 64-byte submission queue entry, as defined by the NVMe specification.

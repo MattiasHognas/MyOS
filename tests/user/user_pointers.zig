@@ -8,11 +8,11 @@
 //! failing check.
 
 const std = @import("std");
+
 const lib = @import("lib");
-
 pub const panic = lib.panic;
-
 const Sys = lib.Sys;
+
 const EFAULT = lib.err(.FAULT);
 /// Nothing is mapped here: programs are linked far below, the stack is far above.
 const UNMAPPED: u64 = 0x1000_0000;

@@ -170,20 +170,34 @@ The ABI a program sees is described in `docs/syscalls.md`.
 - [x] Clear all general-purpose registers on the first entry to user mode, so no kernel value leaks to the program (`context.enterUser`; tested from ring 3 by `/test/entry_regs`).
 
 ### 2.6 Memory-management correctness
-- [ ] Reject invalid, misaligned, and double page frees in the physical allocator.
-- [ ] Verify free-page counts and bitmap consistency under stress.
+- [x] Reject invalid, misaligned, and double page frees in the physical allocator.
+  - `pmm.tryFree` returns `Misaligned`, `OutOfRange`, `NotManaged` or `NotAllocated` and changes nothing; `pmm.free` panics on any of them, in every build mode (the alignment and range checks used to be assertions, which `-Dassertions=false` removed).
+  - New: a second bitmap records which pages the allocator owns. Before, freeing an address in a hole of the memory map (device or firmware memory) or one of the bitmap's own pages succeeded, and the page was handed out later.
+- [x] Verify free-page counts and bitmap consistency under stress.
   - [x] Make `pmm.alloc`/`pmm.free` safe against preemption (interrupts off around the bitmap update); before, two preemptible threads could be handed the same page.
   - [x] Stress test with two preempted kernel threads allocating and freeing concurrently. It checks for shared pages and the free count, but the race window is a few instructions wide: it passed even with the locking removed, so it does not prove the lock. A deterministic test needs a hook that forces a switch inside `alloc`.
-- [ ] Make page mapping report errors rather than silently replacing mappings.
-- [ ] Implement page unmapping and appropriate local TLB invalidation.
-- [ ] Handle page-table allocation failure without a partially corrupted mapping.
-  - Today `vmm.allocTable` panics, so a user program can take the kernel down by exhausting memory, for example by running itself recursively (each `run` keeps its parent alive).
-- [ ] Free all user mappings and page tables on process teardown.
-- [ ] Test memory exhaustion, mapping conflicts, repeated allocation/free, and failed allocations.
-- [ ] Test from ring 3 that a program spawning itself recursively until memory runs out gets an error from `run` and the kernel survives with no leak.
-- [ ] Add per-process resource limits (memory, descendants, open files) so one program cannot starve the rest.
-- [ ] Test unmapping: the translation disappears, freed pages and empty page tables return to the PMM, and a stale TLB entry is never used (moved from 1.2).
-- [ ] Test mapping exhaustion: `map` reports out-of-memory when page tables can't be allocated and leaves existing mappings intact (moved from 1.2).
+  - [x] The bookkeeping is its own module without kernel dependencies (`src/kernel/page_bitmap.zig`), tested on the host: 200 000 random allocations and frees (valid and invalid) against a model, with the count checked after every step.
+  - [x] `pmm.consistent()` recounts the bitmap and compares it with `free_pages`; the in-kernel tests call it after the stress test and after every exhaustion test.
+- [x] Make page mapping report errors rather than silently replacing mappings: `vmm.map` returns `error.AlreadyMapped` for an address that is mapped by a page of either size. To change a mapping, unmap first.
+  - This also fixed mapping a 4 KiB page inside a 2 MiB page, which treated the large page's memory as a page table.
+- [x] Implement page unmapping and appropriate local TLB invalidation. `vmm.unmap` existed (with `invlpg`); it now also frees page tables that became empty, except the ones every address space shares for kernel addresses.
+- [x] Handle page-table allocation failure without a partially corrupted mapping: `vmm.map` returns `error.OutOfMemory` and frees the tables it had added, so a failed call changes nothing. `createAddressSpace` returns the error too.
+  - The kernel no longer panics when memory runs out after boot: the ELF loader, the user and kernel stacks and the heap pass the error on, and free the page they were about to map.
+  - Still a panic, on purpose: running out during boot (`vmm.init`, `mapMmio`, the NVMe driver's buffer), where there is nothing to fall back to.
+- [x] Free all user mappings and page tables on process teardown (`vmm.destroyAddressSpace`, which did this already; now tested for an address space with pages in several parts of the address range, and by every "nothing lost" check below).
+- [x] Test memory exhaustion, mapping conflicts, repeated allocation/free, and failed allocations.
+  - With every page taken, and with one or two pages short of the page tables a mapping needs, `map` fails and changes nothing; address spaces, kernel stacks, heap blocks, threads and processes cannot be created and leave nothing behind.
+  - The test kernel can make the allocator fail after N more allocations (`pmm.fail_after`; compiled out of the normal kernel). Starting a process is repeated with N = 0, 1, 2, ... until it succeeds, so every single allocation in it has failed once (about 60 in a Debug build), each time with nothing lost. The same for kernel stacks across page-table boundaries and for heap growth.
+- [x] Test from ring 3 that a program spawning itself recursively until memory runs out gets an error from `run` and the kernel survives with no leak (`/test/recurse`, with all but 4 MiB of memory taken first so the chain is dozens of processes, not thousands).
+- [x] Add per-process resource limits (memory, descendants, open files) so one program cannot starve the rest (`process.Limits`, inherited by child processes).
+  - Memory: the pages of the program and its stack; a program that does not fit is not started (`ENOMEM`). The limit is 256 MiB by default, as the image cap was. Processes cannot ask for more memory yet, so this is checked once, at start; `mmap` and `brk` (5) must charge against it.
+  - Descendants: processes alive below a process, 1024 by default. Starting one more fails with `EAGAIN`.
+  - Open files: 16 descriptors by default, which is also the size of the table (`EMFILE`).
+  - What this does and does not give: one program and everything it starts are bounded, and the kernel survives memory running out. The default limits add up to far more than the machine has, so a program can still use up memory and make other programs' requests fail. Dividing memory between unrelated programs needs a system-wide policy (a reserve, or accounting per user or group); nothing sets limits yet either (`setrlimit`/`prlimit`, with 6.4 or 7).
+  - Not counted: page tables, kernel stacks and other kernel memory a process causes.
+  - The descendant count follows `parent` pointers, which are valid because a parent waits for its child. 2.7 (parents that exit first) must keep them valid.
+- [x] Test unmapping: the translation disappears, freed pages and empty page tables return to the PMM, and a stale TLB entry is never used (moved from 1.2). The TLB test reads a user page through its mapping, unmaps it and expects a fault, then maps another page there and expects that page's contents, 50 times over.
+- [x] Test mapping exhaustion: `map` reports out-of-memory when page tables can't be allocated and leaves existing mappings intact (moved from 1.2).
 
 ### 2.7 Process and scheduler lifecycle
 - [ ] Define ownership rules for processes, threads, stacks, page tables, and open files.
@@ -191,7 +205,7 @@ The ABI a program sees is described in `docs/syscalls.md`.
 - [ ] Review ready/running/blocked/dead transitions and prevent duplicate queue insertion.
 - [ ] Make block/wake semantics race-safe, including wake-before-block.
 - [ ] Handle children that exit before the parent begins waiting.
-- [ ] Handle parents that exit before their children (reparent or auto-reap the orphans).
+- [ ] Handle parents that exit before their children (reparent or auto-reap the orphans). `Process.parent` and the descendant counts (2.6) assume a parent outlives its children; update them when a child is reparented.
 - [ ] Reap each exited thread/process exactly once.
 - [ ] Close open descriptors and free all resources on process exit and failed spawn.
 - [ ] Stress-test repeated spawn/exit, wait, wakeup, orphaning, and failure paths.

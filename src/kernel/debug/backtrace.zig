@@ -8,8 +8,9 @@
 
 const std = @import("std");
 const root = @import("root");
-const symbols = @import("symbols.zig");
+
 const vmm = @import("../../arch/x86_64/vmm.zig");
+const symbols = @import("symbols.zig");
 
 /// Maximum number of frames `print` shows.
 pub const max_frames = 32;

@@ -4,6 +4,7 @@
 //! wraps at the right edge and scrolls when the cursor passes the last row.
 
 const std = @import("std");
+
 const limine = @import("../boot/limine.zig");
 
 var fb: [*]u32 = undefined;

@@ -24,7 +24,9 @@
 //! target has SSE switched off, and the assembler would refuse them.
 
 const std = @import("std");
+
 const cpu = @import("cpu.zig");
+
 const log = std.log.scoped(.fpu);
 
 /// How extended state is saved, chosen by `init`.

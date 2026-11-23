@@ -2,8 +2,8 @@
 //! path if it contains a slash) and waits for it; `exit` leaves the shell.
 
 const std = @import("std");
-const lib = @import("lib.zig");
 
+const lib = @import("lib.zig");
 pub const panic = lib.panic;
 
 /// Read one line from the keyboard into `buf`, echoing it and handling

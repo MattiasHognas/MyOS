@@ -3,6 +3,7 @@
 //! CPUID, and what a new thread's save area contains.
 
 const std = @import("std");
+
 const fpu = @import("fpu");
 
 const XSAVE: u32 = 1 << 26;

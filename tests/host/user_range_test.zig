@@ -1,11 +1,11 @@
 //! Host unit tests for `src/kernel/user_range.zig`.
 
 const std = @import("std");
-const user_range = @import("user_range");
+const expect = std.testing.expect;
 
+const user_range = @import("user_range");
 const valid = user_range.valid;
 const END = user_range.USER_END;
-const expect = std.testing.expect;
 
 test "user range: ordinary user buffers are valid" {
     try expect(valid(0x40_0000, 4096));

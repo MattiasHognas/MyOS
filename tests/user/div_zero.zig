@@ -4,7 +4,6 @@
 //! 0 if the instruction somehow succeeds.
 
 const lib = @import("lib");
-
 pub const panic = lib.panic;
 
 /// Program entry point.

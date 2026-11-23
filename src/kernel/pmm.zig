@@ -1,17 +1,32 @@
-//! Physical memory manager: a bitmap of 4 KiB pages.
+//! Physical memory manager: hands out 4 KiB pages of RAM.
 //!
-//! One bit per page of physical memory (1 = used), built from the Limine
-//! memory map. The bitmap itself is stored in the first usable region that is
-//! large enough. Physical page 0 is never handed out, so 0 can mean "none".
-//! Physical memory is accessed through the HHDM with `physToVirt`.
+//! The bookkeeping (two bitmaps with one bit per page, built from the Limine
+//! memory map) is `page_bitmap.zig`; this file gives it memory, turns
+//! addresses into page numbers and makes every operation safe against
+//! preemption by disabling interrupts. The bitmaps are stored in the first
+//! usable region that is large enough. Physical page 0 is never handed out,
+//! so 0 can mean "none". Physical memory is accessed through the HHDM with
+//! `physToVirt`.
+//!
+//! A page that is freed must be one `alloc` returned and that has not been
+//! freed since. Anything else (a misaligned address, memory the allocator
+//! does not manage, a double free) is refused and leaves the allocator
+//! untouched: `tryFree` reports it, `free` panics, because the caller has
+//! lost track of who owns the page.
 
-const limine = @import("../boot/limine.zig");
-const assert = @import("debug/assert.zig");
+const build_options = @import("build_options");
+
 const cpu = @import("../arch/x86_64/cpu.zig");
+const limine = @import("../boot/limine.zig");
+const panicFmt = @import("debug/panic.zig").panicFmt;
+const page_bitmap = @import("page_bitmap.zig");
 
-var bitmap: []u8 = &.{}; // 1 bit per page, 1 = used
-var total_pages: usize = 0;
-var hint: usize = 0; // where the next search starts
+/// Test kernel only: when set, `alloc` succeeds this many more times and
+/// then fails as if memory had run out, until it is set to null again. Lets
+/// a test make any single allocation inside a larger operation fail.
+pub var fail_after: ?usize = null;
+
+var pages: page_bitmap.PageBitmap = .{ .used = &.{}, .managed = &.{}, .total = 0 };
 var hhdm: u64 = 0;
 
 /// Size of a physical page in bytes.
@@ -19,110 +34,113 @@ pub const PAGE_SIZE = 4096;
 /// Number of pages currently free.
 pub var free_pages: usize = 0;
 
-/// Return true if page number `p` is marked as used.
-fn isUsed(p: usize) bool {
-    return (bitmap[p / 8] & (@as(u8, 1) << @intCast(p % 8))) != 0;
-}
-
-/// Mark page number `p` as used. Does not update `free_pages`.
-fn setUsed(p: usize) void {
-    bitmap[p / 8] |= @as(u8, 1) << @intCast(p % 8);
-}
-
-/// Mark page number `p` as free. Does not update `free_pages`.
-fn setFree(p: usize) void {
-    bitmap[p / 8] &= ~(@as(u8, 1) << @intCast(p % 8));
-}
-
-/// Mark page number `p` as used so it is never allocated, adjusting
-/// `free_pages` if it was free. Used for the bitmap's own pages and page 0.
-fn reserve(p: usize) void {
-    if (!isUsed(p)) {
-        setUsed(p);
-        free_pages -= 1;
-    }
-}
+/// Why `tryFree` refused an address.
+pub const FreeError = page_bitmap.FreeError || error{
+    /// The address is not the start of a page.
+    Misaligned,
+};
 
 /// Return a pointer to physical address `phys` through the HHDM. Requires `init`.
 pub fn physToVirt(phys: u64) [*]u8 {
     return @ptrFromInt(phys + hhdm);
 }
 
-/// Build the page bitmap from the memory map `mm`.
+/// Build the page bitmaps from the memory map `mm`.
 ///
-/// `hhdm_offset` is the HHDM offset from Limine. Sizes the bitmap to cover the
-/// highest usable address, marks only the usable regions as free, then
-/// reserves the bitmap's own pages and page 0. Panics if no usable region can
-/// hold the bitmap.
+/// `hhdm_offset` is the HHDM offset from Limine. Sizes the bitmaps to cover the
+/// highest usable address, hands only the usable regions to the allocator, then
+/// takes the bitmaps' own pages and page 0 away again. Panics if no usable
+/// region can hold the bitmaps.
 pub fn init(mm: *const limine.MemmapResponse, hhdm_offset: u64) void {
     hhdm = hhdm_offset;
     const entries = mm.entries[0..mm.entry_count];
 
-    // 1. Size the bitmap to cover the highest usable address.
+    // 1. Size the bitmaps to cover the highest usable address.
     var top: u64 = 0;
     for (entries) |e| {
         if (e.type == limine.MEMMAP_USABLE) top = @max(top, e.base + e.length);
     }
-    total_pages = top / PAGE_SIZE;
-    const bytes = (total_pages + 7) / 8;
+    const total: usize = top / PAGE_SIZE;
+    const bytes = page_bitmap.PageBitmap.bytesFor(total);
 
-    // 2. Store the bitmap in the first usable region large enough to hold it.
+    // 2. Store both in the first usable region large enough to hold them.
+    var storage: []u8 = &.{};
     for (entries) |e| {
-        if (e.type == limine.MEMMAP_USABLE and e.length >= bytes) {
-            bitmap = physToVirt(e.base)[0..bytes];
+        if (e.type == limine.MEMMAP_USABLE and e.length >= 2 * bytes) {
+            storage = physToVirt(e.base)[0 .. 2 * bytes];
             break;
         }
     }
-    if (bitmap.len == 0) @panic("no room for the PMM bitmap");
+    if (storage.len == 0) @panic("no room for the PMM bitmaps");
+    pages = .init(storage[0..bytes], storage[bytes..], total);
 
-    // 3. Everything starts as used; then free the usable regions.
+    // 3. Only usable regions are memory to hand out.
     //    (Limine guarantees usable entries are page-aligned.)
-    @memset(bitmap, 0xFF);
     for (entries) |e| {
-        if (e.type != limine.MEMMAP_USABLE) continue;
-        var p = e.base / PAGE_SIZE;
-        while (p < (e.base + e.length) / PAGE_SIZE) : (p += 1) {
-            setFree(p);
-            free_pages += 1;
-        }
+        if (e.type == limine.MEMMAP_USABLE) pages.addRegion(e.base / PAGE_SIZE, e.length / PAGE_SIZE);
     }
 
-    // 4. Don't hand out the bitmap's own pages, or page 0 (keeps 0 meaning "null").
-    const bm_start = (@intFromPtr(bitmap.ptr) - hhdm) / PAGE_SIZE;
-    for (bm_start..bm_start + (bytes + PAGE_SIZE - 1) / PAGE_SIZE) |p| reserve(p);
-    reserve(0);
+    // 4. Never hand out the bitmaps' own pages, or page 0 (keeps 0 meaning "null").
+    const first = (@intFromPtr(storage.ptr) - hhdm) / PAGE_SIZE;
+    for (first..first + (storage.len + PAGE_SIZE - 1) / PAGE_SIZE) |p| pages.reserve(p);
+    pages.reserve(0);
+    free_pages = pages.free_count;
 }
 
 /// Allocate one physical page and return its physical address, or null if
-/// memory is exhausted. The page is not zeroed. Not interrupt safe: callers
-/// that may race with other allocations must disable interrupts.
+/// memory is exhausted. The page is not zeroed. Safe to call from
+/// preemptible code and from interrupt handlers.
 pub fn alloc() ?u64 {
-    // Callers may be preemptible (syscalls); a thread switch between finding
-    // a free page and marking it used would hand the page out twice.
+    // A thread switch between finding a free page and marking it used
+    // would hand the page out twice.
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
-    for (0..total_pages) |n| {
-        const p = (hint + n) % total_pages;
-        if (!isUsed(p)) {
-            setUsed(p);
-            free_pages -= 1;
-            hint = p + 1;
-            return p * PAGE_SIZE;
+    if (comptime build_options.is_test) {
+        if (fail_after) |*left| {
+            if (left.* == 0) return null;
+            left.* -= 1;
         }
     }
-    return null;
+    const page = pages.alloc() orelse return null;
+    free_pages = pages.free_count;
+    return @as(u64, page) * PAGE_SIZE;
 }
 
-/// Free the physical page at `phys`, which must have come from `alloc`.
-/// Panics on a double free. Not interrupt safe, like `alloc`.
-pub fn free(phys: u64) void {
-    assert.check(.pmm, phys % PAGE_SIZE == 0, "freeing unaligned address 0x{x}", .{phys});
-    assert.check(.pmm, phys != 0 and phys / PAGE_SIZE < total_pages, "freeing address 0x{x} outside managed memory", .{phys});
-    const p = phys / PAGE_SIZE;
+/// Free the physical page at `phys`, or say why it cannot be freed. On an
+/// error nothing has changed. As safe to call as `alloc`.
+pub fn tryFree(phys: u64) FreeError!void {
+    if (phys % PAGE_SIZE != 0) return error.Misaligned;
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
-    if (!isUsed(p)) @panic("PMM: double free");
-    setFree(p);
-    free_pages += 1;
-    if (p < hint) hint = p;
+    try pages.free(phys / PAGE_SIZE);
+    free_pages = pages.free_count;
+}
+
+/// Free the physical page at `phys`, which must have come from `alloc` and
+/// not have been freed since. Panics otherwise, in every build mode: the
+/// caller's bookkeeping is wrong, and carrying on would hand one page to
+/// two owners sooner or later.
+pub fn free(phys: u64) void {
+    tryFree(phys) catch |e| panicFmt("PMM: bad free of 0x{x}: {s}", .{ phys, @errorName(e) });
+}
+
+/// True if the page at `phys` is currently allocated.
+pub fn isAllocated(phys: u64) bool {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    return phys % PAGE_SIZE == 0 and pages.isAllocated(phys / PAGE_SIZE);
+}
+
+/// Recount the free pages from the bitmaps and compare with `free_pages`;
+/// also checks that no unmanaged page is marked free. Walks every page, so
+/// it is for tests and debugging.
+pub fn consistent() bool {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    return pages.consistent() and pages.free_count == free_pages;
+}
+
+/// Number of pages the bitmaps cover (the highest usable address).
+pub fn totalPages() usize {
+    return pages.total;
 }

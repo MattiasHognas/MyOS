@@ -9,6 +9,10 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+
+/// The user/kernel ABI shared with user programs: Linux's syscall numbers and error values.
+pub const abi = @import("abi/linux.zig");
+
 /// CPU-architecture specific code.
 pub const arch = struct {
     /// x86-64: descriptor tables, interrupts, paging, context switching and the syscall entry path.
@@ -31,9 +35,6 @@ pub const arch = struct {
 pub const boot = struct {
     pub const limine = @import("boot/limine.zig");
 };
-
-/// The user/kernel ABI shared with user programs: Linux's syscall numbers and error values.
-pub const abi = @import("abi/linux.zig");
 
 /// Hardware device drivers.
 pub const drivers = struct {
@@ -302,7 +303,7 @@ fn kmainOnStack() callconv(.c) noreturn {
     if (comptime build_options.is_test) @import("kernel_tests").run();
 
     keyboard.init();
-    _ = process.spawnPath("/bin/sh", null) catch |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
+    _ = process.spawnPath("/bin/sh", .{}) catch |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
     print("Boot complete.\n", .{});
     if (thread.recordStackUsage()) |bytes| log.debug("boot used {d} of {d} bytes of kernel stack", .{ bytes, kstack.STACK_SIZE });
     idle();

@@ -3,7 +3,6 @@
 //! (exit code 255). Exits with 0 if the read somehow succeeds.
 
 const lib = @import("lib");
-
 pub const panic = lib.panic;
 
 /// Program entry point.

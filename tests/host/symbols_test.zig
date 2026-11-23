@@ -2,6 +2,7 @@
 //! built in memory.
 
 const std = @import("std");
+
 const symbols = @import("symbols");
 
 /// A symbol to place in a fake image.

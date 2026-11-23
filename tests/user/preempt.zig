@@ -7,11 +7,10 @@
 //! first failing check.
 
 const lib = @import("lib");
-const checked = @import("checked.zig");
-
 pub const panic = lib.panic;
-
 const Sys = lib.Sys;
+
+const checked = @import("checked.zig");
 
 /// Bytes to read in total before the program is done.
 const TARGET_BYTES = 3 * 1024 * 1024;

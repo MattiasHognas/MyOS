@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features_sub = sub,
         .cpu_features_add = add,
     });
+
     // User programs use SSE2, like every x86-64 program built for Linux; the
     // kernel saves and restores their registers (src/arch/x86_64/fpu.zig).
     const user_target = b.resolveTargetQuery(.{
@@ -83,7 +84,7 @@ pub fn build(b: *std.Build) void {
         "syscalls",   "kernel_read", "privileged", "write_text",     "user_pointers",
         "entry_regs", "umip",        "div_zero",   "invalid_opcode", "syscall_abi",
         "preempt",    "gs_base",     "fpu",        "fpu_clean",      "fuzz",
-        "bad_return", "single_step",
+        "bad_return", "single_step", "recurse",    "open_count",     "run_many",
     }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, user_target, optimize);
         exe.root_module.addImport("lib", user_lib);
@@ -203,6 +204,7 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "abi", "src/abi/linux.zig" },
         .{ "sysret", "src/arch/x86_64/sysret.zig" },
         .{ "fpu", "src/arch/x86_64/fpu.zig" },
+        .{ "page_bitmap", "src/kernel/page_bitmap.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),

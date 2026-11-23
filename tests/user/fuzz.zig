@@ -16,11 +16,11 @@
 //! Exits with 0 after the last call; the kernel test fails on anything else.
 
 const std = @import("std");
+
 const lib = @import("lib");
-
 pub const panic = lib.panic;
-
 const Sys = lib.Sys;
+
 const ITERATIONS = 20_000;
 const SEED: u64 = 0x4D79_4F53_2D66_757A; // "MyOS-fuz"
 

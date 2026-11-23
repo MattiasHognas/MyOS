@@ -8,11 +8,10 @@
 //! partly mapped and read-only buffers are tested by `/test/user_pointers`.
 
 const lib = @import("lib");
-
 pub const panic = lib.panic;
-
 const Sys = lib.Sys;
 const err = lib.err;
+
 /// An address in the kernel half; user buffers must never point here.
 const KERNEL_PTR: u64 = 0xFFFF_FFFF_8000_0000;
 /// The last 16 bytes below the end of the user half.

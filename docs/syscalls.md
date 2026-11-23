@@ -53,10 +53,11 @@ no `errno` variable in the kernel ABI; a libc builds one from this.
 | `ENOENT` | 2 | No file at the path; empty path |
 | `ENOEXEC` | 8 | `myos_run`: the file is not a program MyOS can load |
 | `EBADF` | 9 | Descriptor not open, or not open for this use |
-| `ENOMEM` | 12 | Out of memory |
+| `EAGAIN` | 11 | `myos_run`: the caller, or a process above it, has as many descendants as it may |
+| `ENOMEM` | 12 | Out of memory; `myos_run`: the program is larger than the memory limit |
 | `EFAULT` | 14 | A pointer is outside user space, not mapped, or (for output) not writable |
 | `EINVAL` | 22 | Invalid argument (reserved; no call returns it yet) |
-| `EMFILE` | 24 | The process's descriptor table is full |
+| `EMFILE` | 24 | The process has as many descriptors as its limit allows |
 | `EROFS` | 30 | Opening for writing, or creating: every filesystem is read-only |
 | `ENAMETOOLONG` | 36 | Path longer than 255 bytes |
 | `ENOSYS` | 38 | Unknown syscall number |
@@ -98,6 +99,12 @@ Every other number returns `ENOSYS`.
   so 13 files can be open at once. `open` returns the lowest free one from 3
   up. Descriptors are not inherited by programs started with `myos_run`.
 - **Counts** above `0x7ffff000` are shortened to that, as on Linux.
+- **Limits.** Every process has limits, inherited from the process that
+  started it: 256 MiB of memory for its program and stack, 16 descriptors,
+  and 1024 processes alive below it. There are no calls to read or change
+  them yet (`getrlimit`, `prlimit`).
+- **Running out of memory** fails the call that needed it with `ENOMEM`.
+  Nothing is killed to make room.
 - **A process the kernel kills** (a fault in ring 3) ends with status 255.
   There are no signals yet (milestone 8).
 

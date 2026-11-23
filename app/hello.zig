@@ -1,7 +1,6 @@
 //! `/bin/hello`: print a greeting and the contents of `/etc/motd`.
 
 const lib = @import("lib.zig");
-
 pub const panic = lib.panic;
 
 /// Program entry point. Exits with 0 on success, or 1 if `/etc/motd` can't be opened.

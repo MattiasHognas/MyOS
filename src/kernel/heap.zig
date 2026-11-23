@@ -13,12 +13,13 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const assert = @import("debug/assert.zig");
-const log = std.log.scoped(.heap);
-const pmm = @import("../kernel/pmm.zig");
-const vmm = @import("../arch/x86_64/vmm.zig");
-const cpu = @import("../arch/x86_64/cpu.zig");
 
+const cpu = @import("../arch/x86_64/cpu.zig");
+const vmm = @import("../arch/x86_64/vmm.zig");
+const pmm = @import("../kernel/pmm.zig");
+const assert = @import("debug/assert.zig");
+
+const log = std.log.scoped(.heap);
 // Below this: HHDM (covers up to 16 TiB of RAM). Above: kernel image.
 const HEAP_START: usize = 0xFFFF_9000_0000_0000;
 const HEAP_MAX: usize = 1 << 30; // 1 GiB of virtual space
@@ -124,7 +125,10 @@ fn grow(min_bytes: usize) bool {
     var got: usize = 0;
     while (got < want) : (got += pmm.PAGE_SIZE) {
         const phys = pmm.alloc() orelse break;
-        vmm.map(vmm.kernel_root, heap_end + got, phys, vmm.WRITABLE | vmm.NX, false);
+        vmm.map(vmm.kernel_root, heap_end + got, phys, vmm.WRITABLE | vmm.NX, false) catch {
+            pmm.free(phys); // no page table for it: stop here
+            break;
+        };
     }
     if (got == 0) return false;
     heap_end += got;

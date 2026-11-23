@@ -4,10 +4,24 @@
 //! (HHDM) of all physical memory in 2 MiB pages, the kernel image with
 //! per-section permissions, and an MMIO window for device registers. Every
 //! user address space shares the kernel half (entries 256-511) of that PML4.
+//!
+//! Rules the rest of the kernel relies on:
+//!
+//! - `map` never replaces a mapping. Mapping over a page that is already
+//!   mapped is `error.AlreadyMapped`, so no page can be lost by being
+//!   overwritten; to change a mapping, `unmap` it first.
+//! - `map` either succeeds or changes nothing. When memory runs out while
+//!   it builds page tables, the tables it had already added are removed
+//!   again and it returns `error.OutOfMemory`.
+//! - `unmap` flushes the page from this CPU's TLB and gives page tables that
+//!   became empty back to the PMM.
+//! - Running out of memory is an error to the caller, never a panic, once
+//!   boot is over.
 
 const limine = @import("../../boot/limine.zig");
-const pmm = @import("../../kernel/pmm.zig");
 const assert = @import("../../kernel/debug/assert.zig");
+const panicFmt = @import("../../kernel/debug/panic.zig").panicFmt;
+const pmm = @import("../../kernel/pmm.zig");
 
 /// Page table entry flag: the mapping is valid.
 pub const PRESENT: u64 = 1 << 0;
@@ -53,22 +67,32 @@ fn table(phys: u64) *[512]u64 {
     return @ptrCast(@alignCast(pmm.physToVirt(phys)));
 }
 
+/// Ways `map` can fail. Nothing has changed when it does.
+pub const MapError = error{
+    /// No physical page for a page table.
+    OutOfMemory,
+    /// The address is already mapped (by a page of either size).
+    AlreadyMapped,
+};
+
 /// Allocate and zero a page for a new page table. Returns its physical address.
-/// Panics if physical memory is exhausted.
-fn allocTable() u64 {
-    const p = pmm.alloc() orelse @panic("vmm: out of memory");
+fn allocTable() error{OutOfMemory}!u64 {
+    const p = pmm.alloc() orelse return error.OutOfMemory;
     @memset(pmm.physToVirt(p)[0..pmm.PAGE_SIZE], 0);
     return p;
 }
 
-/// Follow `entry` to the next-level table, creating it if it is missing.
-/// Returns the physical address of that table.
-///
-/// Intermediate entries are permissive (writable, user); the final entry
-/// decides the actual access rights.
-fn next(entry: *u64) u64 {
-    if (entry.* & PRESENT == 0) entry.* = allocTable() | PRESENT | WRITABLE | USER;
-    return entry.* & ADDR_MASK;
+/// Index into the table of `level` (3 = PML4 ... 0 = PT) for `virt`.
+fn index(virt: u64, level: u6) usize {
+    return @intCast((virt >> (12 + 9 * level)) & 0x1FF);
+}
+
+/// True if no entry of `t` is present.
+fn isEmpty(t: *const [512]u64) bool {
+    for (t) |e| {
+        if (e & PRESENT != 0) return false;
+    }
+    return true;
 }
 
 /// Recursively free the page table at `phys`, every table below it and every
@@ -88,7 +112,8 @@ fn freeTable(phys: u64, level: u6) void {
 fn mapKernelRange(start: *const u8, end: *const u8, flags: u64, k: *const limine.KernelAddressResponse) void {
     var v = @intFromPtr(start);
     while (v < @intFromPtr(end)) : (v += pmm.PAGE_SIZE) {
-        map(kernel_root, v, v - k.virtual_base + k.physical_base, flags, false);
+        map(kernel_root, v, v - k.virtual_base + k.physical_base, flags, false) catch |e|
+            panicFmt("vmm: cannot map the kernel image at 0x{x}: {s}", .{ v, @errorName(e) });
     }
 }
 
@@ -116,41 +141,82 @@ fn wrmsr(msr: u32, val: u64) void {
 /// Map one page at `virt` to `phys` in the address space whose PML4 is `root`.
 ///
 /// Maps a 4 KiB page, or a 2 MiB page if `huge` (both addresses must then be
-/// 2 MiB aligned). Missing intermediate tables are allocated. `PRESENT` is
-/// always added to `flags`. Any existing mapping is overwritten; the TLB is
-/// not flushed.
-pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) void {
+/// 2 MiB aligned). Missing intermediate tables are allocated; their entries
+/// are permissive (writable, user), and the final entry decides the actual
+/// access rights. `PRESENT` is always added to `flags`.
+///
+/// Fails with `error.AlreadyMapped` if `virt` is mapped already, and with
+/// `error.OutOfMemory` if a page table cannot be allocated. Either way the
+/// address space is exactly as it was: tables added on the way are freed.
+/// No TLB flush is needed, since the address was not mapped before.
+pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) MapError!void {
     const align_mask: u64 = if (huge) MIB2 - 1 else pmm.PAGE_SIZE - 1;
     assert.check(.vmm, virt & align_mask == 0 and phys & align_mask == 0, "misaligned mapping 0x{x} -> 0x{x}", .{ virt, phys });
     const last: u6 = if (huge) 1 else 0;
+
+    // Entries this call filled in with new tables, outermost first.
+    var created: [3]*u64 = undefined;
+    var created_len: usize = 0;
+    errdefer while (created_len > 0) {
+        created_len -= 1;
+        const entry = created[created_len];
+        pmm.free(entry.* & ADDR_MASK);
+        entry.* = 0;
+    };
+
     var t = table(root);
     var level: u6 = 3; // 3 = PML4, 2 = PDPT, 1 = PD, 0 = PT
     while (level > last) : (level -= 1) {
-        const idx: usize = @intCast((virt >> (12 + 9 * level)) & 0x1FF);
-        t = table(next(&t[idx]));
+        const entry = &t[index(virt, level)];
+        if (entry.* & PRESENT == 0) {
+            entry.* = (try allocTable()) | PRESENT | WRITABLE | USER;
+            created[created_len] = entry;
+            created_len += 1;
+        } else if (entry.* & HUGE != 0) return error.AlreadyMapped; // inside a 2 MiB page
+        t = table(entry.* & ADDR_MASK);
     }
-    const idx: usize = @intCast((virt >> (12 + 9 * last)) & 0x1FF);
-    t[idx] = (phys & ADDR_MASK) | flags | PRESENT | (if (huge) HUGE else 0);
+    const leaf = &t[index(virt, last)];
+    // For a 2 MiB page this also catches a page table of 4 KiB pages in its place.
+    if (leaf.* & PRESENT != 0) return error.AlreadyMapped;
+    leaf.* = (phys & ADDR_MASK) | flags | PRESENT | (if (huge) HUGE else 0);
 }
 
 /// Remove the 4 KiB mapping of `virt` from the address space whose PML4 is
 /// `root` and flush it from this CPU's TLB. Returns the physical address the
 /// page was mapped to (the caller decides whether to free it), or null if
-/// `virt` was not mapped by a 4 KiB page. Page tables are kept.
+/// `virt` was not mapped by a 4 KiB page.
+///
+/// Page tables left without any entry are freed, up to but not including
+/// the tables the kernel half of every address space shares (the ones the
+/// PML4 points at for kernel addresses). `invlpg` also drops the CPU's
+/// cached pointers to those tables.
 ///
 /// With several CPUs the other ones need a TLB shootdown too.
 pub fn unmap(root: u64, virt: u64) ?u64 {
-    var t = table(root);
+    // tables[level] is the table of that level on the way to `virt`.
+    var tables: [4]*[512]u64 = undefined;
+    tables[3] = table(root);
     var level: u6 = 3;
     while (level > 0) : (level -= 1) {
-        const e = t[@intCast((virt >> (12 + 9 * level)) & 0x1FF)];
+        const e = tables[level][index(virt, level)];
         if (e & PRESENT == 0 or e & HUGE != 0) return null;
-        t = table(e & ADDR_MASK);
+        tables[level - 1] = table(e & ADDR_MASK);
     }
-    const idx: usize = @intCast((virt >> 12) & 0x1FF);
-    const e = t[idx];
+    const leaf = &tables[0][index(virt, 0)];
+    const e = leaf.*;
     if (e & PRESENT == 0) return null;
-    t[idx] = 0;
+    leaf.* = 0;
+
+    // Free tables that are empty now: the PT, then the PD, then (for user
+    // addresses only) the PDPT.
+    const top: u6 = if (virt < USER_END) 3 else 2;
+    level = 0;
+    while (level < top and isEmpty(tables[level])) : (level += 1) {
+        const parent = &tables[level + 1][index(virt, level + 1)];
+        pmm.free(parent.* & ADDR_MASK);
+        parent.* = 0;
+    }
+
     asm volatile ("invlpg (%[v])"
         :
         : [v] "r" (virt),
@@ -185,8 +251,9 @@ pub fn translate(root: u64, virt: u64) ?u64 {
 ///
 /// The user half starts empty; the kernel half points at the same tables as
 /// `kernel_root`, so kernel mappings are shared with every address space.
-pub fn createAddressSpace() u64 {
-    const root = allocTable();
+/// Fails with `error.OutOfMemory` if there is no page for the PML4.
+pub fn createAddressSpace() error{OutOfMemory}!u64 {
+    const root = try allocTable();
     @memcpy(table(root)[256..512], table(kernel_root)[256..512]);
     return root;
 }
@@ -215,13 +282,15 @@ pub fn destroyAddressSpace(root: u64) void {
 ///
 /// Returns the virtual address corresponding to `phys` (which need not be page
 /// aligned). Each call takes fresh virtual space; mappings are never removed.
+/// For drivers during boot: panics if a page table cannot be allocated.
 pub fn mapMmio(phys: u64, size: usize) usize {
     const base = phys & ~@as(u64, 0xFFF);
     const end = (phys + size + 0xFFF) & ~@as(u64, 0xFFF);
     const virt = mmio_next;
     var p = base;
     while (p < end) : (p += pmm.PAGE_SIZE) {
-        map(kernel_root, virt + (p - base), p, WRITABLE | NX | PCD | PWT, false);
+        map(kernel_root, virt + (p - base), p, WRITABLE | NX | PCD | PWT, false) catch |e|
+            panicFmt("vmm: cannot map device memory at 0x{x}: {s}", .{ p, @errorName(e) });
     }
     mmio_next += end - base;
     return virt + (phys - base);
@@ -233,20 +302,25 @@ pub fn mapMmio(phys: u64, size: usize) usize {
 /// spaces can share them), maps every memory map region into the HHDM at
 /// offset `hhdm` with 2 MiB pages, maps the kernel's text, rodata and data
 /// sections with their own permissions, and finally loads the new PML4.
-/// Requires `pmm.init` to have run.
+/// Requires `pmm.init` to have run. Panics if memory runs out: there is
+/// nothing to fall back to this early.
 pub fn init(mm: *const limine.MemmapResponse, k: *const limine.KernelAddressResponse, hhdm: u64) void {
     wrmsr(0xC0000080, rdmsr(0xC0000080) | (1 << 11)); // EFER.NXE: allow the NX bit
 
-    kernel_root = allocTable();
+    kernel_root = allocTable() catch @panic("vmm: no memory for the kernel page tables");
 
     const kh = table(kernel_root);
-    for (256..512) |i| kh[i] = allocTable() | PRESENT | WRITABLE;
+    for (256..512) |i| kh[i] = (allocTable() catch @panic("vmm: no memory for the kernel page tables")) | PRESENT | WRITABLE;
 
     // 1. HHDM: every memory map region, in 2 MiB pages.
     for (mm.entries[0..mm.entry_count]) |e| {
         var p = e.base & ~(MIB2 - 1);
         const end = (e.base + e.length + MIB2 - 1) & ~(MIB2 - 1);
-        while (p < end) : (p += MIB2) map(kernel_root, hhdm + p, p, WRITABLE | NX, true);
+        // Two regions can share a 2 MiB page; the second finds it mapped.
+        while (p < end) : (p += MIB2) map(kernel_root, hhdm + p, p, WRITABLE | NX, true) catch |err| switch (err) {
+            error.AlreadyMapped => {},
+            error.OutOfMemory => @panic("vmm: no memory for the kernel page tables"),
+        };
     }
 
     // 2. Kernel sections, each with its own permissions.

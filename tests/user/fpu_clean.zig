@@ -10,10 +10,11 @@
 //! registers; 4 XMM registers; 5 upper halves of the YMM registers.
 
 const std = @import("std");
-const lib = @import("lib");
-const regs = @import("fpu_regs.zig");
 
+const lib = @import("lib");
 pub const panic = lib.panic;
+
+const regs = @import("fpu_regs.zig");
 
 /// The 512-byte FXSAVE image taken at entry.
 export var fx_area: [512]u8 align(64) = undefined;

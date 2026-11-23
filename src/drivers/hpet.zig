@@ -4,8 +4,9 @@
 //! timeouts and for calibrating the LAPIC timer.
 
 const std = @import("std");
-const acpi = @import("../firmware/acpi.zig");
+
 const vmm = @import("../arch/x86_64/vmm.zig");
+const acpi = @import("../firmware/acpi.zig");
 
 var base: usize = 0;
 var period_fs: u64 = 0; // femtoseconds per counter tick

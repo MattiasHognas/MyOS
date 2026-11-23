@@ -1,6 +1,7 @@
 //! Host unit tests for `src/kernel/vfs.zig`, using an in-memory fake filesystem.
 
 const std = @import("std");
+
 const vfs = @import("vfs");
 
 /// Fake filesystem with a single file, `/hello`, that records how it is called.

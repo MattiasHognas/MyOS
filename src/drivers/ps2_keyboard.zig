@@ -5,10 +5,11 @@
 //! single-producer/single-consumer ring buffer read by `getChar`.
 
 const std = @import("std");
+const root = @import("root");
+
+const apic = @import("../arch/x86_64/apic.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
-const apic = @import("../arch/x86_64/apic.zig");
-const root = @import("root");
 const thread = @import("../kernel/thread.zig");
 
 // Scancode set 1, US layout, indexed by scancode 0x00-0x39. 0 = no character.

@@ -26,12 +26,15 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const log = std.log.scoped(.kstack);
-const pmm = @import("pmm.zig");
-const vmm = @import("../arch/x86_64/vmm.zig");
-const cpu = @import("../arch/x86_64/cpu.zig");
-const assert = @import("debug/assert.zig");
+/// True if stack usage is measured (`-Dstack-usage`).
+pub const track_usage = build_options.stack_usage;
 
+const cpu = @import("../arch/x86_64/cpu.zig");
+const vmm = @import("../arch/x86_64/vmm.zig");
+const assert = @import("debug/assert.zig");
+const pmm = @import("pmm.zig");
+
+const log = std.log.scoped(.kstack);
 /// Pages in one kernel stack.
 pub const STACK_PAGES = 4;
 /// Size of one kernel stack in bytes.
@@ -42,8 +45,6 @@ pub const REGION_START: usize = 0xFFFF_C000_0000_0000;
 /// Maximum number of kernel stacks, and so of threads.
 pub const MAX_STACKS = 4096;
 
-/// True if stack usage is measured (`-Dstack-usage`).
-pub const track_usage = build_options.stack_usage;
 /// `record` warns when a stack was used beyond this many bytes (three quarters).
 pub const WARN_BYTES = STACK_SIZE / 4 * 3;
 /// What every word of a fresh stack holds when usage is measured.
@@ -81,6 +82,15 @@ fn setSlotFree(slot: usize, is_free: bool) void {
     if (is_free) free_slots[slot / 64] |= bit else free_slots[slot / 64] &= ~bit;
 }
 
+/// Unmap and free the first `count` pages of the stack starting at `low`.
+fn unmapPages(low: usize, count: usize) void {
+    for (0..count) |i| {
+        const phys = vmm.unmap(vmm.kernel_root, low + i * pmm.PAGE_SIZE) orelse
+            @panic("kstack: stack page not mapped");
+        pmm.free(phys);
+    }
+}
+
 /// Allocate a kernel stack: reserve a slot and map fresh pages (writable,
 /// not executable) above its guard page. Returns the stack's memory; the
 /// initial stack pointer is its end. The contents are not zeroed. Returns
@@ -93,10 +103,14 @@ pub fn alloc() ?[]u8 {
     const low = REGION_START + slot * SLOT_SIZE + pmm.PAGE_SIZE;
     for (0..STACK_PAGES) |i| {
         const phys = pmm.alloc() orelse {
-            for (0..i) |j| pmm.free(vmm.unmap(vmm.kernel_root, low + j * pmm.PAGE_SIZE).?);
+            unmapPages(low, i);
             return null;
         };
-        vmm.map(vmm.kernel_root, low + i * pmm.PAGE_SIZE, phys, vmm.WRITABLE | vmm.NX, false);
+        vmm.map(vmm.kernel_root, low + i * pmm.PAGE_SIZE, phys, vmm.WRITABLE | vmm.NX, false) catch {
+            pmm.free(phys); // no page table for it
+            unmapPages(low, i);
+            return null;
+        };
     }
     setSlotFree(slot, false);
     if (track_usage) @memset(@as([*]u64, @ptrFromInt(low))[0 .. STACK_SIZE / 8], FILL);
@@ -144,11 +158,7 @@ pub fn free(stack: []u8) void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     assert.check(.kstack, !slotFree(slot), "double free of kernel stack 0x{x}", .{low});
-    for (0..STACK_PAGES) |i| {
-        const phys = vmm.unmap(vmm.kernel_root, low + i * pmm.PAGE_SIZE) orelse
-            @panic("kstack: stack page not mapped");
-        pmm.free(phys);
-    }
+    unmapPages(low, STACK_PAGES);
     setSlotFree(slot, true);
 }
 

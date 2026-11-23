@@ -12,4 +12,5 @@ test {
     std.testing.refAllDecls(@import("abi_test.zig"));
     std.testing.refAllDecls(@import("sysret_test.zig"));
     std.testing.refAllDecls(@import("fpu_test.zig"));
+    std.testing.refAllDecls(@import("page_bitmap_test.zig"));
 }

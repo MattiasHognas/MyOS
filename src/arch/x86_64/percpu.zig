@@ -12,6 +12,7 @@
 //! scheduler's per-CPU variables here.
 
 const std = @import("std");
+
 const cpu = @import("cpu.zig");
 
 /// MSR holding the active GS base.

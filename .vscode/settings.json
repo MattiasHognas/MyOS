@@ -1,6 +1,30 @@
 {
   "zig.zls.enabled": "on",
   "zig.zls.path": "zls",
+  "[zig]": {
+    // Formatting with ZLS matches `zig fmt`.
+    "editor.formatOnSave": true,
+
+    "editor.inlayHints.enabled": "on",
+
+    // overwrite words when accepting completions
+    "editor.suggest.insertMode": "replace",
+    "editor.codeActionsOnSave": {
+      // Run code actions that currently supports adding and removing discards.
+      "source.fixAll": "explicit",
+      
+      // Run code actions that sorts @import declarations.
+      "source.organizeImports": "explicit",
+    }
+  },
+  "editor.semanticTokenColorCustomizations": {
+    "rules": {
+      "*.deprecated": {
+        // highlight semantic tokens that are marked as "deprecated"
+        "strikethrough": true
+      }
+    }
+  },
   "zig.initialSetupDone": true,
   "zig.testArgs": [
     "build",

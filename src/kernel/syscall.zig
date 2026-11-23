@@ -54,7 +54,9 @@ fn userPath(buf: *[abi.PATH_MAX]u8, ptr: u64) union(enum) { path: []const u8, fa
 /// `myos_run`: spawn the program at the user path `ptr` as a child process
 /// and block until it exits. Returns the child's exit status (0-255), or an
 /// error: those of `userPath`, `ENOENT` (no such file), `ENOEXEC` (not a
-/// loadable program) or `ENOMEM`.
+/// loadable program), `ENOMEM` (no memory, or the program is larger than
+/// the caller's memory limit) or `EAGAIN` (the caller, or a process above
+/// it, has as many descendants as it may).
 fn sysRun(ptr: u64) u64 {
     var path_buf: [abi.PATH_MAX]u8 = undefined;
     const path = switch (userPath(&path_buf, ptr)) {
@@ -62,9 +64,10 @@ fn sysRun(ptr: u64) u64 {
         .fail => |e| return e,
     };
     const me = thread.current();
-    _ = proc.spawnPath(path, me) catch |e| return switch (e) {
+    _ = proc.spawnPath(path, .{ .waiter = me, .parent = me.process }) catch |e| return switch (e) {
         error.FileNotFound => err(.NOENT),
-        error.OutOfMemory => err(.NOMEM),
+        error.OutOfMemory, error.TooLarge => err(.NOMEM),
+        error.TooManyProcesses => err(.AGAIN),
         else => err(.NOEXEC), // unreadable, or refused by the ELF loader
     };
     const flags = cpu.saveAndDisableInterrupts();
@@ -105,7 +108,8 @@ fn fileOf(fd: u64) ?*vfs.OpenFile {
 /// lowest free descriptor from 3 up. `flags` must ask for read-only access
 /// (`EROFS` otherwise: every filesystem is read-only); other flag bits and
 /// the mode are ignored. Returns the descriptor, or an error: those of
-/// `userPath`, `ENOENT`, `EMFILE` (descriptor table full) or `ENOMEM`.
+/// `userPath`, `ENOENT`, `EMFILE` (the process has as many descriptors as
+/// its limit allows) or `ENOMEM`.
 fn sysOpen(ptr: u64, flags: u64) u64 {
     var path_buf: [abi.PATH_MAX]u8 = undefined;
     const path = switch (userPath(&path_buf, ptr)) {
@@ -116,7 +120,9 @@ fn sysOpen(ptr: u64, flags: u64) u64 {
         return if (flags & abi.O.CREAT != 0) err(.ROFS) else err(.NOENT);
     if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ROFS);
     const p = thread.current().process orelse return err(.BADF);
-    for (p.files[FIRST_FILE_FD..], FIRST_FILE_FD..) |*slot, fd| {
+    const max_files = @min(p.files.len, p.limits.max_files);
+    if (max_files <= FIRST_FILE_FD) return err(.MFILE);
+    for (p.files[FIRST_FILE_FD..max_files], FIRST_FILE_FD..) |*slot, fd| {
         if (slot.* != null) continue;
         const of = heap.allocator.create(vfs.OpenFile) catch return err(.NOMEM);
         of.* = .{ .node = node };

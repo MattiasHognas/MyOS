@@ -4,7 +4,9 @@
 //! records up to 64 devices at boot; drivers then look them up with `find`.
 
 const std = @import("std");
+
 const cpu = @import("../arch/x86_64/cpu.zig");
+
 const log = std.log.scoped(.pci);
 
 var devices: [64]Device = undefined;

@@ -15,9 +15,9 @@
 //! Exit status 255 is the pass; anything else is the failing step.
 
 const lib = @import("lib");
-const checked = @import("checked.zig");
-
 pub const panic = lib.panic;
+
+const checked = @import("checked.zig");
 
 /// Test-only syscall numbers; must match `tests/kernel/helpers.zig`.
 const VIA_IRET = lib.Sys.PRIVATE_BASE + 0x100;

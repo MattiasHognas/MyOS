@@ -1,6 +1,7 @@
 //! Host unit tests for `src/kernel/debug/log_format.zig`.
 
 const std = @import("std");
+
 const log_format = @import("log_format");
 
 test "log format: level and scope prefix" {

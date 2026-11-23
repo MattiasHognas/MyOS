@@ -28,6 +28,13 @@ const fpu = kernel_root.arch.x86_64.fpu;
 const apic = kernel_root.arch.x86_64.apic;
 const arch_syscall = kernel_root.arch.x86_64.syscall;
 const abi = kernel_root.abi;
+/// Where program images may be loaded and how large they may be.
+pub const image_limits = process.image_limits;
+/// The limits a process gets by default.
+pub const Limits = process.Limits;
+/// Bytes in a kernel stack, and the usage above which the run should fail.
+pub const STACK_SIZE = kstack.STACK_SIZE;
+pub const STACK_WARN_BYTES = kstack.WARN_BYTES;
 
 /// Result of loading an ELF image for inspection (see `elfProbe`).
 pub const ElfProbe = struct {
@@ -36,9 +43,6 @@ pub const ElfProbe = struct {
     /// Leaf page-table entry mapping the probed address, or 0 if unmapped.
     pte: u64,
 };
-
-/// Where program images may be loaded and how large they may be.
-pub const image_limits = process.image_limits;
 
 /// Return the number of free physical pages.
 pub fn freePages() usize {
@@ -104,7 +108,7 @@ pub fn heapRoundtrip() bool {
 pub fn addressSpaceRoundtrip() bool {
     const before = pmm.free_pages;
     const address_space =
-        vmm.createAddressSpace();
+        vmm.createAddressSpace() catch return false;
 
     if (pmm.free_pages + 1 != before) {
         vmm.destroyAddressSpace(address_space);
@@ -121,9 +125,9 @@ pub fn addressSpaceRoundtrip() bool {
 /// Bytes at `addr` (up to the end of that page) into `out`. Returns null if
 /// Loading fails. The address space is always destroyed again.
 pub fn elfProbe(image: []const u8, addr: u64, out: []u8) ?ElfProbe {
-    const root = vmm.createAddressSpace();
+    const root = vmm.createAddressSpace() catch return null;
     defer vmm.destroyAddressSpace(root);
-    const entry = elf.load(root, image, process.image_limits) catch return null;
+    const entry = (elf.load(root, image, process.image_limits) catch return null).entry;
     const pte = vmm.leafEntry(root, addr) orelse 0;
     if (vmm.translate(root, addr)) |phys| {
         const n = @min(out.len, pmm.PAGE_SIZE - (addr % pmm.PAGE_SIZE));
@@ -135,7 +139,7 @@ pub fn elfProbe(image: []const u8, addr: u64, out: []u8) ?ElfProbe {
 /// Load the ELF `image` into a fresh address space, destroy it again and
 /// return the loader's error, or null if the image loaded.
 pub fn elfLoadError(image: []const u8) ?elf.Error {
-    const root = vmm.createAddressSpace();
+    const root = vmm.createAddressSpace() catch return error.OutOfMemory;
     defer vmm.destroyAddressSpace(root);
     _ = elf.load(root, image, process.image_limits) catch |e| return e;
     return null;
@@ -155,7 +159,7 @@ pub fn elfProbePath(path: []const u8, addr: u64, out: []u8) ?ElfProbe {
 pub fn spawnFailsCleanly(image: []const u8) bool {
     const pages = pmm.free_pages;
     const in_use = heap.stats().bytes_in_use;
-    _ = process.spawn("bad", image, null) catch
+    _ = process.spawn("bad", image, .{}) catch
         return pmm.free_pages == pages and heap.stats().bytes_in_use == in_use;
     return false; // it started; the test fails (the process runs on its own)
 }
@@ -164,12 +168,25 @@ pub fn spawnFailsCleanly(image: []const u8) bool {
 /// Thread and wait for it. Returns its exit code (255 if it was killed by a
 /// Fault), or null if it could not be started.
 pub fn runProgram(path: []const u8) ?u64 {
+    return runProgramLimited(path, .{});
+}
+
+/// `runProgram` with `limits` on the new process (and, by inheritance, on
+/// everything it starts).
+pub fn runProgramLimited(path: []const u8, limits: Limits) ?u64 {
     const me = thread.current();
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
-    _ = process.spawnPath(path, me) catch return null;
+    _ = process.spawnPath(path, .{ .waiter = me, .limits = limits }) catch return null;
     thread.block(); // until the child calls process.exit
     return me.wake_value;
+}
+
+/// Try to start the program at `path` with `limits` and return the error
+/// that stopped it. Null means it started (and now runs on its own).
+pub fn spawnError(path: []const u8, limits: Limits) ?anyerror {
+    _ = process.spawnPath(path, .{ .limits = limits }) catch |e| return e;
+    return null;
 }
 
 /// Bytes currently allocated from the kernel heap.
@@ -279,13 +296,13 @@ pub noinline fn captureBacktrace(out: []u64) usize {
 /// That no physical pages leaked.
 pub fn vmmMapTranslate() bool {
     const before = pmm.free_pages;
-    const root = vmm.createAddressSpace();
+    const root = vmm.createAddressSpace() catch return false;
     const virt: u64 = 0x40_0000;
     const phys = pmm.alloc() orelse {
         vmm.destroyAddressSpace(root);
         return false;
     };
-    vmm.map(root, virt, phys, vmm.USER | vmm.WRITABLE, false);
+    vmm.map(root, virt, phys, vmm.USER | vmm.WRITABLE, false) catch return false;
     const ok = vmm.translate(root, virt) == phys and
         vmm.translate(root, virt + 0x123) == phys + 0x123 and
         vmm.translate(root, virt + pmm.PAGE_SIZE) == null and
@@ -322,7 +339,10 @@ pub const USER_PAGE: u64 = 0x40_0000;
 fn mapUserPage(root: u64, virt: u64, flags: u64) ?u64 {
     const phys = pmm.alloc() orelse return null;
     @memset(pmm.physToVirt(phys)[0..pmm.PAGE_SIZE], 0);
-    vmm.map(root, virt, phys, flags, false);
+    vmm.map(root, virt, phys, flags, false) catch {
+        pmm.free(phys);
+        return null;
+    };
     return phys;
 }
 
@@ -346,7 +366,7 @@ pub fn userCopyChecks() u32 {
     const flags = cpu.saveAndDisableInterrupts(); // no thread switch while the root is swapped
     defer cpu.restoreInterrupts(flags);
     const pages_before = pmm.free_pages;
-    const root = vmm.createAddressSpace();
+    const root = vmm.createAddressSpace() catch return 99;
     const rw = vmm.USER | vmm.WRITABLE | vmm.NX;
     const p0 = mapUserPage(root, 0x40_0000, rw);
     const p1 = mapUserPage(root, 0x40_1000, rw);
@@ -682,10 +702,6 @@ pub fn stackPeak() usize {
     return kstack.peak();
 }
 
-/// Bytes in a kernel stack, and the usage above which the run should fail.
-pub const STACK_SIZE = kstack.STACK_SIZE;
-pub const STACK_WARN_BYTES = kstack.WARN_BYTES;
-
 /// Recurse without end, using some stack in every call. `noinline` and the
 /// volatile buffer keep the optimizer from turning it into a loop.
 noinline fn recurseForever(depth: usize) usize {
@@ -783,7 +799,7 @@ pub fn pmmConcurrentStress() bool {
     _ = thread.spawn(pmmStressWorker, null) catch return false;
     _ = thread.spawn(pmmStressWorker, null) catch return false;
     while (pmm_stress_done < 2) thread.block();
-    return pmm_stress_errors == 0 and pmm.free_pages == before;
+    return pmm_stress_errors == 0 and pmm.free_pages == before and pmm.consistent();
 }
 
 /// For the `smap` and `smep` scenarios: switch to a new address space with
@@ -792,7 +808,7 @@ pub fn pmmConcurrentStress() bool {
 /// address space loaded. Returns false if memory ran out.
 pub fn enterUserPageSpace() bool {
     _ = cpu.saveAndDisableInterrupts();
-    const root = vmm.createAddressSpace();
+    const root = vmm.createAddressSpace() catch return false;
     const phys = mapUserPage(root, USER_PAGE, vmm.USER | vmm.WRITABLE) orelse return false;
     pmm.physToVirt(phys)[0] = 0xC3; // ret
     vmm.loadRoot(root);
@@ -1128,4 +1144,458 @@ pub fn debugTrapEntry() u32 {
     if (!onIstStack(gdt.IST_DEBUG, debug_probe_frame)) return 8;
     if (cpu.rdmsr(percpu.MSR_GS_BASE) != kernel_gs or cpu.rdmsr(percpu.MSR_KERNEL_GS_BASE) != 0) return 9;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Memory-management correctness (roadmap 2.6)
+
+/// Check that the physical allocator refuses every free that is not of an
+/// allocated page, and that a refusal changes nothing. Returns 0, or the
+/// number of the first failing check.
+pub fn pmmRejectsBadFrees() u32 {
+    const before = pmm.free_pages;
+    const page = pmm.alloc() orelse return 1;
+
+    // Not the start of a page.
+    if (pmm.tryFree(page + 1) != error.Misaligned) return 2;
+    if (pmm.tryFree(page + 0x800) != error.Misaligned) return 3;
+    if (pmm.tryFree(page + pmm.PAGE_SIZE - 1) != error.Misaligned) return 4;
+    // Beyond the memory the machine has.
+    const beyond = @as(u64, pmm.totalPages()) * pmm.PAGE_SIZE;
+    if (pmm.tryFree(beyond) != error.OutOfRange) return 5;
+    if (pmm.tryFree(0x0000_7FFF_FFFF_F000) != error.OutOfRange) return 6;
+    if (pmm.tryFree(0xFFFF_FFFF_FFFF_F000) != error.OutOfRange) return 7;
+    // Memory the allocator never hands out: page 0 and the legacy video
+    // hole, which is device memory on every PC.
+    if (pmm.tryFree(0) != error.NotManaged) return 8;
+    if (pmm.tryFree(0xA_0000) != error.NotManaged) return 9;
+    if (pmm.isAllocated(0) or pmm.isAllocated(0xA_0000)) return 10;
+    // All of that left the page allocated and the count alone.
+    if (!pmm.isAllocated(page) or pmm.free_pages != before - 1) return 11;
+
+    // The real free works once...
+    pmm.tryFree(page) catch return 12;
+    if (pmm.isAllocated(page) or pmm.free_pages != before) return 13;
+    // ...and only once.
+    if (pmm.tryFree(page) != error.NotAllocated) return 14;
+    if (pmm.free_pages != before) return 15;
+    // A page that was never handed out is not allocated either: the next
+    // allocation returns the lowest free page at or after the hint, so the
+    // page just freed comes back, and it is usable.
+    const again = pmm.alloc() orelse return 16;
+    pmm.free(again);
+    if (pmm.free_pages != before or !pmm.consistent()) return 17;
+    return 0;
+}
+
+// Pages taken by `drainMemory`, chained through their first word.
+var drained_head: u64 = 0;
+var drained_count: usize = 0;
+
+/// Allocate physical pages until only `leave` are free, and keep them until
+/// `releaseDrained`. Returns the number of free pages afterwards.
+pub fn drainMemory(leave: usize) usize {
+    while (pmm.free_pages > leave) {
+        const page = pmm.alloc() orelse break;
+        const link: *u64 = @ptrCast(@alignCast(pmm.physToVirt(page)));
+        link.* = drained_head;
+        drained_head = page;
+        drained_count += 1;
+    }
+    return pmm.free_pages;
+}
+
+/// Give `count` of the drained pages back (all of them if there are fewer).
+pub fn releaseSome(count: usize) void {
+    var n: usize = 0;
+    while (n < count and drained_head != 0) : (n += 1) {
+        const page = drained_head;
+        const link: *u64 = @ptrCast(@alignCast(pmm.physToVirt(page)));
+        drained_head = link.*;
+        drained_count -= 1;
+        pmm.free(page);
+    }
+}
+
+/// Give every drained page back.
+pub fn releaseDrained() void {
+    releaseSome(drained_count);
+}
+
+/// Everything the kernel holds on to, in one comparable value: memory that
+/// is neither free nor part of the heap's pool, heap bytes in use, and
+/// kernel stacks. The heap keeps pages it has grown by, so free pages alone
+/// go down the first time something large is allocated.
+pub const Footprint = struct {
+    pages: usize,
+    heap_bytes: usize,
+    stacks: usize,
+
+    pub fn eql(a: Footprint, b: Footprint) bool {
+        return a.pages == b.pages and a.heap_bytes == b.heap_bytes and a.stacks == b.stacks;
+    }
+};
+
+pub fn footprint() Footprint {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const h = heap.stats();
+    return .{
+        .pages = pmm.free_pages + h.bytes_mapped / pmm.PAGE_SIZE,
+        .heap_bytes = h.bytes_in_use,
+        .stacks = kstack.inUse(),
+    };
+}
+
+const VM_A: u64 = 0x40_0000;
+/// 2 MiB above `VM_A`: another page table under the same page directory.
+const VM_B: u64 = VM_A + 0x20_0000;
+/// In another PML4 slot: nothing shared with `VM_A` below the root.
+const VM_FAR: u64 = 0x7000_0000_0000;
+/// A kernel address nothing uses, in a PML4 slot of its own.
+const VM_KERNEL: u64 = 0xFFFF_B800_0000_0000;
+const USER_RW = vmm.USER | vmm.WRITABLE | vmm.NX;
+
+/// Check that `map` refuses to replace a mapping, of either page size, and
+/// leaves the existing one and the free-page count alone. Returns 0, or
+/// the number of the first failing check.
+pub fn vmmMapConflicts() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const start = pmm.free_pages;
+    const root = vmm.createAddressSpace() catch return 1;
+    const p1 = pmm.alloc() orelse return 2;
+    const p2 = pmm.alloc() orelse return 3;
+
+    vmm.map(root, VM_A, p1, USER_RW, false) catch return 4;
+    const pte = vmm.leafEntry(root, VM_A) orelse return 5;
+    const mapped = pmm.free_pages;
+    // A second mapping of the same address, with other flags or not.
+    if (vmm.map(root, VM_A, p2, USER_RW, false) != error.AlreadyMapped) return 6;
+    if (vmm.map(root, VM_A, p2, vmm.USER, false) != error.AlreadyMapped) return 7;
+    if (vmm.map(root, VM_A, p1, USER_RW, false) != error.AlreadyMapped) return 8;
+    if (vmm.leafEntry(root, VM_A) != pte or vmm.translate(root, VM_A) != p1) return 9;
+    if (pmm.free_pages != mapped) return 10;
+    // A 2 MiB page where a table of 4 KiB pages already is.
+    if (vmm.map(root, VM_A, 0x20_0000, USER_RW, true) != error.AlreadyMapped) return 11;
+    if (vmm.translate(root, VM_A) != p1 or pmm.free_pages != mapped) return 12;
+    // A 4 KiB page inside a 2 MiB page: the direct map of physical memory.
+    const hhdm_page = @intFromPtr(pmm.physToVirt(0x20_0000));
+    const hhdm_before = vmm.leafEntry(vmm.kernel_root, hhdm_page);
+    if (vmm.map(vmm.kernel_root, hhdm_page, p2, vmm.WRITABLE | vmm.NX, false) != error.AlreadyMapped) return 13;
+    if (vmm.leafEntry(vmm.kernel_root, hhdm_page) != hhdm_before or pmm.free_pages != mapped) return 14;
+    // The neighbouring page is free to map.
+    vmm.map(root, VM_A + pmm.PAGE_SIZE, p2, USER_RW, false) catch return 15;
+    if (vmm.translate(root, VM_A + pmm.PAGE_SIZE) != p2 or vmm.translate(root, VM_A) != p1) return 16;
+
+    vmm.destroyAddressSpace(root); // frees p1 and p2 with the tables
+    return if (pmm.free_pages == start and pmm.consistent()) 0 else 17;
+}
+
+/// Check `unmap`: the translation goes away, the page comes back to the
+/// caller, page tables that became empty are freed (and only those), and
+/// the shared kernel tables stay. Returns 0, or the number of the first
+/// failing check.
+pub fn vmmUnmap() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const start = pmm.free_pages;
+    const root = vmm.createAddressSpace() catch return 1;
+    const p1 = pmm.alloc() orelse return 2;
+    const p2 = pmm.alloc() orelse return 3;
+    const empty = pmm.free_pages; // an address space with nothing mapped
+
+    // One page: three tables appear, and all three go again.
+    if (vmm.unmap(root, VM_A) != null) return 4; // nothing there yet
+    vmm.map(root, VM_A, p1, USER_RW, false) catch return 5;
+    if (pmm.free_pages != empty - 3) return 6; // PDPT, PD, PT
+    if (vmm.unmap(root, VM_A) != p1) return 7;
+    if (vmm.translate(root, VM_A) != null or vmm.leafEntry(root, VM_A) != null) return 8;
+    if (pmm.free_pages != empty) return 9;
+    if (vmm.unmap(root, VM_A) != null) return 10; // a second unmap finds nothing
+    if (!pmm.isAllocated(p1)) return 11; // the page itself is the caller's to free
+
+    // Two pages in one page table: the table stays until both are gone.
+    vmm.map(root, VM_A, p1, USER_RW, false) catch return 12;
+    vmm.map(root, VM_A + pmm.PAGE_SIZE, p2, USER_RW, false) catch return 13;
+    if (pmm.free_pages != empty - 3) return 14;
+    if (vmm.unmap(root, VM_A) != p1 or pmm.free_pages != empty - 3) return 15;
+    if (vmm.translate(root, VM_A + pmm.PAGE_SIZE) != p2) return 16;
+    if (vmm.unmap(root, VM_A + pmm.PAGE_SIZE) != p2 or pmm.free_pages != empty) return 17;
+
+    // Two page tables under one page directory: only the empty one goes.
+    vmm.map(root, VM_A, p1, USER_RW, false) catch return 18;
+    vmm.map(root, VM_B, p2, USER_RW, false) catch return 19;
+    if (pmm.free_pages != empty - 4) return 20; // PDPT, PD, two PTs
+    if (vmm.unmap(root, VM_A) != p1 or pmm.free_pages != empty - 3) return 21;
+    if (vmm.translate(root, VM_B) != p2) return 22;
+    if (vmm.unmap(root, VM_B) != p2 or pmm.free_pages != empty) return 23;
+
+    // Kernel addresses: the table the PML4 points at is shared by every
+    // address space and must stay; the ones below it go.
+    const kernel_free = pmm.free_pages;
+    vmm.map(vmm.kernel_root, VM_KERNEL, p1, vmm.WRITABLE | vmm.NX, false) catch return 24;
+    if (pmm.free_pages != kernel_free - 2) return 25; // PD and PT only
+    if (vmm.translate(root, VM_KERNEL) != p1) return 26; // visible in every address space
+    if (vmm.unmap(vmm.kernel_root, VM_KERNEL) != p1 or pmm.free_pages != kernel_free) return 27;
+    if (vmm.translate(root, VM_KERNEL) != null) return 28;
+    vmm.map(vmm.kernel_root, VM_KERNEL, p1, vmm.WRITABLE | vmm.NX, false) catch return 29; // still usable
+    if (vmm.unmap(vmm.kernel_root, VM_KERNEL) != p1 or pmm.free_pages != kernel_free) return 30;
+
+    // Many rounds leave nothing behind.
+    for (0..2000) |round| {
+        const a = VM_A + (round % 7) * pmm.PAGE_SIZE;
+        vmm.map(root, a, p1, USER_RW, false) catch return 31;
+        vmm.map(root, VM_FAR, p2, USER_RW, false) catch return 32;
+        if (vmm.unmap(root, a) != p1 or vmm.unmap(root, VM_FAR) != p2) return 33;
+    }
+    if (pmm.free_pages != empty) return 34;
+
+    // Tearing down an address space frees pages and tables in every part of it.
+    vmm.map(root, VM_A, p1, USER_RW, false) catch return 35;
+    vmm.map(root, VM_FAR, p2, USER_RW, false) catch return 36;
+    if (pmm.free_pages != empty - 6) return 37;
+    vmm.destroyAddressSpace(root);
+    return if (pmm.free_pages == start and pmm.consistent()) 0 else 38;
+}
+
+/// The first byte at user address `addr`, read through the page tables
+/// (and so through the TLB), or null if the read faults.
+fn userByte(addr: u64) ?u8 {
+    var b: [1]u8 = undefined;
+    uaccess.copyFromUser(&b, addr) catch return null;
+    return b[0];
+}
+
+/// Check that `unmap` flushes the TLB: after a page has been read through
+/// its mapping (so the translation is cached), unmapping makes the next
+/// access fault, and mapping another page there shows that page's contents,
+/// never the old one's. Returns 0, or the number of the first failing check.
+pub fn vmmTlbFlush() u32 {
+    const flags = cpu.saveAndDisableInterrupts(); // no thread switch while the root is swapped
+    defer cpu.restoreInterrupts(flags);
+    const start = pmm.free_pages;
+    const root = vmm.createAddressSpace() catch return 1;
+    const p1 = pmm.alloc() orelse return 2;
+    const p2 = pmm.alloc() orelse return 3;
+    pmm.physToVirt(p1)[0] = 0x11;
+    pmm.physToVirt(p2)[0] = 0x22;
+    vmm.loadRoot(root);
+    defer vmm.loadRoot(vmm.kernel_root);
+
+    var failed: u32 = 0;
+    for (0..50) |_| {
+        vmm.map(root, VM_A, p1, USER_RW, false) catch return 4;
+        if (userByte(VM_A) != 0x11) failed = 5; // now cached in the TLB
+        if (vmm.unmap(root, VM_A) != p1) failed = 6;
+        if (userByte(VM_A) != null) failed = 7; // a stale entry would still read 0x11
+        vmm.map(root, VM_A, p2, USER_RW, false) catch return 8;
+        if (userByte(VM_A) != 0x22) failed = 9; // a stale entry would read 0x11
+        // A write goes to the new page too.
+        uaccess.copyToUser(VM_A, &.{0x33}) catch {
+            failed = 10;
+        };
+        if (pmm.physToVirt(p2)[0] != 0x33 or pmm.physToVirt(p1)[0] != 0x11) failed = 11;
+        pmm.physToVirt(p2)[0] = 0x22;
+        if (vmm.unmap(root, VM_A) != p2) failed = 12;
+        if (userByte(VM_A) != null) failed = 13;
+        if (failed != 0) break;
+    }
+    vmm.loadRoot(vmm.kernel_root);
+    pmm.free(p1);
+    pmm.free(p2);
+    vmm.destroyAddressSpace(root);
+    if (failed != 0) return failed;
+    return if (pmm.free_pages == start) 0 else 14;
+}
+
+/// Entry for the thread `memoryExhaustion` must not be able to start.
+fn neverRuns() void {}
+
+/// Check that running out of physical memory is an error everywhere and
+/// corrupts nothing: with no page left, and with too few for the page
+/// tables a mapping needs, `map` fails and leaves the address space as it
+/// was; address spaces, kernel stacks, heap blocks, threads and processes
+/// cannot be created and leave nothing behind. Returns 0, or the number of
+/// the first failing check.
+pub fn memoryExhaustion() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = footprint();
+    const root = vmm.createAddressSpace() catch return 1;
+    const p1 = pmm.alloc() orelse return 2;
+    const p2 = pmm.alloc() orelse return 3;
+    vmm.map(root, VM_A, p1, USER_RW, false) catch return 4;
+    const pte = vmm.leafEntry(root, VM_A);
+
+    var failed: u32 = 0;
+    check: {
+        if (drainMemory(0) != 0 or pmm.alloc() != null) {
+            failed = 5;
+            break :check;
+        }
+        // Next to an existing mapping only one table is missing; with no
+        // page free that fails as well.
+        if (vmm.map(root, VM_B, p2, USER_RW, false) != error.OutOfMemory) failed = 11;
+        // A mapping that needs three new tables, with 0, 1 and 2 pages
+        // free: never enough, and nothing may be left half-built.
+        for (0..3) |have| {
+            if (pmm.free_pages != have) failed = 6;
+            if (vmm.map(root, VM_FAR, p2, USER_RW, false) != error.OutOfMemory) failed = 7;
+            if (pmm.free_pages != have) failed = 8; // tables it had added were freed again
+            if (vmm.leafEntry(root, VM_FAR) != null) failed = 9;
+            if (vmm.leafEntry(root, VM_A) != pte) failed = 10; // the old mapping is intact
+            if (pmm.free_pages != have) failed = 12;
+            releaseSome(1);
+        }
+        // With 3 pages the same mapping works, and uses exactly those.
+        vmm.map(root, VM_FAR, p2, USER_RW, false) catch {
+            failed = 13;
+            break :check;
+        };
+        if (pmm.free_pages != 0 or vmm.translate(root, VM_FAR) != p2) failed = 14;
+        if (vmm.unmap(root, VM_FAR) != p2 or pmm.free_pages != 3) failed = 15;
+
+        // Everything else that allocates fails cleanly with nothing free.
+        if (drainMemory(0) != 0) failed = 16;
+        const stacks = kstack.inUse();
+        const in_use = heap.stats().bytes_in_use;
+        if (vmm.createAddressSpace()) |r| {
+            vmm.destroyAddressSpace(r);
+            failed = 17;
+        } else |_| {}
+        if (kstack.alloc() != null) failed = 18;
+        if (heap.allocator.alloc(u8, 64 * 1024 * 1024)) |block| {
+            heap.allocator.free(block);
+            failed = 19;
+        } else |_| {}
+        if (thread.spawn(neverRuns, null)) |_| {
+            failed = 20;
+        } else |_| {}
+        if (process.spawnPath("/bin/hello", .{})) |_| {
+            failed = 21;
+        } else |e| {
+            if (e != error.OutOfMemory) failed = 22;
+        }
+        if (kstack.inUse() != stacks or heap.stats().bytes_in_use != in_use) failed = 23;
+        if (pmm.free_pages != 0) failed = 24;
+        // One stack's worth short of a kernel stack: the pages it did get go back.
+        releaseSome(kstack.STACK_PAGES - 1);
+        if (kstack.alloc() != null or pmm.free_pages != kstack.STACK_PAGES - 1) failed = 25;
+        if (vmm.leafEntry(root, VM_A) != pte) failed = 26;
+    }
+    releaseDrained();
+    pmm.free(p2);
+    vmm.destroyAddressSpace(root);
+    if (failed != 0) return failed;
+    if (!pmm.consistent()) return 27;
+    return if (footprint().eql(before)) 0 else 28;
+}
+
+/// Start `/bin/hello` again and again, each time letting one more page
+/// allocation succeed before the allocator starts failing, until a start
+/// succeeds. Every failed start must report out-of-memory and leave nothing
+/// behind, whichever allocation it was that failed: a page table, a page of
+/// the program, the user stack, the kernel stack, heap growth. Returns 0,
+/// or the number of the first failing check; `failures.*` is the number of
+/// allocation points that were made to fail.
+pub fn spawnAllocationFailures(failures: *usize) u32 {
+    failures.* = 0;
+    const me = thread.current();
+    // Stands in for a parent process, to see what is counted against it.
+    var parent: process.Process = .{ .root = 0, .entry = 0, .name = "test parent" };
+    var n: usize = 0;
+    while (n < 2000) : (n += 1) {
+        const flags = cpu.saveAndDisableInterrupts();
+        const before = footprint();
+        pmm.fail_after = n;
+        const result = process.spawnPath("/bin/hello", .{ .waiter = me, .parent = &parent });
+        pmm.fail_after = null;
+        if (result) |_| {
+            const counted = parent.descendants;
+            thread.block(); // it started: let it run and finish
+            const code = me.wake_value;
+            cpu.restoreInterrupts(flags);
+            if (code != 0) return 1;
+            if (counted != 1 or parent.descendants != 0) return 6; // alive, then gone
+            return if (failures.* > 10) 0 else 2; // too few: the sweep tested nothing
+        } else |e| {
+            const after = footprint();
+            cpu.restoreInterrupts(flags);
+            if (e != error.OutOfMemory) return 3;
+            if (!after.eql(before)) return 4;
+            if (parent.descendants != 0) return 7; // a process that never started is not counted
+            failures.* += 1;
+        }
+    }
+    return 5; // it never succeeded
+}
+
+/// Allocate enough kernel stacks to need new page tables on the way, and
+/// before each one make every allocation inside `kstack.alloc` fail in
+/// turn: a failed attempt must give back the pages it had taken. Returns 0,
+/// or the number of the first failing check.
+pub fn kstackAllocationFailures() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = footprint();
+    const count = 220; // 5 pages per slot: at least two page-table boundaries
+    const stacks = heap.allocator.alloc(?[]u8, count) catch return 1;
+    @memset(stacks, null);
+
+    var failed: u32 = 0;
+    var needed_table = false;
+    for (stacks) |*slot| {
+        var n: usize = 0;
+        while (n < 8) : (n += 1) {
+            const pages = pmm.free_pages;
+            const in_use = kstack.inUse();
+            pmm.fail_after = n;
+            const stack = kstack.alloc();
+            pmm.fail_after = null;
+            if (stack) |s| {
+                if (n > kstack.STACK_PAGES) needed_table = true;
+                slot.* = s;
+                break;
+            }
+            if (pmm.free_pages != pages or kstack.inUse() != in_use) failed = 2;
+        }
+        if (slot.* == null) failed = 3;
+        if (failed != 0) break;
+    }
+    for (stacks) |slot| {
+        if (slot) |s| kstack.free(s);
+    }
+    heap.allocator.free(stacks); // before the footprint is compared
+    if (failed != 0) return failed;
+    if (!needed_table) return 4; // no attempt had to allocate a page table
+    return if (footprint().eql(before) and pmm.consistent()) 0 else 5;
+}
+
+/// Make the heap grow one page at a time across a page-table boundary, with
+/// the allocation of that page table failing: the page the heap had taken
+/// for the spot must go back to the PMM. Each attempt asks for far more
+/// than can be had while only one page allocation is allowed, so the heap
+/// keeps the single page it could map and the request fails. 600 attempts
+/// cover more than the 512 pages of one page table. Returns 0, or the
+/// number of the first failing check.
+pub fn heapGrowthFailures() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = footprint();
+    var stuck: usize = 0; // attempts that could not grow at all: a table was needed
+    for (0..600) |_| {
+        const mapped = heap.stats().bytes_mapped;
+        pmm.fail_after = 1;
+        const block = heap.allocator.alloc(u8, 512 * 1024 * 1024);
+        pmm.fail_after = null;
+        if (block) |b| {
+            heap.allocator.free(b);
+            return 1;
+        } else |_| {}
+        if (heap.stats().bytes_mapped == mapped) stuck += 1;
+    }
+    if (stuck == 0) return 2; // never reached a page-table boundary
+    // The heap kept what it mapped; nothing else is gone.
+    return if (footprint().eql(before) and pmm.consistent()) 0 else 3;
 }

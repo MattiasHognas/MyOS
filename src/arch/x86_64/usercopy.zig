@@ -18,8 +18,10 @@
 //! Callers go through `kernel/uaccess.zig`, which validates the range first.
 
 const std = @import("std");
-const cpu = @import("cpu.zig");
+
 const user_range = @import("../../kernel/user_range.zig");
+const cpu = @import("cpu.zig");
+
 const log = std.log.scoped(.usercopy);
 
 const CR0_WP: u64 = 1 << 16;

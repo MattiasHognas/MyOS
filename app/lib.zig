@@ -7,8 +7,8 @@
 //! with `isError`, compare with `err(.NOENT)`.
 
 const std = @import("std");
-pub const abi = @import("abi");
 
+pub const abi = @import("abi");
 pub const Sys = abi.Sys;
 pub const E = abi.E;
 pub const err = abi.err;

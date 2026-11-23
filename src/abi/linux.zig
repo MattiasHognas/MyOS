@@ -42,6 +42,8 @@ pub const E = enum(u16) {
     NOEXEC = 8,
     /// Bad file descriptor.
     BADF = 9,
+    /// Resource temporarily unavailable: a limit on processes was reached.
+    AGAIN = 11,
     /// Out of memory.
     NOMEM = 12,
     /// Bad address: a pointer argument is outside user space or not mapped.

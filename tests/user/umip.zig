@@ -4,7 +4,6 @@
 //! address of the kernel's GDT.
 
 const lib = @import("lib");
-
 pub const panic = lib.panic;
 
 /// Program entry point.
