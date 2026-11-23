@@ -4,7 +4,7 @@
 //! mapping pages from the PMM. Free chunks are kept in an address-sorted list
 //! and merged with their neighbours when freed. All sizes are rounded up to 16
 //! bytes, which is also the maximum supported alignment; use the PMM directly
-//! for page-aligned memory. Every operation disables interrupts, so the heap
+//! for page-aligned memory. Every operation takes the heap's spinlock, so the heap
 //! is safe to use from threads and interrupt handlers.
 //!
 //! Usage counters are always kept (see `stats`). Building with
@@ -18,6 +18,7 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const pmm = @import("../kernel/pmm.zig");
 const assert = @import("debug/assert.zig");
+const SpinLock = @import("sync/spinlock.zig").SpinLock;
 
 const log = std.log.scoped(.heap);
 // Below this: HHDM (covers up to 16 TiB of RAM). Above: kernel image.
@@ -38,6 +39,8 @@ const vtable = std.mem.Allocator.VTable{
 /// The kernel heap allocator.
 pub const allocator = std.mem.Allocator{ .ptr = undefined, .vtable = &vtable };
 
+/// Protects the free list, the end of the heap and the counters.
+var lock: SpinLock = .{};
 var free_list: ?*Chunk = null; // sorted by address
 var heap_end: usize = HEAP_START;
 
@@ -60,8 +63,8 @@ var counters: Stats = .{};
 
 /// Return a snapshot of the heap usage counters.
 pub fn stats() Stats {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     return counters;
 }
 
@@ -141,8 +144,8 @@ fn grow(min_bytes: usize) bool {
 /// splitting off the remainder, and grow the heap if none does. Returns null
 /// when out of memory. Panics if `alignment` is larger than 16 bytes.
 fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
 
     if (alignment.toByteUnits() > MIN) @panic("heap: alignment > 16 unsupported; use pmm for pages");
     const n = round(len);
@@ -178,8 +181,8 @@ fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]
 /// returning the tail to the free list. Returns false if `new_len` needs more
 /// space, since blocks never grow in place; the caller then reallocates.
 fn resize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     const old = round(memory.len);
     const new = round(new_len);
     if (new > old) return false; // can't grow in place; caller reallocates
@@ -199,8 +202,8 @@ fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra
 /// `Allocator.free` implementation: return `memory` to the free list.
 /// Heap pages are never unmapped or given back to the PMM.
 fn free(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     insertFree(@intFromPtr(memory.ptr), round(memory.len));
     counters.frees += 1;
     subInUse(round(memory.len));

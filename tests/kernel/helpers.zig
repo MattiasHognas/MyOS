@@ -29,6 +29,11 @@ const apic = kernel_root.arch.x86_64.apic;
 const arch_syscall = kernel_root.arch.x86_64.syscall;
 const abi = kernel_root.abi;
 const hpet = kernel_root.drivers.hpet;
+const keyboard = kernel_root.drivers.ps2_keyboard;
+const timer = kernel_root.kernel.timer;
+const SpinLock = kernel_root.kernel.sync.spinlock.SpinLock;
+const WaitQueue = kernel_root.kernel.sync.wait_queue.WaitQueue;
+const Mutex = kernel_root.kernel.sync.mutex.Mutex;
 /// Where program images may be loaded and how large they may be.
 pub const image_limits = process.image_limits;
 /// The limits a process gets by default.
@@ -160,9 +165,10 @@ pub fn elfProbePath(path: []const u8, addr: u64, out: []u8) ?ElfProbe {
 pub fn spawnFailsCleanly(image: []const u8) bool {
     const pages = pmm.free_pages;
     const in_use = heap.stats().bytes_in_use;
-    _ = process.spawn("bad", image, .{}) catch
+    const p = process.spawn("bad", image, .{}) catch
         return pmm.free_pages == pages and heap.stats().bytes_in_use == in_use;
-    return false; // it started; the test fails (the process runs on its own)
+    _ = process.wait(p); // it started; the test fails
+    return false;
 }
 
 /// Run the program at `path` as a child process of the current
@@ -175,18 +181,16 @@ pub fn runProgram(path: []const u8) ?u64 {
 /// `runProgram` with `limits` on the new process (and, by inheritance, on
 /// everything it starts).
 pub fn runProgramLimited(path: []const u8, limits: Limits) ?u64 {
-    const me = thread.current();
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    _ = process.spawnPath(path, .{ .waiter = me, .limits = limits }) catch return null;
-    thread.block(); // until the child calls process.exit
-    return me.wake_value;
+    const p = process.spawnPath(path, .{ .limits = limits }) catch return null;
+    return process.wait(p);
 }
 
 /// Try to start the program at `path` with `limits` and return the error
-/// that stopped it. Null means it started (and now runs on its own).
+/// that stopped it. Null means it started (and now runs on its own, with
+/// nobody waiting for it).
 pub fn spawnError(path: []const u8, limits: Limits) ?anyerror {
-    _ = process.spawnPath(path, .{ .limits = limits }) catch |e| return e;
+    const p = process.spawnPath(path, .{ .limits = limits }) catch |e| return e;
+    process.release(p);
     return null;
 }
 
@@ -1473,7 +1477,8 @@ pub fn memoryExhaustion() u32 {
         if (thread.spawn(neverRuns, null)) |_| {
             failed = 20;
         } else |_| {}
-        if (process.spawnPath("/bin/hello", .{})) |_| {
+        if (process.spawnPath("/bin/hello", .{})) |p| {
+            process.release(p);
             failed = 21;
         } else |e| {
             if (e != error.OutOfMemory) failed = 22;
@@ -1502,7 +1507,6 @@ pub fn memoryExhaustion() u32 {
 /// allocation points that were made to fail.
 pub fn spawnAllocationFailures(failures: *usize) u32 {
     failures.* = 0;
-    const me = thread.current();
     // Stands in for a parent process, to see what is counted against it.
     var parent: process.Process = .{ .root = 0, .entry = 0, .name = "test parent" };
     var n: usize = 0;
@@ -1510,12 +1514,11 @@ pub fn spawnAllocationFailures(failures: *usize) u32 {
         const flags = cpu.saveAndDisableInterrupts();
         const before = footprint();
         pmm.fail_after = n;
-        const result = process.spawnPath("/bin/hello", .{ .waiter = me, .parent = &parent });
+        const result = process.spawnPath("/bin/hello", .{ .parent = &parent });
         pmm.fail_after = null;
-        if (result) |_| {
+        if (result) |p| {
             const counted = parent.descendants;
-            thread.block(); // it started: let it run and finish
-            const code = me.wake_value;
+            const code = process.wait(p); // it started: let it run and finish
             cpu.restoreInterrupts(flags);
             if (code != 0) return 1;
             if (counted != 1 or parent.descendants != 0) return 6; // alive, then gone
@@ -1679,14 +1682,613 @@ pub fn pmmLockHolds() u32 {
 /// program, stack, page tables and kernel stack), and wait for it. Returns
 /// the charged number, or null if the two differ or it could not start.
 pub fn chargedPages(path: []const u8) ?u64 {
-    const me = thread.current();
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const before = footprint();
-    const p = process.spawnPath(path, .{ .waiter = me }) catch return null;
+    const p = process.spawnPath(path, .{}) catch return null;
     const taken = before.pages - footprint().pages; // it has not run yet
     const charged = p.pages;
-    thread.block(); // until it exits; `p` is gone after this
+    _ = process.wait(p); // until it exits; `p` is gone after this
     if (charged != taken) return null;
     return charged;
+}
+
+// ---------------------------------------------------------------------------
+// Synchronization and timers (roadmap 2.8)
+
+/// True if interrupts are enabled.
+fn interruptsOn() bool {
+    return cpu.readFlags() & RFLAGS_IF != 0;
+}
+
+// State of the spinlock contention test.
+var spin_lock: SpinLock = .{};
+var spin_counter: u64 = 0;
+var spin_done: usize = 0;
+var spin_waiter: WaitQueue = .{};
+const SPIN_ROUNDS = 20_000;
+
+/// Add to a shared counter with a read, a pause and a write: an update is
+/// lost if another thread gets in between, which only the lock prevents.
+fn spinWorker() void {
+    for (0..SPIN_ROUNDS) |_| {
+        const held = spin_lock.acquire();
+        const seen = spin_counter;
+        for (0..20) |_| std.atomic.spinLoopHint();
+        spin_counter = seen + 1;
+        spin_lock.release(held);
+    }
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    spin_done += 1;
+    _ = spin_waiter.wakeAll();
+}
+
+/// Check spinlocks: taking one turns interrupts off and releasing restores
+/// what was there, also when locks nest; a held lock cannot be taken again;
+/// and preemptible threads never lose an update made under one. Must be
+/// called with interrupts on. Returns 0, or the number of the first failing check.
+pub fn spinlockChecks() u32 {
+    if (!interruptsOn()) return 1;
+    var a: SpinLock = .{};
+    var b: SpinLock = .{};
+
+    const held_a = a.acquire();
+    if (interruptsOn() or !a.isHeld()) return 2;
+    const held_b = b.acquire();
+    if (interruptsOn()) return 3;
+    b.release(held_b);
+    if (interruptsOn()) return 4; // still inside `a`: must stay off
+    if (b.isHeld() or !a.isHeld()) return 5;
+    // A held lock cannot be taken, and asking does not disturb anything.
+    if (a.tryAcquire() != null) return 6;
+    if (interruptsOn() or !a.isHeld()) return 7;
+    a.release(held_a);
+    if (!interruptsOn() or a.isHeld()) return 8;
+
+    // Taken with interrupts already off: release leaves them off.
+    const flags = cpu.saveAndDisableInterrupts();
+    const inner = a.acquire();
+    a.release(inner);
+    const still_off = !interruptsOn();
+    cpu.restoreInterrupts(flags);
+    if (!still_off or !interruptsOn()) return 9;
+
+    // tryAcquire on a free lock behaves like acquire.
+    const tried = a.tryAcquire() orelse return 10;
+    if (interruptsOn()) return 11;
+    a.release(tried);
+    if (!interruptsOn()) return 12;
+
+    // Two preemptible threads, one counter.
+    spin_counter = 0;
+    spin_done = 0;
+    {
+        const irq = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(irq);
+        _ = thread.spawn(spinWorker, null) catch return 13;
+        _ = thread.spawn(spinWorker, null) catch return 13;
+        while (spin_done < 2) spin_waiter.wait();
+    }
+    if (spin_counter != 2 * SPIN_ROUNDS) return 14;
+    return 0;
+}
+
+// State of the wait queue test.
+var wq: WaitQueue = .{};
+var wq_go: [3]bool = @splat(false);
+var wq_order: [8]u8 = undefined;
+var wq_order_len: usize = 0;
+var wq_wakeups: [3]usize = @splat(0);
+var wq_next_index: usize = 0;
+var wq_finished: WaitQueue = .{};
+var wq_threads: [3]?*thread.Thread = @splat(null);
+
+/// Wait on `wq` until this waiter's flag is set, then note the order.
+fn wqWaiter() void {
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    const index = wq_next_index;
+    wq_next_index += 1;
+    while (!wq_go[index]) {
+        wq.wait();
+        wq_wakeups[index] += 1;
+    }
+    wq_order[wq_order_len] = @intCast(index);
+    wq_order_len += 1;
+    _ = wq_finished.wakeAll();
+}
+
+/// Let other threads run until `wq` has `n` waiters. False if it never happens.
+fn untilWaiting(q: *WaitQueue, n: usize) bool {
+    for (0..10_000) |_| {
+        if (q.waiting() == n) return true;
+        thread.yield();
+    }
+    return false;
+}
+
+/// Wake `wq` from a timer, for the timeout test.
+fn wqTimerWake(_: *timer.Timer) void {
+    _ = wq.wakeOne();
+}
+
+/// Check wait queues: several threads wait on one queue and are woken one
+/// at a time in arrival order, or all at once; a waiter whose condition is
+/// not true yet goes back to sleep; a wake-up with nobody waiting is not
+/// remembered; a wait with a timeout ends when it is woken or when time is
+/// up, whichever is first. Returns 0, or the number of the first failing check.
+pub fn waitQueueChecks() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = footprint();
+    const timers_before = timer.pending();
+    wq_go = @splat(false);
+    wq_wakeups = @splat(0);
+    wq_order_len = 0;
+    wq_next_index = 0;
+
+    if (wq.wakeOne() != null or wq.wakeAll() != 0) return 1; // empty: nothing to wake
+    for (&wq_threads) |*t| {
+        t.* = thread.spawn(wqWaiter, null) catch return 2;
+        thread.yield(); // let it reach the queue, so the order is known
+    }
+    if (!untilWaiting(&wq, 3)) return 3;
+    if (wq_order_len != 0) return 4;
+
+    // A wake-up for a condition that is not true: the waiter looks and
+    // sleeps again, at the back of the queue.
+    if (wq.wakeOne() != wq_threads[0]) return 5; // first in, first woken
+    if (!untilWaiting(&wq, 3)) return 6;
+    if (wq_wakeups[0] != 1 or wq_order_len != 0) return 7;
+    // The queue is now 1, 2, 0. A plain `thread.wake` is not a wake-up of
+    // the queue: the thread stays on it.
+    thread.wake(wq_threads[1].?);
+    thread.wake(wq_threads[1].?); // twice: must not queue it twice either
+    for (0..20) |_| thread.yield();
+    if (wq.waiting() != 3 or wq_wakeups[1] != 0) return 8;
+
+    // One at a time, in order.
+    wq_go[1] = true;
+    if (wq.wakeOne() != wq_threads[1]) return 9;
+    while (wq_order_len < 1) wq_finished.wait();
+    if (wq.waiting() != 2) return 10; // the other two were left alone
+    if (wq_order[0] != 1) return 11;
+    // All at once: both run, in the order they waited (2, then 0).
+    wq_go[2] = true;
+    wq_go[0] = true;
+    if (wq.wakeAll() != 2) return 12;
+    while (wq_order_len < 3) wq_finished.wait();
+    if (!std.mem.eql(u8, wq_order[0..3], &.{ 1, 2, 0 })) return 13;
+    if (wq.waiting() != 0) return 14;
+
+    // A wake-up with nobody waiting is gone: the next wait really waits.
+    if (wq.wakeOne() != null) return 15;
+    const t0 = timer.now();
+    if (wq.waitTimeout(3)) return 16; // nobody wakes us: time runs out
+    const waited = timer.now() - t0;
+    if (waited < 3 or waited > 6) return 17;
+    if (wq.waiting() != 0 or thread.current().wait_queue != null) return 18;
+
+    // Woken before the timeout: returns true, early, and disarms its timer.
+    var waker: timer.Timer = .{ .callback = wqTimerWake };
+    timer.add(&waker, 2);
+    const t1 = timer.now();
+    if (!wq.waitTimeout(500)) return 19;
+    if (timer.now() - t1 > 10) return 20;
+    if (timer.pending() != timers_before) return 21;
+
+    // Woken and out of time on the same tick: the wake-up counts. (The
+    // waker was armed first, so it fires first and takes this thread off
+    // the queue; then the timeout fires, before the thread has run.)
+    timer.add(&waker, 3);
+    if (!wq.waitTimeout(3)) return 23;
+    if (timer.pending() != timers_before or wq.waiting() != 0) return 24;
+
+    for (0..10) |_| thread.yield(); // let the waiters be reaped
+    return if (footprint().eql(before)) 0 else 22;
+}
+
+// State of the timer test.
+var tm_order: [8]u8 = undefined;
+var tm_ticks: [8]u64 = undefined;
+var tm_len: usize = 0;
+
+/// Timer callback: note which timer fired, and when.
+fn tmFired(t: *timer.Timer) void {
+    if (tm_len < tm_order.len) {
+        tm_order[tm_len] = @intCast(t.context);
+        tm_ticks[tm_len] = timer.now();
+    }
+    tm_len += 1;
+}
+
+var sleep_order: [2]u8 = undefined;
+var sleep_len: usize = 0;
+var sleep_done: WaitQueue = .{};
+
+fn sleeper(ticks: u64, tag: u8) void {
+    timer.sleepTicks(ticks);
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    sleep_order[sleep_len] = tag;
+    sleep_len += 1;
+    _ = sleep_done.wakeAll();
+}
+
+fn sleeperLong() void {
+    sleeper(8, 'L');
+}
+
+fn sleeperShort() void {
+    sleeper(2, 'S');
+}
+
+/// Check kernel timers: they fire at their tick, earliest first and in
+/// arming order among equals; a cancelled timer never fires; a sleep lasts
+/// at least as long as asked, by the tick counter and by the HPET, while
+/// the CPU idles; and sleeping threads wake in deadline order. Returns 0,
+/// or the number of the first failing check.
+pub fn timerChecks() u32 {
+    const before = footprint();
+    const pending_before = timer.pending();
+    var timers: [5]timer.Timer = undefined;
+    for (&timers, 0..) |*t, i| t.* = .{ .callback = tmFired, .context = i };
+    const delays = [5]u64{ 6, 2, 4, 2, 3 };
+    tm_len = 0;
+
+    const flags = cpu.saveAndDisableInterrupts();
+    const start = timer.now();
+    for (&timers, delays) |*t, d| timer.add(t, d);
+    if (timer.pending() != pending_before + 5) return 1;
+    // Timer 4 is cancelled before it is due.
+    if (!timer.cancel(&timers[4]) or timer.cancel(&timers[4])) return 2;
+    cpu.restoreInterrupts(flags);
+
+    timer.sleepTicks(10); // nothing else is ready: the CPU idles meanwhile
+    if (tm_len != 4) return 3; // the cancelled one never fired
+    if (!std.mem.eql(u8, tm_order[0..4], &.{ 1, 3, 2, 0 })) return 4; // 2, 2 (arming order), 4, 6
+    for (tm_order[0..4], tm_ticks[0..4]) |index, tick| {
+        if (tick != start + delays[index]) return 5; // exactly on its tick
+    }
+    if (timer.cancel(&timers[0])) return 6; // it has fired: nothing to cancel
+    if (timer.pending() != pending_before) return 7;
+
+    // A sleep is never shorter than asked: by ticks and by an independent clock.
+    const t0 = timer.now();
+    const ns0 = hpet.nanos();
+    timer.sleepTicks(5);
+    const ticks = timer.now() - t0;
+    const ns = hpet.nanos() - ns0;
+    if (ticks < 5 or ticks > 8) return 8;
+    if (ns < 5 * timer.NS_PER_TICK or ns > 20 * timer.NS_PER_TICK) return 9;
+    if (timer.msToTicks(0) != 0 or timer.msToTicks(1) != 1 or timer.msToTicks(10) != 1 or timer.msToTicks(11) != 2 or timer.msToTicks(1000) != timer.HZ) return 10;
+
+    // Two sleepers: the one with the earlier deadline wakes first, though
+    // it went to sleep second.
+    sleep_len = 0;
+    {
+        const irq = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(irq);
+        _ = thread.spawn(sleeperLong, null) catch return 11;
+        _ = thread.spawn(sleeperShort, null) catch return 11;
+        while (sleep_len < 2) sleep_done.wait();
+    }
+    if (!std.mem.eql(u8, &sleep_order, "SL")) return 12;
+    if (timer.pending() != pending_before) return 13;
+    timer.sleepTicks(1); // let the sleepers be reaped
+    return if (footprint().eql(before)) 0 else 14;
+}
+
+// State of the mutex test.
+var mx: Mutex = .{};
+var mx_inside: usize = 0;
+var mx_overlaps: usize = 0;
+var mx_counter: u64 = 0;
+var mx_done: usize = 0;
+var mx_finished: WaitQueue = .{};
+var mx_order: [3]usize = undefined;
+var mx_order_len: usize = 0;
+const MX_THREADS = 4;
+const MX_ROUNDS = 40;
+
+/// Take the mutex again and again, and do things inside that let other
+/// threads run: spin (the timer preempts), yield, and sleep.
+fn mxWorker() void {
+    const me = thread.id();
+    for (0..MX_ROUNDS) |round| {
+        mx.lock();
+        mx_inside += 1;
+        if (mx_inside != 1 or !mx.heldByMe()) mx_overlaps += 1;
+        const seen = mx_counter;
+        switch ((round + me) % 4) {
+            0 => thread.yield(),
+            1 => timer.sleepTicks(1), // blocks while holding the mutex
+            else => for (0..2000) |_| std.atomic.spinLoopHint(),
+        }
+        mx_counter = seen + 1;
+        if (mx_inside != 1) mx_overlaps += 1;
+        mx_inside -= 1;
+        mx.unlock();
+    }
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    mx_done += 1;
+    _ = mx_finished.wakeAll();
+}
+
+/// Wait for the mutex once and note the order it was obtained in.
+fn mxQueuer() void {
+    mx.lock();
+    mx_order[mx_order_len] = thread.id();
+    mx_order_len += 1;
+    mx.unlock();
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    mx_done += 1;
+    _ = mx_finished.wakeAll();
+}
+
+/// Check the mutex: only one thread is inside at a time, even though the
+/// holder is preempted, yields and sleeps while it holds it; nothing is
+/// lost; `unlock` hands the mutex to the thread that has waited longest,
+/// which owns it before it runs; `tryLock` never waits. Must be called
+/// with interrupts on. Returns 0, or the number of the first failing check.
+pub fn mutexChecks() u32 {
+    const before = footprint();
+    if (!mx.tryLock()) return 1;
+    if (!mx.heldByMe() or mx.tryLock()) return 2; // held: no second taker, not even its owner
+    mx.unlock();
+    if (mx.owner != null) return 3;
+
+    // Exclusion under preemption, yielding and sleeping.
+    mx_inside = 0;
+    mx_overlaps = 0;
+    mx_counter = 0;
+    mx_done = 0;
+    {
+        const irq = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(irq);
+        for (0..MX_THREADS) |_| _ = thread.spawn(mxWorker, null) catch return 4;
+        while (mx_done < MX_THREADS) mx_finished.wait();
+    }
+    if (mx_overlaps != 0) return 5;
+    if (mx_counter != MX_THREADS * MX_ROUNDS) return 6;
+    if (mx.owner != null or mx.waiters.waiting() != 0) return 7;
+
+    // Hand-off: three threads queue up behind the holder, in a known order.
+    mx.lock();
+    mx_order_len = 0;
+    mx_done = 0;
+    var queued: [3]usize = undefined;
+    const irq = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(irq);
+    for (&queued, 0..) |*id, i| {
+        const t = thread.spawn(mxQueuer, null) catch return 8;
+        id.* = t.id;
+        if (!untilWaiting(&mx.waiters, i + 1)) return 9;
+    }
+    if (!mx.heldByMe()) return 10;
+    mx.unlock();
+    // Before anyone else has run, the first waiter already owns it.
+    if (mx.owner == null or mx.owner.?.id != queued[0]) return 11;
+    if (mx.tryLock()) return 12; // it is not free in between
+    while (mx_done < 3) mx_finished.wait();
+    if (!std.mem.eql(usize, &mx_order, &queued)) return 13; // longest wait first
+    if (mx.owner != null) return 14;
+    for (0..10) |_| thread.yield(); // let the threads be reaped
+    return if (footprint().eql(before)) 0 else 15;
+}
+
+/// Check that keyboard readers wait on a queue: three programs each wait
+/// for a key and get one each, in the order they started waiting; a key
+/// typed with nobody waiting is kept for the next reader. Returns 0, or
+/// the number of the first failing check.
+pub fn keyboardReaders() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = footprint();
+    while (keyboard.getChar() != null) {} // start with an empty buffer
+    var readers: [3]*process.Process = undefined;
+    for (&readers, 0..) |*r, i| {
+        r.* = process.spawnPath("/test/getchar", .{}) catch return 1;
+        if (!untilWaiting(&keyboard.readers, i + 1)) return 2;
+    }
+    // One key wakes one reader: the first.
+    keyboard.inject('a');
+    if (process.wait(readers[0]) != 'a') return 3;
+    if (keyboard.readers.waiting() != 2) return 4;
+    // Two keys at once: one each, in order.
+    keyboard.inject('b');
+    keyboard.inject('c');
+    if (process.wait(readers[1]) != 'b') return 5;
+    if (process.wait(readers[2]) != 'c') return 6;
+    if (keyboard.readers.waiting() != 0) return 7;
+    // A key with nobody waiting stays in the buffer.
+    keyboard.inject('d');
+    const late = process.spawnPath("/test/getchar", .{}) catch return 8;
+    if (process.wait(late) != 'd') return 9;
+    if (keyboard.getChar() != null) return 10;
+    for (0..10) |_| thread.yield();
+    return if (footprint().eql(before)) 0 else 11;
+}
+
+// ---------------------------------------------------------------------------
+// Process and scheduler lifecycle (roadmap 2.7)
+
+/// Sleep until `p` has exited and its thread has been reaped (its address
+/// space is gone). False if that takes more than a few seconds.
+fn untilTornDown(p: *const process.Process) bool {
+    for (0..500) |_| {
+        if (p.exit_code != null and p.root == 0) return true;
+        timer.sleepTicks(1);
+    }
+    return false;
+}
+
+/// Sleep until only `count` process structures exist. False on timeout.
+fn untilLive(count: usize) bool {
+    for (0..500) |_| {
+        if (process.liveCount() == count) return true;
+        timer.sleepTicks(1);
+    }
+    return false;
+}
+
+var second_waiter_code: ?u64 = null;
+var second_waiter_target: ?*process.Process = null;
+var second_waiter_done: WaitQueue = .{};
+
+/// Wait for the same process as the test thread does, with its own reference.
+fn secondWaiter() void {
+    const code = process.wait(second_waiter_target.?);
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    second_waiter_code = code;
+    _ = second_waiter_done.wakeAll();
+}
+
+/// Check the lifetime of a process as seen by whoever started it: its exit
+/// status is there however late it is asked for; its files are closed and
+/// its memory freed when it exits, not when it is waited for; several
+/// threads can wait for it; and nobody has to. Must be called with
+/// interrupts on. Returns 0, or the number of the first failing check.
+pub fn processWaiting() u32 {
+    const before = footprint();
+    const live = process.liveCount();
+    const threads_alive = thread.spawnedCount() - thread.reapedCount();
+
+    // Exited long before the wait. It opens 13 files and leaves them open.
+    const early = process.spawnPath("/test/open_count", .{}) catch return 1;
+    if (process.liveCount() != live + 1) return 2;
+    if (!untilTornDown(early)) return 3;
+    if (early.exit_code != 13) return 4;
+    for (early.files) |f| {
+        if (f != null) return 5; // closed at exit
+    }
+    // All it still holds is the structure and its name: no pages, no stack.
+    const zombie = footprint();
+    if (zombie.pages != before.pages or zombie.stacks != before.stacks) return 6;
+    if (zombie.heap_bytes <= before.heap_bytes) return 7;
+    if (thread.spawnedCount() - thread.reapedCount() != threads_alive) return 8; // its thread was reaped
+    if (early.refs != 1 or early.parent != null) return 9;
+    if (process.wait(early) != 13) return 10; // returns at once
+    if (process.liveCount() != live or !footprint().eql(before)) return 11;
+
+    // Two threads wait for one process; both get the status.
+    const shared = process.spawnPath("/test/open_count", .{ .limits = .{ .max_files = 7 } }) catch return 12;
+    process.retain(shared);
+    second_waiter_code = null;
+    second_waiter_target = shared;
+    {
+        const irq = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(irq);
+        _ = thread.spawn(secondWaiter, null) catch return 13;
+        if (process.wait(shared) != 4) return 14;
+        while (second_waiter_code == null) second_waiter_done.wait();
+    }
+    if (second_waiter_code != 4) return 15;
+    if (!untilLive(live)) return 16;
+
+    // Nobody waits: the reference is given up while it runs, and it is
+    // freed when it ends.
+    const detached = process.spawnPath("/bin/hello", .{}) catch return 17;
+    process.release(detached);
+    if (process.liveCount() != live + 1) return 18;
+    if (!untilLive(live)) return 19;
+
+    timer.sleepTicks(1);
+    if (thread.spawnedCount() - thread.reapedCount() != threads_alive) return 20;
+    return if (footprint().eql(before)) 0 else 21;
+}
+
+/// Check what happens when a parent exits before its child: the child is
+/// handed to its grandparent, the counts of descendants stay right, and the
+/// child still exits cleanly. A stand-in grandparent shows the counts.
+/// Returns 0, or the number of the first failing check.
+pub fn orphanedChild() u32 {
+    const before = footprint();
+    const live = process.liveCount();
+    var grandparent: process.Process = .{ .root = 0, .entry = 0, .name = "test grandparent" };
+
+    // The parent finishes at once; the child waits for a key.
+    const flags = cpu.saveAndDisableInterrupts();
+    while (keyboard.getChar() != null) {}
+    const parent = process.spawnPath("/test/entry_regs", .{ .parent = &grandparent }) catch return 1;
+    const child = process.spawnPath("/test/getchar", .{ .parent = parent }) catch return 2;
+    const ok_before = grandparent.descendants == 2 and parent.descendants == 1 and
+        grandparent.first_child == parent and parent.first_child == child and child.parent == parent;
+    cpu.restoreInterrupts(flags);
+    if (!ok_before) return 3;
+
+    if (process.wait(parent) != 0) return 4; // `parent` is gone after this
+    // The child is still running, and is now the grandparent's.
+    if (child.exit_code != null) return 5; // it should have outlived its parent
+    if (child.parent != &grandparent) return 6;
+    if (grandparent.first_child != child or child.next_sibling != null) return 7;
+    if (grandparent.descendants != 1) return 8;
+
+    {
+        const irq = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(irq);
+        if (!untilWaiting(&keyboard.readers, 1)) return 13;
+        keyboard.inject('k');
+    }
+    if (process.wait(child) != 'k') return 9;
+    if (grandparent.descendants != 0 or grandparent.first_child != null) return 10;
+    if (!untilLive(live)) return 11;
+    timer.sleepTicks(1);
+    return if (footprint().eql(before)) 0 else 12;
+}
+
+/// Start and end processes many times in every way there is: waited for at
+/// once, waited for late, in reverse order, never waited for, killed by a
+/// fault, and failing to start for several reasons. Afterwards no process,
+/// thread, stack, page or heap byte is left over, and every thread that
+/// was created has been reaped. `rounds` is the number of repetitions.
+/// Returns 0, or the number of the first failing check.
+pub fn lifecycleStress(rounds: usize) u32 {
+    const before = footprint();
+    const live = process.liveCount();
+    const threads_alive = thread.spawnedCount() - thread.reapedCount();
+    const switches = thread.switchCount();
+
+    for (0..rounds) |round| {
+        // Waited for at once.
+        if (runProgram("/test/entry_regs") != 0) return 1;
+        // Two at a time, collected in reverse order: the first has usually
+        // exited long before it is waited for.
+        const a = process.spawnPath("/test/entry_regs", .{}) catch return 2;
+        const b = process.spawnPath("/test/open_count", .{}) catch return 3;
+        if (process.wait(b) != 13) return 4;
+        if (process.wait(a) != 0) return 5;
+        // Never waited for.
+        const detached = process.spawnPath("/test/entry_regs", .{}) catch return 6;
+        process.release(detached);
+        // A child that starts children of its own.
+        if (runProgramLimited("/test/run_many", .{ .max_descendants = 1 }) != 8) return 7;
+        // Starts that fail: no such file, not a program, over a limit.
+        if (runProgram("/does/not/exist") != null) return 8;
+        if (runProgram("/etc/motd") != null) return 9;
+        if (spawnError("/bin/hello", .{ .max_pages = 6 }) == null) return 10;
+        // Killed by the kernel (one in ten rounds: each prints a fault report).
+        if (round % 10 == 0 and runProgram("/test/div_zero") != process.EXIT_KILLED) return 11;
+        // A chain that is cut off by a limit, each parent waiting on its child.
+        if (round % 5 == 0 and runProgramLimited("/test/recurse", .{ .max_descendants = 3 }) != 103) return 12;
+    }
+
+    if (!untilLive(live)) return 13; // the detached ones have finished too
+    timer.sleepTicks(1);
+    if (thread.spawnedCount() - thread.reapedCount() != threads_alive) return 14; // every thread reaped
+    if (thread.switchCount() == switches) return 15;
+    if (!pmm.consistent()) return 16;
+    return if (footprint().eql(before)) 0 else 17;
+}
+
+/// Turn interrupts on for a test that needs to be preempted or to see
+/// interrupt state change. The test thread otherwise runs with them off.
+/// Returns what to pass to `restoreInterrupts`.
+pub fn enableInterrupts() u64 {
+    const flags = cpu.readFlags();
+    asm volatile ("sti");
+    return flags;
+}
+
+/// Put the interrupt state back as `enableInterrupts` found it.
+pub fn restoreInterrupts(flags: u64) void {
+    if (flags & RFLAGS_IF == 0) asm volatile ("cli");
 }

@@ -10,7 +10,7 @@ const root = @import("root");
 const apic = @import("../arch/x86_64/apic.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
-const thread = @import("../kernel/thread.zig");
+const WaitQueue = @import("../kernel/sync/wait_queue.zig").WaitQueue;
 
 // Scancode set 1, US layout, indexed by scancode 0x00-0x39. 0 = no character.
 const normal = "\x00\x1b1234567890-=\x08\tqwertyuiop[]\n\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";
@@ -26,9 +26,10 @@ var buf: [256]u8 = undefined;
 var head: u8 = 0; // next write (u8 wraps at 256 by itself)
 var tail: u8 = 0; // next read
 
-/// Thread to wake when a key arrives. Set by the getchar syscall before it
-/// blocks; cleared by the IRQ handler when it wakes the thread.
-pub var waiter: ?*thread.Thread = null;
+/// Threads waiting for a key. A reader that finds the buffer empty waits
+/// here (with interrupts off between the look and the wait); the IRQ
+/// handler wakes the one that has waited longest for each key.
+pub var readers: WaitQueue = .{};
 
 /// Append `c` to the ring buffer. Drops the character if the buffer is full.
 /// Only called from the IRQ handler (the single producer).
@@ -41,7 +42,7 @@ fn push(c: u8) void {
 
 /// IRQ 1 handler: read one scancode from the controller, update the modifier
 /// state, translate key presses to ASCII, queue the character and wake
-/// `waiter` if set. Extended (0xE0-prefixed) keys and key releases produce no
+/// a waiting reader. Extended (0xE0-prefixed) keys and key releases produce no
 /// characters.
 fn onIrq(_: *idt.Frame) void {
     const sc = cpu.inb(0x60);
@@ -76,14 +77,20 @@ fn onIrq(_: *idt.Frame) void {
     if (caps and std.ascii.isAlphabetic(c)) c ^= 0x20; // flip case
     if (ctrl and std.ascii.isAlphabetic(c)) c &= 0x1F; // Ctrl+C = 3, etc.
     push(c);
-    if (waiter) |w| {
-        waiter = null;
-        thread.wake(w);
-    }
+    _ = readers.wakeOne();
+}
+
+/// Queue the character `c` as if it had been typed, and wake a waiting
+/// reader. For input that does not come from the keyboard controller: the
+/// tests today, other input sources later. Interrupts must be off, as in
+/// the IRQ handler (there is one producer at a time).
+pub fn inject(c: u8) void {
+    push(c);
+    _ = readers.wakeOne();
 }
 
 /// Take the next character from the ring buffer, or return null if it is
-/// empty. Never blocks; callers that want to wait set `waiter` and block.
+/// empty. Never blocks; callers that want to wait use `readers`.
 pub fn getChar() ?u8 {
     const t = tail;
     if (t == @atomicLoad(u8, &head, .acquire)) return null;

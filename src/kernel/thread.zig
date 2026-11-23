@@ -8,6 +8,35 @@
 //!
 //! Every thread runs on a guarded kernel stack from `kstack.zig`, including
 //! the boot thread once `adoptBootStack` has been called.
+//!
+//! ## States
+//!
+//!     spawn -> ready <-> running -> dead -> (reaped)
+//!                ^          |
+//!                +- blocked +
+//!
+//! - **ready**: in the ready queue, and nowhere else.
+//! - **running**: on the CPU; in no queue.
+//! - **blocked**: called `block` and waits for `wake`; in no scheduler queue
+//!   (it may be on a `WaitQueue`, which is how others find it).
+//! - **dead**: called `exit`; on the zombie list until the next thread that
+//!   runs frees it. Never runs again.
+//!
+//! A thread is in at most one scheduler queue, and `Thread.link` says which.
+//! Every insertion checks it, so a thread can never be queued twice, and
+//! `reap` checks it too, so a thread is freed exactly once.
+//!
+//! ## Blocking
+//!
+//! `block` and `wake` are the two halves of every sleep. `wake` leaves a
+//! permit when its target is not blocked (yet), and `block` returns at once
+//! if a permit is there, so a wake-up that arrives just before the thread
+//! blocks is not lost. Because a permit can be left over from an earlier
+//! wake-up, `block` may return with nothing having happened: callers loop
+//! on their condition. `sync/wait_queue.zig` is the interface to use; it
+//! does this.
+//!
+//! All scheduler state is protected by turning interrupts off (one CPU).
 
 const std = @import("std");
 const root = @import("root");
@@ -23,9 +52,7 @@ const heap = @import("heap.zig");
 const kstack = @import("kstack.zig");
 const proc = @import("process.zig");
 const Process = proc.Process;
-
-// the file: for proc.destroy
-// the struct: for fields and parameters
+const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 var slice_left: u32 = SLICE_TICKS;
@@ -41,11 +68,14 @@ var ready_head: ?*Thread = null;
 var ready_tail: ?*Thread = null;
 
 var zombies: ?*Thread = null;
+var reaped: usize = 0;
+var switches: usize = 0;
 
 /// Append `t` to the tail of the ready queue. Callers must have interrupts disabled.
 fn enqueue(t: *Thread) void {
     assert.check(.thread, t.state == .ready, "enqueueing thread {d} in state {t}", .{ t.id, t.state });
-    assert.check(.thread, ready_tail != t, "thread {d} is already at the tail of the ready queue", .{t.id});
+    assert.check(.thread, t.link == .none, "thread {d} is already queued ({t})", .{ t.id, t.link });
+    t.link = .ready_queue;
     t.next = null;
     if (ready_tail) |tail| tail.next = t else ready_head = t;
     ready_tail = t;
@@ -57,6 +87,8 @@ fn dequeue() ?*Thread {
     const t = ready_head orelse return null;
     ready_head = t.next;
     if (ready_head == null) ready_tail = null;
+    t.next = null;
+    t.link = .none;
     return t;
 }
 
@@ -66,7 +98,11 @@ fn dequeue() ?*Thread {
 fn reap() void {
     while (zombies) |z| {
         zombies = z.next;
-        if (z.process) |p| proc.destroy(p);
+        assert.check(.thread, z.state == .dead and z.link == .zombie_list, "reaping thread {d} in state {t} ({t})", .{ z.id, z.state, z.link });
+        assert.check(.thread, z != current_thread, "thread {d} reaps itself", .{z.id});
+        z.link = .none;
+        reaped += 1;
+        if (z.process) |p| proc.teardown(p);
         if (kstack.used(z.stack.?)) |bytes| kstack.record(z.id, bytes); // -Dstack-usage
         kstack.free(z.stack.?);
         if (z.fpu_alloc) |a| heap.allocator.free(a);
@@ -86,6 +122,9 @@ pub const State = enum {
     dead,
 };
 
+/// Which scheduler queue a thread is in.
+pub const Link = enum { none, ready_queue, zombie_list };
+
 /// A kernel thread: a stack, saved registers and scheduling state. A thread
 /// either belongs to a user process or is a pure kernel thread (`process == null`).
 pub const Thread = struct {
@@ -98,12 +137,16 @@ pub const Thread = struct {
     state: State,
     /// Link in the ready queue or the zombie list.
     next: ?*Thread = null,
+    /// The scheduler queue the thread is in.
+    link: Link = .none,
+    /// The wait queue the thread sleeps on, if any, and its link there.
+    wait_queue: ?*WaitQueue = null,
+    wait_next: ?*Thread = null,
     /// Process this thread runs, if any.
     process: ?*Process = null,
-    /// A `wake` arrived before `block`, so the next `block` returns at once.
+    /// A `wake` arrived while the thread was not blocked, so its next
+    /// `block` returns at once.
     wake_pending: bool = false,
-    /// Value passed from waker to sleeper (e.g. a child's exit code).
-    wake_value: u64 = 0,
     /// Heap block holding the saved x87/SSE/AVX state while the thread is
     /// not running (`fpu.zig`). Null for kernel threads, which have none.
     fpu_alloc: ?[]u8 = null,
@@ -117,26 +160,48 @@ pub const Thread = struct {
 };
 
 /// Block the current thread until another thread or interrupt handler calls
-/// `wake` on it. Returns immediately if a wake is already pending. Callers
-/// must disable interrupts between checking their wait condition and calling
-/// `block`, so a wake cannot slip in between.
+/// `wake` on it. Returns immediately if a wake is already pending, and may
+/// return for a wake-up left over from earlier, so callers loop on the
+/// condition they wait for. Callers must disable interrupts between
+/// checking that condition and calling `block`, so a wake cannot slip in
+/// between; interrupts are off again on return.
+///
+/// While no thread is ready the CPU sleeps here, with interrupts on, until
+/// an interrupt wakes this thread or makes another one ready.
 pub fn block() void {
     const me = current_thread;
+    assert.check(.thread, cpu.readFlags() & (1 << 9) == 0, "thread {d} blocks with interrupts on", .{me.id});
     if (me.wake_pending) { // the event already happened
         me.wake_pending = false;
         return;
     }
     me.state = .blocked;
-    while (me.state == .blocked) yield(); // the idle thread is always ready
+    while (me.state == .blocked) {
+        if (!switchToNext()) idleOnce();
+    }
     me.wake_pending = false;
 }
 
-/// Wake thread `t`: if it is blocked, make it ready and queue it; otherwise
-/// remember the wake so its next `block` returns immediately. Callers must
-/// have interrupts disabled.
+/// Sleep until the next interrupt, then turn interrupts off again. The
+/// `sti` takes effect after the following instruction, so no interrupt can
+/// arrive between enabling them and halting.
+fn idleOnce() void {
+    asm volatile ("sti; hlt; cli");
+}
+
+/// Wake thread `t`: if it is blocked, make it runnable; otherwise leave a
+/// permit so its next `block` returns immediately. Does nothing to a dead
+/// thread. Callers must have interrupts disabled. Safe from interrupt handlers.
 pub fn wake(t: *Thread) void {
+    assert.check(.thread, cpu.readFlags() & (1 << 9) == 0, "wake of thread {d} with interrupts on", .{t.id});
+    if (t.state == .dead) return;
     t.wake_pending = true;
-    if (t.state == .blocked) {
+    if (t.state != .blocked) return;
+    if (t == current_thread) {
+        // It is blocked but still on the CPU, idling in `block` because
+        // nothing else was ready: it just carries on.
+        t.state = .running;
+    } else {
         t.state = .ready;
         enqueue(t);
     }
@@ -189,14 +254,20 @@ pub fn adoptBootStack(stack: []u8) void {
 /// and extended CPU state (saving the previous thread's), resets the time
 /// slice and switches context. Everything happens with interrupts off, on
 /// the previous thread's kernel stack, which stays mapped in every address
-/// space. When this thread is scheduled
-/// again, frees any zombie threads and returns.
+/// space. When this thread is scheduled again, frees any zombie threads
+/// and returns.
 pub fn yield() void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
+    _ = switchToNext();
+}
 
-    const next = dequeue() orelse return;
+/// The switch behind `yield`. Returns false, having done nothing, if no
+/// other thread is ready. Interrupts must be off.
+fn switchToNext() bool {
+    const next = dequeue() orelse return false;
     const prev = current_thread;
+    assert.check(.thread, next != prev, "thread {d} is in the ready queue while running", .{prev.id});
 
     if (prev.state == .running) {
         prev.state = .ready;
@@ -205,6 +276,7 @@ pub fn yield() void {
     next.state = .running;
     current_thread = next;
     slice_left = SLICE_TICKS;
+    switches += 1;
 
     if (next.stack) |s| {
         const top = @intFromPtr(s.ptr) + s.len;
@@ -223,6 +295,7 @@ pub fn yield() void {
     context.switchTo(&prev.rsp, next.rsp);
 
     reap(); // we're running again; any zombie is now some *other* thread
+    return true;
 }
 
 /// Timer tick: count down the current thread's time slice and preempt it with
@@ -236,11 +309,35 @@ pub fn tick() void {
 /// the next thread to run frees its stack and its process (if any). Never returns.
 pub fn exit() noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: this thread is done
-    current_thread.state = .dead;
-    current_thread.next = zombies;
-    zombies = current_thread;
-    yield();
-    root.halt();
+    const me = current_thread;
+    assert.check(.thread, me.state == .running and me.link == .none, "thread {d} exits in state {t} ({t})", .{ me.id, me.state, me.link });
+    assert.check(.thread, me.wait_queue == null, "thread {d} exits while on a wait queue", .{me.id});
+    me.state = .dead;
+    me.link = .zombie_list;
+    me.next = zombies;
+    zombies = me;
+    // Never comes back from the switch. If nothing is ready (every other
+    // thread sleeps), idle on this stack until an interrupt wakes one.
+    while (true) {
+        _ = switchToNext();
+        idleOnce();
+    }
+}
+
+/// Threads freed since boot. With `spawnedCount`, tests use it to see that
+/// every thread that exited was reaped, once.
+pub fn reapedCount() usize {
+    return reaped;
+}
+
+/// Threads created since boot (not counting the boot thread).
+pub fn spawnedCount() usize {
+    return next_id - 1;
+}
+
+/// Context switches since boot.
+pub fn switchCount() usize {
+    return switches;
 }
 
 /// Record how much of its kernel stack the current thread has used so far

@@ -33,6 +33,7 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const assert = @import("debug/assert.zig");
 const pmm = @import("pmm.zig");
+const SpinLock = @import("sync/spinlock.zig").SpinLock;
 
 const log = std.log.scoped(.kstack);
 /// Pages in one kernel stack.
@@ -50,13 +51,16 @@ pub const WARN_BYTES = STACK_SIZE / 4 * 3;
 /// What every word of a fresh stack holds when usage is measured.
 const FILL: u64 = 0x5AFE_57AC_5AFE_57AC;
 
-// Largest stack usage `record` has seen. Guarded by disabling interrupts.
+/// Protects the slot bitmap and the usage peak.
+var lock: SpinLock = .{};
+
+// Largest stack usage `record` has seen. Guarded by `lock`.
 var peak_bytes: usize = 0;
 
 const SLOT_SIZE = STACK_SIZE + pmm.PAGE_SIZE; // the stack plus its guard page
 const REGION_END = REGION_START + MAX_STACKS * SLOT_SIZE;
 
-// One bit per slot; a set bit is a free slot. Guarded by disabling interrupts.
+// One bit per slot; a set bit is a free slot. Guarded by `lock`.
 var free_slots: [MAX_STACKS / 64]u64 = @splat(~@as(u64, 0));
 
 comptime {
@@ -96,8 +100,8 @@ fn unmapPages(low: usize, count: usize) void {
 /// initial stack pointer is its end. The contents are not zeroed. Returns
 /// null if there is no free slot or no physical memory, leaving nothing behind.
 pub fn alloc() ?[]u8 {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
 
     const slot = firstFreeSlot() orelse return null;
     const low = REGION_START + slot * SLOT_SIZE + pmm.PAGE_SIZE;
@@ -134,16 +138,16 @@ pub fn used(stack: []const u8) ?usize {
 /// remember the largest value and warn if it is past `WARN_BYTES`, so a
 /// stack that is getting tight shows up before it overflows.
 pub fn record(thread_id: usize, bytes: usize) void {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     peak_bytes = @max(peak_bytes, bytes);
     if (bytes > WARN_BYTES) log.warn("thread {d} used {d} of {d} bytes of its kernel stack", .{ thread_id, bytes, STACK_SIZE });
 }
 
 /// The largest stack usage `record` has seen since boot.
 pub fn peak() usize {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     return peak_bytes;
 }
 
@@ -155,8 +159,8 @@ pub fn free(stack: []u8) void {
         (low - REGION_START) % SLOT_SIZE == pmm.PAGE_SIZE, "freeing 0x{x}+{d}, which is not a kernel stack", .{ low, stack.len });
     const slot = (low - REGION_START) / SLOT_SIZE;
 
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     assert.check(.kstack, !slotFree(slot), "double free of kernel stack 0x{x}", .{low});
     unmapPages(low, STACK_PAGES);
     setSlotFree(slot, true);
@@ -179,8 +183,8 @@ pub fn owns(stack: []const u8) bool {
 
 /// Number of stacks currently allocated.
 pub fn inUse() usize {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     var free_count: usize = 0;
     for (free_slots) |word| free_count += @popCount(word);
     return MAX_STACKS - free_count;

@@ -202,23 +202,39 @@ The ABI a program sees is described in `docs/syscalls.md`.
 - [x] Test mapping exhaustion: `map` reports out-of-memory when page tables can't be allocated and leaves existing mappings intact (moved from 1.2).
 
 ### 2.7 Process and scheduler lifecycle
-- [ ] Define ownership rules for processes, threads, stacks, page tables, and open files.
-- [ ] Document the current single-thread-per-process assumption explicitly.
-- [ ] Review ready/running/blocked/dead transitions and prevent duplicate queue insertion.
-- [ ] Make block/wake semantics race-safe, including wake-before-block.
-- [ ] Handle children that exit before the parent begins waiting.
-- [ ] Handle parents that exit before their children (reparent or auto-reap the orphans). `Process.parent` and the descendant counts (2.6) assume a parent outlives its children; update them when a child is reparented.
-- [ ] Reap each exited thread/process exactly once.
-- [ ] Close open descriptors and free all resources on process exit and failed spawn.
-- [ ] Stress-test repeated spawn/exit, wait, wakeup, orphaning, and failure paths.
+- [x] Define ownership rules for processes, threads, stacks, page tables, and open files. Written at the top of `src/kernel/process.zig`, with a table of what is freed when:
+  - A process owns its address space, open files and name; a thread owns its kernel stack and saved CPU state.
+  - The `Process` structure is reference-counted: one reference is its thread's, one belongs to whoever called `spawn`, who gives it up with `process.wait` or `process.release`.
+  - Files are closed at exit; the address space and kernel stack are freed when the thread is reaped; the structure goes with the last reference.
+- [x] Document the current single-thread-per-process assumption explicitly (same place: what relies on it, for milestone 7 to revisit).
+- [x] Review ready/running/blocked/dead transitions and prevent duplicate queue insertion. The states and what moves a thread between them are described at the top of `src/kernel/thread.zig`.
+  - `Thread.link` records which scheduler queue a thread is in; every insertion and the reaper check it, so queueing a thread twice or reaping it twice is a panic, not a corrupted list.
+  - Fixed: a blocked thread with no other thread ready spun forever with interrupts off, so nothing could wake it. `block` and `exit` now idle with interrupts on until something is ready. The normal kernel never hit this (its idle thread is always ready); timers and the test kernel do.
+- [x] Make block/wake semantics race-safe, including wake-before-block. `wake` leaves a permit when its target is not blocked yet, and `block` returns at once if one is there. Callers loop on their condition, because a permit can be left over; wait queues (2.8) do this and are the interface to use.
+- [x] Handle children that exit before the parent begins waiting. The exit status is kept in the `Process` structure for as long as anyone holds a reference, so `wait` returns at once however late it is called. Before, the status was written into the waiting thread, which had to be blocked already.
+- [x] Handle parents that exit before their children: the children are handed to the parent's own parent (or to nobody), so `Process.parent` always points at a process that has not exited and the descendant counts (2.6) stay right.
+  - No syscall can cause this yet, since `myos_run` waits for its child. The kernel test builds the situation directly.
+  - Not done: reparenting to an init process that collects orphans' exit statuses. Nobody can ask for an orphan's status, so nothing is kept; revisit with `fork`/`wait4` (6.4).
+- [x] Reap each exited thread/process exactly once (checked by assertions on the thread's queue and state, on tearing a process down, and on the reference count; the tests compare threads created with threads reaped).
+- [x] Close open descriptors and free all resources on process exit and failed spawn. Files are now closed at exit instead of when the thread is reaped, which will matter once closing has effects others see (pipes). Failed spawns are covered by the 2.6 allocation-failure sweep.
+- [x] Stress-test repeated spawn/exit, wait, wakeup, orphaning, and failure paths (`helpers.lifecycleStress`: 40 rounds of processes waited for at once, late and in reverse order, never waited for, killed by a fault, starting children, cut off by a limit, and failing to start; afterwards no process, thread, stack, page or heap byte is left).
 
 ### 2.8 Synchronization and timers
-Pipes, blocking I/O, sleep and interrupt-driven drivers need these, and SMP (milestone 3) builds directly on them.
-- [ ] Add interrupt-aware spinlocks with interrupt-state restoration, as real atomic locks from the start (on one CPU the atomic never contends, and milestone 3 needs no rewrite).
-- [ ] Add wait queues and replace the single-`waiter` pointers (keyboard, process wait) with them.
-- [ ] Add mutexes for code that may block while holding a lock.
-- [ ] Add kernel timers: a timeout queue driven by the timer tick, for sleep, driver timeouts and later TCP.
-- [ ] Test several waiters on one queue, wake-before-block, timer ordering and expiry, and mutex hand-off under preemption.
+Pipes, blocking I/O, sleep and interrupt-driven drivers need these, and SMP (milestone 3) builds directly on them. The code is in `src/kernel/sync/` and `src/kernel/timer.zig`.
+- [x] Add interrupt-aware spinlocks with interrupt-state restoration, as real atomic locks from the start (`sync/spinlock.zig` on the atomic `sync/raw_spinlock.zig`).
+  - The atomic part is tested on the host with four real threads, the only place it can meet true parallelism before milestone 3.
+  - A lock that stays held absurdly long (taken twice, or never released) is a panic rather than a silent hang.
+  - The physical allocator, the heap and the kernel stack allocator use them now. Still protected by turning interrupts off only, for 3.1 and 3.4: the scheduler's queues, process bookkeeping, the page tables, and the drivers.
+- [x] Add wait queues and replace the single-`waiter` pointers (keyboard, process wait) with them (`sync/wait_queue.zig`: any number of waiters, woken in arrival order, one or all, with an optional timeout).
+  - Several programs can now wait for a key; each key goes to the one that has waited longest.
+  - On one CPU the rule "check the condition and wait with interrupts off" is enough to never lose a wake-up. With several, the check and the wait must be under a lock the waker also takes (3.1).
+- [x] Add mutexes for code that may block while holding a lock (`sync/mutex.zig`). `unlock` hands the mutex to the longest waiter, which owns it before it runs, so nobody starves. Nothing in the kernel uses one yet; the first users are expected in 6 (pipes, the terminal).
+- [x] Add kernel timers: a timeout queue driven by the timer tick, for sleep, driver timeouts and later TCP (`timer.zig` with the ordering in `sync/timer_queue.zig`; `sleepTicks`, `sleepMs`, and `WaitQueue.waitTimeout`).
+  - Resolution is one tick (10 ms). The queue is a sorted list: fine for a handful of timers, to be replaced by a heap or a timer wheel when there are many (12, TCP).
+  - No syscall uses it yet (`nanosleep`, `clock_gettime`: 6.4).
+- [x] Test several waiters on one queue, wake-before-block, timer ordering and expiry, and mutex hand-off under preemption.
+  - Host: the timer queue against a model (100 000 random operations), the spinlock under contention.
+  - In the kernel: spinlock interrupt state and nesting; wait queue order, rechecked conditions, wake-ups with nobody waiting, timeouts, and being woken and timing out on the same tick; timers firing on their exact tick, cancellation, sleep length against the HPET; a mutex whose holder is preempted, yields and sleeps; keyboard readers.
 
 ### 2.9 Further hardening
 From the code review before 2.2. None of these fix a known hole; they shrink what a future bug can do. Do them after 2.2 to 2.8, in roughly this order. The random-number generator, stack protectors and page zeroing are wanted before the primary goal; page-table isolation and address randomization can wait until after it.
@@ -244,8 +260,12 @@ Moved up (it was milestone 5): bringing up SMP while the kernel is small is far 
 ### 3.1 Synchronization
 The primitives come from 2.8 and are already real locks; this section makes their users safe on several CPUs.
 - [ ] Decide and document the kernel's preemption and locking model: whether kernel code can be preempted, which locks disable interrupts, and what may be held across a block.
-- [ ] Audit existing `cli`/`sti` critical sections and replace every one that assumes a single CPU.
-- [ ] Make mutexes and wait queues safe against wakeups from another CPU.
+- [ ] Audit existing `cli`/`sti` critical sections and replace every one that assumes a single CPU. Known from 2.7 and 2.8, still protected by turning interrupts off only:
+  - the scheduler's ready queue, zombie list and current thread (`thread.zig`);
+  - the process tree, descendant counts, reference counts and exit status (`process.zig`);
+  - the page tables of `kernel_root`, which the heap and the kernel stack allocator change under two different locks (`vmm.zig`);
+  - the keyboard buffer and modifier state, the console, and the serial port.
+- [ ] Make mutexes and wait queues safe against wakeups from another CPU. Today "check the condition and call `wait` with interrupts off" cannot lose a wake-up because nothing else runs; with several CPUs the check and the wait must be under a lock the waker also takes (`wait` releasing it atomically). `Mutex` and `process.wait` use that pattern and need the same change.
 - [ ] Define lock-ordering rules and test contention.
 
 ### 3.2 Per-CPU state
@@ -381,7 +401,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Assign stable PIDs and track parent-child relationships.
 - [ ] Define generalized process waiting and exit-code handling (`wait4`).
 - [ ] Support Ctrl+C termination of foreground jobs.
-- [ ] Add monotonic timekeeping and a sleep syscall (`clock_gettime`, `nanosleep`), on a calibrated TSC clock where the TSC is invariant and HPET otherwise: runtimes read the clock constantly.
+- [ ] Add monotonic timekeeping and a sleep syscall (`clock_gettime`, `nanosleep`), on a calibrated TSC clock where the TSC is invariant and HPET otherwise: runtimes read the clock constantly. `nanosleep` sits on the kernel timers of 2.8, whose resolution is one tick (10 ms): decide whether that is enough or sleeps need a one-shot timer.
 - [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 11.5 need it).
 - [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.
   - `prlimit64` reads and lowers the limits of 2.6: `RLIMIT_AS` or `RLIMIT_DATA` for memory, `RLIMIT_NOFILE` for descriptors, `RLIMIT_NPROC` for processes (MyOS counts descendants, Linux counts per user: decide how to present that). A process may lower its limits and never raise them above what it was given.
@@ -389,6 +409,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Start an `init` process that launches the shell, restarts it when it exits, and adopts orphans (2.7).
 - [ ] Implement a basic `ps` command.
 - [ ] Test PID and parent tracking, waiting on exited children, sleep accuracy, Ctrl+C termination, wall-clock time, and the shell being restarted after `exit`.
+- [ ] Test from ring 3 that a parent can exit before its child and the child is adopted. 2.7 handles this in the kernel, but no syscall could cause it then, so it is only tested from inside the kernel.
 - [ ] Test each syscall from ring 3 against Linux's documented results and error codes, including the struct layouts.
 
 **Milestone 6 done when:** Commands such as `ls /bin`, `cat /etc/motd`, and `echo hello` work, alone and in pipelines, from MyOS's own programs and from C programs built on Linux.
@@ -449,6 +470,10 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
   - The kernel heap is first-fit over an address-sorted list with interrupts off; allocation and free are linear in the number of free chunks.
   - The page allocator scans its bitmap one bit at a time, now with interrupts off.
   - Every process switch reloads CR3 without PCID and flushes the TLB.
+  - Every switch between user threads saves and restores the whole x87/SSE/AVX state with plain XSAVE (2.5). XSAVEOPT or XSAVES would skip what has not changed.
+  - AVX-512 is disabled (2.5). Decide whether to enable it: the .NET runtime uses it where it can, at the cost of a save area of about 2.5 KiB per thread.
+  - `vmm.unmap` scans whole page tables (512 entries per level) to see whether they became empty (2.6); a count per table would avoid it.
+  - Timers are a sorted list, linear to arm (2.8).
 - [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
 
 ### 9.3 Dynamic linking and the JIT runtime
@@ -570,6 +595,7 @@ Off the critical path (only network programs need it). It can be taken any time 
 - [ ] Implement ICMP echo (ping).
 - [ ] Implement UDP.
 - [ ] Implement TCP handshake, data exchange, close, retransmission, and timeouts.
+- [ ] Replace the sorted list behind kernel timers (2.8) with a heap or a timer wheel before TCP arms several timers per connection.
 - [ ] Implement packet buffers and basic flow control.
 - [ ] Add DNS resolution.
 - [ ] Test protocol parsing, checksums and state machines on the host with recorded and malformed packets.
@@ -597,6 +623,8 @@ Off the critical path (only network programs need it). It can be taken any time 
 - [ ] Copy-on-write and shared file-backed mappings (demand paging and private file mappings: 5).
 - [ ] `fork`/`exec` semantics if desired. A static busybox would then supply the standard utilities and a broad compatibility test.
 - [ ] User/group permissions.
+- [ ] Divide memory between unrelated programs: accounting per user or per group of processes, with a share each cannot exceed. The limits of 2.6 bound one program and what it starts; they do not stop it from using up memory other programs need.
+- [ ] Charge a process for the kernel memory it causes beyond its pages: its process and thread structures, saved x87/SSE/AVX state, open-file records, and later pipe buffers and socket buffers.
 
 ### Other ABIs
 The native ABI is Linux's and there is one of it (see the primary goal). These are things to look into, not plans.

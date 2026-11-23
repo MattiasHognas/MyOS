@@ -3,7 +3,7 @@
 //! The bookkeeping (two bitmaps with one bit per page, built from the Limine
 //! memory map) is `page_bitmap.zig`; this file gives it memory, turns
 //! addresses into page numbers and makes every operation safe against
-//! preemption by disabling interrupts. The bitmaps are stored in the first
+//! preemption, interrupt handlers and (later) other CPUs with a spinlock. The bitmaps are stored in the first
 //! usable region that is large enough. Physical page 0 is never handed out,
 //! so 0 can mean "none". Physical memory is accessed through the HHDM with
 //! `physToVirt`.
@@ -20,6 +20,7 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const limine = @import("../boot/limine.zig");
 const panicFmt = @import("debug/panic.zig").panicFmt;
 const page_bitmap = @import("page_bitmap.zig");
+const SpinLock = @import("sync/spinlock.zig").SpinLock;
 
 /// Test kernel only: when set, `alloc` succeeds this many more times and
 /// then fails as if memory had run out, until it is set to null again. Lets
@@ -39,6 +40,8 @@ inline fn inCriticalSection() void {
     }
 }
 
+/// Protects `pages` and `free_pages`.
+var lock: SpinLock = .{};
 var pages: page_bitmap.PageBitmap = .{ .used = &.{}, .managed = &.{}, .total = 0 };
 var hhdm: u64 = 0;
 
@@ -106,8 +109,8 @@ pub fn init(mm: *const limine.MemmapResponse, hhdm_offset: u64) void {
 pub fn alloc() ?u64 {
     // A thread switch between finding a free page and marking it used
     // would hand the page out twice.
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     inCriticalSection();
     if (comptime build_options.is_test) {
         if (fail_after) |*left| {
@@ -124,8 +127,8 @@ pub fn alloc() ?u64 {
 /// error nothing has changed. As safe to call as `alloc`.
 pub fn tryFree(phys: u64) FreeError!void {
     if (phys % PAGE_SIZE != 0) return error.Misaligned;
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     inCriticalSection();
     try pages.free(phys / PAGE_SIZE);
     free_pages = pages.free_count;
@@ -141,8 +144,8 @@ pub fn free(phys: u64) void {
 
 /// True if the page at `phys` is currently allocated.
 pub fn isAllocated(phys: u64) bool {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     return phys % PAGE_SIZE == 0 and pages.isAllocated(phys / PAGE_SIZE);
 }
 
@@ -150,8 +153,8 @@ pub fn isAllocated(phys: u64) bool {
 /// also checks that no unmanaged page is marked free. Walks every page, so
 /// it is for tests and debugging.
 pub fn consistent() bool {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = lock.acquire();
+    defer lock.release(held);
     return pages.consistent() and pages.free_count == free_pages;
 }
 

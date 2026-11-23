@@ -138,6 +138,7 @@ the terminal.
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
 | `src/kernel/` | Physical memory (`pmm`, with its bookkeeping in `page_bitmap`), heap, guarded kernel stacks (`kstack`), threads/scheduler, processes and their limits, ELF image validation (`elf_image`) and loader (`elf`), syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
+| `src/kernel/sync/` | Spinlocks, wait queues, mutexes and the timer queue; `src/kernel/timer.zig` drives the timers and provides sleep |
 | `src/kernel/fs/` | Filesystems (`tarfs` for the initrd) |
 | `src/kernel/debug/` | Assertions, small-buffer panic formatting, backtraces, ELF symbol lookup, log formatting |
 | `src/assets/` | Console font (fetched, not committed) |
@@ -175,6 +176,29 @@ test image).
    import that `lib.zig` needs. User programs are built for baseline x86-64
    with SSE2; the kernel is built without SSE.
 3. Copy it into the initrd in `scripts/build.sh` (`cp zig-out/bin/<name>.elf "$initrd/bin/<name>"`).
+
+### Waiting, locking and time in kernel code
+
+- **Short critical section, or data an interrupt handler touches:** a
+  `SpinLock` (`sync/spinlock.zig`). `acquire` turns interrupts off and
+  returns what `release` needs to restore them. Never block while holding one.
+- **Waiting for something to happen:** a `WaitQueue` (`sync/wait_queue.zig`)
+  that belongs to the thing waited for. With interrupts off, the waiter runs
+  `while (!condition) queue.wait();` and the other side sets the condition
+  and calls `wakeOne` or `wakeAll`. `waitTimeout` gives up after a number
+  of ticks.
+- **A longer section that may block:** a `Mutex` (`sync/mutex.zig`).
+- **Later, or after a delay:** `timer.sleepTicks`/`sleepMs` for a thread;
+  `timer.add` with a callback (run in the timer interrupt: keep it short)
+  for anything else.
+- **A process someone else started:** `process.spawn` gives the caller a
+  reference, which it must hand back with `process.wait` (to get the exit
+  status) or `process.release`. The rules for who owns what are at the top
+  of `src/kernel/process.zig`; the thread states at the top of
+  `src/kernel/thread.zig`.
+
+`thread.block` and `thread.wake` are the mechanism underneath; use a wait
+queue instead.
 
 ### Adding a syscall
 

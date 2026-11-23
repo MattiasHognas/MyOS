@@ -5,8 +5,8 @@ change or add a subsystem.
 
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
-| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection, the physical allocator's page bookkeeping against a model), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes), memory exhaustion and failed allocations, heap, kernel stacks, process limits, ELF loading, scheduler and processes, syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
+| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection, the physical allocator's page bookkeeping against a model, the timer queue against a model, the spinlock under real multi-threaded contention), compiled natively with fakes. Fast; covered by `zig build coverage`. |
+| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes), memory exhaustion and failed allocations, heap, kernel stacks, process limits, spinlocks, wait queues, mutexes, timers and sleeping, the process lifecycle (late waits, orphans, a stress run), ELF loading, scheduler and processes, syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests, the [stack frame check](#stack-frame-check) and all QEMU scenarios. Add
@@ -95,6 +95,11 @@ create a second copy of the module and its global state. To add a test:
    `check(...)`.
 3. Add it to the `cases` list in `runCases`.
 
+The thread that runs the tests has interrupts off unless a test turns them
+on (`helpers.enableInterrupts`), which tests of preemption, sleeping and
+interrupt state do. A helper that starts a process and wants its result
+calls `process.wait`; one that does not calls `process.release`.
+
 ## User-mode test programs
 
 Programs in `tests/user/` run in ring 3 and test the kernel from the outside
@@ -118,6 +123,7 @@ kernel killed the process for a fault), or two copies at once with
 | `fuzz` | 20 000 random syscalls from a fixed seed: the kernel survives and leaks nothing |
 | `recurse` | A program that starts itself until the kernel refuses: `ENOMEM` when memory runs out, `EAGAIN` at the descendant limit |
 | `open_count`, `run_many` | The descriptor limit; children that have exited no longer count against the descendant limit |
+| `getchar` | Waits for one key; the kernel test starts several and feeds them keys with `keyboard.inject` |
 | `entry_regs` | General-purpose registers are zero at program start |
 | `kernel_read`, `privileged`, `write_text`, `umip`, `div_zero`, `invalid_opcode` | Each fault kills only the process |
 

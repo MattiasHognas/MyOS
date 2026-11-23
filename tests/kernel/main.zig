@@ -218,6 +218,68 @@ fn recursionUntilOutOfMemory() TestError!void {
     try expectProgram("/bin/hello");
 }
 
+/// Run `checks` and report the number of the first one that failed.
+fn expectChecks(comptime what: []const u8, failed: u32) TestError!void {
+    if (failed != 0) report(what ++ " check", failed);
+    try check(failed == 0);
+}
+
+/// Spinlocks turn interrupts off and restore them, nest, and exclude.
+fn spinlocks() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("spinlock", helpers.spinlockChecks());
+}
+
+/// Several waiters on one queue, woken in order; conditions rechecked;
+/// wake-ups with nobody waiting are not kept; waits with a timeout.
+fn waitQueues() TestError!void {
+    try expectChecks("wait queue", helpers.waitQueueChecks());
+}
+
+/// Timers fire on their tick, in order; cancelling; sleeping.
+fn timers() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("timer", helpers.timerChecks());
+}
+
+/// A mutex excludes while its holder is preempted, yields and sleeps, and
+/// is handed to the longest waiter.
+fn mutexes() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("mutex", helpers.mutexChecks());
+}
+
+/// Programs waiting for a key each get one, in the order they waited.
+fn keyboardReaders() TestError!void {
+    try expectChecks("keyboard reader", helpers.keyboardReaders());
+}
+
+/// A process's exit status outlives it; its resources do not.
+fn processWaiting() TestError!void {
+    _ = helpers.runProgram("/test/open_count"); // warm up: the heap may grow
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("process wait", helpers.processWaiting());
+}
+
+/// A child whose parent exits first is handed to its grandparent.
+fn orphanedChild() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("orphan", helpers.orphanedChild());
+}
+
+/// Hundreds of processes started and ended in every way leave nothing behind.
+fn lifecycleStress() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("lifecycle stress warm-up", helpers.lifecycleStress(1));
+    try expectChecks("lifecycle stress", helpers.lifecycleStress(40));
+}
+
 /// The kernel heap can allocate, fill and free a block.
 fn heapTest() TestError!void {
     try check(helpers.heapRoundtrip());
@@ -1184,6 +1246,14 @@ fn runCases() noreturn {
         .{ .name = "guarded kernel stacks (alloc, guard page, free, reuse)", .func = kernelStacks },
         .{ .name = "kernel stack high-water mark", .func = stackUsage },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },
+        .{ .name = "spinlocks (interrupt state, nesting, exclusion under preemption)", .func = spinlocks },
+        .{ .name = "wait queues (several waiters, order, timeouts)", .func = waitQueues },
+        .{ .name = "kernel timers (order, expiry, cancel, sleep)", .func = timers },
+        .{ .name = "mutex exclusion and hand-off under preemption", .func = mutexes },
+        .{ .name = "keyboard readers wait on a queue", .func = keyboardReaders },
+        .{ .name = "process exit status outlives the process; early exit, shared and no waiters", .func = processWaiting },
+        .{ .name = "orphaned child is handed to its grandparent", .func = orphanedChild },
+        .{ .name = "lifecycle stress (spawn, exit, wait, orphan, failures)", .func = lifecycleStress },
         .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin },
         .{ .name = "wake before block", .func = wakeBeforeBlock },
         .{ .name = "tarfs lookup and normalization", .func = tarfsLookup },

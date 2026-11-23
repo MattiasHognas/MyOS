@@ -7,19 +7,19 @@
 //! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
 const root = @import("root");
-const abi = @import("../abi/linux.zig");
-const thread = @import("thread.zig");
-const arch = @import("../arch/x86_64/syscall.zig");
-const heap = @import("heap.zig");
-const vfs = @import("vfs.zig");
-const cpu = @import("../arch/x86_64/cpu.zig");
-const keyboard = @import("../drivers/ps2_keyboard.zig");
-const proc = @import("process.zig");
-const uaccess = @import("uaccess.zig");
-const user_range = @import("user_range.zig");
 
+const abi = @import("../abi/linux.zig");
 const Sys = abi.Sys;
 const err = abi.err;
+const cpu = @import("../arch/x86_64/cpu.zig");
+const arch = @import("../arch/x86_64/syscall.zig");
+const keyboard = @import("../drivers/ps2_keyboard.zig");
+const heap = @import("heap.zig");
+const proc = @import("process.zig");
+const thread = @import("thread.zig");
+const uaccess = @import("uaccess.zig");
+const user_range = @import("user_range.zig");
+const vfs = @import("vfs.zig");
 
 /// Size of the kernel bounce buffer used to move data to and from user space.
 const CHUNK = 256;
@@ -33,8 +33,7 @@ fn sysGetChar() u64 {
     defer cpu.restoreInterrupts(flags);
     while (true) {
         if (keyboard.getChar()) |c| return c;
-        keyboard.waiter = thread.current(); // register first, then sleep
-        thread.block();
+        keyboard.readers.wait(); // until a key arrives; then look again
     }
 }
 
@@ -63,17 +62,13 @@ fn sysRun(ptr: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    const me = thread.current();
-    _ = proc.spawnPath(path, .{ .waiter = me, .parent = me.process }) catch |e| return switch (e) {
+    const child = proc.spawnPath(path, .{ .parent = thread.current().process }) catch |e| return switch (e) {
         error.FileNotFound => err(.NOENT),
         error.OutOfMemory, error.TooLarge => err(.NOMEM),
         error.TooManyProcesses => err(.AGAIN),
         else => err(.NOEXEC), // unreadable, or refused by the ELF loader
     };
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    thread.block(); // until the child calls process.exit
-    return me.wake_value;
+    return proc.wait(child); // whether it is still running or already gone
 }
 
 /// `write`: print `count` bytes at the user address `ptr` to the console.

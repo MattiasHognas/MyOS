@@ -61,9 +61,19 @@ pub const kernel = struct {
     pub const process = @import("kernel/process.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
+    pub const timer = @import("kernel/timer.zig");
     pub const uaccess = @import("kernel/uaccess.zig");
     pub const user_range = @import("kernel/user_range.zig");
     pub const vfs = @import("kernel/vfs.zig");
+
+    /// Locks, wait queues and the timer queue.
+    pub const sync = struct {
+        pub const mutex = @import("kernel/sync/mutex.zig");
+        pub const raw_spinlock = @import("kernel/sync/raw_spinlock.zig");
+        pub const spinlock = @import("kernel/sync/spinlock.zig");
+        pub const timer_queue = @import("kernel/sync/timer_queue.zig");
+        pub const wait_queue = @import("kernel/sync/wait_queue.zig");
+    };
 
     /// Debugging aids: assertions, backtraces, symbol lookup and log formatting.
     pub const debug = struct {
@@ -150,6 +160,7 @@ fn findModule(name: []const u8) ?[]const u8 {
 /// Timer interrupt handler: let the scheduler preempt the current thread
 /// when its time slice is used up.
 fn onTick(_: *idt.Frame) void {
+    kernel.timer.tick(); // first: a thread a timer wakes can run right away
     thread.tick();
 }
 
@@ -291,8 +302,8 @@ fn kmainOnStack() callconv(.c) noreturn {
     } else log.warn("no NVMe controller", .{});
 
     idt.register(apic.TIMER_VECTOR, onTick);
-    apic.timerInit(100);
-    log.info("APIC timer: {d} ticks/ms, running at 100 Hz", .{apic.ticks_per_ms});
+    apic.timerInit(kernel.timer.HZ);
+    log.info("APIC timer: {d} ticks/ms, running at {d} Hz", .{ apic.ticks_per_ms, kernel.timer.HZ });
 
     syscall.init();
 
@@ -303,7 +314,8 @@ fn kmainOnStack() callconv(.c) noreturn {
     if (comptime build_options.is_test) @import("kernel_tests").run();
 
     keyboard.init();
-    _ = process.spawnPath("/bin/sh", .{}) catch |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
+    // Nobody waits for the shell: give up the reference right away.
+    if (process.spawnPath("/bin/sh", .{})) |shell| process.release(shell) else |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
     print("Boot complete.\n", .{});
     if (thread.recordStackUsage()) |bytes| log.debug("boot used {d} of {d} bytes of kernel stack", .{ bytes, kstack.STACK_SIZE });
     idle();
