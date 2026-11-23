@@ -267,6 +267,28 @@ pub fn loadRoot(root: u64) void {
         : .{ .memory = true });
 }
 
+/// Count the page tables under the table at `phys`, itself included.
+/// `level` is as for `freeTable`.
+fn countTables(phys: u64, level: u6) usize {
+    var n: usize = 1;
+    if (level == 0) return n;
+    for (table(phys)) |e| {
+        if (e & PRESENT != 0) n += countTables(e & ADDR_MASK, level - 1);
+    }
+    return n;
+}
+
+/// Number of pages the address space `root` uses for its own page tables:
+/// the PML4 and every table of the user half. The kernel half's tables are
+/// shared and not counted.
+pub fn userTablePages(root: u64) usize {
+    var n: usize = 1; // the PML4
+    for (table(root)[0..256]) |e| {
+        if (e & PRESENT != 0) n += countTables(e & ADDR_MASK, 2);
+    }
+    return n;
+}
+
 /// Free every page and page table in the user half of `root`, then the PML4
 /// itself. The shared kernel half is left alone. `root` must not be the
 /// currently loaded address space.

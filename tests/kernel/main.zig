@@ -83,6 +83,14 @@ fn pmmBadFrees() TestError!void {
     try check(pmm.consistent());
 }
 
+/// The allocator's critical sections keep other threads out, shown by
+/// holding a thread inside one for longer than a time slice.
+fn pmmLock() TestError!void {
+    const failed = helpers.pmmLockHolds();
+    if (failed != 0) report("PMM lock check", failed);
+    try check(failed == 0);
+}
+
 /// Mapping over an existing mapping is an error, for both page sizes.
 fn vmmMapConflicts() TestError!void {
     const failed = helpers.vmmMapConflicts();
@@ -152,6 +160,15 @@ fn processLimits() TestError!void {
     try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = 0 })));
     try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = 5 })));
     try check(helpers.runProgramLimited("/bin/hello", .{ .max_pages = 4096 }) == 0);
+    // The charge is everything the process takes: program, stack, page
+    // tables and kernel stack. It is what the allocator really handed out,
+    // and the limit is exact: that many pages are enough, one less is not.
+    const charged = helpers.chargedPages("/bin/hello") orelse return error.Failed;
+    try check(charged > 4 + 4 + 7); // more than the two stacks and the smallest set of page tables
+    try check(helpers.runProgramLimited("/bin/hello", .{ .max_pages = charged }) == 0);
+    try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = charged - 1 })));
+    // Too little even for the stacks: refused before anything is allocated.
+    try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = 8 })));
 
     // Open files: 13 by default, fewer with a lower limit, none at 3.
     try check(helpers.runProgram("/test/open_count") == 13);
@@ -1156,6 +1173,7 @@ fn runCases() noreturn {
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },
         .{ .name = "syscall fuzzing from ring 3", .func = syscallFuzz },
         .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
+        .{ .name = "PMM critical sections exclude other threads", .func = pmmLock },
         .{ .name = "memory exhaustion fails cleanly (page tables, stacks, heap, processes)", .func = memoryExhaustion },
         .{ .name = "process, kernel stack and heap growth fail cleanly at every allocation", .func = spawnAllocationFailures },
         .{ .name = "per-process limits (memory, open files, descendants)", .func = processLimits },

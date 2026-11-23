@@ -26,6 +26,19 @@ const page_bitmap = @import("page_bitmap.zig");
 /// a test make any single allocation inside a larger operation fail.
 pub var fail_after: ?usize = null;
 
+/// Test kernel only: called inside the critical section of `alloc` and
+/// `tryFree`, after interrupts are off and before the bitmap is touched.
+/// A test uses it to stay in there long enough that a missing lock would
+/// let another thread in.
+pub var critical_hook: ?*const fn () void = null;
+
+/// Run `critical_hook`, in the test kernel only.
+inline fn inCriticalSection() void {
+    if (comptime build_options.is_test) {
+        if (critical_hook) |hook| hook();
+    }
+}
+
 var pages: page_bitmap.PageBitmap = .{ .used = &.{}, .managed = &.{}, .total = 0 };
 var hhdm: u64 = 0;
 
@@ -95,6 +108,7 @@ pub fn alloc() ?u64 {
     // would hand the page out twice.
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
+    inCriticalSection();
     if (comptime build_options.is_test) {
         if (fail_after) |*left| {
             if (left.* == 0) return null;
@@ -112,6 +126,7 @@ pub fn tryFree(phys: u64) FreeError!void {
     if (phys % PAGE_SIZE != 0) return error.Misaligned;
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
+    inCriticalSection();
     try pages.free(phys / PAGE_SIZE);
     free_pages = pages.free_count;
 }

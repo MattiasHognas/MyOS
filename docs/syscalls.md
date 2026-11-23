@@ -100,7 +100,8 @@ Every other number returns `ENOSYS`.
   up. Descriptors are not inherited by programs started with `myos_run`.
 - **Counts** above `0x7ffff000` are shortened to that, as on Linux.
 - **Limits.** Every process has limits, inherited from the process that
-  started it: 256 MiB of memory for its program and stack, 16 descriptors,
+  started it: 256 MiB of memory (its program, stack, page tables and kernel
+  stack), 16 descriptors,
   and 1024 processes alive below it. There are no calls to read or change
   them yet (`getrlimit`, `prlimit`).
 - **Running out of memory** fails the call that needed it with `ENOMEM`.

@@ -8,6 +8,7 @@
 
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
+const kstack = @import("kstack.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const elf = @import("elf.zig");
 const elf_image = @import("elf_image.zig");
@@ -33,9 +34,10 @@ pub const MAX_FILES = 16;
 
 /// What one process may use. Inherited by the processes it starts.
 pub const Limits = struct {
-    /// Most pages of memory the process may have mapped: its program
-    /// (code, data, `.bss`) and its stack. Page tables are not counted.
-    max_pages: u64 = MAX_IMAGE_BYTES / pmm.PAGE_SIZE + STACK_PAGES,
+    /// Most pages of physical memory the process may take: its program
+    /// (code, data, `.bss`), its stack, the page tables of its address
+    /// space and its thread's kernel stack.
+    max_pages: u64 = MAX_IMAGE_BYTES / pmm.PAGE_SIZE,
     /// Most processes that may be alive below this one at once: children,
     /// their children, and so on. Starting one more fails.
     max_descendants: u32 = 1024,
@@ -46,12 +48,14 @@ pub const Limits = struct {
 
 /// Where a program image may be loaded and how large it may be under
 /// `limits`: from `IMAGE_MIN` up to the region reserved for the stack, and
-/// as many pages as the memory limit leaves after the stack.
+/// as many pages as the memory limit leaves after the two stacks. This is
+/// the early check, before anything is allocated; `spawn` checks the exact
+/// total, page tables included, once the address space is built.
 pub fn imageLimits(limits: Limits) elf_image.Limits {
     return .{
         .min_addr = IMAGE_MIN,
         .max_addr = STACK_TOP - STACK_RESERVE,
-        .max_bytes = (limits.max_pages -| STACK_PAGES) * pmm.PAGE_SIZE,
+        .max_bytes = (limits.max_pages -| (STACK_PAGES + kstack.STACK_PAGES)) * pmm.PAGE_SIZE,
     };
 }
 
@@ -77,7 +81,7 @@ pub const Process = struct {
     waiter: ?*thread.Thread = null,
     /// What this process may use.
     limits: Limits = .{},
-    /// Pages of memory mapped for the program and its stack (see `Limits.max_pages`).
+    /// Pages of physical memory the process takes (see `Limits.max_pages`).
     pages: u64 = 0,
     /// The process that started this one, if a process did. It waits for
     /// this one to exit, so it outlives it.
@@ -183,6 +187,10 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         };
     }
 
+    // Everything the process takes, now that its page tables exist.
+    const pages = loaded.pages + STACK_PAGES + vmm.userTablePages(root) + kstack.STACK_PAGES;
+    if (pages > limits.max_pages) return error.TooLarge;
+
     const p = try heap.allocator.create(Process);
     errdefer heap.allocator.destroy(p);
     const name_copy = try heap.allocator.dupe(u8, name);
@@ -193,7 +201,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         .name = name_copy,
         .waiter = options.waiter,
         .limits = limits,
-        .pages = loaded.pages + STACK_PAGES,
+        .pages = pages,
         .parent = options.parent,
     };
 

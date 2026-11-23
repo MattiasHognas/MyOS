@@ -28,6 +28,7 @@ const fpu = kernel_root.arch.x86_64.fpu;
 const apic = kernel_root.arch.x86_64.apic;
 const arch_syscall = kernel_root.arch.x86_64.syscall;
 const abi = kernel_root.abi;
+const hpet = kernel_root.drivers.hpet;
 /// Where program images may be loaded and how large they may be.
 pub const image_limits = process.image_limits;
 /// The limits a process gets by default.
@@ -1598,4 +1599,94 @@ pub fn heapGrowthFailures() u32 {
     if (stuck == 0) return 2; // never reached a page-table boundary
     // The heap kept what it mapped; nothing else is gone.
     return if (footprint().eql(before) and pmm.consistent()) 0 else 3;
+}
+
+// State of `pmmLockHolds` and its hook.
+var lock_workers: [2]usize = .{ 0, 0 }; // thread IDs the hook acts on
+var lock_inside: usize = 0;
+var lock_entries: usize = 0;
+var lock_overlaps: usize = 0;
+var lock_irq_on: usize = 0;
+var lock_errors: usize = 0;
+var lock_done: usize = 0;
+var lock_waiter: ?*thread.Thread = null;
+
+/// Longer than a time slice (50 ms), so a thread that could be preempted
+/// while it waits is preempted.
+const LOCK_HOLD_NS = 70 * 1000 * 1000;
+
+/// `pmm.critical_hook` for `pmmLockHolds`: stay inside the allocator's
+/// critical section for longer than a time slice, and notice if another
+/// thread is in there at the same time.
+fn lockHook() void {
+    const id = thread.id();
+    if (id != lock_workers[0] and id != lock_workers[1]) return;
+    lock_entries += 1;
+    if (cpu.readFlags() & RFLAGS_IF != 0) lock_irq_on += 1;
+    lock_inside += 1;
+    if (lock_inside != 1) lock_overlaps += 1;
+    const until = hpet.nanos() + LOCK_HOLD_NS;
+    while (hpet.nanos() < until) {}
+    if (lock_inside != 1) lock_overlaps += 1;
+    lock_inside -= 1;
+}
+
+/// Worker for `pmmLockHolds`: allocate and free with interrupts on, so the
+/// timer can preempt it anywhere the allocator lets it.
+fn lockWorker() void {
+    for (0..2) |_| {
+        if (pmm.alloc()) |page| pmm.free(page) else lock_errors += 1;
+    }
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    lock_done += 1;
+    if (lock_done == 2) thread.wake(lock_waiter.?);
+}
+
+/// Prove that the physical allocator's critical sections exclude other
+/// threads. Two preemptible threads allocate and free while a hook holds
+/// each of them inside the critical section for longer than a time slice.
+/// With the lock (interrupts off) the other thread cannot run in that time;
+/// without it the timer switches to the other thread, which enters the
+/// critical section too. Returns 0, or the number of the first failing check.
+pub fn pmmLockHolds() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = pmm.free_pages;
+    lock_inside = 0;
+    lock_entries = 0;
+    lock_overlaps = 0;
+    lock_irq_on = 0;
+    lock_errors = 0;
+    lock_done = 0;
+    lock_waiter = thread.current();
+    const a = thread.spawn(lockWorker, null) catch return 1;
+    const b = thread.spawn(lockWorker, null) catch return 1;
+    lock_workers = .{ a.id, b.id };
+    pmm.critical_hook = lockHook;
+    while (lock_done < 2) thread.block();
+    pmm.critical_hook = null;
+    lock_workers = .{ 0, 0 };
+
+    if (lock_errors != 0) return 2;
+    if (lock_entries < 8) return 3; // two threads, two allocations and two frees each
+    if (lock_overlaps != 0) return 4; // two threads inside at once
+    if (lock_irq_on != 0) return 5; // inside the critical section with interrupts on
+    return if (pmm.free_pages == before and pmm.consistent()) 0 else 6;
+}
+
+/// Start the program at `path`, compare the pages the kernel charged to
+/// the new process with the pages that actually left the allocator (its
+/// program, stack, page tables and kernel stack), and wait for it. Returns
+/// the charged number, or null if the two differ or it could not start.
+pub fn chargedPages(path: []const u8) ?u64 {
+    const me = thread.current();
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const before = footprint();
+    const p = process.spawnPath(path, .{ .waiter = me }) catch return null;
+    const taken = before.pages - footprint().pages; // it has not run yet
+    const charged = p.pages;
+    thread.block(); // until it exits; `p` is gone after this
+    if (charged != taken) return null;
+    return charged;
 }

@@ -139,7 +139,7 @@ serial log in the `tests` case of `scripts/test-qemu.sh`.
 
 ### Tests of running out of memory
 
-Two helpers in `tests/kernel/helpers.zig` make memory run out on purpose:
+Two things make memory run out on purpose:
 
 - `drainMemory(leave)` allocates physical pages until only `leave` are
   free, and `releaseDrained` gives them back. Use it to test what happens
@@ -149,6 +149,10 @@ Two helpers in `tests/kernel/helpers.zig` make memory run out on purpose:
   operation with `n` = 0, 1, 2, ... until it succeeds makes each of its
   allocations fail once; `spawnAllocationFailures` does this for starting
   a process.
+
+A third hook, `pmm.critical_hook`, runs inside the allocator's critical
+section; `pmmLockHolds` uses it to stay in there longer than a time slice
+and show that no other thread gets in.
 
 Compare `helpers.footprint()` before and after to check that nothing was
 lost. It counts free pages together with the pages the heap holds, because
