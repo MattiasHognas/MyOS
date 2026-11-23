@@ -126,6 +126,7 @@ run_scenario() {
             expect_line '^CR2=0xffffffff80000000 \(faulting address\)$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/privileged\): General protection in user mode \(vector 13, error 0x0\), killed$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/div_zero\): Divide error in user mode \(vector 0, error 0x0\), killed$'
+            expect_line '^\*\*\* thread [0-9]+ \(/test/single_step\): Debug in user mode \(vector 1, error 0x0\), killed$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/invalid_opcode\): Invalid opcode in user mode \(vector 6, error 0x0\), killed$'
             expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+$'
             # The user's GS base is its own: reading through it faults on a user address.

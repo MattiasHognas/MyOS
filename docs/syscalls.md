@@ -29,7 +29,8 @@ overwrites `rcx`.
 
 - **Flags.** RFLAGS is preserved, except that NT and IOPL, which a program
   has no use for, are cleared. During the call the kernel runs with TF, IF,
-  DF, IOPL, NT and AC cleared.
+  DF, IOPL, NT and AC cleared. A program that single-steps (TF set) gets its
+  trap after the instruction that follows the `syscall`, as on Linux.
 - **Stack.** The kernel never reads or writes the user stack and does not
   care how `rsp` is aligned; there is no red-zone problem.
 - **Extended registers.** x87, SSE and AVX registers are preserved across

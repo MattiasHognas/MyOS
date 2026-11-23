@@ -40,6 +40,10 @@ const assert = @import("../../kernel/debug/assert.zig");
 /// RFLAGS bits the CPU clears on `syscall` entry: TF, IF, DF, IOPL, NT, AC.
 pub const SFMASK: u64 = 0x100 | 0x200 | 0x400 | 0x3000 | 0x4000 | 0x40000;
 
+/// Syscalls that returned with `iretq` instead of `sysretq` since boot. A
+/// statistic: read by tests to see which path a return took.
+pub var iret_returns: usize = 0;
+
 var handler: Handler = undefined;
 
 /// A syscall handler: reads the arguments from the frame and writes the
@@ -152,6 +156,7 @@ export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     const how = sysret.classify(f.rip, f.rflags, f.cs, f.ss);
     if (how == .invalid) bad_return(f);
     asm volatile ("cli"); // the exit path must not be interrupted
+    if (how == .iret) iret_returns += 1;
     return @backingInt(how);
 }
 

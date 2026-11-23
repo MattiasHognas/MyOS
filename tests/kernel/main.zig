@@ -495,6 +495,8 @@ fn kernelEntryInvariants() TestError!void {
 fn syscallReturnStates() TestError!void {
     // Without the probe the test numbers are unknown syscalls.
     try check(helpers.runProgram("/test/bad_return") == 90);
+    const iret_before = helpers.iretReturns();
+    var via_iret: usize = 0;
     const pages = pmm.free_pages;
     const heap_bytes = helpers.heapInUse();
     defer helpers.removeProbes();
@@ -504,8 +506,12 @@ fn syscallReturnStates() TestError!void {
         if (code != 255) report("/test/bad_return (" ++ @tagName(state) ++ ") exit status", code);
         try check(code == 255);
         try check(helpers.probes.violation == 0);
+        via_iret += helpers.probes.via_iret;
     }
     helpers.removeProbes();
+    // Exactly the returns with RF set went through iretq; all others (the
+    // one with privileged flags included) used sysretq.
+    try check(via_iret == 16 and helpers.iretReturns() - iret_before == via_iret);
     try expectProgram("/bin/hello"); // the kernel is fine
     try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
 }
@@ -518,6 +524,15 @@ fn gsBaseSwitching() TestError!void {
     try check(helpers.runProgram("/test/gs_base") == 255); // faults on a user address
     failed = helpers.gsBases();
     if (failed != 0) report("GS base check after a process", failed);
+    try check(failed == 0);
+}
+
+/// A debug exception that hits ring 0 code running with the user's GS base
+/// (as at the first instruction of `syscall_entry`) is handled on its own
+/// stack with the kernel's GS base.
+fn debugTrapEntry() TestError!void {
+    const failed = helpers.debugTrapEntry();
+    if (failed != 0) report("debug trap check", failed);
     try check(failed == 0);
 }
 
@@ -599,11 +614,16 @@ fn userFaults() TestError!void {
     const heap_bytes = helpers.heapInUse();
     try check(helpers.runProgram("/test/div_zero") == 255);
     try check(helpers.runProgram("/test/invalid_opcode") == 255);
+    // Single-stepping into a syscall: the trap arrives in ring 3, after the
+    // syscall has returned through iretq, never in the kernel.
+    const iret_before = helpers.iretReturns();
+    try check(helpers.runProgram("/test/single_step") == 255);
+    try check(helpers.iretReturns() == iret_before + 1);
     try check(helpers.runProgram("/bin/hello") == 0);
     try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
 }
 
-/// Double faults and NMIs have their own stacks, and the CPU switches to them.
+/// Double faults, NMIs and debug exceptions have their own stacks, and the CPU switches to them.
 fn emergencyStacks() TestError!void {
     const failed = helpers.emergencyStacks();
     if (failed != 0) {
@@ -997,6 +1017,7 @@ fn runCases() noreturn {
         .{ .name = "kernel state at syscalls and timer interrupts, preemption mid-syscall", .func = kernelEntryInvariants },
         .{ .name = "syscall return states (iretq fallback, bad states killed)", .func = syscallReturnStates },
         .{ .name = "GS base switched on every entry and exit", .func = gsBaseSwitching },
+        .{ .name = "debug exception with the user GS base in ring 0", .func = debugTrapEntry },
         .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },
         .{ .name = "x87/SSE/AVX registers survive process switches", .func = extendedStateSwitching },
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },
@@ -1004,7 +1025,7 @@ fn runCases() noreturn {
         .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
         .{ .name = "user faults kill only the process (ring 3 exceptions)", .func = userFaults },
-        .{ .name = "double-fault and NMI emergency stacks", .func = emergencyStacks },
+        .{ .name = "double-fault, NMI and debug emergency stacks", .func = emergencyStacks },
         .{ .name = "guarded kernel stacks (alloc, guard page, free, reuse)", .func = kernelStacks },
         .{ .name = "kernel stack high-water mark", .func = stackUsage },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },

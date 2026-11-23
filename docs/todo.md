@@ -143,8 +143,9 @@ The ABI a program sees is described in `docs/syscalls.md`.
   - `read` and `write` return a short count when the buffer turns bad partway, as Linux does, instead of failing after a partial transfer.
 - [x] Introduce the per-CPU structure reached through GS, with `swapgs` on every entry from and exit to ring 3, while there is still one CPU (moved from the SMP milestone, so the entry assembly is audited once, in its final shape).
   - `src/arch/x86_64/percpu.zig` holds the kernel stack for `syscall` and the scratch slot for the user's stack pointer, which were globals. Scheduler state moves there in 3.2.
-  - NMIs, double faults and machine checks can interrupt ring 0 code that has the user's GS base (the first instruction of `syscall_entry`, the last before `sysretq`/`iretq`), so they decide by the GS base MSR instead of the saved CS (`isr_paranoid` in `idt.zig`).
-  - Not covered: a `#DB` or breakpoint exception in those few instructions would see the wrong GS base. Nothing can cause one today (programs cannot set debug registers); revisit with `ptrace` or hardware breakpoints.
+  - NMIs, double faults, machine checks and debug exceptions can interrupt ring 0 code that has the user's GS base (the first instruction of `syscall_entry`, the last before `sysretq`/`iretq`), so they decide by the GS base MSR instead of the saved CS (`isr_paranoid` in `idt.zig`).
+  - Debug exceptions also get their own emergency stack (IST 3): one at the first instruction of `syscall_entry` would otherwise run in ring 0 on the user's stack pointer (the "MOV SS" attack, CVE-2018-8897). Nothing can cause one there today, since programs cannot set debug registers and TF is masked on entry, but `ptrace` or hardware breakpoints would. Tested by raising the exception in ring 0 with the user's GS base loaded, and from ring 3 by single-stepping into a syscall (`/test/single_step`).
+  - A breakpoint exception (`int3`) stays on the ordinary path: it can only come from an instruction in the kernel's own code, never from the entry assembly.
 - [x] Enable SSE (CR0/CR4) and save and restore the extended CPU state per thread on context switch: XSAVE with the area sized from CPUID, AVX enabled where supported, FXSAVE as the fallback. Build user programs with SSE; the kernel stays soft-float.
   - `src/arch/x86_64/fpu.zig`. The state is switched eagerly, and only between user threads: the kernel never touches these registers, so syscalls, interrupts and kernel threads cost nothing. A user thread's save area is 832 bytes with AVX (512 with FXSAVE), allocated with the thread.
   - AVX-512 and AMX stay disabled in XCR0. Enabling AVX-512 is a size and speed question for 9.2.
@@ -157,6 +158,7 @@ The ABI a program sees is described in `docs/syscalls.md`.
   - [x] Close the known case: a `syscall` instruction at the very end of user space returns to a non-canonical address, and `sysretq` then faults in ring 0 on the user's stack pointer (Intel). The ELF loader now refuses to map the last user page or put the entry point there (tested with segments at, across and just below it).
   - [x] Check the saved state in the exit path itself, on every syscall (`src/arch/x86_64/sysret.zig`, host-tested): `sysretq` for ordinary returns, `iretq` when RF or TF is set, and the process is killed when neither can return (return address outside user space, or selectors that are not ring 3's). The flags are sanitized first, so a return can never turn interrupts off or raise IOPL.
   - RSP needs no check: both instructions load any value, and a bad one faults in ring 3.
+  - The kernel counts the returns it makes with `iretq` (`syscall.iret_returns`), and the tests check that exactly the returns that need it take that path.
 - [x] Verify interrupt masking and preemption across syscall entry, blocking, and return. Interrupts are off from the `syscall` instruction until the handler runs on the kernel stack, on during the call, and off again from before the registers are restored. Checked at every syscall of the test programs, including ones that block and switch threads (`helpers.installProbes`).
 - [x] Verify stack and address-space switches during timer interrupts and syscalls: at every timer interrupt and syscall, the frame is where it should be on the running thread's kernel stack, and CR3, the TSS stack and the per-CPU syscall stack are that thread's. Checked by the same probes, including timer interrupts that arrive inside a syscall.
 - [x] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions (`docs/syscalls.md`: says where it is Linux's and lists only what MyOS implements and where it differs).
@@ -330,6 +332,9 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 
 ### 6.2 Descriptors and I/O
 - [ ] Reserve FDs 0/1/2 for stdin/stdout/stderr.
+  - [x] The numbers are reserved since 2.5: `open` returns descriptors from 3 up, and `write` to 1 and 2 reaches the console.
+  - [ ] Still to do: they are not real descriptors. They cannot be closed, redirected or inherited, and `write` handles them as a special case.
+- [ ] Make `read` on descriptor 0 return keyboard input and remove the private `myos_getchar` syscall (`0x4D5900`). Today `read(0, ...)` returns `EBADF` and the shell reads keys with `myos_getchar`. Do it together with the terminal layer below, so blocking, line editing, echo and end of file are designed once; move `app/sh.zig` to `read` and update `docs/syscalls.md`.
 - [ ] Route console I/O through descriptor-backed devices.
 - [ ] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 6.3 depend on it.
 - [ ] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling. Keep it small; anything richer belongs in user space.

@@ -7,15 +7,17 @@
 //! handlers installed with `register`; CPU exceptions are reported and either
 //! kill the faulting user process or halt the kernel.
 //!
-//! Double faults and NMIs run on their own emergency stacks (the IST entries
-//! set up in `gdt.zig`), so they can be reported even when the interrupted
-//! stack is unusable. Both always halt the kernel.
+//! Double faults, NMIs and debug exceptions run on their own emergency
+//! stacks (the IST entries set up in `gdt.zig`), so they can be handled even
+//! when the interrupted stack is unusable or is still the user's. Double
+//! faults and NMIs always halt the kernel; a debug exception in ring 3 kills
+//! the process like any other fault, and one in ring 0 halts.
 //!
 //! GS base: an entry from ring 3 arrives with the user's GS base, so
 //! `isr_common` runs `swapgs` when the saved CS says ring 3, and again
-//! before returning there (see `percpu.zig`). NMIs, double faults and
-//! machine checks can also interrupt ring 0 code that still (or already)
-//! has the user's GS base: the first instruction of `syscall_entry`, or the
+//! before returning there (see `percpu.zig`). NMIs, double faults, machine
+//! checks and debug exceptions can also interrupt ring 0 code that still (or
+//! already) has the user's GS base: the first instruction of `syscall_entry`, or the
 //! last ones before `sysretq`/`iretq`. For them the saved CS proves nothing,
 //! so `isr_paranoid` reads the GS base MSR instead: a kernel address has the
 //! top bit set, and a user program cannot make its own base look like one.
@@ -92,7 +94,7 @@ fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
         else => false,
     };
     const common = switch (vec) {
-        VECTOR_NMI, VECTOR_DOUBLE_FAULT, VECTOR_MACHINE_CHECK => "isr_paranoid",
+        VECTOR_DEBUG, VECTOR_NMI, VECTOR_DOUBLE_FAULT, VECTOR_MACHINE_CHECK => "isr_paranoid",
         else => "isr_common",
     };
     const code = (if (has_err) "" else "pushq $0\n") ++
@@ -164,7 +166,7 @@ comptime {
         \\  add $16, %rsp
         \\  iretq
         \\
-        \\# NMI, double fault, machine check: decide by the GS base MSR
+        \\# Debug, NMI, double fault, machine check: decide by the GS base MSR
         \\# (0xC0000101), not by the saved CS. EBX (callee-saved, so it
         \\# survives the call) remembers whether GS was switched.
         \\.global isr_paranoid
@@ -224,11 +226,12 @@ comptime {
 }
 
 /// The IST index vector `vec` runs on: its own emergency stack for double
-/// faults and NMIs, 0 (no stack switch) for everything else.
+/// faults, NMIs and debug exceptions, 0 (no stack switch) for everything else.
 fn istFor(vec: usize) u3 {
     return switch (vec) {
         VECTOR_DOUBLE_FAULT => gdt.IST_DOUBLE_FAULT,
         VECTOR_NMI => gdt.IST_NMI,
+        VECTOR_DEBUG => gdt.IST_DEBUG,
         else => 0,
     };
 }
@@ -244,6 +247,7 @@ pub fn setGateIst(vector: u8, ist: u3) void {
     idt[vector].ist = ist;
 }
 
+const VECTOR_DEBUG = 1;
 const VECTOR_NMI = 2;
 const VECTOR_BREAKPOINT = 3;
 const VECTOR_DOUBLE_FAULT = 8;
@@ -289,6 +293,9 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
         root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.rsp, f.rflags });
         if (f.vector == VECTOR_PAGE_FAULT) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
         process.exit(process.EXIT_KILLED); // the parent sees exit status 255 for a crash
+    }
+    if (f.vector == VECTOR_DEBUG) {
+        if (handlers[VECTOR_DEBUG]) |h| return h(f); // a test is watching ring 0 debug traps
     }
     if (f.vector == VECTOR_PAGE_FAULT) {
         if (usercopy.fixup(f.rip, readCr2())) |resume_at| { // bad user pointer in a syscall
@@ -338,10 +345,17 @@ fn reportDoubleFault(f: *const Frame) void {
 }
 
 /// Install `h` as the handler for hardware interrupt `vector` (32-255).
+/// Vector 1 is accepted too: its handler gets debug exceptions raised in
+/// ring 0, which otherwise halt the kernel (tests use this).
 ///
 /// The handler runs with interrupts disabled after the EOI has been sent, so it
 /// may switch threads (e.g. the timer handler calling `thread.tick`).
 pub fn register(vector: u8, h: Handler) void {
+    handlers[vector] = h;
+}
+
+/// Install or remove (null) the handler for `vector`; see `register`.
+pub fn setHandler(vector: u8, h: ?Handler) void {
     handlers[vector] = h;
 }
 

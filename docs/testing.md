@@ -112,6 +112,7 @@ kernel killed the process for a fault), or two copies at once with
 | `syscall_abi` | A syscall preserves every register but `rax`, `rcx` and `r11`, the flags and the stack pointer (through `checked.zig`, which other programs use for their syscalls too) |
 | `preempt` | Long syscalls that the timer preempts halfway, run as a pair |
 | `bad_return` | Syscall returns through `iretq`, with privileged flags, and to states the CPU cannot return to (with the kernel test altering the saved state) |
+| `single_step` | Single-stepping into a syscall: the debug trap is delivered in ring 3 after the return, never in the kernel |
 | `gs_base` | The kernel's GS base is not visible in ring 3 |
 | `fpu`, `fpu_clean` | x87, SSE and AVX registers survive switches between two processes; a new process starts clean (`fpu_regs.zig` holds the shared assembly) |
 | `fuzz` | 20 000 random syscalls from a fixed seed: the kernel survives and leaks nothing |

@@ -483,8 +483,8 @@ fn istProbeFrame(ist: u3) u64 {
     return ist_probe_frame;
 }
 
-/// Check the emergency stacks: the double-fault and NMI gates name their own
-/// IST entries, the TSS points those at the ends of two separate, 16-byte
+/// Check the emergency stacks: the double-fault, NMI and debug gates name their own
+/// IST entries, the TSS points those at the ends of three separate, 16-byte
 /// aligned stacks, no other exception uses an IST stack, and the CPU really
 /// switches to such a stack (and back) when a gate asks for it. Returns 0, or
 /// the number of the first failing check.
@@ -494,9 +494,13 @@ pub fn emergencyStacks() u32 {
 
     if (idt.gateIst(8) != gdt.IST_DOUBLE_FAULT) return 1;
     if (idt.gateIst(2) != gdt.IST_NMI) return 2;
+    if (idt.gateIst(1) != gdt.IST_DEBUG) return 14;
     for (0..256) |vec| {
-        if (vec != 8 and vec != 2 and idt.gateIst(@intCast(vec)) != 0) return 3;
+        if (vec != 8 and vec != 2 and vec != 1 and idt.gateIst(@intCast(vec)) != 0) return 3;
     }
+    const dbg = gdt.istStack(gdt.IST_DEBUG);
+    const dbg_low = @intFromPtr(dbg.ptr);
+    if (gdt.istTop(gdt.IST_DEBUG) != dbg_low + dbg.len or gdt.istTop(gdt.IST_DEBUG) % 16 != 0) return 15;
 
     const df = gdt.istStack(gdt.IST_DOUBLE_FAULT);
     const nmi = gdt.istStack(gdt.IST_NMI);
@@ -506,7 +510,9 @@ pub fn emergencyStacks() u32 {
     const df_low = @intFromPtr(df.ptr);
     const nmi_low = @intFromPtr(nmi.ptr);
     if (df_low < nmi_low + nmi.len and nmi_low < df_low + df.len) return 7; // they overlap
-    for (3..8) |index| {
+    if (dbg_low < nmi_low + nmi.len and nmi_low < dbg_low + dbg.len) return 16;
+    if (dbg_low < df_low + df.len and df_low < dbg_low + dbg.len) return 17;
+    for (4..8) |index| {
         if (gdt.istTop(@intCast(index)) != 0) return 8;
     }
 
@@ -865,6 +871,8 @@ pub const Probes = struct {
     /// Timer interrupts that arrived in ring 0 on a process's thread: in
     /// the middle of a syscall.
     syscall_ticks: usize = 0,
+    /// `SYS_VIA_IRET` calls, each of which must return through `iretq`.
+    via_iret: usize = 0,
     /// Number of the first invariant that did not hold; 0 if all did.
     violation: u32 = 0,
 };
@@ -921,6 +929,7 @@ fn syscallProbe(f: *arch_syscall.Frame) void {
 
     switch (f.rax) {
         SYS_VIA_IRET => {
+            probes.via_iret += 1;
             f.rax = 0x1234;
             f.rflags |= 1 << 16; // RF: sysretq cannot restore it
         },
@@ -1038,5 +1047,85 @@ pub fn extendedStateSetup(want_xsave: bool) u32 {
     if (fpu.areaSize() > fpu.MAX_AREA_SIZE) return 12;
     // Kernel threads carry no saved state.
     if (thread.current().fpuArea() != null) return 13;
+    return 0;
+}
+
+/// The syscalls that returned through `iretq` since boot.
+pub fn iretReturns() usize {
+    return arch_syscall.iret_returns;
+}
+
+// What `debugProbe` saw.
+var debug_probe_runs: usize = 0;
+var debug_probe_gs: u64 = 0;
+var debug_probe_frame: u64 = 0;
+
+/// Debug-exception handler for `debugTrapEntry`: record the GS base the
+/// handler runs with and where the CPU pushed the frame.
+fn debugProbe(f: *idt.Frame) void {
+    debug_probe_runs += 1;
+    debug_probe_gs = cpu.rdmsr(percpu.MSR_GS_BASE);
+    debug_probe_frame = @intFromPtr(f);
+}
+
+/// Raise a debug exception in ring 0 and return the GS base seen right
+/// after it returns. With `user_gs` the exception is raised while the
+/// user's GS base is loaded, as at the first instruction of `syscall_entry`.
+fn raiseDebug(user_gs: bool) u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    if (user_gs) {
+        asm volatile (
+            \\ swapgs
+            \\ int $1
+            \\ mov $0xC0000101, %%ecx
+            \\ rdmsr
+            \\ swapgs
+            : [lo] "={eax}" (lo),
+              [hi] "={edx}" (hi),
+            :
+            : .{ .rcx = true, .memory = true });
+    } else {
+        asm volatile (
+            \\ int $1
+            \\ mov $0xC0000101, %%ecx
+            \\ rdmsr
+            : [lo] "={eax}" (lo),
+              [hi] "={edx}" (hi),
+            :
+            : .{ .rcx = true, .memory = true });
+    }
+    return @as(u64, hi) << 32 | lo;
+}
+
+/// Check the entry path of debug exceptions (shared with NMIs, double
+/// faults and machine checks, which cannot be raised and returned from): the
+/// handler runs on the debug emergency stack with the kernel's GS base
+/// whichever base was loaded when the exception hit, and the interrupted
+/// code gets its own base back. Returns 0, or the number of the first
+/// failing check.
+pub fn debugTrapEntry() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const kernel_gs = @intFromPtr(percpu.current());
+    const before = idt.registered(1);
+    idt.register(1, debugProbe);
+    defer idt.setHandler(1, before);
+    debug_probe_runs = 0;
+
+    // With the kernel's GS base: nothing to switch.
+    if (raiseDebug(false) != kernel_gs) return 1;
+    if (debug_probe_runs != 1) return 2;
+    if (debug_probe_gs != kernel_gs) return 3;
+    if (!onIstStack(gdt.IST_DEBUG, debug_probe_frame)) return 4;
+
+    // With the user's GS base, in ring 0: the saved CS says "kernel", and
+    // only the GS base itself shows that it must be switched.
+    const after = raiseDebug(true);
+    if (debug_probe_runs != 2) return 5;
+    if (debug_probe_gs != kernel_gs) return 6; // the handler ran with the user's base
+    if (after != 0) return 7; // the interrupted code did not get the user's base back
+    if (!onIstStack(gdt.IST_DEBUG, debug_probe_frame)) return 8;
+    if (cpu.rdmsr(percpu.MSR_GS_BASE) != kernel_gs or cpu.rdmsr(percpu.MSR_KERNEL_GS_BASE) != 0) return 9;
     return 0;
 }
