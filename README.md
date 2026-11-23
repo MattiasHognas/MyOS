@@ -23,4 +23,5 @@ project layout are in [docs/development.md](docs/development.md).
 - [Syscall ABI](docs/syscalls.md): Linux's x86-64 ABI as MyOS implements it
 - [Debugging](docs/debugging.md): logging, backtraces, QEMU + GDB
 - [Roadmap](docs/todo.md)
+- [Research notes](docs/research.md): code-review findings, papers and techniques, and what we do with each
 - [Specs x86-64 (cheat sheet)](docs/specs-x86_64.md)

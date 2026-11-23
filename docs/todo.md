@@ -262,7 +262,31 @@ From the code review before 2.2. None of these fix a known hole; they shrink wha
 - [x] Zero pages before they reach another process, as a rule in one place instead of at each call site: `pmm.allocZeroed` is the only source of pages for user address spaces and page tables. Tested from ring 3 (`/test/zero_pages`) after filling all free memory with a pattern.
   - Kernel stacks and heap pages are not zeroed: only the kernel sees them.
 
-**Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources. Reached: 2.1 to 2.9 are done.
+### 2.10 Review follow-ups
+From the code review of 2026-11-23 (`docs/research.md`). None fixes a known hole: the first group makes the kernel faster for a few lines each, the second shrinks what a future bug can do. They are part of milestone 2, which is not done until they are, and come before milestone 3, while there is one CPU and the changes are small.
+
+Speed:
+- [ ] Take the idle thread out of the round-robin queue: run it only when no other thread is ready. Today it gets a turn like any thread and halts until the next interrupt while others wait (`idle` in `src/main.zig`), which costs a CPU-bound program about a sixth of the CPU.
+  - Check the ready queue and halt with no gap between them (interrupts off for the check, then `sti; hlt`), so a wake-up cannot arrive just before the halt and wait for the next tick.
+  - Test: a CPU-bound thread gets all the time between two readings of the HPET, within a small margin, and the idle thread is never switched to while another thread is ready (count the switches).
+- [ ] Mark kernel mappings global (page-table bit 8, CR4.PGE), so loading CR3 keeps the kernel's TLB entries: the direct map, the kernel image, the heap, kernel stacks and the device window. `unmap` of a kernel address keeps working, since `invlpg` flushes global entries too.
+  - Test: CR4.PGE is set, kernel leaf entries have the bit and user ones do not; the existing stale-TLB test still passes for a kernel address.
+- [ ] Let a kernel thread keep the previous address space loaded instead of switching to `kernel_root` (`switchToNext` in `src/kernel/thread.zig`): every address space maps the kernel half. A blocking syscall then no longer costs two CR3 loads and TLB flushes for the trip through the idle thread.
+  - An address space must not be destroyed while it is loaded: load `kernel_root` first if it is.
+  - Test: a process that blocks and resumes with nothing else running causes no CR3 load (count them), and tearing down a process whose address space is still loaded is safe.
+- [ ] Scan the page allocator's bitmap a 64-bit word at a time with `@ctz` (`src/kernel/page_bitmap.zig`). The host test against the model covers it; add a case where the only free page is the last bit of a word and one where it is the last page.
+- [ ] Replace the `lfence` at the start of `user_copy` with branch-free clamping of the user address, as `nospec.index` does for indexes and as Linux does in `copy_from_user` since late 2024. An address outside user space becomes one that faults, whatever the CPU predicted.
+  - Test: the existing user-pointer tests, plus a host test of the clamp for addresses at, just below and above the end of user space.
+
+Hardening:
+- [ ] Make `.got` and `.data.rel.ro` read-only once the kernel runs: give them their own page-aligned part of `linker.ld` and map it without `WRITABLE` in `vmm.init`. The bootloader has applied the relocations by then. They hold function-pointer tables.
+  - Test: a write to the allocator's function table faults (a QEMU scenario, like `fault`).
+- [ ] Map the kernel's text and read-only data read-only in the direct map of physical memory as well, where they are writable today through the 2 MiB pages. The pages that hold the image need 4 KiB mappings there.
+  - Test: a write to kernel text through its direct-map address faults.
+- [ ] Give machine checks their own emergency stack (IST), like double faults, NMIs and debug exceptions: one in the first instructions of `syscall_entry` runs on the user's stack pointer today.
+- [ ] Call the syscall dispatcher directly in the normal kernel; keep the replaceable handler pointer (`arch.syscall.setHandler`) in the test kernel only.
+
+**Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources. Not reached yet: 2.1 to 2.9 are done, 2.10 is open.
 
 ---
 
@@ -282,11 +306,14 @@ The primitives come from 2.8 and are already real locks; this section makes thei
   - the keyboard buffer and modifier state, the console, and the serial port.
 - [ ] Make mutexes and wait queues safe against wakeups from another CPU. Today "check the condition and call `wait` with interrupts off" cannot lose a wake-up because nothing else runs; with several CPUs the check and the wait must be under a lock the waker also takes (`wait` releasing it atomically). `Mutex` and `process.wait` use that pattern and need the same change.
 - [ ] Define lock-ordering rules and test contention.
+- [ ] Model-check the blocking protocols before relying on them with several CPUs: write small PlusCal specifications of block/wake with its permit, wait queues with timeouts, and the mutex hand-off, and check them with TLC for lost wake-ups, double queueing and deadlock (the Converos approach, `docs/research.md`). Keep the specifications in the repository and note in each which code it describes.
+- [ ] Go through the syscalls that exist with the scalable commutativity rule (`docs/research.md`) and write down, in the locking document, which pairs must not contend on several CPUs and which cannot avoid it (`open` must return the lowest free descriptor).
 
 ### 3.2 Per-CPU state
 The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [ ] Move current-thread, scheduler, syscall-stack, and interrupt state to per-CPU storage.
 - [ ] Initialize separate GDT/TSS, emergency (IST) stacks and guarded stacks for each CPU.
+- [ ] Add a speculation barrier (`lfence`) after the conditional `swapgs` in `isr_common`, on both branches, once kernel code reads through GS: the CPU can guess the branch wrong and run on with the wrong GS base (CVE-2019-1125). Check the details against Linux's entry code first; the note in `docs/research.md` was written from memory.
 - [ ] Test per-CPU state and `swapgs` transitions (syscalls, interrupts from ring 0 and ring 3) with one and several CPUs.
 
 ### 3.3 Bring up application processors
@@ -303,6 +330,10 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [ ] Add CPU affinity/load balancing if needed.
 - [ ] Synchronize PMM, heap, page tables, and drivers.
 - [ ] Implement cross-CPU TLB shootdowns.
+  - `vmm.unmap` frees page tables that became empty, and hands the page back to its caller, before it flushes. With several CPUs the order must be: clear the entries, flush on every CPU that has the address space loaded, and only then free tables and pages. Otherwise another CPU can walk a freed table.
+- [ ] Decide the page allocator for several CPUs: per-CPU caches of free pages in front of the bitmap, or a lock-free design on bitmaps such as LLFree (`docs/research.md`), which also hands out 2 MiB frames cheaply (9.2).
+- [ ] Give the kernel heap size classes with a per-CPU cache of free objects, replacing the first-fit list under one lock (`docs/research.md`: magazines, snmalloc).
+- [ ] Preempt on wake-up, or otherwise bound how long a woken thread waits: today it goes to the tail of the queue and waits for the running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
 - [ ] Stress-test simultaneous allocations, processes, interrupts, and I/O.
 - [ ] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run.
 - [ ] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
@@ -325,6 +356,8 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 - [ ] Load position-independent executables (`ET_DYN`) at a chosen load bias.
 - [ ] Choose that load bias at random for each process (moved from 2.9, which randomized the stack and the kernel), with `process.SpawnOptions.randomize` turning it off as it does for the stack. Fixed-address executables (`ET_EXEC`) cannot be moved. Test that two runs of a PIE get different bases.
 - [ ] Give each thread its own FS base: `arch_prctl(ARCH_SET_FS)`, saved and restored on context switch; enable FSGSBASE when the CPU has it.
+  - Before FSGSBASE is enabled, change `isr_paranoid` (`src/arch/x86_64/idt.zig`): it takes a GS base with the top bit set to be the kernel's, and with `wrgsbase` a program can load such a value, so an NMI or debug exception would run on the user's GS base. Save the GS base on entry, load this CPU's own unconditionally, and restore the saved one on exit, as Linux does. Test from ring 3: set a kernel-looking GS base, single-step into a syscall, and expect the kernel to survive.
+  - `arch_prctl(ARCH_SET_GS)` and `ARCH_SET_FS` must refuse addresses outside user space.
   - The kernel does not set up the TLS block from `PT_TLS`: on Linux the C library does that itself, from the program headers it finds through `AT_PHDR`.
 - [ ] Extend the syscall ABI document from 2.5 with the startup stack, the auxiliary vector and TLS.
 - [ ] Test empty, long, invalid, and multi-argument commands, and check the stack layout from ring 3.
@@ -332,6 +365,7 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 ### 4.2 Minimal syscall set
 - [ ] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs.
 - [ ] Record what the target programs really ask for: run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
+  - Run them under Loupe as well (`docs/research.md`): it finds which of those calls must really work, which may return `ENOSYS` and which may pretend to succeed. That, not the bare list, is the work order.
 - [ ] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
 
 ### 4.3 Fixtures
@@ -349,6 +383,7 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 
 Designed once, demand-paged from the start, instead of an eager `mmap` first and demand paging later.
 
+- [ ] Before designing the next item, read the two opposite answers to it in `docs/research.md` and write down which way MyOS goes and why: page tables as the only record, with metadata per page (CortenMM), or a region structure built for concurrency (the interval skiplist). Many threads of one process fault and change mappings at once under a garbage collector, so the choice decides how 7 and 9.2 scale.
 - [ ] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults.
 - [ ] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
 - [ ] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
@@ -485,8 +520,8 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
   - Spawning a program copies the whole file to the heap and then into pages, although the initrd is already in memory (Debug builds: about 1.1 MiB per spawn, debug info included).
   - `print` keeps interrupts off while it writes to the polled serial port: about 22 ms for 256 bytes at 115200 baud, more than two timer ticks.
   - The kernel heap is first-fit over an address-sorted list with interrupts off; allocation and free are linear in the number of free chunks.
-  - The page allocator scans its bitmap one bit at a time, now with interrupts off.
-  - Every process switch reloads CR3 without PCID and flushes the TLB.
+  - The page allocator scans its bitmap one bit at a time, now with interrupts off (the scan itself: 2.10).
+  - Every process switch reloads CR3 without PCID and flushes the TLB (global kernel mappings and no reload for kernel threads: 2.10; PCID stays here).
   - Every switch between user threads saves and restores the whole x87/SSE/AVX state with plain XSAVE (2.5). XSAVEOPT or XSAVES would skip what has not changed.
   - AVX-512 is disabled (2.5). Decide whether to enable it: the .NET runtime uses it where it can, at the cost of a save area of about 2.5 KiB per thread.
   - `vmm.unmap` scans whole page tables (512 entries per level) to see whether they became empty (2.6); a count per table would avoid it.
@@ -649,6 +684,9 @@ Off the critical path (only network programs need it). It can be taken any time 
   - Until then: the guard page below each kernel stack (2.3) catches a stack that grows too far, but not an overflow that overwrites a return address inside the stack.
 - [ ] Fuzz the syscall interface with a fuzzer steered by kernel coverage (the fixed-sequence fuzzer of 2.5 stays in CI). Needs coverage instrumentation in the kernel and a way to get it out to the fuzzer.
 - [ ] Mitigate the Spectre variants beyond bounds-check bypass (2.9): branch target injection (retpolines or IBRS, IBPB on process switch, STIBP), return stack underflow, and the newer ones, decided per CPU from its capability bits as for Meltdown.
+  - First step, cheap: turn on enhanced IBRS (Intel) or AutoIBRS (AMD) at boot where the CPU has it. Check the details first; the note in `docs/research.md` was written from memory.
+- [ ] Enable LASS (linear address space separation) where the CPU has it: one CR4 bit that makes ring 3 accesses to kernel addresses fault before the page walk, which closes timing probes of the kernel's layout that KASLR alone does not. It reuses the `stac`/`clac` section of `user_copy` (`docs/research.md`). Needs a CPU model in QEMU that has it to test.
+- [ ] Add a FRED entry path next to the IDT and `syscall` one, once QEMU can emulate FRED in CI: it replaces `swapgs`, the emergency stacks and `sysretq` with entry and return that cannot be caught half-done (`docs/research.md`).
 - [ ] Randomize the kernel's fixed regions as well as its image (2.9): the direct map of physical memory, the heap, the kernel stacks and the device window. They are at fixed addresses today, so a leaked pointer into one of them is as good as before KASLR.
 - [ ] Decide whether to implement kernel page-table isolation after all, so that CPUs affected by Meltdown can run untrusted programs (2.9 refuses to boot on them).
 - [ ] Charge a process for the kernel memory it causes beyond its pages: its process and thread structures, saved x87/SSE/AVX state, open-file records, and later pipe buffers and socket buffers.
