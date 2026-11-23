@@ -9,4 +9,7 @@ test {
     std.testing.refAllDecls(@import("log_format_test.zig"));
     std.testing.refAllDecls(@import("user_range_test.zig"));
     std.testing.refAllDecls(@import("elf_image_test.zig"));
+    std.testing.refAllDecls(@import("abi_test.zig"));
+    std.testing.refAllDecls(@import("sysret_test.zig"));
+    std.testing.refAllDecls(@import("fpu_test.zig"));
 }

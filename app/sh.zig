@@ -47,14 +47,17 @@ export fn _start() callconv(.c) noreturn {
         if (std.mem.eql(u8, cmd, "exit")) lib.exit(0);
 
         // "hello" -> "/bin/hello"; anything with a slash is used as-is
+        // (the kernel wants a NUL-terminated path)
         const full = if (std.mem.indexOfScalar(u8, cmd, '/') != null)
-            cmd
+            std.fmt.bufPrintSentinel(&path, "{s}", .{cmd}, 0) catch continue
         else
-            std.fmt.bufPrint(&path, "/bin/{s}", .{cmd}) catch continue;
+            std.fmt.bufPrintSentinel(&path, "/bin/{s}", .{cmd}, 0) catch continue;
 
         const code = lib.run(full);
-        if (code == lib.ERR) {
+        if (code == lib.err(.NOENT)) {
             lib.print("sh: {s}: not found\n", .{cmd});
+        } else if (lib.isError(code)) {
+            lib.print("sh: {s}: cannot run (error {d})\n", .{ cmd, lib.errno(code) });
         } else if (code != 0) {
             lib.print("sh: {s} exited with code {d}\n", .{ cmd, code });
         }

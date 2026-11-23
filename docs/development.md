@@ -132,7 +132,8 @@ the terminal.
 | Path | Contents |
 | --- | --- |
 | `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
-| `src/arch/x86_64/` | GDT/TSS with the double-fault and NMI emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry, fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), port I/O |
+| `src/abi/linux.zig` | The user/kernel ABI (Linux's syscall numbers, error values and flags), imported by the kernel and by user programs (see [syscalls](syscalls.md)) |
+| `src/arch/x86_64/` | GDT/TSS with the double-fault and NMI emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry and the `sysretq`/`iretq` choice (`syscall`, `sysret`), per-CPU data behind the GS base (`percpu`), x87/SSE/AVX state (`fpu`), fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
@@ -154,7 +155,7 @@ the terminal.
 
 Limine loads `kernel.elf` and `initrd.tar`, answers the requests in
 `src/main.zig`, and jumps to `kmain`. `kmain` brings up, in order: serial, GDT,
-IDT, framebuffer console, PMM, page tables, SMEP/SMAP, kernel symbols, ACPI, APIC, HPET,
+per-CPU data (GS base), IDT, framebuffer console, PMM, page tables, SMEP/SMAP, SSE/AVX and their save area, kernel symbols, ACPI, APIC, HPET,
 PCI (and NVMe if present), the APIC timer, syscalls and the initrd. The
 normal kernel then starts `/bin/sh` and becomes the idle thread; the test
 kernel runs the scenario QEMU asks for instead.
@@ -169,20 +170,31 @@ test image).
 
 1. Create `app/<name>.zig`: import `lib.zig`, set `pub const panic = lib.panic;`
    and export `_start` (see `app/hello.zig`).
-2. Add `_ = userProgram(b, "<name>", "app/<name>.zig", target, optimize);` in
-   `build.zig`.
+2. Add it in `build.zig` next to `hello`: `userProgram(b, "<name>",
+   "app/<name>.zig", <link address>, user_target, optimize)`, with the `abi`
+   import that `lib.zig` needs. User programs are built for baseline x86-64
+   with SSE2; the kernel is built without SSE.
 3. Copy it into the initrd in `scripts/build.sh` (`cp zig-out/bin/<name>.elf "$initrd/bin/<name>"`).
 
 ### Adding a syscall
 
-1. Add the number and an implementation to `src/kernel/syscall.zig` and a case
-   in `dispatch`. Never dereference a user pointer: copy the data into a
-   kernel buffer with `uaccess.copyFromUser`, or out with
-   `uaccess.copyToUser`, and return `ERR` when they fail with `error.Fault`
-   (with SMAP on, a direct access is a kernel page fault).
-2. Add a wrapper to `app/lib.zig` (the numbers must match).
-3. Test it from ring 3 in `tests/user/syscalls.zig`, and its pointer
-   arguments in `tests/user/user_pointers.zig` (see [testing](testing.md)).
+The ABI is Linux's ([syscalls](syscalls.md)), so a new call takes Linux's
+number, arguments, result and error values. Only something Linux has no call
+for gets a private number.
+
+1. Add the number to `src/abi/linux.zig` (and any error value or flag it
+   needs, with Linux's values), an implementation to `src/kernel/syscall.zig`
+   and a case in `dispatch`. Never dereference a user pointer: copy the data
+   into a kernel buffer with `uaccess.copyFromUser` (or
+   `copyStringFromUser` for a path), or out with `uaccess.copyToUser`, and
+   return `err(.FAULT)` when they fail with `error.Fault` (with SMAP on, a
+   direct access is a kernel page fault). Return a specific error for every
+   failure.
+2. Add a wrapper to `app/lib.zig`.
+3. Describe it in `docs/syscalls.md`, including what differs from Linux.
+4. Test it from ring 3: each error in `tests/user/syscalls.zig`, its pointer
+   arguments in `tests/user/user_pointers.zig`, and add its number to
+   `implemented` in `tests/user/fuzz.zig` (see [testing](testing.md)).
 
 ### Releases
 

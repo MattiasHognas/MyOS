@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) void {
         .cpu_features_sub = sub,
         .cpu_features_add = add,
     });
+    // User programs use SSE2, like every x86-64 program built for Linux; the
+    // kernel saves and restores their registers (src/arch/x86_64/fpu.zig).
+    const user_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const kopts: KernelOptions = .{
@@ -52,20 +59,35 @@ pub fn build(b: *std.Build) void {
 
     const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false, kopts);
     b.installArtifact(kernel);
-    const exe_hello = userProgram(b, "hello", "app/hello.zig", 0x80_0000, target, optimize);
+    // Syscall numbers and error values, shared by the kernel and user programs.
+    const abi = b.createModule(.{
+        .root_source_file = b.path("src/abi/linux.zig"),
+        .target = user_target,
+        .optimize = optimize,
+    });
+    const exe_hello = userProgram(b, "hello", "app/hello.zig", 0x80_0000, user_target, optimize);
+    exe_hello.root_module.addImport("abi", abi);
     b.installArtifact(exe_hello);
-    const exe_shell = userProgram(b, "sh", "app/sh.zig", 0x40_0000, target, optimize);
+    const exe_shell = userProgram(b, "sh", "app/sh.zig", 0x40_0000, user_target, optimize);
+    exe_shell.root_module.addImport("abi", abi);
     b.installArtifact(exe_shell);
 
     // User-mode test programs, packaged into the test initrd as /test/<name>.
     const user_lib = b.createModule(.{
         .root_source_file = b.path("app/lib.zig"),
-        .target = target,
+        .target = user_target,
         .optimize = optimize,
     });
-    inline for (.{ "syscalls", "kernel_read", "privileged", "write_text", "user_pointers", "entry_regs", "umip", "div_zero", "invalid_opcode" }) |name| {
-        const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, target, optimize);
+    user_lib.addImport("abi", abi);
+    inline for (.{
+        "syscalls",   "kernel_read", "privileged", "write_text",     "user_pointers",
+        "entry_regs", "umip",        "div_zero",   "invalid_opcode", "syscall_abi",
+        "preempt",    "gs_base",     "fpu",        "fpu_clean",      "fuzz",
+        "bad_return",
+    }) |name| {
+        const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, user_target, optimize);
         exe.root_module.addImport("lib", user_lib);
+        exe.root_module.addImport("abi", abi);
         b.installArtifact(exe); // scripts/build.sh --package-test picks them up from zig-out/bin
     }
 
@@ -178,6 +200,9 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "log_format", "src/kernel/debug/log_format.zig" },
         .{ "user_range", "src/kernel/user_range.zig" },
         .{ "elf_image", "src/kernel/elf_image.zig" },
+        .{ "abi", "src/abi/linux.zig" },
+        .{ "sysret", "src/arch/x86_64/sysret.zig" },
+        .{ "fpu", "src/arch/x86_64/fpu.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),

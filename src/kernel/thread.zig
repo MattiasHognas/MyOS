@@ -9,13 +9,15 @@
 //! Every thread runs on a guarded kernel stack from `kstack.zig`, including
 //! the boot thread once `adoptBootStack` has been called.
 
+const std = @import("std");
 const root = @import("root");
 const heap = @import("heap.zig");
 const kstack = @import("kstack.zig");
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
-const arch_syscall = @import("../arch/x86_64/syscall.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
+const fpu = @import("../arch/x86_64/fpu.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const assert = @import("debug/assert.zig");
 const proc = @import("process.zig"); // the file: for proc.destroy
@@ -63,6 +65,7 @@ fn reap() void {
         if (z.process) |p| proc.destroy(p);
         if (kstack.used(z.stack.?)) |bytes| kstack.record(z.id, bytes); // -Dstack-usage
         kstack.free(z.stack.?);
+        if (z.fpu_alloc) |a| heap.allocator.free(a);
         heap.allocator.destroy(z);
     }
 }
@@ -97,6 +100,16 @@ pub const Thread = struct {
     wake_pending: bool = false,
     /// Value passed from waker to sleeper (e.g. a child's exit code).
     wake_value: u64 = 0,
+    /// Heap block holding the saved x87/SSE/AVX state while the thread is
+    /// not running (`fpu.zig`). Null for kernel threads, which have none.
+    fpu_alloc: ?[]u8 = null,
+
+    /// The save area inside `fpu_alloc`, at the alignment the CPU requires
+    /// (the heap aligns to 16 bytes only, so the block is 64 bytes larger).
+    pub fn fpuArea(t: *const Thread) ?[*]align(fpu.AREA_ALIGN) u8 {
+        const raw = t.fpu_alloc orelse return null;
+        return @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(raw.ptr), fpu.AREA_ALIGN));
+    }
 };
 
 /// Block the current thread until another thread or interrupt handler calls
@@ -128,12 +141,15 @@ pub fn wake(t: *Thread) void {
 /// Create a thread that runs `entry` and put it in the ready queue.
 ///
 /// `process` is the user process the thread belongs to, or null for a kernel
-/// thread. The thread gets a guarded kernel stack from `kstack`; when `entry`
+/// thread. The thread gets a guarded kernel stack from `kstack` and, if it
+/// belongs to a process, clean extended CPU state (`fpu.initArea`); when `entry`
 /// returns the thread exits. Returns `error.OutOfMemory` if an allocation
 /// fails or all kernel stacks are in use.
 pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
     const t = try heap.allocator.create(Thread);
     errdefer heap.allocator.destroy(t);
+    const fpu_alloc: ?[]u8 = if (process != null) try heap.allocator.alloc(u8, fpu.areaSize() + fpu.AREA_ALIGN) else null;
+    errdefer if (fpu_alloc) |a| heap.allocator.free(a);
     const stack = kstack.alloc() orelse return error.OutOfMemory;
 
     t.* = .{
@@ -142,7 +158,9 @@ pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
         .state = .ready,
         .rsp = context.initStack(@intFromPtr(stack.ptr) + stack.len, @intFromPtr(&start), @intFromPtr(entry)),
         .process = process,
+        .fpu_alloc = fpu_alloc,
     };
+    if (t.fpuArea()) |area| fpu.initArea(area[0..fpu.areaSize()]);
 
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -163,8 +181,11 @@ pub fn adoptBootStack(stack: []u8) void {
 /// Switch to the next ready thread, if there is one.
 ///
 /// A running thread goes back to the tail of the ready queue; a blocked or
-/// dead one does not. Loads the next thread's address space and kernel stack,
-/// resets the time slice and switches context. When this thread is scheduled
+/// dead one does not. Loads the next thread's address space, kernel stack
+/// and extended CPU state (saving the previous thread's), resets the time
+/// slice and switches context. Everything happens with interrupts off, on
+/// the previous thread's kernel stack, which stays mapped in every address
+/// space. When this thread is scheduled
 /// again, frees any zombie threads and returns.
 pub fn yield() void {
     const flags = cpu.saveAndDisableInterrupts();
@@ -184,7 +205,7 @@ pub fn yield() void {
     if (next.stack) |s| {
         const top = @intFromPtr(s.ptr) + s.len;
         gdt.setKernelStack(top); // for interrupts from ring 3
-        arch_syscall.setKernelStack(top); // for syscalls
+        percpu.setKernelStack(top); // for syscalls
     }
 
     const new_root = if (next.process) |p| p.root else vmm.kernel_root;
@@ -192,6 +213,8 @@ pub fn yield() void {
         vmm.loadRoot(new_root);
         loaded_root = new_root;
     }
+
+    fpu.switchState(prev.fpuArea(), next.fpuArea());
 
     context.switchTo(&prev.rsp, next.rsp);
 

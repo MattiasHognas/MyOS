@@ -1,12 +1,13 @@
-//! System call numbers and their kernel implementations.
+//! System calls: the kernel side of the ABI in `abi/linux.zig`.
 //!
-//! User programs pass the syscall number in RAX and up to three arguments in
-//! RDI, RSI and RDX; the result is returned in RAX. Failures return `ERR`
-//! (all bits set, i.e. -1). User memory is never dereferenced directly: data
-//! is copied to and from kernel buffers with `uaccess.copyFromUser` and
-//! `uaccess.copyToUser`, which fail cleanly on bad pointers.
+//! The ABI is Linux's for x86-64: the number is in RAX, up to six arguments
+//! in RDI, RSI, RDX, R10, R8 and R9, and the result comes back in RAX, as a
+//! value or as a negated error number (`abi.err`). `docs/syscalls.md` lists
+//! the calls. User memory is never dereferenced directly: data is copied to
+//! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
 const root = @import("root");
+const abi = @import("../abi/linux.zig");
 const thread = @import("thread.zig");
 const arch = @import("../arch/x86_64/syscall.zig");
 const heap = @import("heap.zig");
@@ -17,33 +18,16 @@ const proc = @import("process.zig");
 const uaccess = @import("uaccess.zig");
 const user_range = @import("user_range.zig");
 
-/// `getchar() -> char`: block until a key is pressed and return it.
-pub const GETCHAR = 7;
-/// `run(path_ptr, path_len) -> exit code`: start a program and wait for it to exit.
-pub const RUN = 8;
-/// `open(path_ptr, path_len) -> fd`: open a file for reading.
-pub const OPEN = 4;
-/// `read(fd, buf_ptr, buf_len) -> bytes read`: read from an open file; 0 at end of file.
-pub const READ = 5;
-/// `close(fd) -> 0`: close a file descriptor.
-pub const CLOSE = 6;
-/// `write(ptr, len) -> len`: write a string (at most 4 KiB) to the console.
-pub const WRITE = 0;
-/// `exit(code)`: terminate the calling process. Does not return.
-pub const EXIT = 1;
-/// `yield() -> 0`: give the CPU to another ready thread.
-pub const YIELD = 2;
-/// `gettid() -> id`: return the calling thread's ID.
-pub const GETTID = 3;
+const Sys = abi.Sys;
+const err = abi.err;
 
-/// Longest path accepted from user space, in bytes.
-const MAX_PATH = 256;
 /// Size of the kernel bounce buffer used to move data to and from user space.
 const CHUNK = 256;
-const ERR: u64 = @bitCast(@as(i64, -1));
+/// Descriptors below this are the standard streams; `open` never returns them.
+const FIRST_FILE_FD = 3;
 
-/// `GETCHAR`: return the next key from the keyboard buffer, blocking the
-/// calling thread until one is typed.
+/// `myos_getchar`: return the next key from the keyboard buffer, blocking
+/// the calling thread until one is typed.
 fn sysGetChar() u64 {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -54,44 +38,59 @@ fn sysGetChar() u64 {
     }
 }
 
-/// Copy a path of `len` bytes from the user address `ptr` into `buf`.
-/// Returns null if it is longer than `MAX_PATH` or cannot be read.
-fn userPath(buf: *[MAX_PATH]u8, ptr: u64, len: u64) ?[]const u8 {
-    if (len > MAX_PATH) return null;
-    const path = buf[0..@intCast(len)];
-    uaccess.copyFromUser(path, ptr) catch return null;
-    return path;
+/// Copy the NUL-terminated path at the user address `ptr` into `buf` and
+/// return it without the NUL. Errors are syscall results: `EFAULT` if it
+/// cannot be read, `ENAMETOOLONG` if it does not end within `PATH_MAX`
+/// bytes, `ENOENT` if it is empty.
+fn userPath(buf: *[abi.PATH_MAX]u8, ptr: u64) union(enum) { path: []const u8, fail: u64 } {
+    const len = uaccess.copyStringFromUser(buf, ptr) catch |e| return .{ .fail = switch (e) {
+        error.Fault => err(.FAULT),
+        error.TooLong => err(.NAMETOOLONG),
+    } };
+    if (len == 0) return .{ .fail = err(.NOENT) };
+    return .{ .path = buf[0..len] };
 }
 
-/// `RUN`: spawn the program at the user-space path (`ptr`, `len`) as a child
-/// process and block until it exits. Returns the child's exit code, or `ERR`
-/// if the path is invalid or the program cannot be started.
-fn sysRun(ptr: u64, len: u64) u64 {
-    var path_buf: [MAX_PATH]u8 = undefined;
-    const path = userPath(&path_buf, ptr, len) orelse return ERR;
+/// `myos_run`: spawn the program at the user path `ptr` as a child process
+/// and block until it exits. Returns the child's exit status (0-255), or an
+/// error: those of `userPath`, `ENOENT` (no such file), `ENOEXEC` (not a
+/// loadable program) or `ENOMEM`.
+fn sysRun(ptr: u64) u64 {
+    var path_buf: [abi.PATH_MAX]u8 = undefined;
+    const path = switch (userPath(&path_buf, ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
     const me = thread.current();
-    _ = proc.spawnPath(path, me) catch return ERR;
+    _ = proc.spawnPath(path, me) catch |e| return switch (e) {
+        error.FileNotFound => err(.NOENT),
+        error.OutOfMemory => err(.NOMEM),
+        else => err(.NOEXEC), // unreadable, or refused by the ELF loader
+    };
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     thread.block(); // until the child calls process.exit
     return me.wake_value;
 }
 
-/// `WRITE`: print the user string (`ptr`, `len`) to the serial port and
-/// console. Returns `len`, or `ERR` if the range is over 4 KiB, outside user
-/// space or not readable. If only a later part is unreadable, the part before
-/// it has already been printed.
-fn sysWrite(ptr: u64, len: u64) u64 {
-    if (len > 4096 or !user_range.valid(ptr, len)) return ERR;
+/// `write`: print `count` bytes at the user address `ptr` to the console.
+/// Only descriptors 1 and 2 can be written; anything else is `EBADF` (files
+/// are read-only). Returns the number of bytes written, which is short if a
+/// later part of the buffer cannot be read, or `EFAULT` if none of it can.
+fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
+    if (fd != abi.STDOUT and fd != abi.STDERR) return err(.BADF);
+    const len = @min(count, abi.MAX_RW_COUNT);
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
     var chunk: [CHUNK]u8 = undefined;
-    var off: u64 = 0;
-    while (off < len) {
-        const part = chunk[0..@intCast(@min(CHUNK, len - off))];
-        uaccess.copyFromUser(part, ptr + off) catch return ERR;
+    var done: u64 = 0;
+    while (done < len) {
+        const part = chunk[0..@intCast(@min(CHUNK, len - done))];
+        uaccess.copyFromUser(part, ptr + done) catch break;
         root.print("{s}", .{part});
-        off += part.len;
+        done += part.len;
     }
-    return len;
+    if (done == 0 and len != 0) return err(.FAULT);
+    return done;
 }
 
 /// Return the open file for descriptor `fd` of the current process, or null
@@ -102,76 +101,102 @@ fn fileOf(fd: u64) ?*vfs.OpenFile {
     return p.files[fd];
 }
 
-/// `OPEN`: look up the user path (`ptr`, `len`) and store an `OpenFile` for it
-/// in the lowest free descriptor slot. Returns the descriptor, or `ERR` if the
-/// path is invalid, the file doesn't exist or the descriptor table is full.
-fn sysOpen(ptr: u64, len: u64) u64 {
-    var path_buf: [MAX_PATH]u8 = undefined;
-    const path = userPath(&path_buf, ptr, len) orelse return ERR;
-    const node = vfs.lookup(path) orelse return ERR;
-    const p = thread.current().process orelse return ERR;
-    for (&p.files, 0..) |*slot, fd| {
+/// `open`: look up the user path `ptr` and store an `OpenFile` for it in the
+/// lowest free descriptor from 3 up. `flags` must ask for read-only access
+/// (`EROFS` otherwise: every filesystem is read-only); other flag bits and
+/// the mode are ignored. Returns the descriptor, or an error: those of
+/// `userPath`, `ENOENT`, `EMFILE` (descriptor table full) or `ENOMEM`.
+fn sysOpen(ptr: u64, flags: u64) u64 {
+    var path_buf: [abi.PATH_MAX]u8 = undefined;
+    const path = switch (userPath(&path_buf, ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    const node = vfs.lookup(path) orelse
+        return if (flags & abi.O.CREAT != 0) err(.ROFS) else err(.NOENT);
+    if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ROFS);
+    const p = thread.current().process orelse return err(.BADF);
+    for (p.files[FIRST_FILE_FD..], FIRST_FILE_FD..) |*slot, fd| {
         if (slot.* != null) continue;
-        const of = heap.allocator.create(vfs.OpenFile) catch return ERR;
+        const of = heap.allocator.create(vfs.OpenFile) catch return err(.NOMEM);
         of.* = .{ .node = node };
         slot.* = of;
         return fd;
     }
-    return ERR; // fd table full
+    return err(.MFILE);
 }
 
-/// `READ`: read up to `len` bytes (max 1 MiB) from descriptor `fd` into the
-/// user buffer at `ptr`, advancing the file offset. Returns the number of
-/// bytes read, 0 at end of file, or `ERR` if `fd` or the buffer is invalid.
-/// On `ERR` the file offset is unchanged, though part of the buffer may have
-/// been written.
-fn sysRead(fd: u64, ptr: u64, len: u64) u64 {
-    const of = fileOf(fd) orelse return ERR;
-    if (len > 1 << 20 or !user_range.valid(ptr, len)) return ERR;
+/// `read`: read up to `count` bytes from descriptor `fd` into the user
+/// buffer at `ptr`, advancing the file offset by what was read. Returns the
+/// number of bytes read (0 at end of file), which is short if a later part
+/// of the buffer cannot be written; `EBADF` if `fd` is not an open file
+/// (descriptor 0 has no input yet: milestone 6); `EFAULT` if nothing could
+/// be stored. On `EFAULT` the offset is unchanged.
+fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
+    const of = fileOf(fd) orelse return err(.BADF);
+    const len = @min(count, abi.MAX_RW_COUNT);
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
     var chunk: [CHUNK]u8 = undefined;
     var done: u64 = 0;
+    var faulted = false;
     while (done < len) {
         const want: usize = @intCast(@min(CHUNK, len - done));
         const n = vfs.read(&of.node, of.offset + done, chunk[0..want]);
         if (n == 0) break; // end of file
-        uaccess.copyToUser(ptr + done, chunk[0..n]) catch return ERR;
+        uaccess.copyToUser(ptr + done, chunk[0..n]) catch {
+            faulted = true;
+            break;
+        };
         done += n;
     }
+    if (faulted and done == 0) return err(.FAULT);
     of.offset += done;
     return done;
 }
 
-/// `CLOSE`: free the open file behind descriptor `fd` and clear its slot.
-/// Returns 0, or `ERR` if `fd` is not open.
+/// `close`: free the open file behind descriptor `fd` and clear its slot.
+/// Returns 0, or `EBADF` if `fd` is not an open file. Closing a standard
+/// stream succeeds and changes nothing, since they cannot be reopened yet.
 fn sysClose(fd: u64) u64 {
-    const of = fileOf(fd) orelse return ERR;
+    if (fd < FIRST_FILE_FD) return 0;
+    const of = fileOf(fd) orelse return err(.BADF);
     heap.allocator.destroy(of);
     thread.current().process.?.files[fd] = null;
     return 0;
 }
 
 /// Syscall handler registered with the arch layer: call the implementation
-/// selected by `f.rax` with the arguments from `f.rdi`, `f.rsi` and `f.rdx`,
-/// and store its result in `f.rax`. Unknown numbers return `ERR`.
-fn dispatch(f: *arch.Frame) void {
+/// selected by `f.rax` with the arguments from the frame and store its
+/// result in `f.rax`. Unknown numbers return `ENOSYS`.
+pub fn dispatch(f: *arch.Frame) void {
     f.rax = switch (f.rax) {
-        EXIT => proc.exit(f.rdi),
-        GETCHAR => sysGetChar(),
-        RUN => sysRun(f.rdi, f.rsi),
-        OPEN => sysOpen(f.rdi, f.rsi),
-        READ => sysRead(f.rdi, f.rsi, f.rdx),
-        CLOSE => sysClose(f.rdi),
-        WRITE => sysWrite(f.rdi, f.rsi),
-        YIELD => blk: {
+        Sys.read => sysRead(f.rdi, f.rsi, f.rdx),
+        Sys.write => sysWrite(f.rdi, f.rsi, f.rdx),
+        Sys.open => sysOpen(f.rdi, f.rsi),
+        Sys.close => sysClose(f.rdi),
+        Sys.sched_yield => blk: {
             thread.yield();
             break :blk 0;
         },
-        GETTID => thread.id(),
-        else => ERR,
+        Sys.exit => proc.exit(abi.exitStatus(f.rdi)),
+        Sys.gettid => thread.id(),
+        Sys.myos_getchar => sysGetChar(),
+        Sys.myos_run => sysRun(f.rdi),
+        else => err(.NOSYS),
     };
+}
+
+/// A syscall is about to return to a state the CPU cannot return to (a
+/// return address outside user space, say): report it and kill the process,
+/// as a fault at that address would.
+fn badReturn(f: *const arch.Frame) noreturn {
+    const p = thread.current().process.?;
+    root.print("\n*** thread {d} ({s}): invalid return state after syscall, killed\n", .{ thread.id(), p.name });
+    root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x} CS=0x{x} SS=0x{x}\n", .{ f.rip, f.rsp, f.rflags, f.cs, f.ss });
+    proc.exit(proc.EXIT_KILLED);
 }
 
 /// Enable the `syscall` instruction and route it to `dispatch`. Called once during boot.
 pub fn init() void {
-    arch.init(dispatch);
+    arch.init(dispatch, badReturn);
 }

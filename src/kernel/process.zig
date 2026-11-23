@@ -33,6 +33,10 @@ pub const image_limits: elf_image.Limits = .{
     .max_bytes = MAX_IMAGE_BYTES,
 };
 
+/// Exit status of a process the kernel killed (a fault in ring 3, or a
+/// state it could not return to).
+pub const EXIT_KILLED = 255;
+
 /// A user process. Owned by its thread and freed by `destroy` when that thread is reaped.
 pub const Process = struct {
     /// Physical address of the process's PML4.
@@ -41,13 +45,15 @@ pub const Process = struct {
     entry: u64,
     /// Heap-allocated copy of the name the process was spawned with.
     name: []const u8,
-    /// File descriptor table, indexed by fd.
+    /// File descriptor table, indexed by fd. Slots 0-2 are the standard
+    /// streams and stay null: the console is not a file yet.
     files: [16]?*vfs.OpenFile = @splat(null),
     /// Thread woken with the exit code (in `wake_value`) when the process exits.
     waiter: ?*thread.Thread = null,
 };
 
-/// Terminate the current process with exit code `code`.
+/// Terminate the current process with exit status `code` (0-255; the
+/// `exit` syscall masks it, as on Linux).
 ///
 /// Wakes the waiting parent (if any) with the exit code, then exits the
 /// current thread. The process's memory is freed later, when the scheduler

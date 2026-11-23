@@ -16,9 +16,12 @@ pub const arch = struct {
         pub const apic = @import("arch/x86_64/apic.zig");
         pub const context = @import("arch/x86_64/context.zig");
         pub const cpu = @import("arch/x86_64/cpu.zig");
+        pub const fpu = @import("arch/x86_64/fpu.zig");
         pub const gdt = @import("arch/x86_64/gdt.zig");
         pub const idt = @import("arch/x86_64/idt.zig");
+        pub const percpu = @import("arch/x86_64/percpu.zig");
         pub const syscall = @import("arch/x86_64/syscall.zig");
+        pub const sysret = @import("arch/x86_64/sysret.zig");
         pub const usercopy = @import("arch/x86_64/usercopy.zig");
         pub const vmm = @import("arch/x86_64/vmm.zig");
     };
@@ -28,6 +31,9 @@ pub const arch = struct {
 pub const boot = struct {
     pub const limine = @import("boot/limine.zig");
 };
+
+/// The user/kernel ABI shared with user programs: Linux's syscall numbers and error values.
+pub const abi = @import("abi/linux.zig");
 
 /// Hardware device drivers.
 pub const drivers = struct {
@@ -236,6 +242,7 @@ pub fn halt() noreturn {
 export fn kmain() callconv(.c) noreturn {
     serial.init();
     gdt.init();
+    arch.x86_64.percpu.init(); // after gdt.init: loading GS resets its base
     idt.init();
 
     const fb = response(&fb_request);
@@ -247,6 +254,7 @@ export fn kmain() callconv(.c) noreturn {
     pmm.init(mm, hhdm);
     vmm.init(mm, response(&kaddr_request), hhdm);
     arch.x86_64.usercopy.init(); // SMEP/SMAP: from here on, user memory only through kernel.uaccess
+    arch.x86_64.fpu.init(); // SSE/AVX for user code, and how their state is saved
     log.info("memory: {d} MiB free", .{pmm.free_pages * pmm.PAGE_SIZE / (1024 * 1024)});
 
     // The bootloader's stack has no guard page; leave it as early as possible.

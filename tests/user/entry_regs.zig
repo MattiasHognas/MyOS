@@ -24,7 +24,7 @@ export fn _start() callconv(.naked) noreturn {
         \\ or %%r15, %%rdi
         \\ setnz %%dil
         \\ movzbl %%dil, %%edi
-        \\ mov $1, %%eax   # exit(rdi)
+        \\ mov $60, %%eax  # exit(rdi)
         \\ syscall
         \\ ud2
     );

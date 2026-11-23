@@ -10,6 +10,15 @@
 //! Double faults and NMIs run on their own emergency stacks (the IST entries
 //! set up in `gdt.zig`), so they can be reported even when the interrupted
 //! stack is unusable. Both always halt the kernel.
+//!
+//! GS base: an entry from ring 3 arrives with the user's GS base, so
+//! `isr_common` runs `swapgs` when the saved CS says ring 3, and again
+//! before returning there (see `percpu.zig`). NMIs, double faults and
+//! machine checks can also interrupt ring 0 code that still (or already)
+//! has the user's GS base: the first instruction of `syscall_entry`, or the
+//! last ones before `sysretq`/`iretq`. For them the saved CS proves nothing,
+//! so `isr_paranoid` reads the GS base MSR instead: a kernel address has the
+//! top bit set, and a user program cannot make its own base look like one.
 
 const std = @import("std");
 const root = @import("root");
@@ -82,8 +91,12 @@ fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
         8, 10...14, 17, 21, 29, 30 => true,
         else => false,
     };
+    const common = switch (vec) {
+        VECTOR_NMI, VECTOR_DOUBLE_FAULT, VECTOR_MACHINE_CHECK => "isr_paranoid",
+        else => "isr_common",
+    };
     const code = (if (has_err) "" else "pushq $0\n") ++
-        std.fmt.comptimePrint("pushq ${d}\njmp isr_common", .{vec});
+        std.fmt.comptimePrint("pushq ${d}\njmp {s}", .{ vec, common });
     return struct {
         fn h() callconv(.naked) void {
             asm volatile (code);
@@ -91,7 +104,9 @@ fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
     }.h;
 }
 
-// Common path for all stubs: save registers, call interruptHandler, restore,
+// Common path for all stubs: switch to the kernel GS base if the interrupt
+// came from ring 3 (the saved CS is at 24(%rsp) on entry and before the final
+// `add`), save registers, call interruptHandler, restore, switch GS back,
 // drop the vector and error code, iretq. With SMAP on, RFLAGS.AC is cleared
 // (`clac`, written as bytes) so an interrupt that arrives inside a user copy,
 // or from a user program that set AC, cannot run the handler (or a thread it
@@ -101,6 +116,10 @@ comptime {
         \\.section .text
         \\.global isr_common
         \\isr_common:
+        \\  testb $3, 24(%rsp)
+        \\  jz 1f
+        \\  swapgs
+        \\1:
         \\  push %rax
         \\  push %rbx
         \\  push %rcx
@@ -117,12 +136,73 @@ comptime {
         \\  push %r14
         \\  push %r15
         \\  cmpb $0, smap_enabled(%rip)
-        \\  je 1f
+        \\  je 2f
         \\  .byte 0x0f, 0x01, 0xca
-        \\1:
+        \\2:
         \\  mov %rsp, %rdi
         \\  cld
         \\  call interruptHandler
+        \\  pop %r15
+        \\  pop %r14
+        \\  pop %r13
+        \\  pop %r12
+        \\  pop %r11
+        \\  pop %r10
+        \\  pop %r9
+        \\  pop %r8
+        \\  pop %rbp
+        \\  pop %rdi
+        \\  pop %rsi
+        \\  pop %rdx
+        \\  pop %rcx
+        \\  pop %rbx
+        \\  pop %rax
+        \\  testb $3, 24(%rsp)
+        \\  jz 3f
+        \\  swapgs
+        \\3:
+        \\  add $16, %rsp
+        \\  iretq
+        \\
+        \\# NMI, double fault, machine check: decide by the GS base MSR
+        \\# (0xC0000101), not by the saved CS. EBX (callee-saved, so it
+        \\# survives the call) remembers whether GS was switched.
+        \\.global isr_paranoid
+        \\isr_paranoid:
+        \\  push %rax
+        \\  push %rbx
+        \\  push %rcx
+        \\  push %rdx
+        \\  push %rsi
+        \\  push %rdi
+        \\  push %rbp
+        \\  push %r8
+        \\  push %r9
+        \\  push %r10
+        \\  push %r11
+        \\  push %r12
+        \\  push %r13
+        \\  push %r14
+        \\  push %r15
+        \\  xor %ebx, %ebx
+        \\  mov $0xC0000101, %ecx
+        \\  rdmsr
+        \\  test %edx, %edx
+        \\  js 1f
+        \\  swapgs
+        \\  mov $1, %ebx
+        \\1:
+        \\  cmpb $0, smap_enabled(%rip)
+        \\  je 2f
+        \\  .byte 0x0f, 0x01, 0xca
+        \\2:
+        \\  mov %rsp, %rdi
+        \\  cld
+        \\  call interruptHandler
+        \\  test %ebx, %ebx
+        \\  jz 3f
+        \\  swapgs
+        \\3:
         \\  pop %r15
         \\  pop %r14
         \\  pop %r13
@@ -208,7 +288,7 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
         root.print("\n*** thread {d} ({s}): {s} in user mode (vector {d}, error 0x{x}), killed\n", .{ thread.id(), p.name, name, f.vector, f.error_code });
         root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.rsp, f.rflags });
         if (f.vector == VECTOR_PAGE_FAULT) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
-        process.exit(255); // the parent sees exit code 255 for a crash
+        process.exit(process.EXIT_KILLED); // the parent sees exit status 255 for a crash
     }
     if (f.vector == VECTOR_PAGE_FAULT) {
         if (usercopy.fixup(f.rip, readCr2())) |resume_at| { // bad user pointer in a syscall
@@ -263,6 +343,12 @@ fn reportDoubleFault(f: *const Frame) void {
 /// may switch threads (e.g. the timer handler calling `thread.tick`).
 pub fn register(vector: u8, h: Handler) void {
     handlers[vector] = h;
+}
+
+/// The handler installed for hardware interrupt `vector`, if any. Tests use
+/// it to wrap a handler and put it back.
+pub fn registered(vector: u8) ?Handler {
+    return handlers[vector];
 }
 
 /// The stack as `isr_common` leaves it, lowest address first: the registers it

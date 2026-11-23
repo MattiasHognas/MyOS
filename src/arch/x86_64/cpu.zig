@@ -120,6 +120,14 @@ pub fn writeCr0(val: u64) void {
         : .{ .memory = true });
 }
 
+/// Read control register CR3: the physical address of the loaded page-table
+/// root, plus flag bits in the low 12.
+pub fn readCr3() u64 {
+    return asm volatile ("mov %%cr3, %[ret]"
+        : [ret] "=r" (-> u64),
+    );
+}
+
 /// Read control register CR4.
 pub fn readCr4() u64 {
     return asm volatile ("mov %%cr4, %[ret]"

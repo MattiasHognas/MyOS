@@ -7,6 +7,8 @@
 #
 # Scenarios:
 #   tests  run the in-kernel test suite; must report MYOS_TEST_PASS
+#   tests_fxsave  the same suite on a CPU without XSAVE and AVX, so the
+#          kernel saves x87/SSE state with FXSAVE
 #   panic  fail a subsystem assertion; must print a symbolized backtrace
 #   fault  page-fault in kernel mode; must print CR2 and a symbolized backtrace
 #   smap   read user memory from the kernel outside a user copy; must page-fault
@@ -30,10 +32,12 @@ out="zig-out/test"
 iso="$out/os.iso"
 timeout_s="${MYOS_QEMU_TIMEOUT:-45}"
 
-# Boot one scenario; leaves the QEMU exit status in $status and the
-# CR-stripped log path in $log.
+# Boot one scenario on the CPU model $2 (default: max, every feature QEMU
+# emulates); leaves the QEMU exit status in $status and the CR-stripped log
+# path in $log.
 boot() {
     local scenario="$1"
+    local cpu="${2:-max}"
     local dir="$out/$scenario"
     mkdir -p "$dir"
     local raw="$dir/serial.log"
@@ -48,7 +52,7 @@ boot() {
 
     set +e
     timeout --foreground "${timeout_s}s" qemu-system-x86_64 \
-        -machine q35 -cpu max -smp 1 -m 256M \
+        -machine q35 -cpu "$cpu" -smp 1 -m 256M \
         -cdrom "$iso" -boot d \
         -display none -monitor none -serial stdio \
         -no-reboot \
@@ -94,12 +98,21 @@ frame_re='^  #[0-9]+ 0x[0-9a-f]{16} [^?].*\+0x[0-9a-f]+$'
 run_scenario() {
     scenario="$1"
     echo "=== QEMU scenario: $scenario"
-    boot "$scenario"
+    case "$scenario" in
+        # Without XSAVE there is no AVX either (and nothing that builds on it).
+        tests_fxsave) boot "$scenario" max,xsave=off ;;
+        *) boot "$scenario" ;;
+    esac
     local before=${#failures[@]}
 
     case "$scenario" in
-        tests)
+        tests | tests_fxsave)
             expect_status 1
+            if [[ "$scenario" == tests ]]; then
+                expect_line 'extended state: XSAVE, 832 bytes, AVX on$'
+            else
+                expect_line 'extended state: FXSAVE, 512 bytes \(no XSAVE; AVX off\)$'
+            fi
             expect_line '^MyOS [^ ]+ booting$' # the banner names the version ("dev" unless -Dversion)
             expect_line '^MYOS_TEST_PASS$'
             expect_line '^MYOS_TEST_SUMMARY passed=[1-9][0-9]* failed=0$'
@@ -115,6 +128,16 @@ run_scenario() {
             expect_line '^\*\*\* thread [0-9]+ \(/test/div_zero\): Divide error in user mode \(vector 0, error 0x0\), killed$'
             expect_line '^\*\*\* thread [0-9]+ \(/test/invalid_opcode\): Invalid opcode in user mode \(vector 6, error 0x0\), killed$'
             expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+$'
+            # The user's GS base is its own: reading through it faults on a user address.
+            expect_line '^\*\*\* thread [0-9]+ \(/test/gs_base\): Page fault in user mode \(vector 14, error 0x4\), killed$'
+            expect_line '^CR2=0x5a5000 \(faulting address\)$'
+            # Syscall returns to states the CPU cannot return to kill the process.
+            expect_line '^\*\*\* thread [0-9]+ \(/test/bad_return\): invalid return state after syscall, killed$'
+            expect_line '^RIP=0x800000000000 RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x1b$'
+            expect_line '^RIP=0xffffffff8[0-9a-f]{7} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x1b$'
+            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x8 SS=0x1b$'
+            expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7fff[0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x10$'
+            expect_line '^fuzz done$'
             ;;
         panic)
             expect_status 3
@@ -185,7 +208,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests panic fault smap smep double_fault stack_overflow)
+((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 if [[ "${MYOS_SIMULATE_FAILURE:-}" == true ]]; then

@@ -23,6 +23,11 @@ const thread = kernel_root.kernel.thread;
 const vfs = kernel_root.kernel.vfs;
 const tarfs = kernel_root.kernel.fs.tarfs;
 const backtrace = kernel_root.kernel.debug.backtrace;
+const percpu = kernel_root.arch.x86_64.percpu;
+const fpu = kernel_root.arch.x86_64.fpu;
+const apic = kernel_root.arch.x86_64.apic;
+const arch_syscall = kernel_root.arch.x86_64.syscall;
+const abi = kernel_root.abi;
 
 /// Result of loading an ELF image for inspection (see `elfProbe`).
 pub const ElfProbe = struct {
@@ -786,4 +791,252 @@ pub fn enterUserPageSpace() bool {
     pmm.physToVirt(phys)[0] = 0xC3; // ret
     vmm.loadRoot(root);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Syscall and context-switch correctness (roadmap 2.5)
+
+// State shared by `runPair` and its two runner threads.
+var pair_path: []const u8 = "";
+var pair_codes: [2]?u64 = .{ null, null };
+var pair_done: usize = 0;
+var pair_waiter: ?*thread.Thread = null;
+
+/// Runner thread `index`: run the program and report its exit status.
+fn pairRunner(index: usize) void {
+    const code = runProgram(pair_path);
+    _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    pair_codes[index] = code;
+    pair_done += 1;
+    if (pair_done == 2) thread.wake(pair_waiter.?);
+}
+
+fn pairRunnerA() void {
+    pairRunner(0);
+}
+
+fn pairRunnerB() void {
+    pairRunner(1);
+}
+
+/// Run two copies of the program at `path` at the same time, each started
+/// by a kernel thread of its own, and wait for both. Returns true if both
+/// exited with status 0.
+pub fn runPair(path: []const u8) bool {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    pair_path = path;
+    pair_codes = .{ null, null };
+    pair_done = 0;
+    pair_waiter = thread.current();
+    _ = thread.spawn(pairRunnerA, null) catch return false;
+    _ = thread.spawn(pairRunnerB, null) catch return false;
+    while (pair_done < 2) thread.block();
+    return pair_codes[0] == 0 and pair_codes[1] == 0;
+}
+
+const RFLAGS_IF: u64 = 1 << 9;
+const RFLAGS_DF: u64 = 1 << 10;
+
+/// Test-only syscall numbers handled by `syscallProbe`; must match
+/// `tests/user/bad_return.zig`.
+const SYS_VIA_IRET = abi.Sys.PRIVATE_BASE + 0x100;
+const SYS_BAD_FLAGS = abi.Sys.PRIVATE_BASE + 0x101;
+const SYS_BAD_STATE = abi.Sys.PRIVATE_BASE + 0x102;
+
+/// What `SYS_BAD_STATE` does to the saved state.
+pub const BadState = enum {
+    /// Return address in the non-canonical hole.
+    noncanonical_rip,
+    /// Return address in kernel memory.
+    kernel_rip,
+    /// Kernel code selector: a return to ring 0.
+    kernel_cs,
+    /// Kernel stack selector.
+    kernel_ss,
+};
+
+/// What the probes saw. Cleared by `installProbes`.
+pub const Probes = struct {
+    /// Syscalls that went through `syscallProbe`.
+    syscalls: usize = 0,
+    /// Timer interrupts that arrived in ring 3.
+    user_ticks: usize = 0,
+    /// Timer interrupts that arrived in ring 0 on a process's thread: in
+    /// the middle of a syscall.
+    syscall_ticks: usize = 0,
+    /// Number of the first invariant that did not hold; 0 if all did.
+    violation: u32 = 0,
+};
+
+pub var probes: Probes = .{};
+var bad_state: BadState = .noncanonical_rip;
+var real_syscall_handler: ?arch_syscall.Handler = null;
+var real_tick_handler: ?idt.Handler = null;
+
+/// Record the first violated invariant.
+fn violated(number: u32) void {
+    if (probes.violation == 0) probes.violation = number;
+}
+
+/// Invariants that hold whenever the kernel runs on behalf of a process:
+/// the GS base is the per-CPU area (and the user's value is parked), the
+/// process's address space is loaded, and both ways into the kernel from
+/// ring 3 lead to the top of this thread's kernel stack.
+fn checkKernelState(base: u32) void {
+    const t = thread.current();
+    const p = t.process orelse return violated(base + 1);
+    const stack = t.stack orelse return violated(base + 2);
+    const top = @intFromPtr(stack.ptr) + stack.len;
+    const gs = cpu.rdmsr(percpu.MSR_GS_BASE);
+    if (gs != @intFromPtr(percpu.current()) or gs >> 63 == 0) violated(base + 3);
+    if (cpu.rdmsr(percpu.MSR_KERNEL_GS_BASE) != 0) violated(base + 4);
+    if (percpu.current().kernel_rsp != top) violated(base + 5);
+    if (gdt.kernelStack() != top) violated(base + 6);
+    if (cpu.readCr3() & ~@as(u64, 0xFFF) != p.root) violated(base + 7);
+    const rsp = @frameAddress();
+    if (rsp < @intFromPtr(stack.ptr) or rsp >= top) violated(base + 8);
+}
+
+/// Syscall handler installed by `installProbes`: check the state every
+/// syscall starts and ends in, serve the test-only numbers, and pass
+/// everything else to the real handler.
+fn syscallProbe(f: *arch_syscall.Frame) void {
+    probes.syscalls += 1;
+    const t = thread.current();
+    const flags = cpu.readFlags();
+    // Interrupts are on while a syscall runs; the flags a program could
+    // have set to confuse the kernel are off.
+    if (flags & RFLAGS_IF == 0) violated(1);
+    if (flags & (RFLAGS_AC | RFLAGS_DF) != 0) violated(2);
+    // The frame is the first thing on this thread's kernel stack, aligned.
+    if (t.stack) |stack| {
+        if (@intFromPtr(f) + @sizeOf(arch_syscall.Frame) != @intFromPtr(stack.ptr) + stack.len) violated(3);
+    }
+    if (@intFromPtr(f) % 16 != 0) violated(4);
+    // The saved state is a ring 3 state with interrupts on.
+    if (f.cs != gdt.USER_CODE or f.ss != gdt.USER_DATA) violated(5);
+    if (f.rflags & RFLAGS_IF == 0 or f.rip >= vmm.USER_END) violated(6);
+    checkKernelState(10);
+
+    switch (f.rax) {
+        SYS_VIA_IRET => {
+            f.rax = 0x1234;
+            f.rflags |= 1 << 16; // RF: sysretq cannot restore it
+        },
+        SYS_BAD_FLAGS => {
+            f.rax = 0x1234;
+            f.rflags = (f.rflags & ~RFLAGS_IF) | 0x3000 | 0x4000; // IOPL 3, NT, interrupts off
+        },
+        SYS_BAD_STATE => switch (bad_state) {
+            .noncanonical_rip => f.rip = 0x0000_8000_0000_0000,
+            .kernel_rip => f.rip = @intFromPtr(&syscallProbe),
+            .kernel_cs => f.cs = gdt.KERNEL_CODE,
+            .kernel_ss => f.ss = gdt.KERNEL_DATA,
+        },
+        else => {
+            real_syscall_handler.?(f);
+            // Whatever the syscall did (block, switch threads, fail), it
+            // comes back with interrupts on and the same kernel state.
+            if (cpu.readFlags() & RFLAGS_IF == 0) violated(20);
+            checkKernelState(30);
+        },
+    }
+}
+
+/// Timer handler installed by `installProbes`: check where the interrupt
+/// frame is and which address space is loaded, then run the real handler
+/// (which may switch threads).
+fn tickProbe(f: *idt.Frame) void {
+    const t = thread.current();
+    if (cpu.readFlags() & RFLAGS_IF != 0) violated(40); // interrupt gates mask interrupts
+    if (f.cs & 3 == 3) {
+        probes.user_ticks += 1;
+        // From ring 3 the CPU switched to the top of the thread's kernel stack.
+        if (t.stack) |stack| {
+            if (@intFromPtr(f) + @sizeOf(idt.Frame) != @intFromPtr(stack.ptr) + stack.len) violated(41);
+        }
+        if (f.rflags & RFLAGS_IF == 0) violated(42);
+        checkKernelState(50);
+    } else if (t.process != null) {
+        probes.syscall_ticks += 1;
+        // From ring 0 there is no stack switch: the frame is on the stack
+        // the syscall was using, and the kernel state is already set up.
+        if (t.stack) |stack| {
+            const at = @intFromPtr(f);
+            if (at < @intFromPtr(stack.ptr) or at >= @intFromPtr(stack.ptr) + stack.len) violated(43);
+        }
+        checkKernelState(60);
+    }
+    real_tick_handler.?(f);
+}
+
+/// Route syscalls and timer interrupts through the probes, with `state` as
+/// what `SYS_BAD_STATE` does, and clear `probes`.
+pub fn installProbes(state: BadState) void {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    probes = .{};
+    bad_state = state;
+    if (real_syscall_handler == null) real_syscall_handler = arch_syscall.setHandler(syscallProbe);
+    if (real_tick_handler == null) {
+        real_tick_handler = idt.registered(apic.TIMER_VECTOR);
+        idt.register(apic.TIMER_VECTOR, tickProbe);
+    }
+}
+
+/// Put the real syscall and timer handlers back.
+pub fn removeProbes() void {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    if (real_syscall_handler) |h| _ = arch_syscall.setHandler(h);
+    if (real_tick_handler) |h| idt.register(apic.TIMER_VECTOR, h);
+    real_syscall_handler = null;
+    real_tick_handler = null;
+}
+
+/// Check the GS bases as seen from a kernel thread: the active one is this
+/// CPU's per-CPU area (whose first field points at itself), the parked one
+/// is the user's (0). Returns 0, or the number of the first failing check.
+pub fn gsBases() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const gs = cpu.rdmsr(percpu.MSR_GS_BASE);
+    if (gs >> 63 == 0) return 1; // not a kernel address
+    if (gs != @intFromPtr(percpu.current())) return 2;
+    if (percpu.current().self != percpu.current()) return 3;
+    if (cpu.rdmsr(percpu.MSR_KERNEL_GS_BASE) != 0) return 4;
+    const t = thread.current();
+    const stack = t.stack orelse return 5;
+    if (percpu.current().kernel_rsp != @intFromPtr(stack.ptr) + stack.len) return 6;
+    return 0;
+}
+
+/// Check how extended CPU state is set up: the control-register bits, the
+/// mechanism (`want_xsave` says which one this CPU should get) and the save
+/// area. Returns 0, or the number of the first failing check.
+pub fn extendedStateSetup(want_xsave: bool) u32 {
+    const cr0 = cpu.readCr0();
+    const cr4 = cpu.readCr4();
+    if (cr0 & (1 << 2) != 0 or cr0 & (1 << 3) != 0) return 1; // EM, TS: would trap SSE
+    if (cr0 & (1 << 1) == 0 or cr0 & (1 << 5) == 0) return 2; // MP, NE
+    if (cr4 & (1 << 9) == 0 or cr4 & (1 << 10) == 0) return 3; // OSFXSR, OSXMMEXCPT
+    const leaf1 = cpu.cpuid(1, 0);
+    const cpu_xsave = leaf1.ecx & (1 << 26) != 0;
+    if (cpu_xsave != want_xsave) return 4; // QEMU was not started as the scenario expects
+    if ((fpu.currentMode() == .xsave) != want_xsave) return 5;
+    if ((cr4 & (1 << 18) != 0) != want_xsave) return 6; // OSXSAVE
+    if (want_xsave) {
+        const cpu_avx = leaf1.ecx & (1 << 28) != 0;
+        if (fpu.avxEnabled() != cpu_avx) return 7;
+        if (fpu.enabledFeatures() != @as(u64, if (cpu_avx) 7 else 3)) return 8;
+        if (fpu.areaSize() != cpu.cpuid(0xD, 0).ebx) return 9;
+        if (cpu_avx and fpu.areaSize() != 832) return 10;
+    } else {
+        if (fpu.avxEnabled() or fpu.areaSize() != 512) return 11;
+    }
+    if (fpu.areaSize() > fpu.MAX_AREA_SIZE) return 12;
+    // Kernel threads carry no saved state.
+    if (thread.current().fpuArea() != null) return 13;
+    return 0;
 }

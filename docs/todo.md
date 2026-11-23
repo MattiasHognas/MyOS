@@ -16,7 +16,7 @@ A dependency-ordered roadmap for building a small x86-64 operating system in Zig
 
 ## Current foundation
 
-Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/TSS, physical and virtual memory management, kernel heap, APIC timer, preemptive threading, ring 3, syscalls, ELF64 loading, basic processes, read-only tarfs/VFS, PCI, basic NVMe reads, PS/2 keyboard, and a userspace shell.
+Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/TSS, physical and virtual memory management, kernel heap, APIC timer, preemptive threading, ring 3, syscalls (Linux's x86-64 ABI), SSE/AVX state per thread, ELF64 loading, basic processes, read-only tarfs/VFS, PCI, basic NVMe reads, PS/2 keyboard, and a userspace shell.
 
 ## 1. Tests, debugging, and CI
 
@@ -133,22 +133,38 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 **Done when:** A crafted ELF file is refused before anything is allocated, so it cannot map memory outside the range programs may use, overlap its own segments or leak pages; every rule is covered by a host test.
 
 ### 2.5 Syscall and context-switch correctness
+The ABI a program sees is described in `docs/syscalls.md`.
 - [x] Decide whether the syscall numbers, error values and struct layouts follow Linux. Decided (2026-11-23): the native ABI is Linux's x86-64 syscall ABI, for MyOS's own programs too; no translation layer. Only the 64-bit `syscall` interface (no `int 0x80`, no x32).
-- [ ] Move the existing syscalls to Linux's numbers and argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`): `read` 0, `write` 1, `open` 2, `close` 3. Keep the ones with no Linux equivalent (`getchar`, `run`) on private numbers far above Linux's range until 6 replaces them.
-- [ ] Return Linux's negative errno values from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig`.
-- [ ] Introduce the per-CPU structure reached through GS, with `swapgs` on every entry from and exit to ring 3, while there is still one CPU (moved from the SMP milestone, so the entry assembly is audited once, in its final shape).
-- [ ] Enable SSE (CR0/CR4) and save and restore the extended CPU state per thread on context switch: XSAVE with the area sized from CPUID, AVX enabled where supported, FXSAVE as the fallback. Build user programs with SSE; the kernel stays soft-float. Today user code is soft-float too, and no foreign binary runs without SSE2.
-- [ ] Audit `syscall` entry and exit assembly for register preservation and ABI stack alignment.
-- [ ] Validate return RIP/RSP and avoid unsafe `sysretq` for noncanonical or invalid return states.
+- [x] Move the existing syscalls to Linux's numbers and argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`): `read` 0, `write` 1, `open` 2, `close` 3, and also `sched_yield` 24, `exit` 60 and `gettid` 186. `getchar` and `run` have no Linux equivalent and sit at `0x4D5900` and `0x4D5901` until 6 replaces them.
+  - The numbers, error values and flags are in `src/abi/linux.zig`, which the kernel and `app/lib.zig` both import, so there is nothing to keep in sync by hand. A host test compares them with Zig's own table of Linux's values.
+  - The calls take Linux's arguments too: `write` takes a descriptor (1 and 2 are the console), paths are NUL-terminated (`uaccess.copyStringFromUser`), `open` takes flags and returns descriptors from 3 up, and an exit status is 8 bits.
+  - Not done here, on purpose: reading descriptor 0 (still `myos_getchar`) and descriptors that can be inherited or duplicated. Both are 6.
+- [x] Return Linux's negative errno values from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig` (shared, see above).
+  - `read` and `write` return a short count when the buffer turns bad partway, as Linux does, instead of failing after a partial transfer.
+- [x] Introduce the per-CPU structure reached through GS, with `swapgs` on every entry from and exit to ring 3, while there is still one CPU (moved from the SMP milestone, so the entry assembly is audited once, in its final shape).
+  - `src/arch/x86_64/percpu.zig` holds the kernel stack for `syscall` and the scratch slot for the user's stack pointer, which were globals. Scheduler state moves there in 3.2.
+  - NMIs, double faults and machine checks can interrupt ring 0 code that has the user's GS base (the first instruction of `syscall_entry`, the last before `sysretq`/`iretq`), so they decide by the GS base MSR instead of the saved CS (`isr_paranoid` in `idt.zig`).
+  - Not covered: a `#DB` or breakpoint exception in those few instructions would see the wrong GS base. Nothing can cause one today (programs cannot set debug registers); revisit with `ptrace` or hardware breakpoints.
+- [x] Enable SSE (CR0/CR4) and save and restore the extended CPU state per thread on context switch: XSAVE with the area sized from CPUID, AVX enabled where supported, FXSAVE as the fallback. Build user programs with SSE; the kernel stays soft-float.
+  - `src/arch/x86_64/fpu.zig`. The state is switched eagerly, and only between user threads: the kernel never touches these registers, so syscalls, interrupts and kernel threads cost nothing. A user thread's save area is 832 bytes with AVX (512 with FXSAVE), allocated with the thread.
+  - AVX-512 and AMX stay disabled in XCR0. Enabling AVX-512 is a size and speed question for 9.2.
+  - Not done: the faster save instructions (XSAVEOPT, XSAVES/compacted format). Measure first (9.2).
+- [x] Audit `syscall` entry and exit assembly for register preservation and ABI stack alignment. The audit is written down at the top of `src/arch/x86_64/syscall.zig`. What it changed:
+  - The frame now ends in a complete `iretq` frame (12 words, so the stack is 16-byte aligned at the call; checked at compile time and by an assertion on every syscall).
+  - SFMASK now also clears NT and IOPL on entry. A program can set NT, and an `iretq` in ring 0 with NT set faults.
+  - No register carries a kernel value out: the argument registers are restored, RCX and R11 hold the return address and flags, the rest are callee-saved.
+- [x] Validate return RIP/RSP and avoid unsafe `sysretq` for noncanonical or invalid return states.
   - [x] Close the known case: a `syscall` instruction at the very end of user space returns to a non-canonical address, and `sysretq` then faults in ring 0 on the user's stack pointer (Intel). The ELF loader now refuses to map the last user page or put the entry point there (tested with segments at, across and just below it).
-  - [ ] Still to do: check the saved return address in the exit path itself (needed once `mmap` or signals can put code or return addresses anywhere), and fall back to `iretq` when it is not safe.
-- [ ] Verify interrupt masking and preemption across syscall entry, blocking, and return.
-- [ ] Verify stack and address-space switches during timer interrupts and syscalls.
-- [ ] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions (where it is Linux's, say so and list only what MyOS implements).
-- [ ] Test from ring 3 that syscalls preserve callee-saved registers and RFLAGS, keep the stack aligned, and survive preemption mid-syscall.
-- [ ] Test that each failure case in `/test/syscalls` returns its specific error code.
-- [ ] Test that floating-point, SSE and AVX registers survive preemption between two processes, and that a new thread starts with clean extended state (nothing leaks from the previous owner).
-- [ ] Fuzz the syscall interface from ring 3 (random numbers and arguments, fixed seed in CI): the kernel must survive and leak nothing.
+  - [x] Check the saved state in the exit path itself, on every syscall (`src/arch/x86_64/sysret.zig`, host-tested): `sysretq` for ordinary returns, `iretq` when RF or TF is set, and the process is killed when neither can return (return address outside user space, or selectors that are not ring 3's). The flags are sanitized first, so a return can never turn interrupts off or raise IOPL.
+  - RSP needs no check: both instructions load any value, and a bad one faults in ring 3.
+- [x] Verify interrupt masking and preemption across syscall entry, blocking, and return. Interrupts are off from the `syscall` instruction until the handler runs on the kernel stack, on during the call, and off again from before the registers are restored. Checked at every syscall of the test programs, including ones that block and switch threads (`helpers.installProbes`).
+- [x] Verify stack and address-space switches during timer interrupts and syscalls: at every timer interrupt and syscall, the frame is where it should be on the running thread's kernel stack, and CR3, the TSS stack and the per-CPU syscall stack are that thread's. Checked by the same probes, including timer interrupts that arrive inside a syscall.
+- [x] Document the userspace syscall ABI, argument registers, clobbers, error codes, and return conventions (`docs/syscalls.md`: says where it is Linux's and lists only what MyOS implements and where it differs).
+- [x] Test from ring 3 that syscalls preserve callee-saved registers and RFLAGS, keep the stack aligned, and survive preemption mid-syscall (`/test/syscall_abi`, `/test/preempt`; `tests/user/checked.zig` checks every register around a syscall, with all combinations of the arithmetic and direction flags and with misaligned stack pointers).
+- [x] Test that each failure case in `/test/syscalls` returns its specific error code (65 checks there, 35 in `/test/user_pointers`).
+- [x] Test that floating-point, SSE and AVX registers survive preemption between two processes, and that a new thread starts with clean extended state (`/test/fpu` run as a pair, `/test/fpu_clean`). The whole suite also runs on a CPU without XSAVE (`tests_fxsave` scenario), which tests the FXSAVE path.
+- [x] Fuzz the syscall interface from ring 3 (random numbers and arguments, fixed seed in CI): the kernel must survive and leak nothing (`/test/fuzz`, 20 000 calls).
+  - It finds argument-handling bugs in the calls that exist; it is a fixed sequence, not coverage-guided. Add each new syscall's number to it.
 - [x] Clear all general-purpose registers on the first entry to user mode, so no kernel value leaks to the program (`context.enterUser`; tested from ring 3 by `/test/entry_regs`).
 
 ### 2.6 Memory-management correctness
@@ -557,6 +573,11 @@ Off the critical path (only network programs need it). It can be taken any time 
 - [ ] Copy-on-write and shared file-backed mappings (demand paging and private file mappings: 5).
 - [ ] `fork`/`exec` semantics if desired. A static busybox would then supply the standard utilities and a broad compatibility test.
 - [ ] User/group permissions.
+
+### Other ABIs
+The native ABI is Linux's and there is one of it (see the primary goal). These are things to look into, not plans.
+- [ ] A second syscall ABI in the kernel: each process carries an ABI tag and the dispatcher (`src/kernel/syscall.zig`) picks the table from it, with the numbers in a sibling of `src/abi/linux.zig`. The entry path (`src/arch/x86_64/syscall.zig`) is already independent of the ABI. FreeBSD's Linux emulation and WSL1 work this way.
+- [ ] Windows programs: Windows's stable interface is its DLLs (`ntdll`, `kernel32`), not its syscall numbers, which change between builds. So this is a PE loader plus user-space implementations of those DLLs on top of the native ABI (what Wine does), not a syscall table. Not needed for .NET, which runs as a linux-musl build.
 
 ### Performance and observability
 - [ ] CPU and memory usage statistics.

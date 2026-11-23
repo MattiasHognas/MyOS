@@ -81,6 +81,11 @@ pub fn setKernelStack(top: u64) void {
     tss.rsp0 = top;
 }
 
+/// The stack the CPU switches to for interrupts from ring 3 (`setKernelStack`).
+pub fn kernelStack() u64 {
+    return tss.rsp0;
+}
+
 /// The memory of the emergency stack with IST index `index`
 /// (`IST_DOUBLE_FAULT` or `IST_NMI`); the CPU starts at its end.
 pub fn istStack(index: u3) []u8 {

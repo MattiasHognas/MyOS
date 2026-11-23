@@ -90,10 +90,14 @@ pub fn runOnStack(top: usize, entry: *const fn () callconv(.c) noreturn) noretur
 /// Builds the frame `iretq` expects (SS, RSP, RFLAGS, CS, RIP) using the user
 /// selectors from the GDT and RFLAGS with interrupts enabled, and clears
 /// every general-purpose register so no kernel value (a pointer, say) reaches
-/// the program. Never returns;
+/// the program. Interrupts go off first: after `swapgs` the GS base is the
+/// user's, and no interrupt may arrive in ring 0 in that state (`percpu.zig`).
+/// The extended registers were loaded by the scheduler when it switched to
+/// this thread. Never returns;
 /// the kernel is re-entered only through interrupts or `syscall`.
 pub fn enterUser(rip: u64, rsp: u64) noreturn {
     asm volatile (
+        \\ cli
         \\ pushq $0x1B
         \\ pushq %[rsp]
         \\ pushq $0x202
@@ -114,6 +118,7 @@ pub fn enterUser(rip: u64, rsp: u64) noreturn {
         \\ xor %%r13d, %%r13d
         \\ xor %%r14d, %%r14d
         \\ xor %%r15d, %%r15d
+        \\ swapgs
         \\ iretq
         :
         : [rsp] "r" (rsp),

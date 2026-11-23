@@ -5,8 +5,8 @@ change or add a subsystem.
 
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
-| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenario `tests`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, kernel stacks, ELF loading, scheduler and processes, syscalls from ring 3, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
+| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection), compiled natively with fakes. Fast; covered by `zig build coverage`. |
+| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM, heap, kernel stacks, ELF loading, scheduler and processes, syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests, the [stack frame check](#stack-frame-check) and all QEMU scenarios. Add
@@ -22,7 +22,8 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 
 | Scenario | What the kernel does | What the script checks (kernel exit code; QEMU reports `code*2+1`) |
 | --- | --- | --- |
-| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, the peak kernel stack usage (`MYOS_STACK_PEAK`) under the warning level, and the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2) |
+| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, the peak kernel stack usage (`MYOS_STACK_PEAK`) under the warning level, the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2), the reports of syscall returns to invalid states, and the fuzzer finishing |
+| `tests_fxsave` | Runs the same suite on a CPU without XSAVE and AVX (`-cpu max,xsave=off`), so extended state is saved with FXSAVE | As `tests`, and the boot log names FXSAVE (`tests` requires XSAVE with AVX) |
 | `panic` | Fails a subsystem assertion two calls deep | Exit code 1, the panic message, a symbolized backtrace through `scenarioPanicInner` and `scenarioPanic` |
 | `fault` | Writes to an unmapped kernel address | Exit code 1, `Page fault`, the right CR2, backtrace frame `#0` in `scenarioFault` |
 | `smap` | Reads a mapped user page from kernel code outside a user copy | Exit code 1, `Page fault` with error 0x1 and CR2 = the user page, frame `#0` in `scenarioSmap` (SMAP is enforced) |
@@ -100,8 +101,31 @@ Programs in `tests/user/` run in ring 3 and test the kernel from the outside
 (syscall validation, bad user pointers, user/kernel isolation). The build installs each as
 `zig-out/bin/test-<name>.elf`, and `scripts/build.sh --package-test` puts them
 in the test initrd as `/test/<name>`. In-kernel tests run them with
-`api.run_program("/test/<name>")`, which returns the exit code (255 if the
-kernel killed the process for a fault).
+`helpers.runProgram("/test/<name>")`, which returns the exit status (255 if the
+kernel killed the process for a fault), or two copies at once with
+`helpers.runPair`, for tests that need processes to interleave.
+
+| Program | What it checks |
+| --- | --- |
+| `syscalls` | Every failure of every syscall returns its Linux error number; descriptors and paths at their limits |
+| `user_pointers` | Unmapped, partly mapped and read-only buffers and paths: `EFAULT` or a short count, never a crash |
+| `syscall_abi` | A syscall preserves every register but `rax`, `rcx` and `r11`, the flags and the stack pointer (through `checked.zig`, which other programs use for their syscalls too) |
+| `preempt` | Long syscalls that the timer preempts halfway, run as a pair |
+| `bad_return` | Syscall returns through `iretq`, with privileged flags, and to states the CPU cannot return to (with the kernel test altering the saved state) |
+| `gs_base` | The kernel's GS base is not visible in ring 3 |
+| `fpu`, `fpu_clean` | x87, SSE and AVX registers survive switches between two processes; a new process starts clean (`fpu_regs.zig` holds the shared assembly) |
+| `fuzz` | 20 000 random syscalls from a fixed seed: the kernel survives and leaks nothing |
+| `entry_regs` | General-purpose registers are zero at program start |
+| `kernel_read`, `privileged`, `write_text`, `umip`, `div_zero`, `invalid_opcode` | Each fault kills only the process |
+
+The in-kernel side of the entry tests is a pair of probes in
+`tests/kernel/helpers.zig` (`installProbes`): they wrap the syscall handler
+and the timer handler and check, at every syscall and every timer
+interrupt, that interrupts are masked or enabled as they should be, that
+the frame sits where it should on the thread's kernel stack, and that the GS
+base and address space belong to the running process. Tests that depend on
+the timer hitting a particular place (inside a syscall, say) repeat until
+the probes have seen it, so they do not depend on the machine's speed.
 
 To add one: create `tests/user/<name>.zig` (import the runtime with
 `@import("lib")`, export `_start`), add `<name>` to the list in `build.zig`,

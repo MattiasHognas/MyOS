@@ -133,7 +133,7 @@ noinline fn backtraceInner() TestError!void {
 fn fwCfgScenario() TestError!void {
     var buf: [32]u8 = undefined;
     const scenario = fw_cfg.readFile("opt/myos/scenario", &buf) orelse return error.Failed;
-    try check(std.mem.eql(u8, scenario, "tests"));
+    try check(std.mem.eql(u8, scenario, if (expect_fxsave) "tests_fxsave" else "tests"));
     try check(fw_cfg.readFile("opt/myos/does-not-exist", &buf) == null);
 }
 
@@ -447,6 +447,128 @@ fn acClearedOnKernelEntry() TestError!void {
         serial.puts(std.fmt.bufPrint(&buf, "  AC check {d} failed\n", .{failed}) catch "");
     }
     try check(failed == 0);
+}
+
+/// Print `<what> <number>` as a detail line under a failing test.
+fn report(comptime what: []const u8, number: u64) void {
+    var buf: [96]u8 = undefined;
+    serial.puts(std.fmt.bufPrint(&buf, "  " ++ what ++ " {d}\n", .{number}) catch "");
+}
+
+/// Run `/test/<name>` and require exit status 0, reporting the status otherwise.
+fn expectProgram(comptime path: []const u8) TestError!void {
+    const code = helpers.runProgram(path) orelse return error.Failed;
+    if (code != 0) report(path ++ " failed check", code);
+    try check(code == 0);
+}
+
+/// A syscall returns every register except RAX, RCX and R11 unchanged, with
+/// the flags and the stack pointer, whatever the call did.
+fn syscallRegisters() TestError!void {
+    try expectProgram("/test/syscall_abi");
+}
+
+/// Interrupts are on during a syscall and off on the way in and out; the
+/// kernel stack, the GS base and the address space are the calling
+/// process's at every syscall and every timer interrupt, including timer
+/// interrupts that preempt a syscall halfway. Two processes making long
+/// syscalls run until the timer has hit both ring 3 and a running syscall.
+fn kernelEntryInvariants() TestError!void {
+    helpers.installProbes(.noncanonical_rip);
+    defer helpers.removeProbes();
+    var runs: usize = 0;
+    while (runs < 30) : (runs += 1) {
+        try check(helpers.runPair("/test/preempt"));
+        if (helpers.probes.syscall_ticks >= 3 and helpers.probes.user_ticks >= 3) break;
+    }
+    const seen = helpers.probes;
+    if (seen.violation != 0) report("kernel entry invariant", seen.violation);
+    try check(seen.violation == 0);
+    try check(seen.syscalls > 0);
+    if (seen.syscall_ticks < 3) report("timer interrupts inside syscalls:", seen.syscall_ticks);
+    try check(seen.syscall_ticks >= 3 and seen.user_ticks >= 3);
+}
+
+/// The exit path of a syscall validates the state it returns to: `iretq`
+/// when `sysretq` cannot restore it, no privileged flags, and a process
+/// whose state cannot be returned to at all is killed, with nothing leaked.
+fn syscallReturnStates() TestError!void {
+    // Without the probe the test numbers are unknown syscalls.
+    try check(helpers.runProgram("/test/bad_return") == 90);
+    const pages = pmm.free_pages;
+    const heap_bytes = helpers.heapInUse();
+    defer helpers.removeProbes();
+    inline for (.{ .noncanonical_rip, .kernel_rip, .kernel_cs, .kernel_ss }) |state| {
+        helpers.installProbes(state);
+        const code = helpers.runProgram("/test/bad_return") orelse return error.Failed;
+        if (code != 255) report("/test/bad_return (" ++ @tagName(state) ++ ") exit status", code);
+        try check(code == 255);
+        try check(helpers.probes.violation == 0);
+    }
+    helpers.removeProbes();
+    try expectProgram("/bin/hello"); // the kernel is fine
+    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+}
+
+/// The kernel's GS base never reaches ring 3, and is back after every entry.
+fn gsBaseSwitching() TestError!void {
+    var failed = helpers.gsBases();
+    if (failed != 0) report("GS base check", failed);
+    try check(failed == 0);
+    try check(helpers.runProgram("/test/gs_base") == 255); // faults on a user address
+    failed = helpers.gsBases();
+    if (failed != 0) report("GS base check after a process", failed);
+    try check(failed == 0);
+}
+
+/// True in the `tests_fxsave` scenario, where QEMU hides XSAVE from the kernel.
+var expect_fxsave = false;
+
+/// SSE is on, with XSAVE (or FXSAVE where the scenario says so) sized from CPUID.
+fn extendedStateSetup() TestError!void {
+    const failed = helpers.extendedStateSetup(!expect_fxsave);
+    if (failed != 0) report("extended state check", failed);
+    try check(failed == 0);
+}
+
+/// x87, SSE and AVX registers survive switches between two processes that
+/// both use all of them, by `sched_yield` and by timer preemption; the save
+/// areas are freed with their threads.
+fn extendedStateSwitching() TestError!void {
+    _ = helpers.runPair("/test/fpu"); // warm up: the heap may grow
+    const pages = pmm.free_pages;
+    const heap_bytes = helpers.heapInUse();
+    helpers.installProbes(.noncanonical_rip);
+    defer helpers.removeProbes();
+    // 10 timer interrupts in ring 3 are two full time slices: at least one
+    // of them ended with the timer switching to the other process.
+    var runs: usize = 0;
+    while (runs < 10) : (runs += 1) {
+        try check(helpers.runPair("/test/fpu"));
+        if (helpers.probes.user_ticks >= 10) break;
+    }
+    if (helpers.probes.user_ticks < 10) report("timer interrupts in ring 3:", helpers.probes.user_ticks);
+    try check(helpers.probes.user_ticks >= 10 and helpers.probes.violation == 0);
+    helpers.removeProbes();
+    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+}
+
+/// A new process gets clean x87, SSE and AVX registers, not the previous
+/// program's (`/test/fpu` has just filled them all).
+fn extendedStateClean() TestError!void {
+    try check(helpers.runPair("/test/fpu"));
+    try expectProgram("/test/fpu_clean");
+}
+
+/// 20 000 random syscalls from ring 3: the process is not killed, the
+/// kernel keeps working and no memory is lost.
+fn syscallFuzz() TestError!void {
+    try expectProgram("/test/fuzz"); // also the warm-up: the heap may grow
+    const pages = pmm.free_pages;
+    const heap_bytes = helpers.heapInUse();
+    try expectProgram("/test/fuzz");
+    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+    try expectProgram("/bin/hello");
 }
 
 /// A new process starts with all general-purpose registers zeroed.
@@ -802,7 +924,8 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "smep")) scenarioSmep();
     if (std.mem.eql(u8, scenario, "double_fault")) scenarioDoubleFault();
     if (std.mem.eql(u8, scenario, "stack_overflow")) scenarioStackOverflow();
-    if (!std.mem.eql(u8, scenario, "tests")) panicFmt("unknown test scenario '{s}'", .{scenario});
+    expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
+    if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
 }
 
@@ -870,6 +993,14 @@ fn runCases() noreturn {
         .{ .name = "UMIP, SMEP, SMAP and ring 0 write protection enabled", .func = userProtectionOn },
         .{ .name = "RFLAGS.AC cleared on interrupt and syscall entry", .func = acClearedOnKernelEntry },
         .{ .name = "registers cleared on entry to user mode", .func = userEntryRegisters },
+        .{ .name = "syscalls preserve registers, flags and the stack pointer (ring 3)", .func = syscallRegisters },
+        .{ .name = "kernel state at syscalls and timer interrupts, preemption mid-syscall", .func = kernelEntryInvariants },
+        .{ .name = "syscall return states (iretq fallback, bad states killed)", .func = syscallReturnStates },
+        .{ .name = "GS base switched on every entry and exit", .func = gsBaseSwitching },
+        .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },
+        .{ .name = "x87/SSE/AVX registers survive process switches", .func = extendedStateSwitching },
+        .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },
+        .{ .name = "syscall fuzzing from ring 3", .func = syscallFuzz },
         .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
         .{ .name = "user faults kill only the process (ring 3 exceptions)", .func = userFaults },
