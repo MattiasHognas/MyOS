@@ -47,6 +47,7 @@ pub const firmware = struct {
 pub const kernel = struct {
     pub const console = @import("kernel/console.zig");
     pub const elf = @import("kernel/elf.zig");
+    pub const elf_image = @import("kernel/elf_image.zig");
     pub const heap = @import("kernel/heap.zig");
     pub const kstack = @import("kernel/kstack.zig");
     pub const pmm = @import("kernel/pmm.zig");

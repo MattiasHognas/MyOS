@@ -155,8 +155,11 @@ const ElfSpec = struct {
     data: u8 = 1,
     typ: u16 = 2,
     machine: u16 = 0x3E,
+    version: u32 = 1,
     entry: u64 = 0x40_0000,
     phoff: u64 = 64,
+    ehsize: u16 = 64,
+    phentsize: u16 = 56,
     phnum: u16 = 1,
     /// Fields of the first program header.
     flags: u32 = 5, // R + X
@@ -164,8 +167,11 @@ const ElfSpec = struct {
     vaddr: u64 = 0x40_0000,
     filesz: u64 = 16,
     memsz: u64 = 0x2000,
-    /// Optional second PT_LOAD segment (used for rollback tests).
+    /// Optional second segment: 16 bytes of file data and one page of
+    /// memory at this address (set `phnum` to 2 as well).
     second_vaddr: ?u64 = null,
+    second_type: u32 = 1, // PT_LOAD
+    second_flags: u32 = 6, // R + W
     /// Length of the returned image.
     len: usize = 0x1010,
 };
@@ -180,11 +186,11 @@ fn buildElf(spec: ElfSpec) []const u8 {
     b[6] = 1;
     std.mem.writeInt(u16, b[16..18], spec.typ, .little);
     std.mem.writeInt(u16, b[18..20], spec.machine, .little);
-    std.mem.writeInt(u32, b[20..24], 1, .little);
+    std.mem.writeInt(u32, b[20..24], spec.version, .little);
     std.mem.writeInt(u64, b[24..32], spec.entry, .little);
     std.mem.writeInt(u64, b[32..40], spec.phoff, .little);
-    std.mem.writeInt(u16, b[52..54], 64, .little);
-    std.mem.writeInt(u16, b[54..56], 56, .little);
+    std.mem.writeInt(u16, b[52..54], spec.ehsize, .little);
+    std.mem.writeInt(u16, b[54..56], spec.phentsize, .little);
     std.mem.writeInt(u16, b[56..58], spec.phnum, .little);
 
     const ph = b[64..120];
@@ -196,8 +202,8 @@ fn buildElf(spec: ElfSpec) []const u8 {
     std.mem.writeInt(u64, ph[40..48], spec.memsz, .little);
     if (spec.second_vaddr) |v| {
         const ph2 = b[120..176];
-        std.mem.writeInt(u32, ph2[0..4], 1, .little);
-        std.mem.writeInt(u32, ph2[4..8], 6, .little); // R + W
+        std.mem.writeInt(u32, ph2[0..4], spec.second_type, .little);
+        std.mem.writeInt(u32, ph2[4..8], spec.second_flags, .little);
         std.mem.writeInt(u64, ph2[8..16], 0x1000, .little);
         std.mem.writeInt(u64, ph2[16..24], v, .little);
         std.mem.writeInt(u64, ph2[32..40], 16, .little);
@@ -220,9 +226,50 @@ fn elfLoadValid() TestError!void {
     _ = helpers.elfProbe(buildElf(.{}), 0x40_1000, &out) orelse return error.Failed;
     try check(std.mem.allEqual(u8, &out, 0)); // second page: all .bss
 
-    // The highest loadable segment ends right below the last user page.
-    const top = helpers.elfProbe(buildElf(.{ .vaddr = 0x7FFF_FFFF_D000 }), 0x7FFF_FFFF_E000, &out) orelse return error.Failed;
+    // The lowest and the highest place a program may be loaded.
+    const low = helpers.image_limits.min_addr;
+    const bottom = helpers.elfProbe(buildElf(.{ .vaddr = low, .entry = low }), low, &out) orelse return error.Failed;
+    try check(bottom.pte & PTE_PRESENT != 0);
+    const high = helpers.image_limits.max_addr - 0x2000;
+    const top = helpers.elfProbe(buildElf(.{ .vaddr = high, .entry = high }), high + 0x1000, &out) orelse return error.Failed;
     try check(top.pte & PTE_PRESENT != 0);
+
+    try check(pmm.free_pages == before);
+}
+
+/// A segment that does not start on a page boundary: its data lands at the
+/// right offset in the page, everything around it is zero, and only the
+/// pages it touches are mapped.
+fn elfLoadUnaligned() TestError!void {
+    const before = pmm.free_pages;
+    var out: [32]u8 = undefined;
+
+    // 8 bytes of data at 0x400004. The file has 0xAA in the four bytes before
+    // them too; those belong to no segment and must not show up.
+    const spec: ElfSpec = .{ .offset = 0x1004, .vaddr = 0x40_0004, .filesz = 8, .memsz = 0x1800, .entry = 0x40_0004 };
+    const first = helpers.elfProbe(buildElf(spec), 0x40_0000, &out) orelse return error.Failed;
+    try check(first.entry == 0x40_0004 and first.pte & PTE_PRESENT != 0);
+    try check(std.mem.allEqual(u8, out[0..4], 0)); // before the segment
+    try check(std.mem.allEqual(u8, out[4..12], 0xAA)); // its data
+    try check(std.mem.allEqual(u8, out[12..32], 0)); // .bss
+
+    // 0x400004 + 0x1800 ends in the second page; the third is not mapped.
+    const second = helpers.elfProbe(buildElf(spec), 0x40_1000, &out) orelse return error.Failed;
+    try check(second.pte & PTE_PRESENT != 0 and std.mem.allEqual(u8, &out, 0));
+    const third = helpers.elfProbe(buildElf(spec), 0x40_2000, &out) orelse return error.Failed;
+    try check(third.pte == 0);
+
+    // 16 bytes of data across a page boundary: 8 at the end of one page, 8 at
+    // the start of the next, followed by .bss.
+    const image = buildElf(.{ .offset = 0x1FF8, .vaddr = 0x40_0FF8, .filesz = 16, .memsz = 0x20, .entry = 0x40_0FF8, .len = 0x2008 });
+    @memset(elf_buf[0x1FF8..0x2000], 0xCC);
+    @memset(elf_buf[0x2000..0x2008], 0xDD);
+    _ = helpers.elfProbe(image, 0x40_0FF8, &out) orelse return error.Failed;
+    try check(std.mem.allEqual(u8, out[0..8], 0xCC)); // elfProbe copies up to the end of the page
+    _ = helpers.elfProbe(image, 0x40_0FF0, &out) orelse return error.Failed;
+    try check(std.mem.allEqual(u8, out[0..8], 0)); // just before the segment
+    _ = helpers.elfProbe(image, 0x40_1000, &out) orelse return error.Failed;
+    try check(std.mem.allEqual(u8, out[0..8], 0xDD) and std.mem.allEqual(u8, out[8..32], 0));
 
     try check(pmm.free_pages == before);
 }
@@ -234,10 +281,15 @@ fn elfLoadPermissions() TestError!void {
     try check(rx.pte & PTE_PRESENT != 0 and rx.pte & PTE_USER != 0);
     try check(rx.pte & PTE_WRITABLE == 0 and rx.pte & PTE_NX == 0);
 
-    const rw = helpers.elfProbe(buildElf(.{ .flags = 6 }), 0x40_0000, &out) orelse return error.Failed;
+    // Execute-only is not possible on x86-64: the page is readable anyway.
+    const x = helpers.elfProbe(buildElf(.{ .flags = 1 }), 0x40_0000, &out) orelse return error.Failed;
+    try check(x.pte & PTE_USER != 0 and x.pte & PTE_WRITABLE == 0 and x.pte & PTE_NX == 0);
+
+    // The entry point needs an executable segment, so the others are tested on a second one.
+    const rw = helpers.elfProbe(buildElf(.{ .phnum = 2, .second_vaddr = 0x50_0000, .second_flags = 6 }), 0x50_0000, &out) orelse return error.Failed;
     try check(rw.pte & PTE_USER != 0 and rw.pte & PTE_WRITABLE != 0 and rw.pte & PTE_NX != 0);
 
-    const r = helpers.elfProbe(buildElf(.{ .flags = 4 }), 0x40_0000, &out) orelse return error.Failed;
+    const r = helpers.elfProbe(buildElf(.{ .phnum = 2, .second_vaddr = 0x50_0000, .second_flags = 4 }), 0x50_0000, &out) orelse return error.Failed;
     try check(r.pte & PTE_USER != 0 and r.pte & PTE_WRITABLE == 0 and r.pte & PTE_NX != 0);
 }
 
@@ -273,16 +325,23 @@ fn elfLoadHelloPermissions() TestError!void {
     try check(zero.pte == 0);
 }
 
-/// Malformed or unsupported images are rejected without leaking pages.
+/// Malformed or unsupported images are rejected without leaking pages. The
+/// host tests check each rule and its error; this checks the loader as a
+/// whole refuses them.
 fn elfRejectMalformed() TestError!void {
     const before = pmm.free_pages;
     var out: [8]u8 = undefined;
+    const limit = helpers.image_limits.max_addr;
     const bad = [_]ElfSpec{
         .{ .len = 63 }, // shorter than the ELF header
         .{ .class = 1 }, // 32-bit
         .{ .data = 2 }, // big endian
         .{ .machine = 3 }, // i386
         .{ .typ = 3 }, // ET_DYN, not ET_EXEC
+        .{ .version = 2 }, // unknown ELF version
+        .{ .ehsize = 52 }, // wrong ELF header size
+        .{ .phentsize = 64 }, // wrong program header size
+        .{ .phnum = 0 }, // nothing to load
         .{ .phoff = 0x2FFF }, // program header table past the end of the file
         .{ .phnum = 200 }, // program header table runs past the end
         .{ .vaddr = 0xFFFF_8000_0000_0000 }, // kernel half
@@ -290,23 +349,50 @@ fn elfRejectMalformed() TestError!void {
         .{ .vaddr = 0x7FFF_FFFF_E000 }, // fits, but covers the last user page (never mapped: sysret)
         .{ .vaddr = 0x7FFF_FFFF_F000, .memsz = 0x1000 }, // exactly the last user page
         .{ .entry = 0x7FFF_FFFF_F000 }, // entry point in the last user page
+        .{ .vaddr = 0x7FFF_FFFE_C000, .entry = 0x7FFF_FFFE_C000 }, // on top of the user stack
+        .{ .vaddr = limit - 0x1000, .entry = limit - 0x1000 }, // ends inside the region reserved for the stack
+        .{ .vaddr = 0, .entry = 0 }, // page zero
+        .{ .vaddr = 0xF000, .entry = 0xF000 }, // below the lowest loadable address
         .{ .vaddr = 0xFFFF_FFFF_FFFF_F000 }, // vaddr + memsz wraps around
-        .{ .vaddr = 0x40_0100 }, // not page aligned
+        .{ .vaddr = 0x40_0100 }, // not congruent with the file offset
         .{ .filesz = 0x3000 }, // filesz > memsz
         .{ .offset = 0x1000, .filesz = 0x100 }, // file data past the end of the image
+        .{ .flags = 7 }, // writable and executable
+        .{ .flags = 4 }, // entry point in a segment that is not executable
+        .{ .entry = 0x40_2000 }, // entry point just past the segment
         .{ .entry = 0xFFFF_FFFF_8000_0000 }, // entry point in the kernel
+        .{ .phnum = 2, .second_vaddr = 0x40_1000 }, // second segment on a page of the first
+        .{ .phnum = 2, .second_vaddr = 0x50_0000, .second_flags = 7 }, // second segment writable and executable
+        .{ .phnum = 2, .second_vaddr = 0x50_0000, .second_type = 3 }, // PT_INTERP: dynamically linked
+        .{ .memsz = 1 << 40 }, // a terabyte of .bss
+        .{ .memsz = helpers.image_limits.max_bytes + 1 }, // one byte over the memory limit
     };
     for (bad) |spec| try check(helpers.elfProbe(buildElf(spec), 0x40_0000, &out) == null);
     try check(pmm.free_pages == before);
 }
 
-/// A failure after some segments were already loaded rolls everything back.
+/// A program that cannot be loaded leaves nothing behind in `process.spawn`:
+/// no pages, no page tables and no heap memory.
 fn elfSpawnRollback() TestError!void {
-    // First segment loads (pages allocated), the second is in the kernel half.
+    // The first segment is fine, the second is not.
     try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0xFFFF_8000_0000_0000 })));
     try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0x40_0123 })));
+    try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0x40_1000 })));
     try check(helpers.spawnFailsCleanly(buildElf(.{ .machine = 3 })));
     try check(helpers.spawnFailsCleanly("not an ELF"));
+
+    // An image within the limit that needs more pages than are free is
+    // refused before anything is allocated (skipped on a machine with more
+    // free memory than the limit).
+    const want = (@as(u64, pmm.free_pages) + 1) * pmm.PAGE_SIZE;
+    if (want <= helpers.image_limits.max_bytes) {
+        try check(helpers.spawnFailsCleanly(buildElf(.{ .memsz = want })));
+        const no_memory = helpers.elfLoadError(buildElf(.{ .memsz = want })) orelse return error.Failed;
+        try check(no_memory == error.OutOfMemory);
+    }
+    const too_large = helpers.elfLoadError(buildElf(.{ .memsz = 1 << 40 })) orelse return error.Failed;
+    try check(too_large == error.TooLarge);
+    try check(helpers.elfLoadError(buildElf(.{})) == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -773,6 +859,7 @@ fn runCases() noreturn {
             .func = missingFile,
         },
         .{ .name = "ELF load valid image", .func = elfLoadValid },
+        .{ .name = "ELF segment not on a page boundary", .func = elfLoadUnaligned },
         .{ .name = "ELF segment permissions", .func = elfLoadPermissions },
         .{ .name = "ELF /bin/hello permissions", .func = elfLoadHelloPermissions },
         .{ .name = "ELF reject malformed images", .func = elfRejectMalformed },

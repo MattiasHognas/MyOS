@@ -32,6 +32,9 @@ pub const ElfProbe = struct {
     pte: u64,
 };
 
+/// Where program images may be loaded and how large they may be.
+pub const image_limits = process.image_limits;
+
 /// Return the number of free physical pages.
 pub fn freePages() usize {
     return pmm.free_pages;
@@ -115,13 +118,22 @@ pub fn addressSpaceRoundtrip() bool {
 pub fn elfProbe(image: []const u8, addr: u64, out: []u8) ?ElfProbe {
     const root = vmm.createAddressSpace();
     defer vmm.destroyAddressSpace(root);
-    const entry = elf.load(root, image) catch return null;
+    const entry = elf.load(root, image, process.image_limits) catch return null;
     const pte = vmm.leafEntry(root, addr) orelse 0;
     if (vmm.translate(root, addr)) |phys| {
         const n = @min(out.len, pmm.PAGE_SIZE - (addr % pmm.PAGE_SIZE));
         @memcpy(out[0..n], pmm.physToVirt(phys)[0..n]);
     }
     return .{ .entry = entry, .pte = pte };
+}
+
+/// Load the ELF `image` into a fresh address space, destroy it again and
+/// return the loader's error, or null if the image loaded.
+pub fn elfLoadError(image: []const u8) ?elf.Error {
+    const root = vmm.createAddressSpace();
+    defer vmm.destroyAddressSpace(root);
+    _ = elf.load(root, image, process.image_limits) catch |e| return e;
+    return null;
 }
 
 /// `elfProbe` on the file at `path`.

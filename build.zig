@@ -177,6 +177,7 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "symbols", "src/kernel/debug/symbols.zig" },
         .{ "log_format", "src/kernel/debug/log_format.zig" },
         .{ "user_range", "src/kernel/user_range.zig" },
+        .{ "elf_image", "src/kernel/elf_image.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),
@@ -236,7 +237,8 @@ fn kernelArtifact(
 
 /// Build the user program `name`.elf from `root`, linked at address `base`.
 /// `sh` and `hello` get different bases so a debugger can load the symbols of
-/// both at once (docs/debugging.md); the kernel accepts any user address.
+/// both at once (docs/debugging.md); the kernel accepts any address from
+/// 64 KiB up to the region reserved for the user stack.
 fn userProgram(
     b: *std.Build,
     name: []const u8,

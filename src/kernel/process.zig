@@ -5,14 +5,33 @@ const heap = @import("heap.zig");
 const pmm = @import("pmm.zig");
 const thread = @import("thread.zig");
 const elf = @import("elf.zig");
+const elf_image = @import("elf_image.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const context = @import("../arch/x86_64/context.zig");
 const vfs = @import("vfs.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 
 /// Initial user stack pointer; the stack grows down from here.
-const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
+pub const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 const STACK_PAGES = 4; // 16 KiB
+/// Address space below `STACK_TOP` kept for the user stack: 8 MiB, Linux's
+/// default stack limit. Only `STACK_PAGES` of it are mapped; a program image
+/// may not be loaded into any of it.
+pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
+/// Lowest address a program may be loaded at. The first 64 KiB stay unmapped
+/// (as on Linux), so a null pointer faults even with a small offset added.
+pub const IMAGE_MIN: u64 = 0x1_0000;
+/// Most memory the segments of one program may take. Stands in for a
+/// per-process memory limit until there is one.
+pub const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Where a program image may be loaded and how large it may be: from
+/// `IMAGE_MIN` up to the region reserved for the stack.
+pub const image_limits: elf_image.Limits = .{
+    .min_addr = IMAGE_MIN,
+    .max_addr = STACK_TOP - STACK_RESERVE,
+    .max_bytes = MAX_IMAGE_BYTES,
+};
 
 /// A user process. Owned by its thread and freed by `destroy` when that thread is reaped.
 pub const Process = struct {
@@ -78,7 +97,7 @@ pub fn spawn(name: []const u8, image: []const u8, waiter: ?*thread.Thread) !*Pro
     const root = vmm.createAddressSpace();
     errdefer vmm.destroyAddressSpace(root);
 
-    const entry = try elf.load(root, image);
+    const entry = try elf.load(root, image, image_limits);
 
     for (1..STACK_PAGES + 1) |i| {
         const phys = pmm.alloc() orelse return error.OutOfMemory;

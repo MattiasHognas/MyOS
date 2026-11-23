@@ -136,7 +136,7 @@ the terminal.
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
-| `src/kernel/` | Physical memory (`pmm`), heap, guarded kernel stacks (`kstack`), threads/scheduler, processes, ELF loader, syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
+| `src/kernel/` | Physical memory (`pmm`), heap, guarded kernel stacks (`kstack`), threads/scheduler, processes, ELF image validation (`elf_image`) and loader (`elf`), syscalls, user-memory access (`uaccess`, `user_range`), VFS, console |
 | `src/kernel/fs/` | Filesystems (`tarfs` for the initrd) |
 | `src/kernel/debug/` | Assertions, small-buffer panic formatting, backtraces, ELF symbol lookup, log formatting |
 | `src/assets/` | Console font (fetched, not committed) |

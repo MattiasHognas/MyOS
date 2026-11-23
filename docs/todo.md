@@ -102,20 +102,35 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 **Done when:** A kernel stack overflow is caught and reported instead of corrupting memory, and no stack pages or slots leak when threads exit.
 
 ### 2.4 Harden ELF loading
-- [ ] Validate ELF class, endianness, machine type, type, version, and header sizes.
-- [x] Validate program-header offset, count, entry size, and full table bounds.
+- [x] Validate ELF class, endianness, machine type, type, version, and header sizes (`kernel/elf_image.zig`: both version fields, `e_ehsize` and `e_phentsize` must be exact; only `ET_EXEC` until position-independent executables are loaded in 4.1).
+- [x] Validate program-header offset, count, entry size, and full table bounds (1 to 64 program headers).
 - [x] Use overflow-safe arithmetic for file offsets, address ranges, and segment sizes.
-- [ ] Validate segment alignment and enforce user-only mapping ranges.
-- [ ] Reject overlapping or conflicting load segments unless intentionally supported.
-  - Today a second segment (or the user stack) mapped over an existing page silently replaces it and the old page is never freed: a permanent leak a crafted ELF can repeat.
-- [ ] Prevent mapping page zero and reserved user regions.
+- [x] Validate segment alignment and enforce user-only mapping ranges.
+  - The alignment must be zero or a power of two, and the address and file offset must agree modulo the alignment and modulo the page size, as on Linux.
+  - A segment no longer has to start on a page boundary: the loader places its data at the right offset in the page and zeroes the rest. Linux toolchains produce such segments.
+- [x] Reject overlapping or conflicting load segments: two segments may not share a page (`error.Overlap`), since a page has one set of permissions.
+  - This closes the leak where a second segment (or the user stack) mapped over an existing page replaced it without freeing the old page. `vmm.map` itself still replaces silently (2.6).
+- [x] Prevent mapping page zero and reserved user regions (`process.image_limits`).
   - [x] The last user page is never mapped (`vmm.USER_MAP_END`; see the `sysretq` item in 2.5).
-- [ ] Cap segment sizes (`memsz`) against a per-process memory limit, so one ELF cannot ask for all physical memory.
-- [ ] Verify the entry point is inside an executable loaded segment.
-- [ ] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages (a JIT later needs pages that go from writable to executable with `mprotect`, never both at once; see 9.3).
+  - The first 64 KiB are never mapped (`IMAGE_MIN`, the same as Linux's `mmap_min_addr`).
+  - The 8 MiB below the top of the user stack are reserved for the stack (`STACK_RESERVE`, Linux's default stack limit; 16 KiB of it is mapped today), and a program may not be loaded there or above.
+- [x] Cap segment sizes (`memsz`) so one ELF cannot ask for all physical memory.
+  - The segments of one program may take 256 MiB together (`process.MAX_IMAGE_BYTES`), a stand-in until there are per-process limits (2.6).
+  - The loader refuses an image that needs more pages than are free, with some left over for page tables, before it allocates anything.
+  - Not covered: memory that runs out for another reason while page tables are being allocated still panics (`vmm.allocTable`, 2.6).
+- [x] Verify the entry point is inside an executable loaded segment (`error.BadEntry`).
+- [x] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages (a JIT later needs pages that go from writable to executable with `mprotect`, never both at once; see 9.3).
+  - A segment that is both writable and executable is refused (`error.WritableExecutable`), and so is one with no permissions at all.
+  - x86-64 pages are always readable, so write-only and execute-only segments are readable too.
+- [x] Refuse dynamically linked executables (`PT_INTERP`) with `error.Unsupported` instead of starting them without their interpreter (until 9.3).
 - [x] Roll back every allocated page and table on loading failure.
 - [x] Add malformed and truncated ELF tests.
-- [ ] Split ELF header/segment validation from page mapping so it runs in host tests, and fuzz it there.
+- [x] Split ELF header/segment validation from page mapping so it runs in host tests, and fuzz it there.
+  - `kernel/elf_image.zig` validates the whole image before anything is mapped and has no kernel dependencies; `kernel/elf.zig` only maps. It keeps no segment table, so loading adds nothing to the kernel stack peak.
+  - `tests/host/elf_image_test.zig` checks each rule and its error, and runs 200 000 mutated and random images through the validator with a fixed seed, checking every accepted image against the rules. It is a mutation loop in an ordinary test, so it runs in `zig build test-host` and CI; coverage-guided fuzzing (`zig build test --fuzz`) is not set up.
+  - In-kernel tests ("ELF ..." in `tests/kernel/main.zig`) check the loader itself: contents and zeroing of unaligned segments, permissions, 33 rejected images with no leaked pages, and refusal before allocation when memory is short.
+
+**Done when:** A crafted ELF file is refused before anything is allocated, so it cannot map memory outside the range programs may use, overlap its own segments or leak pages; every rule is covered by a host test.
 
 ### 2.5 Syscall and context-switch correctness
 - [x] Decide whether the syscall numbers, error values and struct layouts follow Linux. Decided (2026-11-23): the native ABI is Linux's x86-64 syscall ABI, for MyOS's own programs too; no translation layer. Only the 64-bit `syscall` interface (no `int 0x80`, no x32).
