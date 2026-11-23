@@ -26,7 +26,7 @@ fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-curl -fsSL --retry 3 -o "$work/kcov.tar.gz" "$url"
+curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$work/kcov.tar.gz" "$url"
 echo "$sha256  $work/kcov.tar.gz" | sha256sum -c --quiet
 tar -xzf "$work/kcov.tar.gz" -C "$work"
 cmake -S "$work/kcov-$version" -B "$work/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" >/dev/null

@@ -27,7 +27,7 @@ fi
 work="$(mktemp -d)"
 trap 'rm -rf "${work:?}"' EXIT
 
-curl -fsSL --retry 3 -o "$work/qemu.tar.xz" "$url"
+curl -fsSL --retry 3 --connect-timeout 20 --max-time 900 -o "$work/qemu.tar.xz" "$url"
 echo "$sha256  $work/qemu.tar.xz" | sha256sum -c --quiet
 tar -xJf "$work/qemu.tar.xz" -C "$work"
 cd "$work/qemu-$version"

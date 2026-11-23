@@ -18,7 +18,7 @@ if [[ -f "$local_font" ]]; then
 else
     tmp="$(mktemp)"
     trap 'rm -f "$tmp"' EXIT
-    curl -fsSL --retry 3 -o "$tmp" "$url"
+    curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$tmp" "$url"
     echo "$sha256  $tmp" | sha256sum -c --quiet
     mv "$tmp" "$dest"
 fi

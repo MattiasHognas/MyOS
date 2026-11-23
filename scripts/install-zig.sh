@@ -21,7 +21,7 @@ fi
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-curl -fsSL --retry 3 -o "$tmp" "$url"
+curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 -o "$tmp" "$url"
 echo "$sha256  $tmp" | sha256sum -c --quiet
 rm -rf "$dir"
 mkdir -p "$dir"

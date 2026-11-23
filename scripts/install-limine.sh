@@ -17,7 +17,7 @@ mkdir -p "$dir"
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
-curl -fsSL --retry 3 -o "$tmp" "$url"
+curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$tmp" "$url"
 echo "$sha256  $tmp" | sha256sum -c --quiet
 tar -xzf "$tmp" -C "$dir" --strip-components=1
 make -C "$dir" >/dev/null
