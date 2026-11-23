@@ -7,14 +7,19 @@ Everything needed to build, run and work on MyOS. See also
 
 | Tool | Version | Needed for |
 | --- | --- | --- |
-| [Zig](https://ziglang.org/download/) | 0.17.1 (CI pins this) | everything |
-| [Limine](https://github.com/Limine-Bootloader/Limine) | 12.x (CI uses 12.10.0) | the bootable ISO |
-| xorriso | any | the bootable ISO |
-| QEMU (x86-64) | any recent | running and testing |
+| [Zig](https://ziglang.org/download/) | 0.17.1 | everything |
+| [Limine](https://github.com/Limine-Bootloader/Limine) | 12.11.1 (it must support `kaslr` and relocatable kernels) | the bootable ISO |
+| xorriso | 1.5.8.pl02 (any recent one works) | the bootable ISO |
+| QEMU (x86-64) | 11.1.3 (the tests expect its `max` CPU: AVX, RDRAND, SMEP/SMAP/UMIP) | running and testing |
 | binutils (`objdump`) | any | the stack frame check in `zig build test` |
 | OVMF (edk2) | any | UEFI boot in `scripts/run-qemu.sh` (optional, `--bios` works without) |
 | GDB | any | debugging (optional) |
-| kcov | any | `zig build coverage` (optional) |
+| kcov | 43 | `zig build coverage` (optional) |
+
+The versions are the ones in `tools.versions`, which CI installs exactly
+(kcov: 43). The build compares your tools with that file and prints a
+warning for any that differ; it does not stop. See
+[testing](testing.md#ci) for the check and how to install a pinned version.
 
 Arch Linux:
 
@@ -22,15 +27,18 @@ Arch Linux:
 sudo pacman -S zig zls limine xorriso qemu-desktop edk2-ovmf binutils gdb kcov
 ```
 
-Debian/Ubuntu (Zig and Limine are not packaged in the right versions; install
-them with the scripts, as CI does):
+Debian/Ubuntu (Zig, Limine and QEMU are not packaged in the right versions;
+install them with the scripts, as CI does):
 
 ```bash
-sudo apt install qemu-system-x86 xorriso ovmf binutils gdb
+sudo apt install xorriso ovmf binutils gdb \
+    ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev
 scripts/install-zig.sh ~/.local/zig              # checksum-verified 0.17.1
 export PATH=~/.local/zig:$PATH
-scripts/install-limine.sh ~/.local/limine        # checksum-verified 12.10.0
+scripts/install-limine.sh ~/.local/limine        # checksum-verified 12.11.1
 export LIMINE=~/.local/limine PATH=~/.local/limine:$PATH
+scripts/install-qemu.sh ~/.local/qemu            # optional: builds 11.1.3, the version CI uses (the packaged one is older)
+export PATH=~/.local/qemu/bin:$PATH
 scripts/install-kcov.sh ~/.local                 # optional, for coverage
 ```
 

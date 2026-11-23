@@ -7,6 +7,10 @@ cd "$(dirname "$0")/.."  # run from the repository root
 # Release: build an optimized kernel that reports <version> and write
 #   zig-out/release/myos-<version>.iso, myos-<version>-kernel.elf (with
 #   symbols, for symbolizing backtraces) and SHA256SUMS.
+# What makes the ISO must be the pinned versions in CI; elsewhere a
+# difference is a warning (scripts/check-tools.sh).
+bash scripts/check-tools.sh zig limine xorriso
+
 mode="${1:-normal}"
 iso_name="os.iso"
 case "$mode" in

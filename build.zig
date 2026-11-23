@@ -68,6 +68,12 @@ pub fn build(b: *std.Build) void {
         ) orelse "dev",
     };
 
+    // Compare the tools with tools.versions: an error in CI, a warning
+    // elsewhere. Every build checks Zig itself; the steps that run QEMU or
+    // kcov check those too (below).
+    const check_zig = b.addSystemCommand(&.{ "bash", "scripts/check-tools.sh", "zig" });
+    b.getInstallStep().dependOn(&check_zig.step);
+
     const kernel = kernelArtifact(b, "kernel.elf", target, optimize, false, kopts);
     b.installArtifact(kernel);
     // Syscall numbers and error values, shared by the kernel and user programs.
@@ -165,7 +171,9 @@ pub fn build(b: *std.Build) void {
 
     // Host-code coverage with kcov (scripts/coverage.sh explains how to install
     // it if it is missing). Report: zig-out/coverage/index.html
+    const check_kcov = b.addSystemCommand(&.{ "bash", "scripts/check-tools.sh", "zig", "kcov" });
     const run_coverage = b.addSystemCommand(&.{"bash"});
+    run_coverage.step.dependOn(&check_kcov.step);
     run_coverage.addFileArg(b.path("scripts/coverage.sh")); // tracked: edits re-run coverage
     run_coverage.addDirectoryArg(b.path("src"));
     const coverage_dir = run_coverage.addOutputDirectoryArg("coverage");
@@ -182,6 +190,8 @@ pub fn build(b: *std.Build) void {
 
     // scripts/test-qemu.sh packages already installed binaries; it never calls zig build.
     const run_qemu = b.addSystemCommand(&.{ "bash", "scripts/test-qemu.sh" });
+    const check_qemu_tools = b.addSystemCommand(&.{ "bash", "scripts/check-tools.sh", "zig", "limine", "qemu", "xorriso" });
+    run_qemu.step.dependOn(&check_qemu_tools.step);
     run_qemu.step.dependOn(&install_test_kernel.step);
     run_qemu.step.dependOn(b.getInstallStep());
     const qemu_step = b.step("test-qemu", "Run real kernel tests under QEMU");

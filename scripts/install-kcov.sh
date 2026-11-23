@@ -9,8 +9,10 @@
 # Afterwards: add <prefix>/bin to PATH.
 set -euo pipefail
 
-version="43"
-sha256="4cbba86af11f72de0c7514e09d59c7927ed25df7cebdad087f6d3623213b95bf"
+# The version and its checksum are in tools.versions.
+source "$(dirname "$0")/../tools.versions"
+version="$KCOV_VERSION"
+sha256="$KCOV_SHA256"
 url="https://github.com/SimonKagstrom/kcov/archive/refs/tags/v$version.tar.gz"
 
 prefix="${1:?usage: $0 <prefix>}"

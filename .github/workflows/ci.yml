@@ -14,8 +14,11 @@ permissions:
   contents: read
 
 env:
-  # Keep in sync with scripts/install-zig.sh (which pins the checksum).
-  ZIG_VERSION: 0.17.1
+  # The tool versions are in tools.versions: the install scripts install
+  # them, and scripts/check-tools.sh (run by every build and test step)
+  # fails the job if a tool on PATH is any other version. The caches of
+  # the tools are keyed on that file, so changing any version there
+  # rebuilds them all once.
   # One Zig cache directory per job, saved and restored by actions/cache.
   ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
@@ -36,7 +39,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig
-          key: zig-toolchain-${{ runner.os }}-${{ env.ZIG_VERSION }}
+          key: zig-toolchain-${{ runner.os }}-${{ hashFiles('tools.versions') }}
 
       - name: Install Zig
         run: |
@@ -54,18 +57,45 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .zig-cache
-          key: zig-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ matrix.optimize }}-${{ hashFiles('build.zig') }}
+          key: zig-build-${{ runner.os }}-${{ matrix.optimize }}-${{ hashFiles('tools.versions', 'build.zig') }}
 
+      # QEMU and xorriso are the versions MyOS is developed with, built from
+      # pinned source releases (Ubuntu's packages are older) and cached.
+      - name: Cache QEMU
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/qemu
+          key: qemu-ubuntu-24.04-${{ hashFiles('tools.versions', 'scripts/install-qemu.sh') }}
+
+      - name: Cache xorriso
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/xorriso
+          key: xorriso-ubuntu-24.04-${{ hashFiles('tools.versions', 'scripts/install-xorriso.sh') }}
+
+      # The packages are installed even when the caches are full: the cached
+      # QEMU needs the shared libraries. binutils (objdump, for the stack
+      # frame check) is the distribution's.
       - name: Install QEMU, xorriso and binutils
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso binutils
+          sudo apt-get install -y --no-install-recommends binutils \
+            ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev
+          scripts/install-qemu.sh "$RUNNER_TEMP/qemu"
+          scripts/install-xorriso.sh "$RUNNER_TEMP/xorriso"
+          echo "$RUNNER_TEMP/qemu/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/xorriso/bin" >> "$GITHUB_PATH"
 
       - name: Install Limine
         run: |
           scripts/install-limine.sh "$RUNNER_TEMP/limine"
           echo "LIMINE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/limine" >> "$GITHUB_PATH"
+
+      # The builds and tests check this themselves; as a step of its own, a
+      # wrong version is the first thing the log shows.
+      - name: Check tool versions
+        run: scripts/check-tools.sh zig limine qemu xorriso
 
       - name: Fetch console font
         run: scripts/fetch-font.sh
@@ -83,6 +113,10 @@ jobs:
       - name: Stack frame check script tests
         if: matrix.optimize == 'Debug'
         run: scripts/test-check-frames.sh
+
+      - name: Tool version check script tests
+        if: matrix.optimize == 'Debug'
+        run: scripts/test-check-tools.sh
 
       - name: Kernel stack frame sizes
         run: zig build check-frames -Doptimize=${{ matrix.optimize }}
@@ -142,7 +176,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig
-          key: zig-toolchain-${{ runner.os }}-${{ env.ZIG_VERSION }}
+          key: zig-toolchain-${{ runner.os }}-${{ hashFiles('tools.versions') }}
 
       - name: Install Zig
         if: steps.version.outputs.skip != 'true'
@@ -150,11 +184,18 @@ jobs:
           scripts/install-zig.sh "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      - name: Cache xorriso
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/xorriso
+          key: xorriso-ubuntu-24.04-${{ hashFiles('tools.versions', 'scripts/install-xorriso.sh') }}
+
       - name: Install xorriso
         if: steps.version.outputs.skip != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xorriso
+          scripts/install-xorriso.sh "$RUNNER_TEMP/xorriso"
+          echo "$RUNNER_TEMP/xorriso/bin" >> "$GITHUB_PATH"
 
       - name: Install Limine
         if: steps.version.outputs.skip != 'true'
@@ -162,6 +203,10 @@ jobs:
           scripts/install-limine.sh "$RUNNER_TEMP/limine"
           echo "LIMINE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/limine" >> "$GITHUB_PATH"
+
+      - name: Check tool versions
+        if: steps.version.outputs.skip != 'true'
+        run: scripts/check-tools.sh zig limine xorriso
 
       - name: Fetch console font
         if: steps.version.outputs.skip != 'true'
@@ -217,7 +262,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig
-          key: zig-toolchain-${{ runner.os }}-${{ env.ZIG_VERSION }}
+          key: zig-toolchain-${{ runner.os }}-${{ hashFiles('tools.versions') }}
 
       - name: Install Zig
         run: |
@@ -229,13 +274,13 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .zig-cache
-          key: zig-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-coverage-${{ hashFiles('build.zig') }}
+          key: zig-build-${{ runner.os }}-coverage-${{ hashFiles('tools.versions', 'build.zig') }}
 
       - name: Cache kcov
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/kcov
-          key: kcov-ubuntu-24.04-${{ hashFiles('scripts/install-kcov.sh') }}
+          key: kcov-ubuntu-24.04-${{ hashFiles('tools.versions', 'scripts/install-kcov.sh') }}
 
       # Ubuntu 24.04 has no kcov package, so build a pinned release, unless
       # the cache already has it. The packages are installed either way: the
@@ -247,6 +292,9 @@ jobs:
             libssl-dev libcurl4-openssl-dev libelf-dev zlib1g-dev libdw-dev libiberty-dev
           scripts/install-kcov.sh "$RUNNER_TEMP/kcov"
           echo "$RUNNER_TEMP/kcov/bin" >> "$GITHUB_PATH"
+
+      - name: Check tool versions
+        run: scripts/check-tools.sh zig kcov
 
       - name: Run host tests under kcov
         run: zig build coverage

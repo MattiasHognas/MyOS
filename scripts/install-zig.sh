@@ -7,8 +7,10 @@
 # Afterwards: add <directory> to PATH.
 set -euo pipefail
 
-version="0.17.1"
-sha256="3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
+# The version and its checksum are in tools.versions.
+source "$(dirname "$0")/../tools.versions"
+version="$ZIG_VERSION"
+sha256="$ZIG_SHA256"
 url="https://ziglang.org/download/$version/zig-x86_64-linux-$version.tar.xz"
 
 dir="${1:?usage: $0 <directory>}"

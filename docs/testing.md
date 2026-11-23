@@ -238,19 +238,53 @@ hand with **simulate failure** enabled (Actions → CI → Run workflow, or
 `gh workflow run ci.yml -f simulate_failure=true`). The QEMU tests then fail
 on purpose after running, and each matrix job uploads `serial-logs-<mode>`.
 
-CI installs Zig from ziglang.org (`scripts/install-zig.sh`, checksum verified)
-and gets Limine from its release tarball (`scripts/install-limine.sh`, checksum
-verified), kcov from source (`scripts/install-kcov.sh`), and the console font
-with `scripts/fetch-font.sh`.
+CI uses the same tool versions as development. They are written down in
+one file, `tools.versions`, with the checksum of each release archive:
 
-The jobs cache the Zig toolchain (keyed on the Zig version), the kcov build
-(keyed on `scripts/install-kcov.sh`) and, except for the release job, the Zig
-build cache `.zig-cache`. The build cache is keyed on job, build mode, Zig
-version and `build.zig` only, not on the sources: what it saves is compiler-rt,
+| Tool | Installed in CI by |
+| --- | --- |
+| Zig | `scripts/install-zig.sh` (binary from ziglang.org) |
+| Limine | `scripts/install-limine.sh` (release tarball) |
+| QEMU | `scripts/install-qemu.sh` (built from source: the x86-64 system emulator only) |
+| xorriso | `scripts/install-xorriso.sh` (built from source) |
+| kcov | `scripts/install-kcov.sh` (built from source) |
+
+`scripts/check-tools.sh` compares the tools on `PATH` with that file. Every
+`zig build` checks Zig, `zig build test-qemu` checks Limine, QEMU and
+xorriso too, `zig build coverage` checks kcov, and `scripts/build.sh`
+checks what makes the ISO.
+
+- **In CI** (the `CI` variable is set) a missing tool or another version
+  fails the job.
+- **On a development machine** it prints a warning and carries on, because a
+  distribution's packages move on by themselves:
+
+  ```
+  warning: tool versions differ from tools.versions (CI uses exactly those):
+    qemu: found 11.2.0, want 11.1.3
+  ```
+
+  Either install the pinned version (`scripts/install-qemu.sh ~/tools/qemu`,
+  then put `~/tools/qemu/bin` first in `PATH`), or move the project to the
+  new version. `MYOS_STRICT_TOOLS=1` makes the check fail locally as it
+  does in CI.
+
+To move to a new version of a tool, change its version and checksum in
+`tools.versions`: the install scripts, the check and the CI caches all
+follow from that file. `scripts/test-check-tools.sh` tests the check with
+fake tools.
+
+The console font comes from `scripts/fetch-font.sh`. `objdump`, for the
+stack frame check, is the one tool taken from the runner's distribution.
+
+The jobs cache the Zig toolchain and the QEMU, xorriso and kcov builds (keyed
+on `tools.versions` and the install script, so a version change rebuilds them
+once; QEMU takes several minutes to build when its cache is empty) and, except for the release job, the Zig
+build cache `.zig-cache`. The build cache is keyed on job, build mode,
+`tools.versions` and `build.zig` only, not on the sources: what it saves is compiler-rt,
 the build runner and unchanged programs (about 80 s from nothing), while the
 kernel is recompiled on every change anyway. A commit that changes `build.zig`
 therefore builds from an empty cache once per job. Zig's cache is
 content-addressed, so a restored cache never gives stale results. The release
 job builds from an empty cache on purpose. To change the Zig
-version, update both `ZIG_VERSION` in the workflow and the version and
-checksum in `scripts/install-zig.sh`.
+version, update its version and checksum in `tools.versions`.
