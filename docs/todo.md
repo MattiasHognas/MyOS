@@ -245,6 +245,7 @@ From the code review before 2.2. None of these fix a known hole; they shrink wha
 - [ ] Decide on kernel page-table isolation: detect CPUs that need it (Meltdown) and either implement it or refuse to run untrusted code on them.
 - [ ] Randomize the kernel's load address and the user stack and program base (KASLR/ASLR); needs the PIE loading of 4.1 for programs.
 - [ ] Poison freed heap memory and freed pages in debug builds to catch use-after-free.
+- [ ] Set up coverage-guided fuzzing next to the fixed-seed runs: the ELF validator (2.4) and the other host-tested parsers with `zig build test --fuzz`, and the syscall interface (2.5) with a fuzzer that is steered by kernel coverage instead of a fixed random sequence. The fixed-seed runs stay in CI; these run longer, on demand.
 - [ ] Zero pages when they are freed or before they reach another process, as a rule in one place instead of at each call site.
 
 **Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources.
@@ -359,6 +360,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Add directory lookup and `readdir` operations (`getdents64`).
 - [ ] Add `stat`-like metadata queries (`fstat`/`newfstatat`).
 - [ ] Normalize paths and handle `.` and `..`.
+- [ ] Raise the longest path from 255 bytes to Linux's 4095 (`PATH_MAX` 4096). Paths are copied to a buffer on the 16 KiB kernel stack today (2.5), which is why the limit is low; the buffer has to move to the heap first. Relative paths and a current directory belong here too.
 - [ ] Add mount-point traversal so multiple filesystems can coexist.
 - [ ] Add create/write/truncate/unlink/mkdir operations to the VFS interface.
 - [ ] Add a small in-memory filesystem (ramfs) mounted at `/tmp`, so redirection (6.3) has somewhere to write and the write API is proven before FAT32 (11.5).
@@ -474,6 +476,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
   - AVX-512 is disabled (2.5). Decide whether to enable it: the .NET runtime uses it where it can, at the cost of a save area of about 2.5 KiB per thread.
   - `vmm.unmap` scans whole page tables (512 entries per level) to see whether they became empty (2.6); a count per table would avoid it.
   - Timers are a sorted list, linear to arm (2.8).
+  - The kernel heap never gives pages back to the page allocator: memory it grew by for one large allocation stays with it.
 - [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
 
 ### 9.3 Dynamic linking and the JIT runtime
