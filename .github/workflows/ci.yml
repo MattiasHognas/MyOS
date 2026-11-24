@@ -106,6 +106,10 @@ jobs:
       - name: Host unit tests
         run: zig build test-host --summary all
 
+      - name: Model checks of the blocking protocols
+        if: matrix.optimize == 'Debug'
+        run: zig build check-models --summary all
+
       - name: Release version script tests
         if: matrix.optimize == 'Debug'
         run: scripts/test-next-version.sh

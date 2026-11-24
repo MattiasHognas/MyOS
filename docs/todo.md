@@ -301,14 +301,22 @@ Moved up (it was milestone 5): bringing up SMP while the kernel is small is far 
 ### 3.1 Synchronization
 The primitives come from 2.8 and are already real locks; this section makes their users safe on several CPUs.
 - [ ] Decide and document the kernel's preemption and locking model: whether kernel code can be preempted, which locks disable interrupts, and what may be held across a block.
+  - Proposed in `docs/locking.md` (locks and what each protects, the lock order, the sleep and wake pattern, per-CPU state, TLB rules). Not ticked until it has been reviewed and the model checks below have run.
 - [ ] Audit existing `cli`/`sti` critical sections and replace every one that assumes a single CPU. Known from 2.7 and 2.8, still protected by turning interrupts off only:
   - the scheduler's ready queue, zombie list and current thread (`thread.zig`);
   - the process tree, descendant counts, reference counts and exit status (`process.zig`);
   - the page tables of `kernel_root`, which the heap and the kernel stack allocator change under two different locks (`vmm.zig`);
   - the keyboard buffer and modifier state, the console, and the serial port.
+- [ ] Hold the scheduler lock across the context switch and release it in the thread that is switched to (a new thread's first code included), so a thread that has marked itself blocked cannot be woken and run by another CPU while its own CPU is still on its stack (`docs/locking.md`).
+- [ ] Make timer callbacks safe against the thread that armed them returning: `sleepTicks` and `waitTimeout` keep their timer in the waiter's stack frame, and with several CPUs the callback can still be running when the waiter returns. `timer.cancel` must report "already started", and the waiter then waits for the callback to finish; the callback needs two flags, "fired" before the wake and "finished" last (`docs/locking.md`). Test with a timer that fires on another CPU exactly as the waiter is woken.
+- [ ] Wake a thread before releasing the lock of the condition it waited for (`WaitQueue.wakeOne` and `wakeAll` are called with that lock held), so a waiter with a timeout cannot have returned and exited in between (`docs/locking.md`, found by the timeout model).
 - [ ] Make mutexes and wait queues safe against wakeups from another CPU. Today "check the condition and call `wait` with interrupts off" cannot lose a wake-up because nothing else runs; with several CPUs the check and the wait must be under a lock the waker also takes (`wait` releasing it atomically). `Mutex` and `process.wait` use that pattern and need the same change.
 - [ ] Define lock-ordering rules and test contention.
-- [ ] Model-check the blocking protocols before relying on them with several CPUs: write small PlusCal specifications of block/wake with its permit, wait queues with timeouts, and the mutex hand-off, and check them with TLC for lost wake-ups, double queueing and deadlock (the Converos approach, `docs/research.md`). Keep the specifications in the repository and note in each which code it describes.
+- [x] Model-check the blocking protocols before relying on them with several CPUs (the Converos approach, `docs/research.md`): sleep and wake with the permit, the context switch out of a blocking thread, wait queues with timeouts, and the mutex hand-off.
+  - The checker is `tools/modelcheck`, about 200 lines of Zig that try a model's steps in every order; no outside tool (TLA+ was the first idea and needs Java). The models are in `tests/models/`, each naming the code it describes. `zig build check-models` runs them; it is part of `zig build test` and CI.
+  - Every rule can be switched off in its model, and a test expects the failure that follows (a lost wake-up, a thread on two CPUs, a thread woken after it has gone, two owners of a mutex): 5 models that must hold and 6 that must fail.
+  - It showed one thing the design had wrong: the waker must wake a thread before it releases the condition's lock, not after, or a waiter with a timeout can be gone by then. `docs/locking.md` says so now.
+  - Limits: a model is not the code, so the conversions below still need tests on several CPUs. The checker has no fairness; "eventually" is checked as "nothing gets stuck and finishing stays possible".
 - [ ] Go through the syscalls that exist with the scalable commutativity rule (`docs/research.md`) and write down, in the locking document, which pairs must not contend on several CPUs and which cannot avoid it (`open` must return the lowest free descriptor).
 
 ### 3.2 Per-CPU state

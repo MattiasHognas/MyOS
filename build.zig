@@ -213,8 +213,34 @@ pub fn build(b: *std.Build) void {
     const dispatch_step = b.step("check-dispatch", "Check that the normal kernel has no replaceable syscall handler");
     dispatch_step.dependOn(&run_dispatch.step);
 
-    const all = b.step("test", "Run host tests, the stack frame and syscall dispatch checks and QEMU kernel tests");
+    // Model checks of the blocking protocols (docs/locking.md): the checker
+    // in tools/modelcheck with its own tests, and the models in tests/models.
+    // Optimized, since a check visits every state of a model.
+    const modelcheck = b.createModule(.{
+        .root_source_file = b.path("tools/modelcheck/modelcheck.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const modelcheck_tests = b.addTest(.{ .root_module = modelcheck, .filters = test_filters });
+    const model_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/models/main.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+        .filters = test_filters,
+    });
+    model_tests.root_module.addImport("modelcheck", modelcheck);
+    const run_modelcheck_tests = b.addRunArtifact(modelcheck_tests);
+    const run_model_tests = b.addRunArtifact(model_tests);
+    const models_step = b.step("check-models", "Model-check the kernel's blocking protocols");
+    models_step.dependOn(&run_modelcheck_tests.step);
+    models_step.dependOn(&run_model_tests.step);
+
+    const all = b.step("test", "Run host tests, the model checks, the stack frame and syscall dispatch checks and QEMU kernel tests");
     all.dependOn(&run_host_tests.step);
+    all.dependOn(&run_modelcheck_tests.step);
+    all.dependOn(&run_model_tests.step);
     all.dependOn(&run_frames.step);
     all.dependOn(&run_dispatch.step);
     all.dependOn(&run_qemu.step);

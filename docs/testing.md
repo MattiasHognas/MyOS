@@ -87,6 +87,26 @@ fails if any thread used more than 12 of its 16 KiB.
 disassembly. The limits can be changed with `MYOS_FRAME_HARD_LIMIT` and
 `MYOS_FRAME_SOFT_LIMIT`.
 
+## Model checks
+
+The kernel's blocking protocols (sleeping and waking, timeouts, the mutex)
+are checked as models before they are relied on with several CPUs. A model
+describes a protocol as a handful of variables and steps;
+`tools/modelcheck/modelcheck.zig` tries the steps in every order they can
+happen and reports an invariant that breaks, a state where nothing can move
+although the model is not finished (a deadlock or a lost wake-up), or a
+state from which it can never finish, with the shortest sequence of steps
+that leads there.
+
+- The models are in `tests/models/`; `docs/locking.md` says what they show.
+- `zig build check-models` runs them and the checker's own tests. It is part
+  of `zig build test` and CI, and takes a second or two.
+- Every rule a protocol depends on can be switched off in its model
+  (`Config`), and `tests/models/main.zig` has a test that expects the
+  failure that follows. Add such a test with every rule: a model that
+  cannot fail proves nothing.
+- A model is not the code. When the code it names changes, change the model.
+
 ## Syscall dispatch check
 
 The normal kernel calls its syscall dispatcher directly. Only the test

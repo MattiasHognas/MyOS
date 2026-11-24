@@ -75,9 +75,10 @@ scripts/run-qemu.sh   # boots into the shell; type "hello", or "exit"
 | `zig build test-host` | Native host unit tests. |
 | `zig build test-kernel` | Compile the test kernel only (no QEMU). |
 | `zig build check-frames` | Check that no kernel function has a stack frame near the size of a stack guard page (see [testing](testing.md#stack-frame-check)). |
+| `zig build check-models` | Model-check the kernel's blocking protocols (see [testing](testing.md#model-checks)). |
 | `zig build check-dispatch` | Check that the normal kernel calls its syscall dispatcher directly (see [testing](testing.md#syscall-dispatch-check)). |
 | `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (listed in [testing](testing.md#qemu-integration-test-scenarios)). |
-| `zig build test` | Host tests, the stack frame and syscall dispatch checks and QEMU scenarios. |
+| `zig build test` | Host tests, the model checks, the stack frame and syscall dispatch checks and QEMU scenarios. |
 | `zig build coverage` | Host tests under kcov; report in `zig-out/coverage/`. |
 
 Build options (they apply to the test commands too):
@@ -160,24 +161,15 @@ the terminal.
 | `tests/kernel/` | In-kernel test suite, its kernel-side helpers, the crash scenarios and the QEMU fw_cfg reader |
 | `tests/user/` | Ring 3 test programs, packaged as `/test/<name>` in the test initrd |
 | `tests/support/` | QEMU exit device helper for the test kernel |
+| `tests/models/` | Models of the blocking protocols, checked in every order of their steps (see [testing](testing.md#model-checks)) |
+| `tools/` | Tools that are not part of the OS. `tools/modelcheck/` is the model checker |
 | `scripts/` | Build, run, test, release, CI install scripts and the GDB setup |
 | `VERSION` | `<major>.<minor>` of the next release (see [releases](#releases)) |
 | `linker.ld`, `limine.conf` | Kernel link layout (a position-independent executable linked at 0xffffffff80000000) and boot menu, which turns on KASLR |
 | `.github/workflows/ci.yml` | CI (see [testing](testing.md#ci)) |
 
-### Boot flow
-
-Limine loads `kernel.elf` and `initrd.tar`, answers the requests in
-`src/main.zig`, and jumps to `kmain`. `kmain` brings up, in order: serial, GDT,
-per-CPU data (GS base), IDT, framebuffer console, PMM, page tables, SMEP/SMAP, SSE/AVX and their save area, kernel symbols, ACPI, APIC, HPET,
-PCI (and NVMe if present), the APIC timer, syscalls and the initrd. The
-normal kernel then starts `/bin/sh` and its boot thread blocks for good
-(there is no idle thread: with nothing to run, the CPU halts inside
-`thread.block`); the test kernel runs the scenario QEMU asks for instead.
-
-The initrd is a ustar archive built by `scripts/build.sh` from
-`zig-out/bin/` (`/bin/sh`, `/bin/hello`, `/etc/motd`, plus `/test/*` in the
-test image).
+How the parts work together, the boot order and the layout of the address
+space are in [architecture](architecture.md).
 
 ## Making changes
 

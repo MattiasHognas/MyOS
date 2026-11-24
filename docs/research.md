@@ -159,10 +159,13 @@ specifications, with the specification kept in step with the code. 20 bugs
 (data races, deadlocks, livelocks, panics) in 12 modules of a Linux-ABI
 kernel, for four person-months of work.
 
-*For MyOS:* **adopt** in [3.1](todo.md#31-synchronization). The specification
-is separate from the code, so the kernel being in Zig does not matter. The
-block/wake permit, wait queues with timeouts and the mutex hand-off are small
-and are the parts that change meaning with several CPUs.
+*For MyOS:* **adopt**. Done in [3.1](todo.md#31-synchronization), with our
+own checker in place of PlusCal and TLC (`tools/modelcheck`, a few hundred
+lines of Zig, no outside tool): sleep and wake, timeouts and the mutex are
+modelled in `tests/models/`, each with variants that must fail. It found one
+mistake in the design before any code was written (wake before releasing the
+condition's lock). What we do not have from the paper: checking that the
+model and the code still agree; that is by hand.
 
 ### The scalable commutativity rule (sv6, SOSP 2013)
 

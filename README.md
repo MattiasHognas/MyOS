@@ -18,10 +18,12 @@ project layout are in [docs/development.md](docs/development.md).
 
 ## Documentation
 
+- [Architecture](docs/architecture.md): how the kernel works inside, and where each part is explained
 - [Development](docs/development.md): setup, building, running, project layout, conventions
 - [Testing](docs/testing.md): host tests, in-kernel tests, QEMU scenarios, coverage, CI
 - [Syscall ABI](docs/syscalls.md): Linux's x86-64 ABI as MyOS implements it
 - [Debugging](docs/debugging.md): logging, backtraces, QEMU + GDB
+- [Concurrency and locking](docs/locking.md): the model the SMP work follows (proposed)
 - [Roadmap](docs/todo.md)
 - [Research notes](docs/research.md): code-review findings, papers and techniques, and what we do with each
 - [Specs x86-64 (cheat sheet)](docs/specs-x86_64.md)
