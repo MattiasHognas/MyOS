@@ -34,7 +34,7 @@ const HW_WORDS = 8;
 /// Timing samples taken per seed.
 const TIMING_SAMPLES = 256;
 
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .rank = .random };
 var generator: core.Generator = .init(@splat(0));
 var ready = false;
 var has_rdseed = false;

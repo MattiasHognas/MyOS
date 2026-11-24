@@ -41,7 +41,7 @@ const vtable = std.mem.Allocator.VTable{
 pub const allocator = std.mem.Allocator{ .ptr = undefined, .vtable = &vtable };
 
 /// Protects the free list, the end of the heap and the counters.
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .rank = .kernel_region };
 var free_list: ?*Chunk = null; // sorted by address
 var heap_end: usize = HEAP_START;
 

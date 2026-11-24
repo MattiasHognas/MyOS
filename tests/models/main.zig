@@ -1,7 +1,7 @@
 //! Model checks of the kernel's blocking protocols for several CPUs.
 //!
 //! Each model (`sleep_wake.zig`, `timeout.zig`, `mutex.zig`) describes a
-//! protocol as `docs/locking.md` says it is to work, and is checked here in
+//! protocol as `docs/locking.md` says it works, and is checked here in
 //! every order its steps can happen (`tools/modelcheck`). Each rule the
 //! protocol depends on can be switched off, and for each there is a test
 //! that expects the check to fail then, and how: a model that could not
@@ -50,7 +50,14 @@ test "sleep and wake: checking the condition outside the lock loses a wake-up" {
 }
 
 test "sleep and wake: releasing the scheduler lock before the switch puts a thread on two CPUs" {
-    try expectViolation(sleep_wake.Model(.{ .hold_across_switch = false }), "a thread runs on two CPUs at once");
+    try expectViolation(sleep_wake.Model(.{ .hold_across_switch = false, .wake_idle_in_place = false }), "a thread runs on two CPUs at once");
+}
+
+test "sleep and wake: releasing the scheduler lock before the switch strands a thread woken in place" {
+    // "Blocked, with a CPU on its stack" means "idling" only because the
+    // lock covers the switch. Without that, the waker can find a thread
+    // that is just leaving, tell it to carry on, and nobody ever runs it.
+    try expectOutcome(sleep_wake.Model(.{ .hold_across_switch = false }), .stuck);
 }
 
 test "sleep and wake: without timeouts, waking after releasing the condition's lock is safe too" {
@@ -58,6 +65,10 @@ test "sleep and wake: without timeouts, waking after releasing the condition's l
     // leave before it is woken, so the waker never finds it gone. With
     // timeouts that is no longer true: see the timeout model.
     try expectOutcome(sleep_wake.Model(.{ .wake_under_lock = false }), null);
+}
+
+test "sleep and wake: waking a thread whose CPU idles on its stack as if it had left puts it on two CPUs" {
+    try expectViolation(sleep_wake.Model(.{ .wake_idle_in_place = false }), "a thread runs on two CPUs at once");
 }
 
 test "timeout: the waiter returns, knows whether it was woken, and is not touched afterwards" {

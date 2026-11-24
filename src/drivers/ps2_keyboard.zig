@@ -1,43 +1,59 @@
 //! PS/2 keyboard driver.
 //!
 //! The IRQ 1 handler translates scancode set 1 (US layout) into ASCII,
-//! tracking Shift, Ctrl and Caps Lock, and pushes characters into a lock-free
-//! single-producer/single-consumer ring buffer read by `getChar`.
+//! tracking Shift, Ctrl and Caps Lock, and puts characters into a ring
+//! buffer. `read` takes them out, sleeping while there is none.
+//!
+//! One spinlock protects the buffer, the modifier state and the queue of
+//! waiting readers: "is there a key" is the condition the readers wait
+//! for, and the interrupt handler takes the same lock to add a key and
+//! wake one of them (`docs/locking.md`).
 
 const std = @import("std");
-const root = @import("root");
 
 const apic = @import("../arch/x86_64/apic.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
+const SpinLock = @import("../kernel/sync/spinlock.zig").SpinLock;
 const WaitQueue = @import("../kernel/sync/wait_queue.zig").WaitQueue;
 
 // Scancode set 1, US layout, indexed by scancode 0x00-0x39. 0 = no character.
 const normal = "\x00\x1b1234567890-=\x08\tqwertyuiop[]\n\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";
 const shifted = "\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\n\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?\x00*\x00 ";
 
+/// Protects everything below.
+var lock: SpinLock = .{ .rank = .condition };
+
 var shift = false;
 var ctrl = false;
 var caps = false;
 var extended = false; // previous byte was the 0xE0 prefix
 
-// Ring buffer: written by the IRQ handler, read by getChar.
+// Ring buffer: written by the IRQ handler, read by `read` and `getChar`.
 var buf: [256]u8 = undefined;
 var head: u8 = 0; // next write (u8 wraps at 256 by itself)
 var tail: u8 = 0; // next read
 
-/// Threads waiting for a key. A reader that finds the buffer empty waits
-/// here (with interrupts off between the look and the wait); the IRQ
-/// handler wakes the one that has waited longest for each key.
-pub var readers: WaitQueue = .{};
+/// Threads waiting for a key. The IRQ handler wakes the one that has
+/// waited longest for each key.
+var readers: WaitQueue = .{};
 
-/// Append `c` to the ring buffer. Drops the character if the buffer is full.
-/// Only called from the IRQ handler (the single producer).
+/// Append `c` to the ring buffer and wake a waiting reader. Drops the
+/// character if the buffer is full. The lock must be held.
 fn push(c: u8) void {
-    const h = head;
-    if (h +% 1 == @atomicLoad(u8, &tail, .acquire)) return; // full: drop the key
-    buf[h] = c;
-    @atomicStore(u8, &head, h +% 1, .release);
+    if (head +% 1 == tail) return; // full: drop the key
+    buf[head] = c;
+    head +%= 1;
+    _ = readers.wakeOne();
+}
+
+/// Take the next character out of the ring buffer, or return null if it is
+/// empty. The lock must be held.
+fn pop() ?u8 {
+    if (tail == head) return null;
+    const c = buf[tail];
+    tail +%= 1;
+    return c;
 }
 
 /// IRQ 1 handler: read one scancode from the controller, update the modifier
@@ -45,6 +61,8 @@ fn push(c: u8) void {
 /// a waiting reader. Extended (0xE0-prefixed) keys and key releases produce no
 /// characters.
 fn onIrq(_: *idt.Frame) void {
+    const held = lock.acquire();
+    defer lock.release(held);
     const sc = cpu.inb(0x60);
     if (sc == 0xE0) {
         extended = true;
@@ -77,26 +95,41 @@ fn onIrq(_: *idt.Frame) void {
     if (caps and std.ascii.isAlphabetic(c)) c ^= 0x20; // flip case
     if (ctrl and std.ascii.isAlphabetic(c)) c &= 0x1F; // Ctrl+C = 3, etc.
     push(c);
-    _ = readers.wakeOne();
 }
 
 /// Queue the character `c` as if it had been typed, and wake a waiting
 /// reader. For input that does not come from the keyboard controller: the
-/// tests today, other input sources later. Interrupts must be off, as in
-/// the IRQ handler (there is one producer at a time).
+/// tests today, other input sources later.
 pub fn inject(c: u8) void {
+    const held = lock.acquire();
+    defer lock.release(held);
     push(c);
-    _ = readers.wakeOne();
 }
 
 /// Take the next character from the ring buffer, or return null if it is
-/// empty. Never blocks; callers that want to wait use `readers`.
+/// empty. Never blocks.
 pub fn getChar() ?u8 {
-    const t = tail;
-    if (t == @atomicLoad(u8, &head, .acquire)) return null;
-    const c = buf[t];
-    @atomicStore(u8, &tail, t +% 1, .release);
-    return c;
+    const held = lock.acquire();
+    defer lock.release(held);
+    return pop();
+}
+
+/// Return the next character, sleeping until one is typed. Readers are
+/// served in the order they started waiting. Not for interrupt handlers.
+pub fn read() u8 {
+    const held = lock.acquire();
+    defer lock.release(held);
+    while (true) {
+        if (pop()) |c| return c;
+        readers.wait(&lock); // until a key arrives; then look again
+    }
+}
+
+/// Number of threads waiting in `read`.
+pub fn waitingReaders() usize {
+    const held = lock.acquire();
+    defer lock.release(held);
+    return readers.waiting();
 }
 
 /// Discard any stale bytes in the controller's output buffer, install the IRQ

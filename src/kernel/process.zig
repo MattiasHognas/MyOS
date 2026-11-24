@@ -42,6 +42,15 @@
 //! thread touches them; and blocking syscalls block the whole process.
 //! Milestone 7 (threads) has to revisit each of these.
 //!
+//! ## Locking
+//!
+//! One spinlock, the process-tree lock, protects every process's parent
+//! and child links, descendant count, reference count and exit status, and
+//! the wait queue of threads waiting for that status (`docs/locking.md`).
+//! It is outermost in the lock order, and nothing is allocated or freed
+//! while it is held. Everything else in a `Process` is set before the
+//! process can be seen, or used only by its own thread.
+//!
 //! Every process has `Limits` on what it may use: memory, open files, and
 //! how many processes may be alive below it. A child inherits its parent's
 //! limits. They bound what one program and the programs it starts can take;
@@ -56,6 +65,7 @@ const elf_image = @import("elf_image.zig");
 const heap = @import("heap.zig");
 const kstack = @import("kstack.zig");
 const pmm = @import("pmm.zig");
+const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
 const thread = @import("thread.zig");
 const vfs = @import("vfs.zig");
@@ -157,6 +167,9 @@ pub const Process = struct {
     next_sibling: ?*Process = null,
 };
 
+/// The process-tree lock: see "Locking" at the top of this file.
+var tree_lock: SpinLock = .{ .rank = .process_tree };
+
 /// How a process is started.
 pub const SpawnOptions = struct {
     /// The process starting this one.
@@ -171,7 +184,7 @@ pub const SpawnOptions = struct {
 
 /// Count a new process against every ancestor from `parent` up. Fails,
 /// changing nothing, if one of them already has as many descendants as it
-/// may. Interrupts must be off.
+/// may. The tree lock must be held.
 fn chargeDescendant(parent: ?*Process) error{TooManyProcesses}!void {
     var a = parent;
     while (a) |anc| : (a = anc.parent) {
@@ -181,20 +194,20 @@ fn chargeDescendant(parent: ?*Process) error{TooManyProcesses}!void {
     while (a) |anc| : (a = anc.parent) anc.descendants += 1;
 }
 
-/// Undo `chargeDescendant`. Interrupts must be off.
+/// Undo `chargeDescendant`. The tree lock must be held.
 fn releaseDescendant(parent: ?*Process) void {
     var a = parent;
     while (a) |anc| : (a = anc.parent) anc.descendants -= 1;
 }
 
-/// Put `child` in the child list of `child.parent`. Interrupts must be off.
+/// Put `child` in the child list of `child.parent`. The tree lock must be held.
 fn linkChild(child: *Process) void {
     const parent = child.parent orelse return;
     child.next_sibling = parent.first_child;
     parent.first_child = child;
 }
 
-/// Take `child` out of its parent's child list. Interrupts must be off.
+/// Take `child` out of its parent's child list. The tree lock must be held.
 fn unlinkChild(child: *Process) void {
     const parent = child.parent orelse return;
     var link = &parent.first_child;
@@ -209,7 +222,7 @@ fn unlinkChild(child: *Process) void {
 
 /// Give the children of `p`, which is exiting, to its parent (or to nobody).
 /// The ancestors above `p` already count them as descendants, so only the
-/// links change. Interrupts must be off.
+/// links change. The tree lock must be held.
 fn reparentChildren(p: *Process) void {
     while (p.first_child) |child| {
         p.first_child = child.next_sibling;
@@ -229,14 +242,16 @@ fn reparentChildren(p: *Process) void {
 pub fn exit(code: u64) noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: we're done
     const p = thread.current().process.?;
+    closeFiles(p); // only this thread uses them
+    tree_lock.take();
     assert.check(.process, p.exit_code == null, "process '{s}' exits twice", .{p.name});
-    closeFiles(p);
     reparentChildren(p);
     unlinkChild(p);
     releaseDescendant(p.parent);
     p.parent = null;
     p.exit_code = code;
-    _ = p.exited.wakeAll();
+    _ = p.exited.wakeAll(); // before the lock is released: the waiters are still there
+    tree_lock.drop();
     thread.exit();
 }
 
@@ -245,10 +260,12 @@ pub fn exit(code: u64) noreturn {
 /// already exited, however long ago. Several threads may wait for the same
 /// process, each with a reference of its own (`retain`).
 pub fn wait(p: *Process) u64 {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    while (p.exit_code == null) p.exited.wait();
-    const code = p.exit_code.?;
+    const code = blk: {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        while (p.exit_code == null) p.exited.wait(&tree_lock);
+        break :blk p.exit_code.?;
+    };
     release(p);
     return code;
 }
@@ -256,8 +273,8 @@ pub fn wait(p: *Process) u64 {
 /// Take another reference to `p`, for a second thread that will `wait` for
 /// it or look at it. The caller must already hold one.
 pub fn retain(p: *Process) void {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
     assert.check(.process, p.refs > 0, "retaining process '{s}', which has no references", .{p.name});
     p.refs += 1;
 }
@@ -265,14 +282,17 @@ pub fn retain(p: *Process) void {
 /// Give up a reference to `p` without waiting for it. The process runs on
 /// regardless; its structure is freed when the last reference is gone.
 pub fn release(p: *Process) void {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    assert.check(.process, p.refs > 0, "releasing process '{s}', which has no references", .{p.name});
-    p.refs -= 1;
-    if (p.refs > 0) return;
-    assert.check(.process, p.exit_code != null and p.root == 0, "freeing process '{s}' while it is alive", .{p.name});
-    assert.check(.process, p.exited.waiting() == 0 and p.first_child == null, "freeing process '{s}' that others still point at", .{p.name});
-    live -= 1;
+    {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        assert.check(.process, p.refs > 0, "releasing process '{s}', which has no references", .{p.name});
+        p.refs -= 1;
+        if (p.refs > 0) return;
+        assert.check(.process, p.exit_code != null and p.root == 0, "freeing process '{s}' while it is alive", .{p.name});
+        assert.check(.process, p.exited.waiting() == 0 and p.first_child == null, "freeing process '{s}' that others still point at", .{p.name});
+        live -= 1;
+    }
+    // Nobody else has a reference, so nobody else can reach it.
     heap.allocator.free(p.name);
     heap.allocator.destroy(p);
 }
@@ -280,9 +300,12 @@ pub fn release(p: *Process) void {
 /// Number of `Process` structures that exist: processes that run, and
 /// exited ones somebody still holds a reference to.
 pub fn liveCount() usize {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
     return live;
 }
 
+// Guarded by the tree lock.
 var live: usize = 0;
 
 /// Close every open file of `p`.
@@ -309,7 +332,12 @@ pub fn spawnPath(path: []const u8, options: SpawnOptions) !*Process {
 /// Called by the scheduler when the thread of `p` has been reaped: nothing
 /// runs in `p` any more. Its address space may still be loaded, if only
 /// kernel threads ran since, so it is switched away from first. Frees the
-/// address space and gives up the thread's reference. Interrupts are off.
+/// address space and gives up the thread's reference. Interrupts are off
+/// and no lock is held.
+///
+/// With several CPUs the address space may also be loaded on another one
+/// that only ran kernel threads since; that CPU has to be asked to switch
+/// away first (3.4).
 pub fn teardown(p: *Process) void {
     assert.check(.process, p.exit_code != null, "tearing down process '{s}', which has not exited", .{p.name});
     assert.check(.process, p.root != 0, "process '{s}' torn down twice", .{p.name});
@@ -372,18 +400,21 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         .refs = 2, // the thread's and the caller's
     };
 
-    // From here to the end nothing may run in between: the new process
-    // is in the tree exactly when it has a thread.
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    // Everything that can fail for lack of memory happens before the
+    // tree lock, which is held for the few lines that put the process in
+    // the tree: it is in the tree exactly when its thread is started.
+    const t = try thread.create(userStart, p);
+    errdefer thread.destroy(t);
+
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
     if (options.parent) |parent| {
         assert.check(.process, parent.exit_code == null, "process '{s}' starts a child after exiting", .{parent.name});
     }
     try chargeDescendant(options.parent);
-    errdefer releaseDescendant(options.parent);
-    _ = try thread.spawn(userStart, p);
     linkChild(p);
     live += 1;
+    thread.start(t);
     return p;
 }
 

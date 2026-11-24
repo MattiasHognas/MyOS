@@ -299,25 +299,29 @@ Found on the way: the "kernel runs at a randomized address" test overflowed, and
 Moved up (it was milestone 5): bringing up SMP while the kernel is small is far cheaper than retrofitting it onto pipes, a terminal, `mmap`, futexes and signals written for one CPU. Everything after this milestone is written and tested on several cores.
 
 ### 3.1 Synchronization
-The primitives come from 2.8 and are already real locks; this section makes their users safe on several CPUs.
-- [ ] Decide and document the kernel's preemption and locking model: whether kernel code can be preempted, which locks disable interrupts, and what may be held across a block.
-  - Proposed in `docs/locking.md` (locks and what each protects, the lock order, the sleep and wake pattern, per-CPU state, TLB rules). Not ticked until it has been reviewed and the model checks below have run.
-- [ ] Audit existing `cli`/`sti` critical sections and replace every one that assumes a single CPU. Known from 2.7 and 2.8, still protected by turning interrupts off only:
-  - the scheduler's ready queue, zombie list and current thread (`thread.zig`);
-  - the process tree, descendant counts, reference counts and exit status (`process.zig`);
-  - the page tables of `kernel_root`, which the heap and the kernel stack allocator change under two different locks (`vmm.zig`);
-  - the keyboard buffer and modifier state, the console, and the serial port.
-- [ ] Hold the scheduler lock across the context switch and release it in the thread that is switched to (a new thread's first code included), so a thread that has marked itself blocked cannot be woken and run by another CPU while its own CPU is still on its stack (`docs/locking.md`).
-- [ ] Make timer callbacks safe against the thread that armed them returning: `sleepTicks` and `waitTimeout` keep their timer in the waiter's stack frame, and with several CPUs the callback can still be running when the waiter returns. `timer.cancel` must report "already started", and the waiter then waits for the callback to finish; the callback needs two flags, "fired" before the wake and "finished" last (`docs/locking.md`). Test with a timer that fires on another CPU exactly as the waiter is woken.
-- [ ] Wake a thread before releasing the lock of the condition it waited for (`WaitQueue.wakeOne` and `wakeAll` are called with that lock held), so a waiter with a timeout cannot have returned and exited in between (`docs/locking.md`, found by the timeout model).
-- [ ] Make mutexes and wait queues safe against wakeups from another CPU. Today "check the condition and call `wait` with interrupts off" cannot lose a wake-up because nothing else runs; with several CPUs the check and the wait must be under a lock the waker also takes (`wait` releasing it atomically). `Mutex` and `process.wait` use that pattern and need the same change.
-- [ ] Define lock-ordering rules and test contention.
+The primitives come from 2.8 and are already real locks; this section makes their users safe on several CPUs. It is done on one CPU: what needs a second CPU to be tested is listed under 3.4.
+- [x] Decide and document the kernel's preemption and locking model: whether kernel code can be preempted, which locks disable interrupts, and what may be held across a block.
+  - In `docs/locking.md` (locks and what each protects, the lock order, the sleep and wake pattern, per-CPU state, TLB rules), describing the code. The model checks have run.
+- [x] Audit existing `cli`/`sti` critical sections and replace every one that assumes a single CPU:
+  - the scheduler's ready queue, zombie list and thread states: the scheduler lock (`thread.zig`);
+  - the process tree, descendant counts, reference counts and exit status: the process-tree lock (`process.zig`). A new process's thread is created before the lock is taken (`thread.create`, `start`, `destroy`), so nothing is allocated under it;
+  - the page tables of `kernel_root`: each region (heap, kernel stacks, device window) has its own lock and its own top-level slot, whose tables exist from boot, so no two regions share a page table. The device window got its lock (`vmm.zig`);
+  - the keyboard buffer, modifier state and readers: one lock, and `keyboard.read` does the waiting (`ps2_keyboard.zig`). The console and the serial port: the console lock (`main.zig`); a CPU reporting a panic or a kernel fault prints without waiting for it.
+  - What is left with interrupts off only is state that belongs to the CPU (the running thread, the time slice, the loaded address space), which moves to per-CPU storage in 3.2.
+- [x] Hold the scheduler lock across the context switch and release it in the thread that is switched to (a new thread's first code included), so a thread that has marked itself blocked cannot be woken and run by another CPU while its own CPU is still on its stack (`docs/locking.md`).
+  - An exited thread goes on the zombie list on the far side of the switch too, so no CPU can free a stack another one is still on.
+  - A blocked thread whose CPU idles on its stack (there is no idle thread) is woken in place (`Thread.on_cpu`), never through the ready queue. Added to the model, with the failure that follows without it.
+- [x] Make timer callbacks safe against the thread that armed them returning: `timer.WakeTimer` has the two flags ("fired" before the wake, "finished" last) and `finish`, which cancels the timer or waits for a callback that has started. `sleepTicks` and `waitTimeout` use it.
+- [x] Wake a thread before releasing the lock of the condition it waited for: `WaitQueue.wakeOne` and `wakeAll` are called with that lock held, and assert that a lock is.
+- [x] Make mutexes and wait queues safe against wakeups from another CPU: `WaitQueue.wait` takes the condition's lock, which the waker takes too, and releases it only once the thread is on the queue. A wait queue has no lock of its own any more. `Mutex` has an internal spinlock; `process.wait` waits under the process-tree lock.
+- [x] Define lock-ordering rules: every `SpinLock` has a rank (`sync/lock_order.zig`), each CPU records the locks it holds, and taking one out of order, blocking, yielding or exiting with one held, or releasing one that is not the innermost panics at once, in every build with assertions.
+  - Tests: the bookkeeping on the host (every pair of ranks); in the kernel, that the record follows the locks through waits, switches and interrupts; two QEMU scenarios that break the rules on purpose (`lock_order`, `sleep_with_lock`) and must panic.
 - [x] Model-check the blocking protocols before relying on them with several CPUs (the Converos approach, `docs/research.md`): sleep and wake with the permit, the context switch out of a blocking thread, wait queues with timeouts, and the mutex hand-off.
   - The checker is `tools/modelcheck`, about 200 lines of Zig that try a model's steps in every order; no outside tool (TLA+ was the first idea and needs Java). The models are in `tests/models/`, each naming the code it describes. `zig build check-models` runs them; it is part of `zig build test` and CI.
-  - Every rule can be switched off in its model, and a test expects the failure that follows (a lost wake-up, a thread on two CPUs, a thread woken after it has gone, two owners of a mutex): 5 models that must hold and 6 that must fail.
+  - Every rule can be switched off in its model, and a test expects the failure that follows (a lost wake-up, a thread on two CPUs, a thread that is never run again, a thread woken after it has gone, two owners of a mutex): 4 models that must hold and 9 that must fail.
   - It showed one thing the design had wrong: the waker must wake a thread before it releases the condition's lock, not after, or a waiter with a timeout can be gone by then. `docs/locking.md` says so now.
-  - Limits: a model is not the code, so the conversions below still need tests on several CPUs. The checker has no fairness; "eventually" is checked as "nothing gets stuck and finishing stays possible".
-- [ ] Go through the syscalls that exist with the scalable commutativity rule (`docs/research.md`) and write down, in the locking document, which pairs must not contend on several CPUs and which cannot avoid it (`open` must return the lowest free descriptor).
+  - Limits: a model is not the code, so the conversions above still need tests on several CPUs (3.4). The checker has no fairness; "eventually" is checked as "nothing gets stuck and finishing stays possible".
+- [x] Go through the syscalls that exist with the scalable commutativity rule (`docs/research.md`) and write down, in the locking document, which pairs must not contend on several CPUs and which cannot avoid it (`open` must return the lowest free descriptor). Calls that commute and still contend today do so on the heap lock, the scheduler lock and the process-tree lock; the first two have items in 3.4.
 
 ### 3.2 Per-CPU state
 The per-CPU structure and the `swapgs` transitions come from 2.5.
@@ -337,6 +341,8 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [ ] Protect shared scheduler state.
 - [ ] Choose per-CPU queues or a documented global-queue scheduling model.
 - [ ] Support cross-CPU wakeups and inter-processor interrupts.
+  - A CPU that halted with nothing to run must be interrupted when another CPU makes a thread ready or wakes the thread it idles in (`thread.wake`, `idleOnce`); until then it notices at its next timer tick.
+  - A CPU that reports a panic or a kernel fault stops the others first, so the report comes out whole (`root.seizeConsole`).
 - [ ] Add CPU affinity/load balancing if needed.
 - [ ] Synchronize PMM, heap, page tables, and drivers.
 - [ ] Implement cross-CPU TLB shootdowns.
@@ -345,6 +351,8 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [ ] Give the kernel heap size classes with a per-CPU cache of free objects, replacing the first-fit list under one lock (`docs/research.md`: magazines, snmalloc).
 - [ ] Preempt on wake-up, or otherwise bound how long a woken thread waits: today it goes to the tail of the queue and waits for the running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
 - [ ] Stress-test simultaneous allocations, processes, interrupts, and I/O.
+  - From 3.1, the cases one CPU cannot produce: a timer that fires on another CPU exactly as the waiter is woken (`WakeTimer.finish` then has to wait for the callback); a wake-up from another CPU between a waiter's check and its sleep; a thread woken while its CPU is still switching away from it; real contention on the scheduler, process-tree and console locks.
+  - The in-kernel tests keep their own shared state safe with interrupts off in many places, which is only enough on one CPU: give them locks (as the wait-queue, mutex and timer tests have) before running them on several.
 - [ ] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run.
 - [ ] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
 

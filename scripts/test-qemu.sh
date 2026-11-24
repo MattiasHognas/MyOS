@@ -224,6 +224,20 @@ run_scenario() {
             expect_line '^  #0 0x[0-9a-f]{16} [^ ]*writeTextThroughDirectMap\+0x'
             if grep -q 'was not caught' "$log"; then fail "the kernel wrote to its own code through the direct map"; fi
             ;;
+        lock_order)
+            expect_status 3
+            expect_line '^PANIC: spinlock: taking a condition lock while holding a timer lock \(docs/locking.md, lock order\)$'
+            expect_line '^backtrace:$'
+            expect_line ' [^ ]*takeLocksOutOfOrder\+0x'
+            if grep -q 'was not caught' "$log"; then fail "the kernel took two locks in the wrong order"; fi
+            ;;
+        sleep_with_lock)
+            expect_status 3
+            expect_line '^PANIC: spinlock: assertion failed: blocking with 1 spinlocks held, not 0$'
+            expect_line '^backtrace:$'
+            expect_line ' [^ ]*sleepHoldingSpinlock\+0x'
+            if grep -q 'was not caught' "$log"; then fail "the kernel slept while holding a spinlock"; fi
+            ;;
         *)
             echo "unknown scenario: $scenario" >&2
             exit 2
@@ -240,7 +254,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow use_after_free relro text_alias)
+((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow use_after_free relro text_alias lock_order sleep_with_lock)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 # KASLR: the kernel reports where it was loaded in every boot. Seeing the

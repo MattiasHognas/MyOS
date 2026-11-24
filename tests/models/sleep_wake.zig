@@ -1,10 +1,11 @@
 //! Model of sleeping and waking on several CPUs (`docs/locking.md`,
-//! "Sleeping and waking"): `WaitQueue.wait`, `wakeOne`, `thread.block` and
-//! `thread.wake` in `src/kernel/`, as they are to work with several CPUs.
+//! "Sleeping and waking"): `WaitQueue.wait`, `wakeOne`, `thread.block`,
+//! `thread.wake` and the context switch in `src/kernel/`.
 //!
 //! Some threads each wait for an event; a waker posts as many events as
 //! there are waiters, waking the longest waiter each time; other CPUs pick
-//! up threads that became ready. Every step that the kernel does under one
+//! up threads that became ready; a CPU whose thread blocks may find nothing
+//! else to run and idle on that thread's stack. Every step that the kernel does under one
 //! lock without releasing it is one action here; a lock that is held from
 //! one action to the next is a variable.
 //!
@@ -27,6 +28,11 @@ pub const Config = struct {
     hold_across_switch: bool = true,
     /// The waker wakes the thread before it releases the condition's lock.
     wake_under_lock: bool = true,
+    /// A blocked thread whose CPU found nothing else to run idles on the
+    /// thread's own stack (there is no idle thread), and waking it lets it
+    /// carry on there. Off: it is put in the ready queue like any blocked
+    /// thread, as if "blocked" meant "off its stack".
+    wake_idle_in_place: bool = true,
 };
 
 /// Number of waiting threads, and of events posted.
@@ -36,7 +42,7 @@ const waker_id = waiters + 1; // as a lock holder; waiter i holds as i + 1
 
 pub fn Model(comptime cfg: Config) type {
     return struct {
-        const Pc = enum(u8) { check, test_condition, lock_to_join, join, block_lock, block_decide, switch_out, asleep, recheck, done };
+        const Pc = enum(u8) { check, test_condition, lock_to_join, join, block_lock, block_decide, switch_out, idle, idle_lock, asleep, recheck, done };
         const Run = enum(u8) { running, ready, blocked };
         const WakerPc = enum(u8) { start, post, wake_lock, wake, end };
 
@@ -66,8 +72,9 @@ pub fn Model(comptime cfg: Config) type {
             woke_exited: bool = false,
         };
 
-        /// Waiter i, the waker, and "a CPU picks thread i from the ready queue".
-        pub const action_count = waiters + 1 + waiters;
+        /// Waiter i, the waker, "a CPU picks thread i from the ready queue",
+        /// and "waiter i's CPU has nothing else to run, and idles".
+        pub const action_count = waiters + 1 + waiters + waiters;
 
         pub fn initial() State {
             return .{};
@@ -128,10 +135,32 @@ pub fn Model(comptime cfg: Config) type {
                     if (cfg.hold_across_switch) n.sched_lock = 0;
                     n.pc[i] = .asleep;
                 },
+                // Off its stack. It goes on when a CPU has picked it up; being
+                // marked running is not enough if no CPU is there to run it.
                 .asleep => {
-                    if (s.run[i] != .running) return null;
+                    if (s.run[i] != .running or !s.on_stack[i]) return null;
                     n.permit[i] = false;
                     n.pc[i] = .recheck;
+                },
+                // Halted in `block`, on its own stack, the scheduler lock
+                // released. An interrupt ends the halt at any time.
+                .idle => {
+                    if (s.sched_lock != 0) return null;
+                    n.sched_lock = me;
+                    n.pc[i] = .idle_lock;
+                },
+                // Woken in place: carry on. Still blocked, and another
+                // thread is ready: switch to it after all, leaving this
+                // stack under the lock like any switch. Otherwise halt again.
+                .idle_lock => {
+                    n.sched_lock = 0;
+                    if (s.run[i] == .running) {
+                        n.permit[i] = false;
+                        n.pc[i] = .recheck;
+                    } else if (std.mem.indexOfScalar(bool, &s.in_ready_queue, true) != null) {
+                        n.on_stack[i] = false;
+                        n.pc[i] = .asleep;
+                    } else n.pc[i] = .idle;
                 },
                 // WaitQueue.wait: still on the queue means "not woken yet".
                 .recheck => {
@@ -181,9 +210,13 @@ pub fn Model(comptime cfg: Config) type {
                     if (s.exited[t]) n.woke_exited = true;
                     n.permit[t] = true;
                     if (s.run[t] == .blocked) {
-                        if (s.in_ready_queue[t]) n.queued_twice = true;
-                        n.run[t] = .ready;
-                        n.in_ready_queue[t] = true;
+                        if (cfg.wake_idle_in_place and s.on_stack[t]) {
+                            n.run[t] = .running; // its CPU idles on its stack: it carries on there
+                        } else {
+                            if (s.in_ready_queue[t]) n.queued_twice = true;
+                            n.run[t] = .ready;
+                            n.in_ready_queue[t] = true;
+                        }
                     }
                     n.sched_lock = 0;
                     if (cfg.wake_under_lock) n.cond_lock = 0;
@@ -206,10 +239,26 @@ pub fn Model(comptime cfg: Config) type {
             return n;
         }
 
+        /// The CPU of waiter `i`, which is about to switch away from it,
+        /// finds the ready queue empty instead: it releases the scheduler
+        /// lock and halts where it is. The thread stays blocked, with a
+        /// CPU on its stack.
+        fn idle(s: State, i: u8) ?State {
+            if (s.pc[i] != .switch_out) return null;
+            for (s.in_ready_queue) |queued| {
+                if (queued) return null; // something to run: it switches
+            }
+            var n = s;
+            n.sched_lock = 0;
+            n.pc[i] = .idle;
+            return n;
+        }
+
         pub fn step(s: State, action: usize) ?State {
             if (action < waiters) return waiter(s, @intCast(action));
             if (action == waiters) return waker(s);
-            return pick(s, @intCast(action - waiters - 1));
+            if (action < 2 * waiters + 1) return pick(s, @intCast(action - waiters - 1));
+            return idle(s, @intCast(action - 2 * waiters - 1));
         }
 
         pub fn invariant(s: State) ?[]const u8 {
@@ -227,7 +276,7 @@ pub fn Model(comptime cfg: Config) type {
         }
 
         pub fn actionName(action: usize) []const u8 {
-            const names = [action_count][]const u8{ "waiter 0", "waiter 1", "waker", "a CPU picks waiter 0", "a CPU picks waiter 1" };
+            const names = [action_count][]const u8{ "waiter 0", "waiter 1", "waker", "a CPU picks waiter 0", "a CPU picks waiter 1", "waiter 0's CPU idles", "waiter 1's CPU idles" };
             return names[action];
         }
     };

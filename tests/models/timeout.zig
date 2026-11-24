@@ -1,8 +1,8 @@
 //! Model of waiting with a timeout on several CPUs (`docs/locking.md`,
 //! "Sleeping and waking"): `WaitQueue.waitTimeout` and the timer callback
-//! it arms (`src/kernel/sync/wait_queue.zig`, `src/kernel/timer.zig`), as
-//! they are to work with several CPUs. `timer.sleepTicks` is the same
-//! without the wait queue.
+//! it arms (`src/kernel/sync/wait_queue.zig`, `timer.WakeTimer` in
+//! `src/kernel/timer.zig`). `timer.sleepTicks` is the same without the
+//! wait queue.
 //!
 //! One thread waits with a timeout. A waker may wake it, or never come. The
 //! timer may fire at any moment, on another CPU: its callback runs

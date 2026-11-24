@@ -269,6 +269,7 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "fpu", "src/arch/x86_64/fpu.zig" },
         .{ "page_bitmap", "src/kernel/page_bitmap.zig" },
         .{ "raw_spinlock", "src/kernel/sync/raw_spinlock.zig" },
+        .{ "lock_order", "src/kernel/sync/lock_order.zig" },
         .{ "random_core", "src/kernel/random_core.zig" },
         .{ "meltdown_rule", "src/arch/x86_64/meltdown_rule.zig" },
         .{ "timer_queue", "src/kernel/sync/timer_queue.zig" },

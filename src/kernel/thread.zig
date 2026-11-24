@@ -16,11 +16,11 @@
 //!                +- blocked +
 //!
 //! - **ready**: in the ready queue, and nowhere else.
-//! - **running**: on the CPU; in no queue.
+//! - **running**: on a CPU; in no queue.
 //! - **blocked**: called `block` and waits for `wake`; in no scheduler queue
 //!   (it may be on a `WaitQueue`, which is how others find it).
-//! - **dead**: called `exit`; on the zombie list until the next thread that
-//!   runs frees it. Never runs again.
+//! - **dead**: called `exit`; on the zombie list once its CPU has left its
+//!   stack, until the next thread that runs frees it. Never runs again.
 //!
 //! A thread is in at most one scheduler queue, and `Thread.link` says which.
 //! Every insertion checks it, so a thread can never be queued twice, and
@@ -41,8 +41,10 @@
 //! There is no idle thread. When a thread blocks or exits and nothing is
 //! ready, the CPU halts right there, in `block` or `exit` on that thread's
 //! stack, until an interrupt makes a thread ready. So a ready thread never
-//! waits behind an idle one, and the check for "nothing to run" and the
-//! halt happen with interrupts off, with no gap a wake-up could fall into.
+//! waits behind an idle one. A blocked thread whose CPU idles on its stack
+//! is still "on a CPU" (`Thread.on_cpu`): waking it lets it carry on where
+//! it is and does not put it in the ready queue, where another CPU could
+//! pick it up and run on the same stack.
 //!
 //! ## Address spaces
 //!
@@ -51,7 +53,22 @@
 //! which are mapped the same in all of them. So a switch to a kernel thread
 //! and back costs no CR3 load and no TLB flush.
 //!
-//! All scheduler state is protected by turning interrupts off (one CPU).
+//! ## Locking
+//!
+//! One spinlock, the scheduler lock, protects the ready queue, the zombie
+//! list and every thread's `state`, `link`, `on_cpu` and wake-up permit
+//! (`docs/locking.md`). It is nearly innermost: nothing is allocated, freed
+//! or printed while it is held, so threads are created before it is taken
+//! and exited ones are freed after it is released.
+//!
+//! **The lock is held across the context switch and released by the thread
+//! that is switched to** (`finishSwitch`; a new thread's first code does it
+//! too). A thread that blocks marks itself blocked and then leaves its
+//! stack; if the lock were released in between, another CPU could wake it
+//! and a third could run it while the first is still on its stack.
+//!
+//! The running thread and what is left of its time slice belong to the CPU
+//! (`current_thread`, `slice_left`): one of each today, per CPU from 3.2.
 
 const std = @import("std");
 const root = @import("root");
@@ -67,13 +84,21 @@ const heap = @import("heap.zig");
 const kstack = @import("kstack.zig");
 const proc = @import("process.zig");
 const Process = proc.Process;
+const spinlock = @import("sync/spinlock.zig");
+const SpinLock = spinlock.SpinLock;
 const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
-var slice_left: u32 = SLICE_TICKS;
 
-var boot_thread: Thread = .{ .id = 0, .stack = null, .state = .running };
+// What belongs to the CPU (one today): touched with interrupts off, no lock.
+var slice_left: u32 = SLICE_TICKS;
+var boot_thread: Thread = .{ .id = 0, .stack = null, .state = .running, .on_cpu = true };
 var current_thread: *Thread = &boot_thread;
+
+/// The scheduler lock. Protects everything below, and in every `Thread`
+/// the fields `state`, `link`, `next`, `on_cpu` and `wake_pending`.
+var lock: SpinLock = .{ .rank = .scheduler };
+
 var next_id: usize = 1;
 
 // FIFO ready queue
@@ -81,11 +106,15 @@ var ready_head: ?*Thread = null;
 var ready_tail: ?*Thread = null;
 
 var zombies: ?*Thread = null;
+/// The thread a CPU is switching away from, from just before the switch
+/// until `finishSwitch` on the other side. The lock is held all that time,
+/// so one variable does for every CPU.
+var switched_from: ?*Thread = null;
 var reaped: usize = 0;
 var switches: usize = 0;
 var halts: usize = 0;
 
-/// Append `t` to the tail of the ready queue. Callers must have interrupts disabled.
+/// Append `t` to the tail of the ready queue. The scheduler lock must be held.
 fn enqueue(t: *Thread) void {
     assert.check(.thread, t.state == .ready, "enqueueing thread {d} in state {t}", .{ t.id, t.state });
     assert.check(.thread, t.link == .none, "thread {d} is already queued ({t})", .{ t.id, t.link });
@@ -96,7 +125,7 @@ fn enqueue(t: *Thread) void {
 }
 
 /// Remove and return the thread at the head of the ready queue, or null if it
-/// is empty. Callers must have interrupts disabled.
+/// is empty. The scheduler lock must be held.
 fn dequeue() ?*Thread {
     const t = ready_head orelse return null;
     ready_head = t.next;
@@ -106,16 +135,30 @@ fn dequeue() ?*Thread {
     return t;
 }
 
-/// Free every thread on the zombie list, together with its process (if any)
-/// and its stack, after recording how much of the stack it used. Called after a context switch, when the dead threads are
-/// guaranteed not to be running.
-fn reap() void {
-    while (zombies) |z| {
-        zombies = z.next;
-        assert.check(.thread, z.state == .dead and z.link == .zombie_list, "reaping thread {d} in state {t} ({t})", .{ z.id, z.state, z.link });
-        assert.check(.thread, z != current_thread, "thread {d} reaps itself", .{z.id});
-        z.link = .none;
+/// Take every thread off the zombie list and return them, linked through
+/// `next`. The scheduler lock must be held; the threads belong to the
+/// caller afterwards, to be freed with `reap` once the lock is released.
+fn takeZombies() ?*Thread {
+    const list = zombies;
+    zombies = null;
+    var z = list;
+    while (z) |t| : (z = t.next) {
+        assert.check(.thread, t.state == .dead and t.link == .zombie_list and !t.on_cpu, "reaping thread {d} in state {t} ({t})", .{ t.id, t.state, t.link });
+        t.link = .none;
         reaped += 1;
+    }
+    return list;
+}
+
+/// Free every thread on `list` (from `takeZombies`), together with its
+/// process (if any) and its stack, after recording how much of the stack it
+/// used. Interrupts are off and no lock is held: this allocator work is
+/// what the scheduler lock must not cover.
+fn reap(list: ?*Thread) void {
+    var rest = list;
+    while (rest) |z| {
+        rest = z.next;
+        assert.check(.thread, z != current_thread, "thread {d} reaps itself", .{z.id});
         if (z.process) |p| proc.teardown(p);
         if (kstack.used(z.stack.?)) |bytes| kstack.record(z.id, bytes); // -Dstack-usage
         kstack.free(z.stack.?);
@@ -161,6 +204,10 @@ pub const Thread = struct {
     /// A `wake` arrived while the thread was not blocked, so its next
     /// `block` returns at once.
     wake_pending: bool = false,
+    /// A CPU is executing on this thread's stack: from when it is switched
+    /// to until the CPU that switches away from it has left the stack. A
+    /// blocked thread with this set is idling in `block`.
+    on_cpu: bool = false,
     /// Heap block holding the saved x87/SSE/AVX state while the thread is
     /// not running (`fpu.zig`). Null for kernel threads, which have none.
     fpu_alloc: ?[]u8 = null,
@@ -176,17 +223,24 @@ pub const Thread = struct {
 /// Block the current thread until another thread or interrupt handler calls
 /// `wake` on it. Returns immediately if a wake is already pending, and may
 /// return for a wake-up left over from earlier, so callers loop on the
-/// condition they wait for. Callers must disable interrupts between
-/// checking that condition and calling `block`, so a wake cannot slip in
-/// between; interrupts are off again on return.
+/// condition they wait for. Interrupts must be off and no spinlock held;
+/// interrupts are off again on return.
+///
+/// This is the bottom half of waiting. Checking a condition and blocking
+/// must be covered by a lock the waker takes too, released only after the
+/// thread is on a wait queue: `WaitQueue.wait` does all of that and is
+/// what to call.
 ///
 /// While no thread is ready the CPU sleeps here, with interrupts on, until
 /// an interrupt wakes this thread or makes another one ready.
 pub fn block() void {
+    assert.check(.thread, cpu.readFlags() & (1 << 9) == 0, "thread {d} blocks with interrupts on", .{current_thread.id});
+    spinlock.assertHeld(0, "blocking");
+    lock.take();
     const me = current_thread;
-    assert.check(.thread, cpu.readFlags() & (1 << 9) == 0, "thread {d} blocks with interrupts on", .{me.id});
     if (me.wake_pending) { // the event already happened
         me.wake_pending = false;
+        lock.drop();
         return;
     }
     me.state = .blocked;
@@ -194,29 +248,42 @@ pub fn block() void {
         if (!switchToNext()) idleOnce();
     }
     me.wake_pending = false;
+    const dead = takeZombies();
+    lock.drop();
+    reap(dead);
 }
 
-/// Sleep until the next interrupt, then turn interrupts off again. The
-/// `sti` takes effect after the following instruction, so no interrupt can
-/// arrive between enabling them and halting. Only called when the ready
-/// queue is empty, with interrupts off since that was found out.
+/// Sleep until the next interrupt. Called with the scheduler lock held and
+/// the ready queue empty; the lock is released for the sleep and held again
+/// on return. The `sti` takes effect after the following instruction, so no
+/// interrupt of this CPU can arrive between enabling them and halting.
+///
+/// Another CPU can make a thread ready in that gap. It has to send this one
+/// an interrupt for that (3.4); until it does, the timer ends the halt.
 fn idleOnce() void {
     assert.check(.thread, ready_head == null, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
     halts += 1;
+    lock.drop();
     asm volatile ("sti; hlt; cli");
+    lock.take();
 }
 
 /// Wake thread `t`: if it is blocked, make it runnable; otherwise leave a
 /// permit so its next `block` returns immediately. Does nothing to a dead
-/// thread. Callers must have interrupts disabled. Safe from interrupt handlers.
+/// thread. Safe from interrupt handlers.
+///
+/// `t` must still exist. A waker knows that by holding the lock of the
+/// condition `t` waits for, which `t` needs to stop waiting
+/// (`docs/locking.md`): wake first, release that lock afterwards.
 pub fn wake(t: *Thread) void {
-    assert.check(.thread, cpu.readFlags() & (1 << 9) == 0, "wake of thread {d} with interrupts on", .{t.id});
+    const held = lock.acquire();
+    defer lock.release(held);
     if (t.state == .dead) return;
     t.wake_pending = true;
     if (t.state != .blocked) return;
-    if (t == current_thread) {
-        // It is blocked but still on the CPU, idling in `block` because
-        // nothing else was ready: it just carries on.
+    if (t.on_cpu) {
+        // It is blocked but a CPU is still on its stack, idling in `block`
+        // because nothing else was ready: it just carries on there.
         t.state = .running;
     } else {
         t.state = .ready;
@@ -224,14 +291,15 @@ pub fn wake(t: *Thread) void {
     }
 }
 
-/// Create a thread that runs `entry` and put it in the ready queue.
+/// Create a thread that will run `entry`, without starting it: it runs
+/// once `start` is called, and until then `destroy` takes it back.
 ///
 /// `process` is the user process the thread belongs to, or null for a kernel
 /// thread. The thread gets a guarded kernel stack from `kstack` and, if it
 /// belongs to a process, clean extended CPU state (`fpu.initArea`); when `entry`
 /// returns the thread exits. Returns `error.OutOfMemory` if an allocation
 /// fails or all kernel stacks are in use.
-pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
+pub fn create(entry: *const fn () void, process: ?*Process) !*Thread {
     const t = try heap.allocator.create(Thread);
     errdefer heap.allocator.destroy(t);
     const fpu_alloc: ?[]u8 = if (process != null) try heap.allocator.alloc(u8, fpu.areaSize() + fpu.AREA_ALIGN) else null;
@@ -239,20 +307,40 @@ pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
     const stack = kstack.alloc() orelse return error.OutOfMemory;
 
     t.* = .{
-        .id = next_id,
+        .id = 0, // `start` numbers it
         .stack = stack,
         .state = .ready,
-        .rsp = context.initStack(@intFromPtr(stack.ptr) + stack.len, @intFromPtr(&start), @intFromPtr(entry)),
+        .rsp = context.initStack(@intFromPtr(stack.ptr) + stack.len, @intFromPtr(&firstRun), @intFromPtr(entry)),
         .process = process,
         .fpu_alloc = fpu_alloc,
     };
     if (t.fpuArea()) |area| fpu.initArea(area[0..fpu.areaSize()]);
+    return t;
+}
 
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+/// Free a thread from `create` that was never started.
+pub fn destroy(t: *Thread) void {
+    assert.check(.thread, t.id == 0 and t.link == .none, "destroying thread {d}, which was started", .{t.id});
+    kstack.free(t.stack.?);
+    if (t.fpu_alloc) |a| heap.allocator.free(a);
+    heap.allocator.destroy(t);
+}
+
+/// Give a thread from `create` its ID and put it in the ready queue. From
+/// here on it runs, exits and is freed on its own.
+pub fn start(t: *Thread) void {
+    const held = lock.acquire();
+    defer lock.release(held);
     t.id = next_id;
     next_id += 1;
     enqueue(t);
+}
+
+/// Create a thread that runs `entry` and put it in the ready queue: `create`
+/// and `start` in one.
+pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
+    const t = try create(entry, process);
+    start(t);
     return t;
 }
 
@@ -273,25 +361,37 @@ pub fn adoptBootStack(stack: []u8) void {
 /// slice and switches context. Everything happens with interrupts off, on
 /// the previous thread's kernel stack, which stays mapped in every address
 /// space. When this thread is scheduled again, frees any zombie threads
-/// and returns.
+/// and returns. No spinlock may be held.
 pub fn yield() void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
+    spinlock.assertHeld(0, "yielding");
+    lock.take();
     _ = switchToNext();
+    const dead = takeZombies();
+    lock.drop();
+    reap(dead);
 }
 
 /// The switch behind `yield`. Returns false, having done nothing, if no
-/// other thread is ready. Interrupts must be off.
+/// other thread is ready. The scheduler lock is held on entry and on
+/// return, but not by the same thread in between: it is handed to the
+/// thread switched to, and whichever thread later switches back to this
+/// one hands it over again.
 fn switchToNext() bool {
+    spinlock.assertHeld(1, "switching threads");
     const next = dequeue() orelse return false;
     const prev = current_thread;
-    assert.check(.thread, next != prev, "thread {d} is in the ready queue while running", .{prev.id});
+    assert.check(.thread, next != prev and !next.on_cpu, "thread {d} is in the ready queue while on a CPU", .{next.id});
 
+    // Safe before the switch only because the lock is held across it:
+    // nobody can take `prev` from the queue while this CPU is on its stack.
     if (prev.state == .running) {
         prev.state = .ready;
         enqueue(prev);
     }
     next.state = .running;
+    next.on_cpu = true;
     current_thread = next;
     slice_left = SLICE_TICKS;
     switches += 1;
@@ -312,10 +412,26 @@ fn switchToNext() bool {
 
     fpu.switchState(prev.fpuArea(), next.fpuArea());
 
+    switched_from = prev;
     context.switchTo(&prev.rsp, next.rsp);
-
-    reap(); // we're running again; any zombie is now some *other* thread
+    finishSwitch(); // we're running again, switched to by some other thread
     return true;
+}
+
+/// The first thing a thread does when it gets a CPU, on its own stack, with
+/// the scheduler lock still held from the other side of the switch: the
+/// thread it was switched from is off its stack now. Only from here on may
+/// that thread be run by another CPU (once the lock is released) or, if it
+/// has exited, be freed.
+fn finishSwitch() void {
+    const prev = switched_from.?;
+    switched_from = null;
+    prev.on_cpu = false;
+    if (prev.state == .dead) {
+        prev.link = .zombie_list;
+        prev.next = zombies;
+        zombies = prev;
+    }
 }
 
 /// Stop running the current thread for good without freeing it: it blocks
@@ -334,17 +450,17 @@ pub fn tick() void {
     if (slice_left == 0) yield();
 }
 
-/// Terminate the current thread. It is marked dead and put on the zombie list;
-/// the next thread to run frees its stack and its process (if any). Never returns.
+/// Terminate the current thread. It is marked dead; the next thread to run
+/// puts it on the zombie list, once this CPU has left its stack, and frees
+/// its stack and its process (if any). Never returns.
 pub fn exit() noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: this thread is done
+    spinlock.assertHeld(0, "exiting");
+    lock.take(); // released by the thread that is switched to
     const me = current_thread;
     assert.check(.thread, me.state == .running and me.link == .none, "thread {d} exits in state {t} ({t})", .{ me.id, me.state, me.link });
     assert.check(.thread, me.wait_queue == null, "thread {d} exits while on a wait queue", .{me.id});
     me.state = .dead;
-    me.link = .zombie_list;
-    me.next = zombies;
-    zombies = me;
     // Never comes back from the switch. If nothing is ready (every other
     // thread sleeps), idle on this stack until an interrupt wakes one.
     while (true) {
@@ -355,21 +471,29 @@ pub fn exit() noreturn {
 /// Threads freed since boot. With `spawnedCount`, tests use it to see that
 /// every thread that exited was reaped, once.
 pub fn reapedCount() usize {
+    const held = lock.acquire();
+    defer lock.release(held);
     return reaped;
 }
 
 /// Threads created since boot (not counting the boot thread).
 pub fn spawnedCount() usize {
+    const held = lock.acquire();
+    defer lock.release(held);
     return next_id - 1;
 }
 
 /// Context switches since boot.
 pub fn switchCount() usize {
+    const held = lock.acquire();
+    defer lock.release(held);
     return switches;
 }
 
 /// Times the CPU was halted because no thread was ready, since boot.
 pub fn haltCount() usize {
+    const held = lock.acquire();
+    defer lock.release(held);
     return halts;
 }
 
@@ -395,10 +519,16 @@ pub fn id() usize {
 }
 
 /// First code a new thread runs, reached through `thread_trampoline` (see
-/// `context.initStack`). Enables interrupts, calls the thread's entry
-/// function and exits the thread when it returns.
-fn start(entry: usize) callconv(.c) noreturn {
-    asm volatile ("sti"); // new threads begin inside yield, with interrupts off
+/// `context.initStack`). It was switched to like any other thread, so it
+/// finishes that switch and releases the scheduler lock; then it enables
+/// interrupts, calls the thread's entry function and exits the thread when
+/// it returns.
+fn firstRun(entry: usize) callconv(.c) noreturn {
+    finishSwitch();
+    const dead = takeZombies();
+    lock.drop();
+    reap(dead);
+    asm volatile ("sti"); // new threads begin inside a switch, with interrupts off
     const f: *const fn () void = @ptrFromInt(entry);
     f();
     exit();

@@ -30,12 +30,7 @@ const FIRST_FILE_FD = 3;
 /// `myos_getchar`: return the next key from the keyboard buffer, blocking
 /// the calling thread until one is typed.
 fn sysGetChar() u64 {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
-    while (true) {
-        if (keyboard.getChar()) |c| return c;
-        keyboard.readers.wait(); // until a key arrives; then look again
-    }
+    return keyboard.read();
 }
 
 /// Copy the NUL-terminated path at the user address `ptr` into `buf` and

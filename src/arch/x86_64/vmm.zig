@@ -15,6 +15,15 @@
 //! loaded, since they are the same in every address space. `unmap` still
 //! removes them, because `invlpg` flushes global entries too.
 //!
+//! Page tables have no lock of their own. A user address space is changed
+//! under its process's lock (today: by its only thread, or before the
+//! process runs, or after it has gone). The kernel half is changed under
+//! the lock of the region the address is in: the heap, the kernel stacks
+//! and the device window each have one, and each region has its own entry
+//! in the PML4, whose tables `init` allocates. So two regions never share
+//! a page table below the PML4, and the PML4's kernel half never changes
+//! (`docs/locking.md`).
+//!
 //! Rules the rest of the kernel relies on:
 //!
 //! - `map` never replaces a mapping. Mapping over a page that is already
@@ -33,6 +42,7 @@ const cpu = @import("cpu.zig");
 const assert = @import("../../kernel/debug/assert.zig");
 const panicFmt = @import("../../kernel/debug/panic.zig").panicFmt;
 const pmm = @import("../../kernel/pmm.zig");
+const SpinLock = @import("../../kernel/sync/spinlock.zig").SpinLock;
 
 /// Page table entry flag: the mapping is valid.
 pub const PRESENT: u64 = 1 << 0;
@@ -55,6 +65,8 @@ pub const PCD: u64 = 1 << 4;
 
 // Separate from the HHDM, so these 4 KiB mappings never collide with its 2 MiB pages.
 var mmio_next: usize = 0xFFFF_A000_0000_0000;
+/// Protects the device window: `mmio_next` and the page tables under it.
+var mmio_lock: SpinLock = .{ .rank = .kernel_region };
 
 /// Physical address of the kernel's PML4. Set by `init`.
 pub var kernel_root: u64 = 0;
@@ -336,6 +348,8 @@ pub fn destroyAddressSpace(root: u64) void {
 pub fn mapMmio(phys: u64, size: usize) usize {
     const base = phys & ~@as(u64, 0xFFF);
     const end = (phys + size + 0xFFF) & ~@as(u64, 0xFFF);
+    const held = mmio_lock.acquire();
+    defer mmio_lock.release(held);
     const virt = mmio_next;
     var p = base;
     while (p < end) : (p += pmm.PAGE_SIZE) {

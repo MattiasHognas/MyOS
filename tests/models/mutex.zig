@@ -1,6 +1,6 @@
 //! Model of the mutex on several CPUs (`docs/locking.md`): `Mutex.lock` and
 //! `unlock` in `src/kernel/sync/mutex.zig`, which hands the mutex to the
-//! longest waiter, as they are to work with several CPUs.
+//! longest waiter.
 //!
 //! Three threads each take the mutex once and release it.
 //!

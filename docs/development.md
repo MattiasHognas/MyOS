@@ -187,16 +187,21 @@ space are in [architecture](architecture.md).
 
 - **Short critical section, or data an interrupt handler touches:** a
   `SpinLock` (`sync/spinlock.zig`). `acquire` turns interrupts off and
-  returns what `release` needs to restore them. Never block while holding one.
+  returns what `release` needs to restore them. Never block while holding
+  one. Give it the rank of what it protects (`sync/lock_order.zig`); locks
+  are taken in the order of their ranks, and the kernel panics when they
+  are not ([locking](locking.md)).
 - **Waiting for something to happen:** a `WaitQueue` (`sync/wait_queue.zig`)
-  that belongs to the thing waited for. With interrupts off, the waiter runs
-  `while (!condition) queue.wait();` and the other side sets the condition
-  and calls `wakeOne` or `wakeAll`. `waitTimeout` gives up after a number
-  of ticks.
+  that belongs to the thing waited for, and a spinlock that protects both.
+  Holding the lock, the waiter runs `while (!condition) queue.wait(&lock);`
+  and the other side, holding it too, sets the condition and calls
+  `wakeOne` or `wakeAll`. `waitTimeout` gives up after a number of ticks.
 - **A longer section that may block:** a `Mutex` (`sync/mutex.zig`).
 - **Later, or after a delay:** `timer.sleepTicks`/`sleepMs` for a thread;
   `timer.add` with a callback (run in the timer interrupt: keep it short)
-  for anything else.
+  for anything else. A timer that lives on a waiting thread's stack must be
+  a `timer.WakeTimer`: its callback can be running on another CPU when the
+  thread stops waiting.
 - **A process someone else started:** `process.spawn` gives the caller a
   reference, which it must hand back with `process.wait` (to get the exit
   status) or `process.release`. The rules for who owns what are at the top
@@ -204,7 +209,8 @@ space are in [architecture](architecture.md).
   `src/kernel/thread.zig`.
 
 `thread.block` and `thread.wake` are the mechanism underneath; use a wait
-queue instead.
+queue instead. Turning interrupts off without a lock protects only what
+belongs to the running CPU.
 
 ### Adding a syscall
 

@@ -5,12 +5,20 @@
 //! (`sync/timer_queue.zig` keeps them in order). Sleeping, waits with a
 //! timeout and (later) driver and network timeouts are built on this.
 //!
-//! Callbacks run in the timer interrupt, with interrupts off: they must be
-//! short and must not block. Waking a thread is the usual thing to do.
+//! Callbacks run in the timer interrupt, with interrupts off and the timer
+//! lock released: they must be short and must not block. Waking a thread is
+//! the usual thing to do, and they may arm and cancel timers.
+//!
+//! With several CPUs a callback can run on one CPU while the thread that
+//! armed the timer runs on another. A timer that lives in a waiting
+//! thread's stack frame therefore needs `WakeTimer`, which makes the waiter
+//! stay until the callback is done with it (`docs/locking.md`).
 //!
 //! Resolution is one tick (10 ms). A timeout of `n` ticks fires at the
 //! n-th tick from now, which is between `n - 1` and `n` tick periods away;
 //! `sleepTicks` adds one so that a sleep is never shorter than asked.
+
+const std = @import("std");
 
 const thread = @import("thread.zig");
 const timer_queue = @import("sync/timer_queue.zig");
@@ -25,7 +33,7 @@ pub const HZ = 100;
 /// Nanoseconds per tick.
 pub const NS_PER_TICK = 1_000_000_000 / HZ;
 
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .rank = .timer };
 var queue: timer_queue.Queue = .{};
 var ticks: u64 = 0;
 
@@ -45,8 +53,12 @@ pub fn add(timer: *Timer, delay: u64) void {
     queue.add(timer, ticks + @max(delay, 1));
 }
 
-/// Disarm `timer`. Returns true if it was still pending, false if it had
-/// fired already (or was never armed).
+/// Disarm `timer`. Returns true if it was still pending: its callback will
+/// not run. Returns false if it was never armed, or if it has been taken
+/// out of the queue to fire: then its callback has started, and with
+/// several CPUs it may still be running. Whoever owns the timer's memory
+/// must then wait for the callback before letting the memory go
+/// (`WakeTimer.finish`).
 pub fn cancel(timer: *Timer) bool {
     const held = lock.acquire();
     defer lock.release(held);
@@ -80,27 +92,60 @@ pub fn msToTicks(ms: u64) u64 {
     return (ms * HZ + 999) / 1000;
 }
 
-/// State of one sleeping thread, on its stack.
-const Sleeper = struct {
+/// A timer that wakes a thread, made to live in that thread's stack frame.
+///
+/// The callback sets `fired`, wakes the thread, and sets `finished` as the
+/// last thing it does. The thread loops on `fired` (or on whatever else
+/// ends its wait) and calls `finish` before it returns; `finish` does not
+/// return while the callback can still touch the timer or the thread.
+///
+/// Two flags, because one cannot do both jobs: a flag set before the wake
+/// lets the thread leave, and even exit, while the callback is still about
+/// to wake it; a flag set after the wake can be found unset by the woken
+/// thread, which then sleeps again with nobody left to wake it
+/// (`tests/models/timeout.zig` shows both).
+pub const WakeTimer = struct {
     timer: Timer,
-    fired: bool = false,
-};
+    fired: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
 
-/// Timer callback of `sleepTicks`: note that time is up and wake the thread.
-fn wakeSleeper(timer: *Timer) void {
-    const sleeper: *Sleeper = @fieldParentPtr("timer", timer);
-    sleeper.fired = true;
-    thread.wake(@ptrFromInt(timer.context));
-}
+    /// A timer that wakes `t`. Arm it with `timer.add(&w.timer, delay)`.
+    pub fn init(t: *thread.Thread) WakeTimer {
+        return .{ .timer = .{ .callback = fire, .context = @intFromPtr(t) } };
+    }
+
+    fn fire(timer: *Timer) void {
+        const self: *WakeTimer = @fieldParentPtr("timer", timer);
+        self.fired.store(true, .release);
+        // The thread is still there: it does not leave before `finished`.
+        thread.wake(@ptrFromInt(timer.context));
+        self.finished.store(true, .release); // nothing of the waiter's is touched after this
+    }
+
+    /// True once time is up.
+    pub fn hasFired(self: *const WakeTimer) bool {
+        return self.fired.load(.acquire);
+    }
+
+    /// Disarm the timer, or, if its callback has already started, wait
+    /// until the callback is done. Must be called once the timer has been
+    /// armed, before the `WakeTimer` goes out of scope. The callback is a
+    /// few instructions in an interrupt handler on another CPU, so the
+    /// wait is a short spin. The caller may hold its condition's lock (the
+    /// callback takes only the scheduler lock) but not the scheduler lock.
+    pub fn finish(self: *WakeTimer) void {
+        if (cancel(&self.timer)) return;
+        while (!self.finished.load(.acquire)) std.atomic.spinLoopHint();
+    }
+};
 
 /// Block the calling thread for at least `n` tick periods. Other threads
 /// run meanwhile; if none is ready the CPU idles. Not for interrupt
 /// handlers.
 pub fn sleepTicks(n: u64) void {
-    const me = thread.current();
-    var sleeper: Sleeper = .{ .timer = .{ .callback = wakeSleeper, .context = @intFromPtr(me) } };
-    // Interrupts stay off from arming the timer until the thread blocks,
-    // so the timer cannot fire in between.
+    var sleeper = WakeTimer.init(thread.current());
+    // Interrupts stay off from here on, as `block` wants. If the timer
+    // fires before the thread blocks, the wake-up leaves a permit.
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     {
@@ -109,7 +154,8 @@ pub fn sleepTicks(n: u64) void {
         queue.add(&sleeper.timer, ticks + n + 1);
     }
     // An unrelated wake-up may end `block` early; only the timer ends the sleep.
-    while (!sleeper.fired) thread.block();
+    while (!sleeper.hasFired()) thread.block();
+    sleeper.finish();
 }
 
 /// Block the calling thread for at least `ms` milliseconds.

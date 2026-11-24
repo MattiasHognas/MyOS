@@ -306,6 +306,9 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
             return;
         }
     }
+    // A kernel fault. Unless it is a breakpoint, this CPU halts after the
+    // report, and it may hold the console lock or any other: print regardless.
+    if (f.vector != VECTOR_BREAKPOINT) root.seizeConsole();
     root.print("\n*** {s} (vector {d}, error 0x{x})\n", .{ name, f.vector, f.error_code });
     root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });
     root.print("RSP=0x{x} RAX=0x{x} RBX=0x{x}\n", .{ f.rsp, f.rax, f.rbx });

@@ -186,10 +186,30 @@ pub var nvme_ready = false;
 /// (e.g. while printing the backtrace) halts instead of recursing.
 var panicking = false;
 
+/// Protects the serial port and the framebuffer console, so that messages
+/// come out whole. Innermost in the lock order: anything may print.
+var console_lock: kernel.sync.spinlock.SpinLock = .{ .rank = .console };
+/// Set by a CPU that is going down (`seizeConsole`); never cleared.
+var console_seized = false;
+
+/// Make this CPU's output go out without waiting for the console lock, and
+/// stop the lock-order checks. For a CPU that reports a panic or a kernel
+/// fault and then halts: it may be the one holding the console lock, or
+/// whichever lock the fault happened under, and its report matters more
+/// than a tidy log. Interrupts must be off.
+///
+/// With several CPUs the others keep running and may print in between,
+/// until this CPU can stop them with an interrupt (3.4).
+pub fn seizeConsole() void {
+    console_seized = true;
+    kernel.sync.spinlock.stopChecking();
+}
+
 /// Panic handler behind `panic`: print the message and a symbolized
 /// backtrace, then halt. In the test kernel, report failure and exit QEMU.
 fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
     _ = cpu.saveAndDisableInterrupts();
+    seizeConsole();
     if (panicking) {
         serial.puts("PANIC while panicking\n");
         halt();
@@ -202,19 +222,24 @@ fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
 }
 
 /// Format `args` with `fmt` and write the result to the serial port and, once
-/// it is initialized, the framebuffer console. Interrupts are disabled while
-/// writing so messages are not interleaved. Output longer than 512 bytes is
-/// replaced by `<print overflow>`. Other modules call this as `root.print`.
+/// it is initialized, the framebuffer console, as one piece. Output longer
+/// than 512 bytes is replaced by `<print overflow>`. Other modules call this
+/// as `root.print`.
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     write(std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n");
 }
 
-/// Write `s` to the serial port and (once initialized) the console, with
-/// interrupts disabled so the whole message comes out in one piece.
+/// Write `s` to the serial port and (once initialized) the console, under
+/// the console lock so the whole message comes out in one piece.
 fn write(s: []const u8) void {
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+    if (console_seized) return writeUnlocked(s);
+    const held = console_lock.acquire();
+    defer console_lock.release(held);
+    writeUnlocked(s);
+}
+
+fn writeUnlocked(s: []const u8) void {
     serial.puts(s);
     if (console.ready) for (s) |c| console.putc(c);
 }

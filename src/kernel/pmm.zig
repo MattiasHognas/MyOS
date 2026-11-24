@@ -52,7 +52,7 @@ inline fn inCriticalSection() void {
 }
 
 /// Protects `pages` and `free_pages`.
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .rank = .page_allocator };
 var pages: page_bitmap.PageBitmap = .{ .used = &.{}, .managed = &.{}, .total = 0 };
 var hhdm: u64 = 0;
 

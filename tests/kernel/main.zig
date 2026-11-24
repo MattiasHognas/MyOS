@@ -235,6 +235,13 @@ fn spinlocks() TestError!void {
     try expectChecks("spinlock", helpers.spinlockChecks());
 }
 
+/// What the locking model promises, as far as one CPU can show it.
+fn lockingModel() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("locking model", helpers.lockingModelChecks());
+}
+
 /// Several waiters on one queue, woken in order; conditions rechecked;
 /// wake-ups with nobody waiting are not kept; waits with a timeout.
 fn waitQueues() TestError!void {
@@ -1237,6 +1244,23 @@ noinline fn scenarioStackOverflow() void {
     @panic("stack_overflow scenario: the overflow was not caught");
 }
 
+/// Integration-test scenario "lock_order": take two spinlocks in the wrong
+/// order. The kernel must panic on the spot, naming both, on one CPU as on
+/// several: a wrong order that is only noticed when it deadlocks is noticed
+/// too late.
+noinline fn scenarioLockOrder() void {
+    helpers.takeLocksOutOfOrder();
+    @panic("lock_order scenario: the wrong order was not caught");
+}
+
+/// Integration-test scenario "sleep_with_lock": sleep while holding a
+/// spinlock. Interrupts are off and no other CPU could take the lock for as
+/// long as the thread sleeps, so the kernel must refuse.
+noinline fn scenarioSleepWithLock() void {
+    helpers.sleepHoldingSpinlock();
+    @panic("sleep_with_lock scenario: the sleep was not caught");
+}
+
 /// Entry point of the test kernel, called by `kmain` after boot: run the
 /// scenario the host passed through fw_cfg (`opt/myos/scenario`, default
 /// "tests"). Never returns; every scenario ends by exiting QEMU.
@@ -1257,6 +1281,8 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "use_after_free")) scenarioUseAfterFree();
     if (std.mem.eql(u8, scenario, "relro")) scenarioRelro();
     if (std.mem.eql(u8, scenario, "text_alias")) scenarioTextAlias();
+    if (std.mem.eql(u8, scenario, "lock_order")) scenarioLockOrder();
+    if (std.mem.eql(u8, scenario, "sleep_with_lock")) scenarioSleepWithLock();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
     if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
@@ -1363,6 +1389,7 @@ fn runCases() noreturn {
         .{ .name = "kernel runs at a randomized address", .func = kernelRelocation },
         .{ .name = "spinlocks (interrupt state, nesting, exclusion under preemption)", .func = spinlocks },
         .{ .name = "wait queues (several waiters, order, timeouts)", .func = waitQueues },
+        .{ .name = "locking model (locks held per CPU, idle wake-up in place, wake timers, unstarted threads)", .func = lockingModel },
         .{ .name = "kernel timers (order, expiry, cancel, sleep)", .func = timers },
         .{ .name = "mutex exclusion and hand-off under preemption", .func = mutexes },
         .{ .name = "keyboard readers wait on a queue", .func = keyboardReaders },

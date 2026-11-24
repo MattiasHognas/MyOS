@@ -1729,6 +1729,34 @@ var spin_lock: SpinLock = .{};
 var spin_counter: u64 = 0;
 var spin_done: usize = 0;
 var spin_waiter: WaitQueue = .{};
+
+/// The lock of the conditions the tests in this section wait for: their
+/// counters of finished threads, and the wait queues that go with them.
+var test_lock: SpinLock = .{};
+
+/// Count one more in `counter` and wake everyone on `queue`, under `test_lock`.
+fn signalDone(counter: *usize, queue: *WaitQueue) void {
+    const held = test_lock.acquire();
+    defer test_lock.release(held);
+    counter.* += 1;
+    _ = queue.wakeAll();
+}
+
+/// Sleep on `queue` until `counter` has reached `n`. The other side is `signalDone`.
+fn waitForDone(counter: *const usize, n: usize, queue: *WaitQueue) void {
+    const held = test_lock.acquire();
+    defer test_lock.release(held);
+    while (counter.* < n) queue.wait(&test_lock);
+}
+
+/// Let other threads run until `count` returns `n`. False if it never happens.
+fn untilCount(comptime count: fn () usize, n: usize) bool {
+    for (0..10_000) |_| {
+        if (count() == n) return true;
+        thread.yield();
+    }
+    return false;
+}
 const SPIN_ROUNDS = 20_000;
 
 /// Add to a shared counter with a read, a pause and a write: an update is
@@ -1742,8 +1770,7 @@ fn spinWorker() void {
         spin_lock.release(held);
     }
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
-    spin_done += 1;
-    _ = spin_waiter.wakeAll();
+    signalDone(&spin_done, &spin_waiter);
 }
 
 /// Check spinlocks: taking one turns interrupts off and releasing restores
@@ -1753,7 +1780,7 @@ fn spinWorker() void {
 pub fn spinlockChecks() u32 {
     if (!interruptsOn()) return 1;
     var a: SpinLock = .{};
-    var b: SpinLock = .{};
+    var b: SpinLock = .{ .rank = .timer }; // taken inside `a`, so it ranks after it
 
     const held_a = a.acquire();
     if (interruptsOn() or !a.isHeld()) return 2;
@@ -1785,19 +1812,17 @@ pub fn spinlockChecks() u32 {
     // Two preemptible threads, one counter.
     spin_counter = 0;
     spin_done = 0;
-    {
-        const irq = cpu.saveAndDisableInterrupts();
-        defer cpu.restoreInterrupts(irq);
-        _ = thread.spawn(spinWorker, null) catch return 13;
-        _ = thread.spawn(spinWorker, null) catch return 13;
-        while (spin_done < 2) spin_waiter.wait();
-    }
+    _ = thread.spawn(spinWorker, null) catch return 13;
+    _ = thread.spawn(spinWorker, null) catch return 13;
+    waitForDone(&spin_done, 2, &spin_waiter);
     if (spin_counter != 2 * SPIN_ROUNDS) return 14;
     return 0;
 }
 
 // State of the wait queue test.
 var wq: WaitQueue = .{};
+/// The lock of `wq`, `wq_finished` and the conditions waited for on them.
+var wq_lock: SpinLock = .{};
 var wq_go: [3]bool = @splat(false);
 var wq_order: [8]u8 = undefined;
 var wq_order_len: usize = 0;
@@ -1809,10 +1834,12 @@ var wq_threads: [3]?*thread.Thread = @splat(null);
 /// Wait on `wq` until this waiter's flag is set, then note the order.
 fn wqWaiter() void {
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    const held = wq_lock.acquire();
+    defer wq_lock.release(held);
     const index = wq_next_index;
     wq_next_index += 1;
     while (!wq_go[index]) {
-        wq.wait();
+        wq.wait(&wq_lock);
         wq_wakeups[index] += 1;
     }
     wq_order[wq_order_len] = @intCast(index);
@@ -1820,18 +1847,41 @@ fn wqWaiter() void {
     _ = wq_finished.wakeAll();
 }
 
-/// Let other threads run until `wq` has `n` waiters. False if it never happens.
-fn untilWaiting(q: *WaitQueue, n: usize) bool {
-    for (0..10_000) |_| {
-        if (q.waiting() == n) return true;
-        thread.yield();
-    }
-    return false;
+/// `wq.wakeOne`, `wakeAll`, `waiting` and `waitTimeout` under the queue's lock.
+fn wqWakeOne() ?*thread.Thread {
+    const held = wq_lock.acquire();
+    defer wq_lock.release(held);
+    return wq.wakeOne();
+}
+
+fn wqWakeAll() usize {
+    const held = wq_lock.acquire();
+    defer wq_lock.release(held);
+    return wq.wakeAll();
+}
+
+fn wqWaiting() usize {
+    const held = wq_lock.acquire();
+    defer wq_lock.release(held);
+    return wq.waiting();
+}
+
+fn wqWaitTimeout(ticks: u64) bool {
+    const held = wq_lock.acquire();
+    defer wq_lock.release(held);
+    return wq.waitTimeout(&wq_lock, ticks);
+}
+
+/// Sleep until `n` of the waiters have finished.
+fn wqUntilFinished(n: usize) void {
+    const held = wq_lock.acquire();
+    defer wq_lock.release(held);
+    while (wq_order_len < n) wq_finished.wait(&wq_lock);
 }
 
 /// Wake `wq` from a timer, for the timeout test.
 fn wqTimerWake(_: *timer.Timer) void {
-    _ = wq.wakeOne();
+    _ = wqWakeOne();
 }
 
 /// Check wait queues: several threads wait on one queue and are woken one
@@ -1849,53 +1899,53 @@ pub fn waitQueueChecks() u32 {
     wq_order_len = 0;
     wq_next_index = 0;
 
-    if (wq.wakeOne() != null or wq.wakeAll() != 0) return 1; // empty: nothing to wake
+    if (wqWakeOne() != null or wqWakeAll() != 0) return 1; // empty: nothing to wake
     for (&wq_threads) |*t| {
         t.* = thread.spawn(wqWaiter, null) catch return 2;
         thread.yield(); // let it reach the queue, so the order is known
     }
-    if (!untilWaiting(&wq, 3)) return 3;
+    if (!untilCount(wqWaiting, 3)) return 3;
     if (wq_order_len != 0) return 4;
 
     // A wake-up for a condition that is not true: the waiter looks and
     // sleeps again, at the back of the queue.
-    if (wq.wakeOne() != wq_threads[0]) return 5; // first in, first woken
-    if (!untilWaiting(&wq, 3)) return 6;
+    if (wqWakeOne() != wq_threads[0]) return 5; // first in, first woken
+    if (!untilCount(wqWaiting, 3)) return 6;
     if (wq_wakeups[0] != 1 or wq_order_len != 0) return 7;
     // The queue is now 1, 2, 0. A plain `thread.wake` is not a wake-up of
     // the queue: the thread stays on it.
     thread.wake(wq_threads[1].?);
     thread.wake(wq_threads[1].?); // twice: must not queue it twice either
     for (0..20) |_| thread.yield();
-    if (wq.waiting() != 3 or wq_wakeups[1] != 0) return 8;
+    if (wqWaiting() != 3 or wq_wakeups[1] != 0) return 8;
 
     // One at a time, in order.
     wq_go[1] = true;
-    if (wq.wakeOne() != wq_threads[1]) return 9;
-    while (wq_order_len < 1) wq_finished.wait();
-    if (wq.waiting() != 2) return 10; // the other two were left alone
+    if (wqWakeOne() != wq_threads[1]) return 9;
+    wqUntilFinished(1);
+    if (wqWaiting() != 2) return 10; // the other two were left alone
     if (wq_order[0] != 1) return 11;
     // All at once: both run, in the order they waited (2, then 0).
     wq_go[2] = true;
     wq_go[0] = true;
-    if (wq.wakeAll() != 2) return 12;
-    while (wq_order_len < 3) wq_finished.wait();
+    if (wqWakeAll() != 2) return 12;
+    wqUntilFinished(3);
     if (!std.mem.eql(u8, wq_order[0..3], &.{ 1, 2, 0 })) return 13;
-    if (wq.waiting() != 0) return 14;
+    if (wqWaiting() != 0) return 14;
 
     // A wake-up with nobody waiting is gone: the next wait really waits.
-    if (wq.wakeOne() != null) return 15;
+    if (wqWakeOne() != null) return 15;
     const t0 = timer.now();
-    if (wq.waitTimeout(3)) return 16; // nobody wakes us: time runs out
+    if (wqWaitTimeout(3)) return 16; // nobody wakes us: time runs out
     const waited = timer.now() - t0;
     if (waited < 3 or waited > 6) return 17;
-    if (wq.waiting() != 0 or thread.current().wait_queue != null) return 18;
+    if (wqWaiting() != 0 or thread.current().wait_queue != null) return 18;
 
     // Woken before the timeout: returns true, early, and disarms its timer.
     var waker: timer.Timer = .{ .callback = wqTimerWake };
     timer.add(&waker, 2);
     const t1 = timer.now();
-    if (!wq.waitTimeout(500)) return 19;
+    if (!wqWaitTimeout(500)) return 19;
     if (timer.now() - t1 > 10) return 20;
     if (timer.pending() != timers_before) return 21;
 
@@ -1903,8 +1953,8 @@ pub fn waitQueueChecks() u32 {
     // waker was armed first, so it fires first and takes this thread off
     // the queue; then the timeout fires, before the thread has run.)
     timer.add(&waker, 3);
-    if (!wq.waitTimeout(3)) return 23;
-    if (timer.pending() != timers_before or wq.waiting() != 0) return 24;
+    if (!wqWaitTimeout(3)) return 23;
+    if (timer.pending() != timers_before or wqWaiting() != 0) return 24;
 
     for (0..10) |_| thread.yield(); // let the waiters be reaped
     return if (footprint().eql(before)) 0 else 22;
@@ -1931,6 +1981,8 @@ var sleep_done: WaitQueue = .{};
 fn sleeper(ticks: u64, tag: u8) void {
     timer.sleepTicks(ticks);
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    const held = test_lock.acquire();
+    defer test_lock.release(held);
     sleep_order[sleep_len] = tag;
     sleep_len += 1;
     _ = sleep_done.wakeAll();
@@ -1992,8 +2044,8 @@ pub fn timerChecks() u32 {
         defer cpu.restoreInterrupts(irq);
         _ = thread.spawn(sleeperLong, null) catch return 11;
         _ = thread.spawn(sleeperShort, null) catch return 11;
-        while (sleep_len < 2) sleep_done.wait();
     }
+    waitForDone(&sleep_len, 2, &sleep_done);
     if (!std.mem.eql(u8, &sleep_order, "SL")) return 12;
     if (timer.pending() != pending_before) return 13;
     timer.sleepTicks(1); // let the sleepers be reaped
@@ -2032,8 +2084,11 @@ fn mxWorker() void {
         mx.unlock();
     }
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
-    mx_done += 1;
-    _ = mx_finished.wakeAll();
+    signalDone(&mx_done, &mx_finished);
+}
+
+fn mxWaiting() usize {
+    return mx.waiterCount();
 }
 
 /// Wait for the mutex once and note the order it was obtained in.
@@ -2043,8 +2098,7 @@ fn mxQueuer() void {
     mx_order_len += 1;
     mx.unlock();
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
-    mx_done += 1;
-    _ = mx_finished.wakeAll();
+    signalDone(&mx_done, &mx_finished);
 }
 
 /// Check the mutex: only one thread is inside at a time, even though the
@@ -2068,11 +2122,11 @@ pub fn mutexChecks() u32 {
         const irq = cpu.saveAndDisableInterrupts();
         defer cpu.restoreInterrupts(irq);
         for (0..MX_THREADS) |_| _ = thread.spawn(mxWorker, null) catch return 4;
-        while (mx_done < MX_THREADS) mx_finished.wait();
     }
+    waitForDone(&mx_done, MX_THREADS, &mx_finished);
     if (mx_overlaps != 0) return 5;
     if (mx_counter != MX_THREADS * MX_ROUNDS) return 6;
-    if (mx.owner != null or mx.waiters.waiting() != 0) return 7;
+    if (mx.owner != null or mx.waiterCount() != 0) return 7;
 
     // Hand-off: three threads queue up behind the holder, in a known order.
     mx.lock();
@@ -2084,14 +2138,14 @@ pub fn mutexChecks() u32 {
     for (&queued, 0..) |*id, i| {
         const t = thread.spawn(mxQueuer, null) catch return 8;
         id.* = t.id;
-        if (!untilWaiting(&mx.waiters, i + 1)) return 9;
+        if (!untilCount(mxWaiting, i + 1)) return 9;
     }
     if (!mx.heldByMe()) return 10;
     mx.unlock();
     // Before anyone else has run, the first waiter already owns it.
     if (mx.owner == null or mx.owner.?.id != queued[0]) return 11;
     if (mx.tryLock()) return 12; // it is not free in between
-    while (mx_done < 3) mx_finished.wait();
+    waitForDone(&mx_done, 3, &mx_finished);
     if (!std.mem.eql(usize, &mx_order, &queued)) return 13; // longest wait first
     if (mx.owner != null) return 14;
     for (0..10) |_| thread.yield(); // let the threads be reaped
@@ -2110,18 +2164,18 @@ pub fn keyboardReaders() u32 {
     var readers: [3]*process.Process = undefined;
     for (&readers, 0..) |*r, i| {
         r.* = process.spawnPath("/test/getchar", .{}) catch return 1;
-        if (!untilWaiting(&keyboard.readers, i + 1)) return 2;
+        if (!untilCount(keyboard.waitingReaders, i + 1)) return 2;
     }
     // One key wakes one reader: the first.
     keyboard.inject('a');
     if (process.wait(readers[0]) != 'a') return 3;
-    if (keyboard.readers.waiting() != 2) return 4;
+    if (keyboard.waitingReaders() != 2) return 4;
     // Two keys at once: one each, in order.
     keyboard.inject('b');
     keyboard.inject('c');
     if (process.wait(readers[1]) != 'b') return 5;
     if (process.wait(readers[2]) != 'c') return 6;
-    if (keyboard.readers.waiting() != 0) return 7;
+    if (keyboard.waitingReaders() != 0) return 7;
     // A key with nobody waiting stays in the buffer.
     keyboard.inject('d');
     const late = process.spawnPath("/test/getchar", .{}) catch return 8;
@@ -2129,6 +2183,126 @@ pub fn keyboardReaders() u32 {
     if (keyboard.getChar() != null) return 10;
     for (0..10) |_| thread.yield();
     return if (footprint().eql(before)) 0 else 11;
+}
+
+// ---------------------------------------------------------------------------
+// The locking model on one CPU (roadmap 3.1)
+
+const spinlock = kernel_root.kernel.sync.spinlock;
+
+/// A thread for `lockingModelChecks` that is never started.
+fn neverStarted() void {}
+
+/// Timer callback for `lockingModelChecks`: the interrupt it runs in must
+/// have found this CPU holding no lock.
+var lm_locks_in_timer: ?usize = null;
+fn lmTimerProbe(_: *timer.Timer) void {
+    lm_locks_in_timer = spinlock.heldCount();
+}
+
+/// Check what the locking model promises and can be seen on one CPU: each
+/// CPU knows the locks it holds; a wait hands its condition's lock back; a
+/// thread switch and an interrupt happen with no lock held; a thread can be
+/// created and taken back without ever running; a thread that blocks with
+/// nothing else to run idles on its own stack and carries on there when it
+/// is woken, without passing through the ready queue; a timer that wakes a
+/// thread can be let go safely whether it fired, was cancelled or never
+/// ran. Must be called with interrupts on. Returns 0, or the number of the
+/// first failing check.
+pub fn lockingModelChecks() u32 {
+    if (!interruptsOn()) return 1;
+    if (spinlock.heldCount() == null) return 2; // the test kernel always records
+    const before = footprint();
+
+    // The record follows the locks, also through tryAcquire.
+    var outer: SpinLock = .{};
+    var inner: SpinLock = .{ .rank = .timer };
+    if (spinlock.heldCount() != 0) return 3;
+    const held_outer = outer.acquire();
+    if (spinlock.heldCount() != 1) return 4;
+    const held_inner = inner.tryAcquire() orelse return 5;
+    if (spinlock.heldCount() != 2) return 6;
+    if (outer.tryAcquire() != null or spinlock.heldCount() != 2) return 7; // a failed try records nothing
+    inner.release(held_inner);
+    outer.release(held_outer);
+    if (spinlock.heldCount() != 0 or !interruptsOn()) return 8;
+
+    // A wait releases the condition's lock for the sleep and returns with
+    // it: one lock held before and after, and the timer interrupt that ended
+    // the wait saw none.
+    lm_locks_in_timer = null;
+    var probe: timer.Timer = .{ .callback = lmTimerProbe };
+    {
+        const held = wq_lock.acquire();
+        defer wq_lock.release(held);
+        timer.add(&probe, 1);
+        if (wq.waitTimeout(&wq_lock, 3)) return 9;
+        if (spinlock.heldCount() != 1 or !wq_lock.isHeld()) return 10;
+    }
+    if (lm_locks_in_timer != 0) return 11;
+    // The kernel's own locks are all free again after sleeping and switching.
+    thread.yield();
+    timer.sleepTicks(1);
+    if (spinlock.heldCount() != 0 or !interruptsOn()) return 12;
+
+    // A thread that was created but never started leaves nothing behind
+    // and is not counted.
+    const spawned = thread.spawnedCount();
+    const t = thread.create(neverStarted, null) catch return 13;
+    if (t.id != 0 or t.on_cpu or t.link != .none) return 14;
+    thread.destroy(t);
+    if (thread.spawnedCount() != spawned or !footprint().eql(before)) return 15;
+
+    // Blocking with nothing else ready: the CPU halts on this stack, and
+    // the wake-up lets the thread carry on in place.
+    {
+        const irq = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(irq);
+        const me = thread.current();
+        if (!me.on_cpu or me.state != .running) return 16;
+        const halts = thread.haltCount();
+        const switches = thread.switchCount();
+        var alarm = timer.WakeTimer.init(me);
+        timer.add(&alarm.timer, 2);
+        while (!alarm.hasFired()) thread.block();
+        alarm.finish();
+        if (thread.haltCount() == halts) return 17; // it idled
+        if (thread.switchCount() != switches) return 18; // and was not switched away from
+        if (me.state != .running or me.link != .none or !me.on_cpu or me.wake_pending) return 19;
+    }
+
+    // A wake timer can be let go when it has fired (above), when it is
+    // cancelled before it fires, and the cancelled one never wakes anybody.
+    {
+        const pending = timer.pending();
+        var alarm = timer.WakeTimer.init(thread.current());
+        timer.add(&alarm.timer, 2);
+        alarm.finish();
+        if (timer.pending() != pending or alarm.hasFired()) return 20;
+        timer.sleepTicks(4);
+        if (alarm.hasFired() or thread.current().wake_pending) return 21;
+    }
+    return if (footprint().eql(before)) 0 else 22;
+}
+
+/// For the `lock_order` scenario: take two spinlocks against the lock
+/// order. Returns only if nothing noticed.
+pub fn takeLocksOutOfOrder() void {
+    var first: SpinLock = .{ .rank = .timer };
+    var second: SpinLock = .{ .rank = .condition };
+    const held_first = first.acquire();
+    const held_second = second.acquire();
+    second.release(held_second);
+    first.release(held_first);
+}
+
+/// For the `sleep_with_lock` scenario: sleep while holding a spinlock.
+/// Returns only if nothing noticed.
+pub fn sleepHoldingSpinlock() void {
+    var lock: SpinLock = .{};
+    const held = lock.acquire();
+    timer.sleepTicks(1);
+    lock.release(held);
 }
 
 // ---------------------------------------------------------------------------
@@ -2161,6 +2335,8 @@ var second_waiter_done: WaitQueue = .{};
 fn secondWaiter() void {
     const code = process.wait(second_waiter_target.?);
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
+    const held = test_lock.acquire();
+    defer test_lock.release(held);
     second_waiter_code = code;
     _ = second_waiter_done.wakeAll();
 }
@@ -2202,7 +2378,9 @@ pub fn processWaiting() u32 {
         defer cpu.restoreInterrupts(irq);
         _ = thread.spawn(secondWaiter, null) catch return 13;
         if (process.wait(shared) != 4) return 14;
-        while (second_waiter_code == null) second_waiter_done.wait();
+        const held = test_lock.acquire();
+        defer test_lock.release(held);
+        while (second_waiter_code == null) second_waiter_done.wait(&test_lock);
     }
     if (second_waiter_code != 4) return 15;
     if (!untilLive(live)) return 16;
@@ -2248,7 +2426,7 @@ pub fn orphanedChild() u32 {
     {
         const irq = cpu.saveAndDisableInterrupts();
         defer cpu.restoreInterrupts(irq);
-        if (!untilWaiting(&keyboard.readers, 1)) return 13;
+        if (!untilCount(keyboard.waitingReaders, 1)) return 13;
         keyboard.inject('k');
     }
     if (process.wait(child) != 'k') return 9;

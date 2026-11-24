@@ -52,7 +52,7 @@ pub const WARN_BYTES = STACK_SIZE / 4 * 3;
 const FILL: u64 = 0x5AFE_57AC_5AFE_57AC;
 
 /// Protects the slot bitmap and the usage peak.
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .rank = .kernel_region };
 
 // Largest stack usage `record` has seen. Guarded by `lock`.
 var peak_bytes: usize = 0;
