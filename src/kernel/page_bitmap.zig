@@ -34,9 +34,16 @@ pub const PageBitmap = struct {
     /// Where the next search starts.
     hint: usize = 0,
 
-    /// Bytes each of the two bitmaps needs to cover `total` pages.
+    /// Bytes each of the two bitmaps needs to cover `total` pages: one bit
+    /// per page, rounded up to whole 64-bit words, because `alloc` searches
+    /// a word at a time.
     pub fn bytesFor(total: usize) usize {
-        return (total + 7) / 8;
+        return (total + 63) / 64 * 8;
+    }
+
+    /// The 64 `used` bits starting at page `word * 64`, bit 0 first.
+    fn usedWord(self: *const PageBitmap, word: usize) u64 {
+        return std.mem.readInt(u64, self.used[word * 8 ..][0..8], .little);
     }
 
     /// Start with every page taken and none managed. Both slices must hold
@@ -80,23 +87,28 @@ pub const PageBitmap = struct {
     }
 
     /// Take a free page and return its number, or null if there is none.
+    ///
+    /// The search starts at `hint` and looks at 64 pages at a time: a word
+    /// with every bit set has nothing free and is skipped whole, and in any
+    /// other word the lowest clear bit is the page. The bits past `total` in
+    /// the last word stay set for good (`init`), so they are never found.
     pub fn alloc(self: *PageBitmap) ?usize {
         if (self.free_count == 0) return null;
-        var n: usize = 0;
-        while (n < self.total) {
-            const page = (self.hint + n) % self.total;
-            // Skip a whole byte of taken pages at once.
-            if (page % 8 == 0 and self.used[page / 8] == 0xFF) {
-                n += 8;
-                continue;
-            }
-            if (!get(self.used, page)) {
-                set(self.used, page, true);
-                self.free_count -= 1;
-                self.hint = page + 1;
-                return page;
-            }
-            n += 1;
+        const words = bytesFor(self.total) / 8;
+        const start = if (self.hint < self.total) self.hint else 0;
+        const first = start / 64;
+        // The first word is looked at twice: above the hint to begin with,
+        // and whole at the very end, once the search has wrapped around.
+        for (0..words + 1) |n| {
+            const word = (first + n) % words;
+            var bits = ~self.usedWord(word);
+            if (n == 0) bits &= ~@as(u64, 0) << @intCast(start % 64); // not below the hint
+            if (bits == 0) continue;
+            const page = word * 64 + @ctz(bits);
+            set(self.used, page, true);
+            self.free_count -= 1;
+            self.hint = page + 1;
+            return page;
         }
         return null;
     }

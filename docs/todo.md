@@ -263,30 +263,32 @@ From the code review before 2.2. None of these fix a known hole; they shrink wha
   - Kernel stacks and heap pages are not zeroed: only the kernel sees them.
 
 ### 2.10 Review follow-ups
-From the code review of 2026-11-23 (`docs/research.md`). None fixes a known hole: the first group makes the kernel faster for a few lines each, the second shrinks what a future bug can do. They are part of milestone 2, which is not done until they are, and come before milestone 3, while there is one CPU and the changes are small.
+From the code review of 2026-11-23 (`docs/research.md`). None fixed a known hole: the first group makes the kernel faster for a few lines each, the second shrinks what a future bug can do. They are part of milestone 2 and came before milestone 3, while there is one CPU and the changes are small.
 
 Speed:
-- [ ] Take the idle thread out of the round-robin queue: run it only when no other thread is ready. Today it gets a turn like any thread and halts until the next interrupt while others wait (`idle` in `src/main.zig`), which costs a CPU-bound program about a sixth of the CPU.
-  - Check the ready queue and halt with no gap between them (interrupts off for the check, then `sti; hlt`), so a wake-up cannot arrive just before the halt and wait for the next tick.
-  - Test: a CPU-bound thread gets all the time between two readings of the HPET, within a small margin, and the idle thread is never switched to while another thread is ready (count the switches).
-- [ ] Mark kernel mappings global (page-table bit 8, CR4.PGE), so loading CR3 keeps the kernel's TLB entries: the direct map, the kernel image, the heap, kernel stacks and the device window. `unmap` of a kernel address keeps working, since `invlpg` flushes global entries too.
-  - Test: CR4.PGE is set, kernel leaf entries have the bit and user ones do not; the existing stale-TLB test still passes for a kernel address.
-- [ ] Let a kernel thread keep the previous address space loaded instead of switching to `kernel_root` (`switchToNext` in `src/kernel/thread.zig`): every address space maps the kernel half. A blocking syscall then no longer costs two CR3 loads and TLB flushes for the trip through the idle thread.
-  - An address space must not be destroyed while it is loaded: load `kernel_root` first if it is.
-  - Test: a process that blocks and resumes with nothing else running causes no CR3 load (count them), and tearing down a process whose address space is still loaded is safe.
-- [ ] Scan the page allocator's bitmap a 64-bit word at a time with `@ctz` (`src/kernel/page_bitmap.zig`). The host test against the model covers it; add a case where the only free page is the last bit of a word and one where it is the last page.
-- [ ] Replace the `lfence` at the start of `user_copy` with branch-free clamping of the user address, as `nospec.index` does for indexes and as Linux does in `copy_from_user` since late 2024. An address outside user space becomes one that faults, whatever the CPU predicted.
-  - Test: the existing user-pointer tests, plus a host test of the clamp for addresses at, just below and above the end of user space.
+- [x] Take the idle thread out of the round-robin queue. There is no idle thread any more: the boot thread blocks for good once the system is up (`thread.retire`), and when nothing is ready the CPU halts inside `block` or `exit` of whichever thread ran last. Before, the idle thread got a turn like any thread and halted until the next interrupt while others waited, which cost a CPU-bound program about a sixth of the CPU.
+  - The check for "nothing to run" and the halt happen with interrupts off (`sti; hlt`), so a wake-up cannot arrive just before the halt and wait for the next tick. `idleOnce` asserts the ready queue is empty.
+  - Tested in the kernel ("no idling while a thread is ready"): with a retired thread and this one blocked, a CPU-bound thread runs for 200 ms without one switch or halt, and finishes within two ticks of that; with nothing ready, the CPU does halt. With the old idle loop in place of `retire` the test fails. The normal kernel was also booted to the shell prompt under QEMU, with and without KVM.
+- [x] Mark kernel mappings global (page-table bit 8, CR4.PGE), so loading CR3 keeps the kernel's TLB entries. `vmm.map` sets the bit on every kernel address and on no user address, whatever the caller passes. `vmm.init` turns CR4.PGE off around its first CR3 load, so nothing of the bootloader's page tables stays in the TLB.
+  - Tested: CR4.PGE is on; code, constants, data, heap, a kernel stack and the direct map have the bit, in the kernel's tables and seen from another address space; a user page has not. A second TLB test maps, reads, unmaps and remaps a kernel address 50 times, with CR3 loads in between, and never sees the old page.
+- [x] A kernel thread keeps the address space that is loaded instead of switching to `kernel_root` (`switchToNext` in `src/kernel/thread.zig`): every address space maps the kernel half. `vmm` now records which root is loaded (`loadedRoot`), and `process.teardown` switches to the kernel's own tables before it destroys one that is still loaded (`vmm.unloadRoot`); destroying the loaded one is an assertion failure.
+  - Tested: a kernel thread and a process take turns for over 100 round trips at the cost of exactly two CR3 loads (into the process, and away from it at teardown); CR3 holds the process's root while the kernel thread runs, and the kernel's after teardown, with no page lost. With either change undone the test fails.
+- [x] Scan the page allocator's bitmap a 64-bit word at a time with `@ctz` (`src/kernel/page_bitmap.zig`); the bitmaps are whole words now. Host tests: the only free page at the first and last bit of every word and as the last page, for search hints before, at and after it; a search that starts mid-word and wraps; and the existing run against the model.
+- [x] Replace the `lfence` at the start of `user_copy` with branch-free clamping of the user address (`user_copy_from` and `user_copy_to` in `src/arch/x86_64/usercopy.zig`): an address outside user space becomes 0, which is never mapped, so the copy fails whatever the CPU predicted. Only the start is clamped: the copy runs upwards and meets the unmapped gap above user space before any kernel address.
+  - Tested in the kernel, by calling the copy routines without the range check: reading from kernel data, the direct map and the first addresses past user space fails and brings nothing back; writing to kernel data fails and changes nothing. With the clamp removed the test fails. (Not a host test, as planned first: the clamp is in the assembly routine, and this tests the routine itself.)
 
 Hardening:
-- [ ] Make `.got` and `.data.rel.ro` read-only once the kernel runs: give them their own page-aligned part of `linker.ld` and map it without `WRITABLE` in `vmm.init`. The bootloader has applied the relocations by then. They hold function-pointer tables.
-  - Test: a write to the allocator's function table faults (a QEMU scenario, like `fault`).
-- [ ] Map the kernel's text and read-only data read-only in the direct map of physical memory as well, where they are writable today through the 2 MiB pages. The pages that hold the image need 4 KiB mappings there.
-  - Test: a write to kernel text through its direct-map address faults.
-- [ ] Give machine checks their own emergency stack (IST), like double faults, NMIs and debug exceptions: one in the first instructions of `syscall_entry` runs on the user's stack pointer today.
-- [ ] Call the syscall dispatcher directly in the normal kernel; keep the replaceable handler pointer (`arch.syscall.setHandler`) in the test kernel only.
+- [x] Make the relocated constants read-only once the kernel runs: `.data.rel.ro`, `.dynamic` and `.got` have their own page-aligned part of `linker.ld` and are mapped without `WRITABLE` in `vmm.init`. They hold tables of function pointers, the heap allocator's among them.
+  - Tested: the `relro` scenario writes to that table and gets a page fault; an in-kernel test checks the page-table entries.
+- [x] Map the kernel's text, read-only data and relocated constants read-only in the direct map of physical memory as well (`mapDirect` in `vmm.zig`): the 2 MiB pages around the image are 4 KiB pages there, so the rest stays writable.
+  - Tested: the `text_alias` scenario writes to kernel code through its direct-map address and gets a page fault; an in-kernel test checks the entries at both ends of the read-only range and walks every kernel mapping to see that none is writable and executable.
+- [x] Give machine checks their own emergency stack (IST 4), like double faults, NMIs and debug exceptions. The emergency-stack test covers all four: gates, separate aligned stacks, and the CPU really switching to each.
+- [x] Call the syscall dispatcher directly in the normal kernel; the replaceable handler pointer (`arch.syscall.setHandler`) exists in the test kernel only. The handler for returns to an invalid state is called directly in both.
+  - Tested by `zig build check-dispatch` (`scripts/check-dispatch.sh`, part of `zig build test` and CI in every build mode): the pointer's symbol must be in the test kernel and not in the normal one.
 
-**Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources. Not reached yet: 2.1 to 2.9 are done, 2.10 is open.
+Found on the way: the "kernel runs at a randomized address" test overflowed, and panicked, when the bootloader placed the kernel in the top 64 MiB (about 3 boots in 100). Fixed in `tests/kernel/helpers.zig`.
+
+**Milestone 2 done when:** Malformed binaries, invalid pointers, expected user faults, and resource exhaustion do not take down the OS or leak resources. Reached: 2.1 to 2.10 are done.
 
 ---
 
@@ -520,8 +522,8 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
   - Spawning a program copies the whole file to the heap and then into pages, although the initrd is already in memory (Debug builds: about 1.1 MiB per spawn, debug info included).
   - `print` keeps interrupts off while it writes to the polled serial port: about 22 ms for 256 bytes at 115200 baud, more than two timer ticks.
   - The kernel heap is first-fit over an address-sorted list with interrupts off; allocation and free are linear in the number of free chunks.
-  - The page allocator scans its bitmap one bit at a time, now with interrupts off (the scan itself: 2.10).
-  - Every process switch reloads CR3 without PCID and flushes the TLB (global kernel mappings and no reload for kernel threads: 2.10; PCID stays here).
+  - The page allocator scans its whole bitmap for a free page, with interrupts off (a word at a time since 2.10; a free list or per-CPU caches would not scan at all: 3.4).
+  - Every switch between two processes reloads CR3 without PCID and flushes the user TLB entries (kernel entries are global and kernel threads do not reload it since 2.10).
   - Every switch between user threads saves and restores the whole x87/SSE/AVX state with plain XSAVE (2.5). XSAVEOPT or XSAVES would skip what has not changed.
   - AVX-512 is disabled (2.5). Decide whether to enable it: the .NET runtime uses it where it can, at the cost of a save area of about 2.5 KiB per thread.
   - `vmm.unmap` scans whole page tables (512 entries per level) to see whether they became empty (2.6); a count per table would avoid it.

@@ -308,9 +308,53 @@ fn userMemoryIsZeroed() TestError!void {
     try check(helpers.runProgram("/test/zero_pages") == 0);
 }
 
-/// Index clamping without a branch, and `lfence` in the user-copy routine.
+/// Index clamping without a branch, and the same for user addresses in the copy routines.
 fn speculationGuards() TestError!void {
     try expectChecks("speculation guard", helpers.speculationGuards());
+}
+
+/// A ready thread never waits behind an idle CPU; with nothing ready, the CPU sleeps.
+fn idleOnlyWhenNothingIsReady() TestError!void {
+    try expectChecks("idle", helpers.idleChecks());
+}
+
+/// Kernel mappings are global, user mappings are not.
+fn globalMappings() TestError!void {
+    try expectChecks("global mapping", helpers.globalMappings());
+}
+
+/// Unmapping a kernel address flushes its global TLB entry.
+fn kernelTlbFlush() TestError!void {
+    try expectChecks("kernel TLB", helpers.kernelTlbFlush());
+}
+
+/// A kernel thread keeps the loaded address space; teardown switches away first.
+fn kernelThreadAddressSpace() TestError!void {
+    try expectChecks("kernel thread address space", helpers.kernelThreadAddressSpace());
+}
+
+/// Kernel code, constants and relocated tables are read-only under every address.
+fn kernelWriteProtection() TestError!void {
+    try expectChecks("kernel write protection", helpers.kernelWriteProtection());
+}
+
+/// Only the test kernel can replace the syscall handler.
+fn syscallHandlerReplaceable() TestError!void {
+    try check(helpers.syscallHandlerReplaceable());
+}
+
+/// Integration-test scenario "relro": write to a table of function pointers
+/// that the bootloader relocated. It is read-only once the kernel runs.
+noinline fn scenarioRelro() void {
+    helpers.writeRelocatedTable();
+    @panic("relro scenario: the write to a relocated table was not caught");
+}
+
+/// Integration-test scenario "text_alias": write to kernel code through the
+/// direct map of physical memory. It is read-only there too.
+noinline fn scenarioTextAlias() void {
+    helpers.writeTextThroughDirectMap();
+    @panic("text_alias scenario: the write to kernel code was not caught");
 }
 
 /// The CPU is not one that lets programs read kernel memory (Meltdown).
@@ -1211,6 +1255,8 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "double_fault")) scenarioDoubleFault();
     if (std.mem.eql(u8, scenario, "stack_overflow")) scenarioStackOverflow();
     if (std.mem.eql(u8, scenario, "use_after_free")) scenarioUseAfterFree();
+    if (std.mem.eql(u8, scenario, "relro")) scenarioRelro();
+    if (std.mem.eql(u8, scenario, "text_alias")) scenarioTextAlias();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
     if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
@@ -1252,6 +1298,9 @@ fn runCases() noreturn {
         .{ .name = "VMM refuses to replace a mapping", .func = vmmMapConflicts },
         .{ .name = "VMM unmap frees empty page tables", .func = vmmUnmap },
         .{ .name = "VMM unmap and remap flush the TLB", .func = vmmTlbFlush },
+        .{ .name = "kernel mappings are global, user mappings are not", .func = globalMappings },
+        .{ .name = "VMM unmap flushes a global kernel mapping from the TLB", .func = kernelTlbFlush },
+        .{ .name = "kernel code, constants and relocated tables are read-only, also in the direct map", .func = kernelWriteProtection },
         .{
             .name = "NVMe sector reads",
             .func = nvmeRead,
@@ -1301,14 +1350,14 @@ fn runCases() noreturn {
         .{ .name = "recursive spawning until memory runs out (ring 3)", .func = recursionUntilOutOfMemory },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
         .{ .name = "user faults kill only the process (ring 3 exceptions)", .func = userFaults },
-        .{ .name = "double-fault, NMI and debug emergency stacks", .func = emergencyStacks },
+        .{ .name = "double-fault, NMI, debug and machine-check emergency stacks", .func = emergencyStacks },
         .{ .name = "guarded kernel stacks (alloc, guard page, free, reuse)", .func = kernelStacks },
         .{ .name = "kernel stack high-water mark", .func = stackUsage },
         .{ .name = "process lifecycle and cleanup", .func = processLifecycle },
         .{ .name = "random-number generator (seeding, balance, bounds)", .func = randomNumbers },
         .{ .name = "freed memory is poisoned, user pages are zeroed", .func = poisonAndZero },
         .{ .name = "a new process sees only zeroes (ring 3)", .func = userMemoryIsZeroed },
-        .{ .name = "speculation guards (index clamp, lfence in user copy)", .func = speculationGuards },
+        .{ .name = "speculation guards (index clamp, user address clamp in user copies)", .func = speculationGuards },
         .{ .name = "Meltdown: CPU checked at boot", .func = meltdownDecision },
         .{ .name = "user stack address randomization", .func = stackRandomization },
         .{ .name = "kernel runs at a randomized address", .func = kernelRelocation },
@@ -1322,6 +1371,9 @@ fn runCases() noreturn {
         .{ .name = "lifecycle stress (spawn, exit, wait, orphan, failures)", .func = lifecycleStress },
         .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin },
         .{ .name = "wake before block", .func = wakeBeforeBlock },
+        .{ .name = "kernel thread keeps the loaded address space (no CR3 load)", .func = kernelThreadAddressSpace },
+        .{ .name = "no idling while a thread is ready; a retired thread never runs", .func = idleOnlyWhenNothingIsReady },
+        .{ .name = "syscall handler is replaceable in the test kernel only", .func = syscallHandlerReplaceable },
         .{ .name = "tarfs lookup and normalization", .func = tarfsLookup },
         .{ .name = "tarfs offsets and partial reads", .func = tarfsBoundaries },
         .{ .name = "tarfs malformed archives", .func = tarfsMalformed },

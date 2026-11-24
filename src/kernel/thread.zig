@@ -36,6 +36,21 @@
 //! on their condition. `sync/wait_queue.zig` is the interface to use; it
 //! does this.
 //!
+//! ## Idling
+//!
+//! There is no idle thread. When a thread blocks or exits and nothing is
+//! ready, the CPU halts right there, in `block` or `exit` on that thread's
+//! stack, until an interrupt makes a thread ready. So a ready thread never
+//! waits behind an idle one, and the check for "nothing to run" and the
+//! halt happen with interrupts off, with no gap a wake-up could fall into.
+//!
+//! ## Address spaces
+//!
+//! A thread of a process runs on its process's address space. A kernel
+//! thread runs on whichever one is loaded: it only uses kernel addresses,
+//! which are mapped the same in all of them. So a switch to a kernel thread
+//! and back costs no CR3 load and no TLB flush.
+//!
 //! All scheduler state is protected by turning interrupts off (one CPU).
 
 const std = @import("std");
@@ -61,8 +76,6 @@ var boot_thread: Thread = .{ .id = 0, .stack = null, .state = .running };
 var current_thread: *Thread = &boot_thread;
 var next_id: usize = 1;
 
-var loaded_root: u64 = 0;
-
 // FIFO ready queue
 var ready_head: ?*Thread = null;
 var ready_tail: ?*Thread = null;
@@ -70,6 +83,7 @@ var ready_tail: ?*Thread = null;
 var zombies: ?*Thread = null;
 var reaped: usize = 0;
 var switches: usize = 0;
+var halts: usize = 0;
 
 /// Append `t` to the tail of the ready queue. Callers must have interrupts disabled.
 fn enqueue(t: *Thread) void {
@@ -184,8 +198,11 @@ pub fn block() void {
 
 /// Sleep until the next interrupt, then turn interrupts off again. The
 /// `sti` takes effect after the following instruction, so no interrupt can
-/// arrive between enabling them and halting.
+/// arrive between enabling them and halting. Only called when the ready
+/// queue is empty, with interrupts off since that was found out.
 fn idleOnce() void {
+    assert.check(.thread, ready_head == null, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
+    halts += 1;
     asm volatile ("sti; hlt; cli");
 }
 
@@ -250,7 +267,8 @@ pub fn adoptBootStack(stack: []u8) void {
 /// Switch to the next ready thread, if there is one.
 ///
 /// A running thread goes back to the tail of the ready queue; a blocked or
-/// dead one does not. Loads the next thread's address space, kernel stack
+/// dead one does not. Loads the next thread's address space (if it belongs
+/// to a process; a kernel thread keeps the one that is loaded), kernel stack
 /// and extended CPU state (saving the previous thread's), resets the time
 /// slice and switches context. Everything happens with interrupts off, on
 /// the previous thread's kernel stack, which stays mapped in every address
@@ -284,10 +302,12 @@ fn switchToNext() bool {
         percpu.setKernelStack(top); // for syscalls
     }
 
-    const new_root = if (next.process) |p| p.root else vmm.kernel_root;
-    if (new_root != loaded_root) {
-        vmm.loadRoot(new_root);
-        loaded_root = new_root;
+    // A kernel thread uses kernel addresses only, and those are mapped the
+    // same in every address space: it runs on whichever is loaded, and CR3
+    // (and the TLB) is left alone. `process.teardown` switches away from an
+    // address space before it is destroyed.
+    if (next.process) |p| {
+        if (p.root != vmm.loadedRoot()) vmm.loadRoot(p.root);
     }
 
     fpu.switchState(prev.fpuArea(), next.fpuArea());
@@ -296,6 +316,15 @@ fn switchToNext() bool {
 
     reap(); // we're running again; any zombie is now some *other* thread
     return true;
+}
+
+/// Stop running the current thread for good without freeing it: it blocks
+/// and nothing wakes it, so it never gets the CPU again. For the boot
+/// thread once the system is up. While no other thread is ready, the CPU
+/// sleeps here or in `block` of whichever thread blocked last. Never returns.
+pub fn retire() noreturn {
+    _ = cpu.saveAndDisableInterrupts(); // `block` wants them off; it turns them on to sleep
+    while (true) block();
 }
 
 /// Timer tick: count down the current thread's time slice and preempt it with
@@ -319,8 +348,7 @@ pub fn exit() noreturn {
     // Never comes back from the switch. If nothing is ready (every other
     // thread sleeps), idle on this stack until an interrupt wakes one.
     while (true) {
-        _ = switchToNext();
-        idleOnce();
+        if (!switchToNext()) idleOnce();
     }
 }
 
@@ -338,6 +366,11 @@ pub fn spawnedCount() usize {
 /// Context switches since boot.
 pub fn switchCount() usize {
     return switches;
+}
+
+/// Times the CPU was halted because no thread was ready, since boot.
+pub fn haltCount() usize {
+    return halts;
 }
 
 /// Record how much of its kernel stack the current thread has used so far

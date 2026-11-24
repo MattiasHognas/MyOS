@@ -14,7 +14,8 @@
 //! A debug exception (#DB) can be made to arrive at the first of those
 //! instructions too, once a program can set a breakpoint or single-step into
 //! `syscall` (the "MOV SS" attack, CVE-2018-8897): without its own stack the
-//! handler would run in ring 0 on a stack pointer the program chose.
+//! handler would run in ring 0 on a stack pointer the program chose. A machine
+//! check (#MC) is not caused by any instruction and can arrive there as well.
 
 const std = @import("std");
 
@@ -38,11 +39,16 @@ pub const IST_DOUBLE_FAULT = 1;
 pub const IST_NMI = 2;
 /// IST index of the debug-exception stack.
 pub const IST_DEBUG = 3;
+/// IST index of the machine-check stack.
+pub const IST_MACHINE_CHECK = 4;
+/// Every IST index in use.
+pub const IST_INDEXES = [_]u3{ IST_DOUBLE_FAULT, IST_NMI, IST_DEBUG, IST_MACHINE_CHECK };
 
 // Emergency stacks, in .bss: independent of the heap and of every thread stack.
 var double_fault_stack: [IST_STACK_SIZE]u8 align(16) = undefined;
 var nmi_stack: [IST_STACK_SIZE]u8 align(16) = undefined;
 var debug_stack: [IST_STACK_SIZE]u8 align(16) = undefined;
+var machine_check_stack: [IST_STACK_SIZE]u8 align(16) = undefined;
 
 const TSS_SEL = 0x28;
 
@@ -94,12 +100,13 @@ pub fn kernelStack() u64 {
 }
 
 /// The memory of the emergency stack with IST index `index`
-/// (`IST_DOUBLE_FAULT`, `IST_NMI` or `IST_DEBUG`); the CPU starts at its end.
+/// (one of `IST_INDEXES`); the CPU starts at its end.
 pub fn istStack(index: u3) []u8 {
     return switch (index) {
         IST_DOUBLE_FAULT => &double_fault_stack,
         IST_NMI => &nmi_stack,
         IST_DEBUG => &debug_stack,
+        IST_MACHINE_CHECK => &machine_check_stack,
         else => unreachable,
     };
 }
@@ -115,7 +122,7 @@ pub fn istTop(index: u3) u64 {
 /// far return and the data segment registers with the kernel data selector,
 /// then loads the task register with `ltr`. Must run before `idt.init`.
 pub fn init() void {
-    inline for (.{ IST_DOUBLE_FAULT, IST_NMI, IST_DEBUG }) |index| {
+    inline for (IST_INDEXES) |index| {
         const stack = istStack(index);
         tss.ist[index - 1] = @intFromPtr(stack.ptr) + stack.len;
     }

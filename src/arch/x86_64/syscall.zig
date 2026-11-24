@@ -2,9 +2,13 @@
 //!
 //! Configures the syscall MSRs and provides the assembly entry point, which
 //! switches to the kernel GS base and the current thread's kernel stack,
-//! builds a `Frame` and calls the handler registered with `init`. The
-//! kernel-side dispatcher lives in `kernel/syscall.zig`; `docs/syscalls.md`
-//! describes the ABI a program sees.
+//! builds a `Frame` and calls the dispatcher in `kernel/syscall.zig`.
+//! `docs/syscalls.md` describes the ABI a program sees.
+//!
+//! The call to the dispatcher is a direct one. Only the test kernel goes
+//! through a pointer (`setHandler`), so that tests can watch and alter
+//! syscalls; the normal kernel has no such pointer for a stray write to
+//! redirect, and no indirect branch on the way.
 //!
 //! Entry and exit, step by step (interrupts are off wherever the GS base or
 //! the stack pointer is not the kernel's):
@@ -31,9 +35,11 @@
 //! (`isr_paranoid` in `idt.zig`).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("root");
 
 const assert = @import("../../kernel/debug/assert.zig");
+const dispatcher = @import("../../kernel/syscall.zig");
 const cpu = @import("cpu.zig");
 const gdt = @import("gdt.zig");
 const sysret = @import("sysret.zig");
@@ -45,16 +51,15 @@ pub const SFMASK: u64 = 0x100 | 0x200 | 0x400 | 0x3000 | 0x4000 | 0x40000;
 /// statistic: read by tests to see which path a return took.
 pub var iret_returns: usize = 0;
 
-var handler: Handler = undefined;
+/// True if syscalls go through a replaceable pointer: in the test kernel only.
+pub const replaceable = build_options.is_test;
+
+// The handler in use, in the test kernel. The normal kernel has no such variable.
+var handler: if (replaceable) Handler else void = if (replaceable) &dispatcher.dispatch else {};
 
 /// A syscall handler: reads the arguments from the frame and writes the
 /// result to `f.rax`.
 pub const Handler = *const fn (*Frame) void;
-
-/// Called when a syscall would return to a state no instruction can return
-/// to (see `sysret.classify`). Must not return.
-pub const BadReturn = *const fn (*const Frame) noreturn;
-var bad_return: BadReturn = undefined;
 
 /// User register state saved on syscall entry, lowest address first.
 ///
@@ -148,22 +153,24 @@ extern fn syscall_entry() callconv(.c) void;
 /// preempted, and disables them again for the exit path, which runs with
 /// the user's stack pointer and GS base. Returns how to leave: 0 for
 /// `sysretq`, 1 for `iretq`. A state neither can return to goes to the
-/// `BadReturn` handler instead.
+/// dispatcher's `badReturn` instead, which kills the process.
 export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     assert.check(.syscall, @intFromPtr(f) % 16 == 0, "syscall frame at 0x{x} is not 16-byte aligned", .{@intFromPtr(f)});
     asm volatile ("sti"); // long syscalls may be preempted
-    handler(f);
+    if (comptime replaceable) handler(f) else dispatcher.dispatch(f);
     f.rflags = sysret.sanitizeFlags(f.rflags);
     const how = sysret.classify(f.rip, f.rflags, f.cs, f.ss);
-    if (how == .invalid) bad_return(f);
+    if (how == .invalid) dispatcher.badReturn(f);
     asm volatile ("cli"); // the exit path must not be interrupted
     if (how == .iret) iret_returns += 1;
     return @backingInt(how);
 }
 
 /// Replace the syscall handler and return the previous one. For tests,
-/// which wrap the real handler to observe or alter syscalls.
+/// which wrap the real handler to observe or alter syscalls; it does not
+/// compile into the normal kernel.
 pub fn setHandler(h: Handler) Handler {
+    if (comptime !replaceable) @compileError("syscall.setHandler exists in the test kernel only");
     const old = handler;
     handler = h;
     return old;
@@ -181,12 +188,7 @@ pub fn initCpu() void {
     cpu.wrmsr(0xC0000084, SFMASK);
 }
 
-/// Enable the `syscall` instruction and route it to `h`, which receives the
-/// saved user registers and returns its result by writing `f.rax`. `bad` is
-/// called instead of returning to user mode when the saved state is one the
-/// CPU cannot return to.
-pub fn init(h: Handler, bad: BadReturn) void {
-    handler = h;
-    bad_return = bad;
+/// Enable the `syscall` instruction on the boot CPU. Called once during boot.
+pub fn init() void {
     initCpu();
 }

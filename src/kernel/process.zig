@@ -307,11 +307,13 @@ pub fn spawnPath(path: []const u8, options: SpawnOptions) !*Process {
 }
 
 /// Called by the scheduler when the thread of `p` has been reaped: nothing
-/// runs in `p` any more and its address space is not loaded. Frees the
-/// address space and gives up the thread's reference.
+/// runs in `p` any more. Its address space may still be loaded, if only
+/// kernel threads ran since, so it is switched away from first. Frees the
+/// address space and gives up the thread's reference. Interrupts are off.
 pub fn teardown(p: *Process) void {
     assert.check(.process, p.exit_code != null, "tearing down process '{s}', which has not exited", .{p.name});
     assert.check(.process, p.root != 0, "process '{s}' torn down twice", .{p.name});
+    vmm.unloadRoot(p.root);
     vmm.destroyAddressSpace(p.root);
     p.root = 0;
     release(p);

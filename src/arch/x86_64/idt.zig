@@ -7,10 +7,10 @@
 //! handlers installed with `register`; CPU exceptions are reported and either
 //! kill the faulting user process or halt the kernel.
 //!
-//! Double faults, NMIs and debug exceptions run on their own emergency
+//! Double faults, NMIs, debug exceptions and machine checks run on their own emergency
 //! stacks (the IST entries set up in `gdt.zig`), so they can be handled even
 //! when the interrupted stack is unusable or is still the user's. Double
-//! faults and NMIs always halt the kernel; a debug exception in ring 3 kills
+//! faults, NMIs and machine checks always halt the kernel; a debug exception in ring 3 kills
 //! the process like any other fault, and one in ring 0 halts.
 //!
 //! GS base: an entry from ring 3 arrives with the user's GS base, so
@@ -227,12 +227,14 @@ comptime {
 }
 
 /// The IST index vector `vec` runs on: its own emergency stack for double
-/// faults, NMIs and debug exceptions, 0 (no stack switch) for everything else.
+/// faults, NMIs, debug exceptions and machine checks, 0 (no stack switch) for
+/// everything else.
 fn istFor(vec: usize) u3 {
     return switch (vec) {
         VECTOR_DOUBLE_FAULT => gdt.IST_DOUBLE_FAULT,
         VECTOR_NMI => gdt.IST_NMI,
         VECTOR_DEBUG => gdt.IST_DEBUG,
+        VECTOR_MACHINE_CHECK => gdt.IST_MACHINE_CHECK,
         else => 0,
     };
 }

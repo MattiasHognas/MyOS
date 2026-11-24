@@ -23,7 +23,7 @@ pub const Error = error{Fault};
 /// that owns the pointer.
 pub fn copyFromUser(dst: []u8, src: u64) Error!void {
     if (!user_range.valid(src, dst.len)) return error.Fault;
-    if (!usercopy.copy(@intFromPtr(dst.ptr), src, dst.len)) return error.Fault;
+    if (!usercopy.copyFromUser(@intFromPtr(dst.ptr), src, dst.len)) return error.Fault;
 }
 
 /// Copy `src` to the user address `dst`.
@@ -32,7 +32,7 @@ pub fn copyFromUser(dst: []u8, src: u64) Error!void {
 /// been written. Same address-space rule as `copyFromUser`.
 pub fn copyToUser(dst: u64, src: []const u8) Error!void {
     if (!user_range.valid(dst, src.len)) return error.Fault;
-    if (!usercopy.copy(dst, @intFromPtr(src.ptr), src.len)) return error.Fault;
+    if (!usercopy.copyToUser(dst, @intFromPtr(src.ptr), src.len)) return error.Fault;
 }
 
 /// Why `copyStringFromUser` failed.

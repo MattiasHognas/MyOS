@@ -29,10 +29,20 @@ SECTIONS {
     . = ALIGN(4096);
     __rodata_end = .;
 
-    __data_start = .;
-    .data   : { KEEP(*(.limine_requests)) *(.data .data.*) *(.data.rel.ro*) } :data
+    /* Data that is only written while the kernel is loaded: constants that
+       hold addresses (tables of function pointers among them), which the
+       bootloader fills in when it relocates the kernel. Nothing writes to
+       them afterwards, so the kernel maps these pages read-only (vmm.init).
+       They are in the writable segment for the bootloader's sake. */
+    __relro_start = .;
+    .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) } :data
     .dynamic : { *(.dynamic) } :data :dynamic
     .got    : { *(.got .got.*) } :data
+    . = ALIGN(4096);
+    __relro_end = .;
+
+    __data_start = .;
+    .data   : { KEEP(*(.limine_requests)) *(.data .data.*) } :data
     .bss    : { *(.bss .bss.*) *(COMMON) } :data
     . = ALIGN(4096);
     __data_end = .;

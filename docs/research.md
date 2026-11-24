@@ -26,7 +26,8 @@ found in the code as it stands.
 
 ### Fix now
 
-Tasks: [2.10](todo.md#210-review-follow-ups).
+All done in [2.10](todo.md#210-review-follow-ups), each with a test. The table
+describes the code as it was reviewed.
 
 | Finding | Where | Why it matters |
 | --- | --- | --- |
@@ -233,7 +234,8 @@ branch instead of executing `lfence`, because the barrier was slow. An
 objection about AMD processors was raised on the list and rejected by the
 author; the pattern was already in `get_user`.
 
-*For MyOS:* **adopt**, see the review findings above.
+*For MyOS:* **adopt**. Done in 2.10: the copy routines clamp the address to 0
+when it is outside user space.
 
 ## Compatibility
 

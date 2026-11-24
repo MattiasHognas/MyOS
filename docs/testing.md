@@ -5,8 +5,8 @@ change or add a subsystem.
 
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
-| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection, the physical allocator's page bookkeeping against a model, the timer queue against a model, the spinlock under real multi-threaded contention, the random generator's core, the Meltdown rule; two coverage-guided fuzz tests, see [fuzzing](#fuzzing)), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes), memory exhaustion and failed allocations, heap, kernel stacks, process limits, spinlocks, wait queues, mutexes, timers and sleeping, the random-number generator, poisoning and zeroing of memory, speculation guards, address randomization, the process lifecycle (late waits, orphans, a stress run), ELF loading, scheduler and processes, syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
+| Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection, the physical allocator's page bookkeeping against a model and at every position in a 64-bit word, the timer queue against a model, the spinlock under real multi-threaded contention, the random generator's core, the Meltdown rule; two coverage-guided fuzz tests, see [fuzzing](#fuzzing)), compiled natively with fakes. Fast; covered by `zig build coverage`. |
+| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes for user and global kernel mappings, which kernel mappings are global, what in the kernel is writable), memory exhaustion and failed allocations, heap, kernel stacks, process limits, spinlocks, wait queues, mutexes, timers and sleeping, the random-number generator, poisoning and zeroing of memory, speculation guards (also that the user-copy routines cannot be made to touch kernel memory), address randomization, the process lifecycle (late waits, orphans, a stress run), ELF loading, scheduler and processes (round robin, no idling while a thread is ready, the address space a kernel thread runs on), syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests, the [stack frame check](#stack-frame-check) and all QEMU scenarios. Add
@@ -31,6 +31,8 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 | `double_fault` | A kernel thread points RSP at unmapped memory and pushes | Exit code 1, `Double fault` with the bad RSP, CR2, the thread's stack bounds and frame `#0` in `doubleFaultThread` (a triple fault would end QEMU with status 0 and no report) |
 | `stack_overflow` | A kernel thread recurses until its stack is used up | Exit code 1, `Double fault` with CR2 in a kernel stack guard page, `kernel stack overflow`, RSP below the thread's stack, backtrace frames in `recurseForever` |
 | `use_after_free` | Writes to a heap block after freeing it, then allocates again | Exit code 1, a panic naming the address, the byte written and its offset, a backtrace through `writeAfterFree` |
+| `relro` | Writes to the heap's table of function pointers, which the bootloader relocated | Exit code 1, `Page fault` with error 0x3 and CR2 in the kernel image, frame `#0` in `writeRelocatedTable` (relocated tables are read-only once the kernel runs) |
+| `text_alias` | Writes to kernel code through the direct map of physical memory | Exit code 1, `Page fault` with error 0x3 and CR2 in the direct map, frame `#0` in `writeTextThroughDirectMap` (kernel code is read-only under every address) |
 
 After the scenarios the script compares where the kernel was loaded in each
 boot (the test kernel prints `MYOS_KERNEL_SLIDE`): with KASLR the addresses
@@ -84,6 +86,17 @@ fails if any thread used more than 12 of its 16 KiB.
 `scripts/test-check-frames.sh` tests the script itself against hand-written
 disassembly. The limits can be changed with `MYOS_FRAME_HARD_LIMIT` and
 `MYOS_FRAME_SOFT_LIMIT`.
+
+## Syscall dispatch check
+
+The normal kernel calls its syscall dispatcher directly. Only the test
+kernel reaches it through a pointer (`arch.syscall.setHandler`), so that
+tests can watch and alter syscalls; in the normal kernel such a pointer
+would be one more thing a stray write could redirect, and an indirect branch
+on every syscall. `zig build check-dispatch` (run by `zig build test` and by
+CI in every build mode) looks in the symbol tables: `scripts/check-dispatch.sh`
+fails if `kernel.elf` has the pointer, and also if `kernel-test.elf` does
+not, since then the check is looking for the wrong name.
 
 ## Adding in-kernel tests
 

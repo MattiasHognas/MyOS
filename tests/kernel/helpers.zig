@@ -516,50 +516,65 @@ fn istProbeFrame(ist: u3) u64 {
     return ist_probe_frame;
 }
 
-/// Check the emergency stacks: the double-fault, NMI and debug gates name their own
-/// IST entries, the TSS points those at the ends of three separate, 16-byte
-/// aligned stacks, no other exception uses an IST stack, and the CPU really
-/// switches to such a stack (and back) when a gate asks for it. Returns 0, or
-/// the number of the first failing check.
+/// Check the emergency stacks: the double-fault, NMI, debug and
+/// machine-check gates name their own IST entries, the TSS points those at
+/// the ends of four separate, 16-byte aligned stacks, no other exception
+/// uses an IST stack, and the CPU really switches to each such stack (and
+/// back) when a gate asks for it. Returns 0, or the number of the first
+/// failing check.
 pub fn emergencyStacks() u32 {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
 
-    if (idt.gateIst(8) != gdt.IST_DOUBLE_FAULT) return 1;
-    if (idt.gateIst(2) != gdt.IST_NMI) return 2;
-    if (idt.gateIst(1) != gdt.IST_DEBUG) return 14;
-    for (0..256) |vec| {
-        if (vec != 8 and vec != 2 and vec != 1 and idt.gateIst(@intCast(vec)) != 0) return 3;
+    // Vector and the IST index its gate must name.
+    const gates = [_]struct { vector: u8, ist: u3 }{
+        .{ .vector = 8, .ist = gdt.IST_DOUBLE_FAULT },
+        .{ .vector = 2, .ist = gdt.IST_NMI },
+        .{ .vector = 1, .ist = gdt.IST_DEBUG },
+        .{ .vector = 18, .ist = gdt.IST_MACHINE_CHECK },
+    };
+    for (gates) |g| {
+        if (idt.gateIst(g.vector) != g.ist) return 1;
     }
-    const dbg = gdt.istStack(gdt.IST_DEBUG);
-    const dbg_low = @intFromPtr(dbg.ptr);
-    if (gdt.istTop(gdt.IST_DEBUG) != dbg_low + dbg.len or gdt.istTop(gdt.IST_DEBUG) % 16 != 0) return 15;
+    vectors: for (0..256) |vec| {
+        for (gates) |g| {
+            if (g.vector == vec) continue :vectors;
+        }
+        if (idt.gateIst(@intCast(vec)) != 0) return 2;
+    }
 
-    const df = gdt.istStack(gdt.IST_DOUBLE_FAULT);
-    const nmi = gdt.istStack(gdt.IST_NMI);
-    if (gdt.istTop(gdt.IST_DOUBLE_FAULT) != @intFromPtr(df.ptr) + df.len) return 4;
-    if (gdt.istTop(gdt.IST_NMI) != @intFromPtr(nmi.ptr) + nmi.len) return 5;
-    if (gdt.istTop(gdt.IST_DOUBLE_FAULT) % 16 != 0 or gdt.istTop(gdt.IST_NMI) % 16 != 0) return 6;
-    const df_low = @intFromPtr(df.ptr);
-    const nmi_low = @intFromPtr(nmi.ptr);
-    if (df_low < nmi_low + nmi.len and nmi_low < df_low + df.len) return 7; // they overlap
-    if (dbg_low < nmi_low + nmi.len and nmi_low < dbg_low + dbg.len) return 16;
-    if (dbg_low < df_low + df.len and df_low < dbg_low + dbg.len) return 17;
-    for (4..8) |index| {
-        if (gdt.istTop(@intCast(index)) != 0) return 8;
+    // Each index has a stack of its own; the TSS points at its aligned end.
+    for (gdt.IST_INDEXES, 0..) |index, n| {
+        const stack = gdt.istStack(index);
+        const low = @intFromPtr(stack.ptr);
+        if (gdt.istTop(index) != low + stack.len or gdt.istTop(index) % 16 != 0) return 3;
+        for (gdt.IST_INDEXES[n + 1 ..]) |other_index| {
+            const other = gdt.istStack(other_index);
+            const other_low = @intFromPtr(other.ptr);
+            if (low < other_low + other.len and other_low < low + stack.len) return 4; // they overlap
+        }
+    }
+    used: for (1..8) |index| {
+        for (gdt.IST_INDEXES) |in_use| {
+            if (in_use == index) continue :used;
+        }
+        if (gdt.istTop(@intCast(index)) != 0) return 5;
     }
 
     idt.register(IST_TEST_VECTOR, istProbe);
     const plain = istProbeFrame(0);
-    if (plain == 0) return 9; // the handler never ran
-    if (onIstStack(gdt.IST_DOUBLE_FAULT, plain) or onIstStack(gdt.IST_NMI, plain)) return 10;
-    if (!onIstStack(gdt.IST_DOUBLE_FAULT, istProbeFrame(gdt.IST_DOUBLE_FAULT))) return 11;
-    if (!onIstStack(gdt.IST_NMI, istProbeFrame(gdt.IST_NMI))) return 12;
+    if (plain == 0) return 6; // the handler never ran
+    for (gdt.IST_INDEXES) |index| {
+        if (onIstStack(index, plain)) return 7;
+        if (!onIstStack(index, istProbeFrame(index))) return 10 + @as(u32, index);
+    }
     // Back on the thread's own stack: a local is not on an emergency stack.
     var here: u8 = 0;
     const here_addr = @intFromPtr(&here);
     here = 1;
-    if (onIstStack(gdt.IST_DOUBLE_FAULT, here_addr) or onIstStack(gdt.IST_NMI, here_addr)) return 13;
+    for (gdt.IST_INDEXES) |index| {
+        if (onIstStack(index, here_addr)) return 8;
+    }
     return 0;
 }
 
@@ -2420,13 +2435,18 @@ pub fn dirtyFreeMemory() void {
     releaseDrained(); // with poisoning on, freeing fills them again; either way, not zero
 }
 
-// The first instruction of the kernel's user-copy routine.
-extern fn user_copy() callconv(.c) void;
+// A value in kernel memory that the user-copy routines must never give out,
+// and one they must never overwrite.
+var clamp_secret: u64 = 0x5EC2_E75E_C2E7_5EC2;
+var clamp_target: u64 = 0x7A26_E77A_26E7_7A26;
 
 /// Check the speculation guards: the branch-free index clamp gives the
 /// index inside the bounds and 0 outside, for every boundary; and the
-/// user-copy routine starts with `lfence`. Returns 0, or the number of the
-/// first failing check.
+/// user-copy routines clamp the user address the same way, so that even
+/// called without the range check (which is what a mispredicted check
+/// amounts to) they cannot read or write kernel memory: an address outside
+/// user space is treated as address 0, and the copy fails. Returns 0, or the
+/// number of the first failing check.
 pub fn speculationGuards() u32 {
     const cases = [_]struct { i: usize, len: usize, want: usize }{
         .{ .i = 0, .len = 16, .want = 0 },
@@ -2450,9 +2470,43 @@ pub fn speculationGuards() u32 {
         const pl: *volatile usize = &len;
         if (nospec.index(pi.*, pl.*) != c.want) return @intCast(n);
     }
-    // lfence is 0F AE E8.
-    const code: [*]const u8 = @ptrCast(&user_copy);
-    if (!std.mem.eql(u8, code[0..3], &.{ 0x0F, 0xAE, 0xE8 })) return 20;
+
+    const flags = cpu.saveAndDisableInterrupts(); // one address space throughout
+    defer cpu.restoreInterrupts(flags);
+    const end = kernel_root.kernel.user_range.USER_END;
+    var buf: u64 = 0x1111_1111_1111_1111;
+    const buf_addr = @intFromPtr(&buf);
+    const pbuf: *volatile u64 = &buf;
+    const psecret: *volatile u64 = &clamp_secret;
+    const ptarget: *volatile u64 = &clamp_target;
+    const secret = psecret.*;
+    const target = ptarget.*;
+
+    // Reading from kernel addresses: readable memory, yet the copy fails
+    // and brings nothing back.
+    const kernel_sources = [_]u64{
+        @intFromPtr(&clamp_secret), // kernel data
+        @intFromPtr(pmm.physToVirt(vmm.kernel_root)), // the direct map
+        end, // the first address that is not the user's
+        end + 1,
+        0xFFFF_8000_0000_0000,
+        std.math.maxInt(u64) - 7,
+    };
+    for (kernel_sources, 0..) |src, n| {
+        if (usercopy.copyFromUser(buf_addr, src, 8)) return 20 + @as(u32, @intCast(n));
+        if (pbuf.* != 0x1111_1111_1111_1111) return 30 + @as(u32, @intCast(n));
+    }
+    // Writing to a kernel address: writable memory, yet nothing is written.
+    if (usercopy.copyToUser(@intFromPtr(&clamp_target), buf_addr, 8)) return 40;
+    if (ptarget.* != target or psecret.* != secret) return 41;
+    if (usercopy.copyToUser(end, buf_addr, 8)) return 42;
+    // An empty copy touches nothing, wherever it points.
+    if (!usercopy.copyFromUser(buf_addr, @intFromPtr(&clamp_secret), 0)) return 43;
+    if (!usercopy.copyToUser(end, buf_addr, 0)) return 44;
+    // The last user address is not clamped away: it is simply not mapped.
+    if (usercopy.copyFromUser(buf_addr, end - 8, 8)) return 45;
+    // The user-access window is closed after every one of these.
+    if (cpu.readFlags() & (1 << 18) != 0) return 46; // RFLAGS.AC
     return 0;
 }
 
@@ -2531,7 +2585,9 @@ pub fn kernelRelocation() u32 {
     if (slide % pmm.PAGE_SIZE != 0) return 1;
     if (slide >= 0x8000_0000) return 2; // beyond the top 2 GiB
     const here = @intFromPtr(&kernelRelocation);
-    if (here < backtrace.LINK_BASE + slide or here >= backtrace.LINK_BASE + slide + 64 * 1024 * 1024) return 3;
+    // The image is near the top of the address space: compare distances, since
+    // "base + 64 MiB" does not fit in 64 bits when the slide is large.
+    if (here < backtrace.LINK_BASE + slide or here - (backtrace.LINK_BASE + slide) >= 64 * 1024 * 1024) return 3;
     // A function's own address is found under its own name.
     const sym = backtrace.symbolize(here) orelse return 4;
     if (sym.offset != 0 or !std.mem.endsWith(u8, sym.name, "kernelRelocation")) return 5;
@@ -2555,4 +2611,311 @@ pub noinline fn writeAfterFree() void {
     stale[64] = 0x42; // the bug
     const again = heap.allocator.alloc(u8, 128) catch return;
     heap.allocator.free(again);
+}
+
+// ---------------------------------------------------------------------------
+// Review follow-ups (2.10): idling, global mappings, address spaces of kernel
+// threads, and what in the kernel is writable.
+
+const PTE_PRESENT: u64 = vmm.PRESENT;
+
+/// A kernel address nothing else maps, for `kernelTlbFlush`.
+const SPARE_KERNEL_PAGE: u64 = 0xFFFF_B000_0010_0000;
+
+var hog_done = false;
+var hog_switches: usize = 0;
+var hog_halts: usize = 0;
+var hog_waiter: ?*thread.Thread = null;
+/// How long the CPU-bound thread of `idleChecks` runs: several time slices.
+const HOG_NS = 200_000_000;
+
+/// Kernel thread for `idleChecks`: use the CPU for `HOG_NS` without ever
+/// blocking, and note how often it was switched away from and how often the
+/// CPU was halted in that time.
+fn hogWorker() void {
+    const switches = thread.switchCount();
+    const halts = thread.haltCount();
+    const until = hpet.nanos() + HOG_NS;
+    while (hpet.nanos() < until) {}
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    hog_switches = thread.switchCount() - switches;
+    hog_halts = thread.haltCount() - halts;
+    hog_done = true;
+    thread.wake(hog_waiter.?);
+}
+
+var retired_started = false;
+var retired_returned = false;
+
+/// Kernel thread for `idleChecks`: retire, as the boot thread does.
+fn retiredWorker() void {
+    retired_started = true;
+    thread.retire();
+    retired_returned = true; // unreachable: `retire` never returns
+}
+
+/// Check that the CPU is never left idle while a thread could run, and
+/// sleeps when none can.
+///
+/// A thread retires for good, as the boot thread of the normal kernel does
+/// once the system is up. Then, with this thread blocked, one CPU-bound
+/// thread is the only thing that can run: over several time slices it must
+/// never be switched away from and the CPU must never be halted (an idle
+/// thread that took turns with the others would fail both). Finally, with nothing
+/// ready at all, the CPU does halt. Returns 0, or the number of the first
+/// failing check.
+///
+/// The retired thread and its stack stay for the rest of the run: that is
+/// what retiring means.
+pub fn idleChecks() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+
+    retired_started = false;
+    const retired = thread.spawn(retiredWorker, null) catch return 1;
+    thread.yield(); // let it run up to its `block`
+    if (!retired_started or retired.state != .blocked or retired.link != .none) return 2;
+
+    hog_done = false;
+    hog_waiter = thread.current();
+    _ = thread.spawn(hogWorker, null) catch return 3;
+    const t0 = hpet.nanos();
+    while (!hog_done) thread.block();
+    const elapsed = hpet.nanos() - t0;
+    if (hog_switches != 0) return 4; // something else was given the CPU
+    if (hog_halts != 0) return 5; // the CPU slept while the thread was ready
+    // It started at once and nothing delayed it: within a tick of its own run time.
+    if (elapsed < HOG_NS or elapsed > HOG_NS + 2 * timer.NS_PER_TICK) return 6;
+    if (retired.state != .blocked or retired_returned) return 7; // it never ran again
+
+    // Nothing is ready now: sleeping halts the CPU instead of spinning.
+    const halts = thread.haltCount();
+    timer.sleepTicks(3);
+    if (thread.haltCount() == halts) return 8;
+    if (retired.state != .blocked or retired_returned) return 9;
+    return 0;
+}
+
+/// The leaf entry that maps `addr` in the kernel's page tables, or 0.
+fn kernelLeaf(addr: u64) u64 {
+    return vmm.leafEntry(vmm.kernel_root, addr) orelse 0;
+}
+
+/// Check that kernel mappings are global and user mappings are not: CR4.PGE
+/// is on; code, constants, data, the heap, a kernel stack and the direct
+/// map all have the global bit, in the kernel's page tables and seen from
+/// another address space; a user page has not, even if the caller asks for
+/// it. Returns 0, or the number of the first failing check.
+pub fn globalMappings() u32 {
+    if (cpu.readCr4() & (1 << 7) == 0) return 1; // CR4.PGE
+    const block = heap.allocator.alloc(u8, 64) catch return 2;
+    defer heap.allocator.free(block);
+    const stack = thread.current().stack orelse return 3;
+    const page = pmm.alloc() orelse return 4;
+    defer pmm.free(page);
+    const kernel_addrs = [_]u64{
+        @intFromPtr(&globalMappings), // code
+        @intFromPtr("a string constant".ptr), // read-only data
+        @intFromPtr(&hog_done), // data
+        @intFromPtr(block.ptr), // heap
+        @intFromPtr(stack.ptr), // kernel stack
+        @intFromPtr(pmm.physToVirt(page)), // direct map
+    };
+    for (kernel_addrs, 0..) |addr, n| {
+        const e = kernelLeaf(addr);
+        if (e & PTE_PRESENT == 0 or e & vmm.GLOBAL == 0) return 10 + @as(u32, @intCast(n));
+    }
+
+    const root = vmm.createAddressSpace() catch return 5;
+    defer vmm.destroyAddressSpace(root);
+    for (kernel_addrs, 0..) |addr, n| {
+        if (vmm.leafEntry(root, addr) != kernelLeaf(addr)) return 20 + @as(u32, @intCast(n));
+    }
+    const user_page = pmm.allocZeroed() orelse return 6;
+    vmm.map(root, VM_A, user_page, USER_RW | vmm.GLOBAL, false) catch {
+        pmm.free(user_page);
+        return 7;
+    };
+    const user_leaf = vmm.leafEntry(root, VM_A) orelse return 8;
+    if (user_leaf & vmm.GLOBAL != 0) return 9;
+    return 0;
+}
+
+/// Check that `unmap` flushes a kernel address from the TLB although the
+/// entry is global: after a page has been read through its mapping,
+/// unmapping it and mapping another page there shows the new page, also
+/// after loading another address space in between (which keeps global
+/// entries). Returns 0, or the number of the first failing check.
+pub fn kernelTlbFlush() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const start = pmm.free_pages;
+    const p1 = pmm.alloc() orelse return 1;
+    const p2 = pmm.alloc() orelse return 2;
+    const root = vmm.createAddressSpace() catch return 3;
+    const previous = vmm.loadedRoot();
+    pmm.physToVirt(p1)[0] = 0x11;
+    pmm.physToVirt(p2)[0] = 0x22;
+    const here: *volatile u8 = @ptrFromInt(SPARE_KERNEL_PAGE);
+    const kernel_rw = vmm.WRITABLE | vmm.NX;
+
+    var failed: u32 = 0;
+    for (0..50) |round| {
+        vmm.map(vmm.kernel_root, SPARE_KERNEL_PAGE, p1, kernel_rw, false) catch return 4;
+        if (kernelLeaf(SPARE_KERNEL_PAGE) & vmm.GLOBAL == 0) failed = 5;
+        if (here.* != 0x11) failed = 6; // now cached in the TLB, as a global entry
+        if (round % 2 == 1) vmm.loadRoot(root); // a CR3 load keeps it there
+        if (here.* != 0x11) failed = 7;
+        if (vmm.unmap(vmm.kernel_root, SPARE_KERNEL_PAGE) != p1) failed = 8;
+        vmm.map(vmm.kernel_root, SPARE_KERNEL_PAGE, p2, kernel_rw, false) catch return 9;
+        if (here.* != 0x22) failed = 10; // a stale entry would read 0x11
+        here.* = 0x33; // and a write goes to the new page
+        if (pmm.physToVirt(p2)[0] != 0x33 or pmm.physToVirt(p1)[0] != 0x11) failed = 11;
+        pmm.physToVirt(p2)[0] = 0x22;
+        if (vmm.unmap(vmm.kernel_root, SPARE_KERNEL_PAGE) != p2) failed = 12;
+        if (round % 2 == 1) vmm.loadRoot(previous);
+        if (failed != 0) break;
+    }
+    vmm.loadRoot(previous);
+    vmm.destroyAddressSpace(root);
+    pmm.free(p1);
+    pmm.free(p2);
+    if (failed != 0) return failed;
+    return if (pmm.free_pages == start and kernelLeaf(SPARE_KERNEL_PAGE) == 0) 0 else 13;
+}
+
+/// Check which address space a kernel thread runs on. This thread (a kernel
+/// thread) takes turns with a process for many switches: CR3 is loaded once
+/// when the process first runs and never again while the two alternate,
+/// because this thread keeps the process's address space loaded. When the
+/// process has exited, its address space is still the loaded one; tearing
+/// it down switches to the kernel's own page tables first. So the whole run
+/// costs exactly two CR3 loads. Returns 0, or the number of the first
+/// failing check.
+pub fn kernelThreadAddressSpace() u32 {
+    if (cpu.readCr3() & ~@as(u64, 0xFFF) != vmm.loadedRoot()) return 1;
+    const pages = pmm.free_pages;
+    const loads = vmm.rootLoads();
+    const switches = thread.switchCount();
+    // `/test/fpu` gives up the CPU with `sched_yield` 300 times and is preempted
+    // by the timer a few times more; this thread takes every one of those turns.
+    const p = process.spawnPath("/test/fpu", .{}) catch return 2;
+    const root = p.root;
+    var saw_process_root = false;
+    while (true) {
+        const flags = cpu.saveAndDisableInterrupts();
+        const done = p.exit_code != null;
+        // Whenever this thread runs after the process has, the process's
+        // address space is what is loaded, in CR3 itself too.
+        if (!done and vmm.loadedRoot() == root and cpu.readCr3() & ~@as(u64, 0xFFF) == root) saw_process_root = true;
+        cpu.restoreInterrupts(flags);
+        if (done) break;
+        thread.yield();
+    }
+    const round_trips = (thread.switchCount() - switches) / 2;
+    const loaded = vmm.rootLoads() - loads;
+    if (process.wait(p) != 0) return 3;
+    if (round_trips < 100) return 4; // too few switches to show anything
+    if (!saw_process_root) return 5;
+    if (loaded != 2) return 6; // into the process once, and away from it at teardown
+    // The dead process's address space is gone and no longer loaded.
+    if (vmm.loadedRoot() != vmm.kernel_root or cpu.readCr3() & ~@as(u64, 0xFFF) != vmm.kernel_root) return 7;
+    return if (pmm.free_pages == pages) 0 else 8;
+}
+
+extern const __text_start: u8;
+extern const __data_start: u8;
+
+/// Walk the page table at `phys` (`level` 3 = PML4 ... 0 = PT) and count
+/// the leaf entries that are writable and executable at once. `first` and
+/// `last` select the entries of this table to look at.
+fn writableExecutable(phys: u64, level: u6, first: usize, last: usize) usize {
+    const entries: *const [512]u64 = @ptrCast(@alignCast(pmm.physToVirt(phys)));
+    var n: usize = 0;
+    for (entries[first..last]) |e| {
+        if (e & PTE_PRESENT == 0) continue;
+        if (level == 0 or e & vmm.HUGE != 0) {
+            if (e & vmm.WRITABLE != 0 and e & vmm.NX == 0) n += 1;
+        } else n += writableExecutable(e & 0x000F_FFFF_FFFF_F000, level - 1, 0, 512);
+    }
+    return n;
+}
+
+/// The address at which the direct map shows the physical page behind the
+/// kernel address `addr`.
+fn directMapAlias(addr: u64) ?u64 {
+    const phys = vmm.translate(vmm.kernel_root, addr) orelse return null;
+    return @intFromPtr(pmm.physToVirt(phys));
+}
+
+/// Check what in the kernel can be written: code and constants cannot, and
+/// neither can the tables of addresses the bootloader relocated (the heap's
+/// table of functions is one); data can and is not executable. The same
+/// holds at the addresses where the direct map shows those physical pages.
+/// No kernel mapping at all is writable and executable. Returns 0, or the
+/// number of the first failing check.
+pub fn kernelWriteProtection() u32 {
+    const W = vmm.WRITABLE;
+    const text = @intFromPtr(&kernelWriteProtection);
+    const rodata = @intFromPtr("a string constant".ptr);
+    const relocated = @intFromPtr(heap.allocator.vtable);
+    const data = @intFromPtr(&hog_done);
+
+    // Where the kernel runs.
+    var e = kernelLeaf(text);
+    if (e & PTE_PRESENT == 0 or e & W != 0 or e & vmm.NX != 0) return 1;
+    e = kernelLeaf(rodata);
+    if (e & PTE_PRESENT == 0 or e & W != 0 or e & vmm.NX == 0) return 2;
+    e = kernelLeaf(relocated);
+    if (e & PTE_PRESENT == 0 or e & W != 0 or e & vmm.NX == 0) return 3;
+    e = kernelLeaf(data);
+    if (e & PTE_PRESENT == 0 or e & W == 0 or e & vmm.NX == 0) return 4;
+    // The relocated tables lie between the constants and the data.
+    if (relocated < rodata or relocated >= @intFromPtr(&__data_start)) return 5;
+
+    // The same physical pages in the direct map: never executable there,
+    // and writable only where the image is.
+    for ([_]u64{ text, rodata, relocated, @intFromPtr(&__text_start), @intFromPtr(&__data_start) - 1 }, 0..) |addr, n| {
+        const alias = directMapAlias(addr) orelse return 10;
+        if (alias == addr) return 11;
+        e = kernelLeaf(alias);
+        if (e & PTE_PRESENT == 0 or e & W != 0 or e & vmm.NX == 0 or e & vmm.HUGE != 0) return 20 + @as(u32, @intCast(n));
+    }
+    const data_alias = directMapAlias(data) orelse return 12;
+    e = kernelLeaf(data_alias);
+    if (e & PTE_PRESENT == 0 or e & W == 0 or e & vmm.NX == 0) return 13;
+    // The first page of data follows the last read-only page directly.
+    const boundary = directMapAlias(@intFromPtr(&__data_start)) orelse return 14;
+    if (kernelLeaf(boundary) & W == 0) return 15;
+    // Ordinary memory in the direct map is still writable, and works.
+    const page = pmm.alloc() orelse return 16;
+    defer pmm.free(page);
+    if (kernelLeaf(@intFromPtr(pmm.physToVirt(page))) & W == 0) return 17;
+
+    if (writableExecutable(vmm.kernel_root, 3, 256, 512) != 0) return 18;
+    return 0;
+}
+
+/// For the `relro` scenario: overwrite an entry of the heap's table of
+/// functions, which is what an attacker with a kernel write would do to
+/// take over the next allocation. The table is read-only, so this faults.
+pub noinline fn writeRelocatedTable() void {
+    const table: *volatile usize = @ptrFromInt(@intFromPtr(heap.allocator.vtable));
+    table.* = 0x4141_4141;
+}
+
+/// For the `text_alias` scenario: overwrite kernel code through the direct
+/// map of physical memory, where it used to be writable. Faults.
+pub noinline fn writeTextThroughDirectMap() void {
+    const alias = directMapAlias(@intFromPtr(&writeTextThroughDirectMap)) orelse return;
+    const code: *volatile u8 = @ptrFromInt(alias);
+    code.* = 0xCC;
+}
+
+/// True if syscalls go through a pointer tests can replace. So in this
+/// (test) kernel; the normal kernel calls the dispatcher directly, which
+/// `scripts/check-dispatch.sh` checks in the kernel file itself.
+pub fn syscallHandlerReplaceable() bool {
+    return arch_syscall.replaceable;
 }

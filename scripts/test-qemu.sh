@@ -19,6 +19,10 @@
 #          guard page and be reported as a kernel stack overflow
 #   use_after_free  write to freed heap memory; the next allocation must
 #          panic, naming the address
+#   relro  write to a table of function pointers that the bootloader
+#          relocated; it is read-only once the kernel runs, so must page-fault
+#   text_alias  write to kernel code through the direct map of physical
+#          memory; it is read-only there too, so must page-fault
 #
 # After the scenarios, the addresses the kernel was loaded at are compared:
 # with KASLR they must not be the same in every boot.
@@ -205,6 +209,21 @@ run_scenario() {
             expect_line ' [^ ]*writeAfterFree\+0x'
             if grep -q 'was not caught' "$log"; then fail "the kernel did not notice a write to freed memory"; fi
             ;;
+        relro)
+            # Error 0x3: protection violation on a supervisor write to a present page.
+            expect_status 3
+            expect_line '^\*\*\* Page fault \(vector 14, error 0x3\)$'
+            expect_line '^CR2=0xffffffff[89a-f][0-9a-f]{7} \(faulting address\)$' # in the kernel image
+            expect_line '^  #0 0x[0-9a-f]{16} [^ ]*writeRelocatedTable\+0x'
+            if grep -q 'was not caught' "$log"; then fail "the kernel wrote to a relocated table"; fi
+            ;;
+        text_alias)
+            expect_status 3
+            expect_line '^\*\*\* Page fault \(vector 14, error 0x3\)$'
+            expect_line '^CR2=0xffff8[0-9a-f]{11} \(faulting address\)$' # in the direct map
+            expect_line '^  #0 0x[0-9a-f]{16} [^ ]*writeTextThroughDirectMap\+0x'
+            if grep -q 'was not caught' "$log"; then fail "the kernel wrote to its own code through the direct map"; fi
+            ;;
         *)
             echo "unknown scenario: $scenario" >&2
             exit 2
@@ -221,7 +240,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow use_after_free)
+((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow use_after_free relro text_alias)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 # KASLR: the kernel reports where it was loaded in every boot. Seeing the

@@ -31,11 +31,43 @@ test "a new bitmap has nothing to hand out" {
     try expectError(error.NotManaged, bm.free(3));
 }
 
-test "bytesFor rounds up" {
+test "bytesFor rounds up to whole 64-bit words" {
     try expectEqual(@as(usize, 0), PageBitmap.bytesFor(0));
-    try expectEqual(@as(usize, 1), PageBitmap.bytesFor(1));
-    try expectEqual(@as(usize, 1), PageBitmap.bytesFor(8));
-    try expectEqual(@as(usize, 2), PageBitmap.bytesFor(9));
+    try expectEqual(@as(usize, 8), PageBitmap.bytesFor(1));
+    try expectEqual(@as(usize, 8), PageBitmap.bytesFor(64));
+    try expectEqual(@as(usize, 16), PageBitmap.bytesFor(65));
+}
+
+test "the only free page is found wherever it is in a word" {
+    // 200 pages: three full words and a last one with 8 pages and 56 bits of padding.
+    var f: Fixture(200) = .{};
+    var bm = f.init();
+    bm.addRegion(0, 200);
+    for (0..200) |_| _ = bm.alloc().?;
+    // The first and last bit of a word, the last page, and the page before
+    // the search hint (which is past the end after the loop above).
+    for ([_]usize{ 0, 63, 64, 127, 128, 191, 192, 199 }) |page| {
+        for ([_]usize{ 0, 1, 63, 64, 65, 199, 200 }) |hint| {
+            try bm.free(page);
+            bm.hint = hint;
+            try expectEqual(@as(?usize, page), bm.alloc());
+            try expectEqual(@as(?usize, null), bm.alloc());
+            try expect(bm.consistent());
+        }
+    }
+}
+
+test "the search starts at the hint and wraps around" {
+    var f: Fixture(256) = .{};
+    var bm = f.init();
+    bm.addRegion(0, 256);
+    for (0..256) |_| _ = bm.alloc().?;
+    try bm.free(10);
+    try bm.free(70);
+    bm.hint = 20; // in the same word as page 10, but past it
+    try expectEqual(@as(?usize, 70), bm.alloc()); // the first free page from the hint on
+    try expectEqual(@as(?usize, 10), bm.alloc()); // found after wrapping, in the first word again
+    try expectEqual(@as(?usize, null), bm.alloc());
 }
 
 test "regions become free pages, and only they are handed out" {

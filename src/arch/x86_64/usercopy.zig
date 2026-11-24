@@ -10,16 +10,21 @@
 //!   again with `clac`. Interrupt entry and `syscall` entry clear AC too, so
 //!   it never leaks into other kernel code.
 //!
-//! `user_copy` starts with `lfence`. Its caller has just checked that the
-//! user range lies in user space, and that check is a branch the CPU may
-//! guess wrong; without the barrier it could start copying from a kernel
-//! address in the meantime and leave traces of what it read in the cache
-//! (Spectre variant 1, see `nospec.zig`).
+//! The copy routines clamp the user address without a branch before they
+//! use it: an address in user space is unchanged, any other becomes 0, which
+//! is never mapped (`cmp`, `sbb`, `and`, as in `nospec.zig`). Their caller
+//! has just checked that the range lies in user space, but that check is a
+//! branch the CPU may guess wrong; with the clamp, even then the copy cannot
+//! start at a kernel address and leave traces of what it read in the cache
+//! (Spectre variant 1). Only the start needs it: the copy runs upwards, and
+//! a range that begins in user space reaches the unmapped gap above it long
+//! before any kernel address. An `lfence` would close the same gap, but hold
+//! up every copy until all earlier instructions had finished.
 //!
 //! A page fault at the copy instruction (between the `user_copy_start` and
 //! `user_copy_end` labels) on a user address is expected: the user passed a
 //! bad pointer. The page-fault handler asks `fixup` and resumes at
-//! `user_copy_fault`, which makes `copy` return false.
+//! `user_copy_fault`, which makes the copy return false.
 //!
 //! Callers go through `kernel/uaccess.zig`, which validates the range first.
 
@@ -45,15 +50,35 @@ pub var smep_enabled = false;
 /// True once UMIP is on.
 pub var umip_enabled = false;
 
-// user_copy(dst: rdi, src: rsi, len: rdx) -> rax: 0 = copied, 1 = faulted.
+// user_copy_from(dst: rdi, src: rsi, len: rdx) and
+// user_copy_to(dst: rdi, src: rsi, len: rdx) -> rax: 0 = copied, 1 = faulted.
+// `from` clamps the source, `to` the destination; then both run the same copy.
+// 0x800000000000 is user_range.USER_END (checked below).
 // stac/clac are written as bytes so the assembler needs no SMAP feature flag.
 comptime {
     asm (
         \\.section .text
-        \\.global user_copy
+        \\.global user_copy_from
+        \\.type user_copy_from, @function
+        \\user_copy_from:
+        \\  movabs $0x800000000000, %rax
+        \\  cmp %rax, %rsi           # carry set exactly when src is below the end of user space
+        \\  sbb %rax, %rax           # all ones then, all zeroes otherwise
+        \\  and %rax, %rsi
+        \\  jmp user_copy
+        \\.size user_copy_from, . - user_copy_from
+        \\
+        \\.global user_copy_to
+        \\.type user_copy_to, @function
+        \\user_copy_to:
+        \\  movabs $0x800000000000, %rax
+        \\  cmp %rax, %rdi
+        \\  sbb %rax, %rax
+        \\  and %rax, %rdi
+        \\.size user_copy_to, . - user_copy_to
+        \\
         \\.type user_copy, @function
         \\user_copy:
-        \\  lfence                   # nothing below runs until the caller's range check is decided
         \\  mov %rdx, %rcx
         \\  cmpb $0, smap_enabled(%rip)
         \\  je user_copy_start
@@ -78,16 +103,29 @@ comptime {
     );
 }
 
-extern fn user_copy(dst: usize, src: usize, len: usize) callconv(.c) u64;
+comptime {
+    std.debug.assert(user_range.USER_END == 0x8000_0000_0000); // the constant in the assembly above
+}
+
+extern fn user_copy_from(dst: usize, src: usize, len: usize) callconv(.c) u64;
+extern fn user_copy_to(dst: usize, src: usize, len: usize) callconv(.c) u64;
 extern const user_copy_start: u8;
 extern const user_copy_end: u8;
 extern const user_copy_fault: u8;
 
-/// Copy `len` bytes from `src` to `dst`, where one of the two is a user
-/// address. Returns false if a user page was not accessible; some bytes may
-/// have been copied by then. The caller must have validated the user range.
-pub fn copy(dst: usize, src: usize, len: usize) bool {
-    return user_copy(dst, src, len) == 0;
+/// Copy `len` bytes from the user address `src` to the kernel address
+/// `dst`. Returns false if a user page was not accessible; some bytes may
+/// have been copied by then. The caller must have validated the user range;
+/// if it has not, an address outside user space reads from address 0
+/// instead, which fails.
+pub fn copyFromUser(dst: usize, src: usize, len: usize) bool {
+    return user_copy_from(dst, src, len) == 0;
+}
+
+/// Copy `len` bytes from the kernel address `src` to the user address
+/// `dst`. Otherwise as `copyFromUser`.
+pub fn copyToUser(dst: usize, src: usize, len: usize) bool {
+    return user_copy_to(dst, src, len) == 0;
 }
 
 /// Called by the page-fault handler for a fault in ring 0 at `rip` on

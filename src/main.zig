@@ -201,15 +201,6 @@ fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
     halt();
 }
 
-/// Idle loop run by the boot thread after initialization: yield to any ready
-/// thread, otherwise sleep until the next interrupt. Never returns.
-fn idle() noreturn {
-    while (true) {
-        thread.yield(); // let anything that's ready run
-        asm volatile ("sti; hlt"); // otherwise sleep until an interrupt
-    }
-}
-
 /// Format `args` with `fmt` and write the result to the serial port and, once
 /// it is initialized, the framebuffer console. Interrupts are disabled while
 /// writing so messages are not interleaved. Output longer than 512 bytes is
@@ -285,7 +276,7 @@ export fn kmain() callconv(.c) noreturn {
 ///
 /// Initializes the remaining subsystems in dependency order, mounts the
 /// initrd as the root filesystem, then either runs the kernel test suite
-/// (test builds) or starts `/bin/sh` and becomes the idle thread. Never returns.
+/// (test builds) or starts `/bin/sh` and blocks for good. Never returns.
 fn kmainOnStack() callconv(.c) noreturn {
     const hhdm = response(&hhdm_request).offset;
 
@@ -324,5 +315,7 @@ fn kmainOnStack() callconv(.c) noreturn {
     if (process.spawnPath("/bin/sh", .{})) |shell| process.release(shell) else |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
     print("Boot complete.\n", .{});
     if (thread.recordStackUsage()) |bytes| log.debug("boot used {d} of {d} bytes of kernel stack", .{ bytes, kstack.STACK_SIZE });
-    idle();
+    // The boot thread has nothing left to do. It does not become an idle
+    // thread that takes turns with the others: the scheduler has none.
+    thread.retire();
 }

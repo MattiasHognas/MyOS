@@ -75,8 +75,9 @@ scripts/run-qemu.sh   # boots into the shell; type "hello", or "exit"
 | `zig build test-host` | Native host unit tests. |
 | `zig build test-kernel` | Compile the test kernel only (no QEMU). |
 | `zig build check-frames` | Check that no kernel function has a stack frame near the size of a stack guard page (see [testing](testing.md#stack-frame-check)). |
-| `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (`tests`, `panic`, `fault`, `smap`, `smep`, `double_fault`, `stack_overflow`). |
-| `zig build test` | Host tests, the stack frame check and QEMU scenarios. |
+| `zig build check-dispatch` | Check that the normal kernel calls its syscall dispatcher directly (see [testing](testing.md#syscall-dispatch-check)). |
+| `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (listed in [testing](testing.md#qemu-integration-test-scenarios)). |
+| `zig build test` | Host tests, the stack frame and syscall dispatch checks and QEMU scenarios. |
 | `zig build coverage` | Host tests under kcov; report in `zig-out/coverage/`. |
 
 Build options (they apply to the test commands too):
@@ -145,7 +146,7 @@ the terminal.
 | --- | --- |
 | `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
 | `src/abi/linux.zig` | The user/kernel ABI (Linux's syscall numbers, error values and flags), imported by the kernel and by user programs (see [syscalls](syscalls.md)) |
-| `src/arch/x86_64/` | GDT/TSS with the double-fault, NMI and debug emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry and the `sysretq`/`iretq` choice (`syscall`, `sysret`), per-CPU data behind the GS base (`percpu`), x87/SSE/AVX state (`fpu`), fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), speculation guards (`nospec`), the Meltdown check (`meltdown`), port I/O |
+| `src/arch/x86_64/` | GDT/TSS with the double-fault, NMI, debug and machine-check emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry and the `sysretq`/`iretq` choice (`syscall`, `sysret`), per-CPU data behind the GS base (`percpu`), x87/SSE/AVX state (`fpu`), fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), speculation guards (`nospec`), the Meltdown check (`meltdown`), port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |
@@ -170,8 +171,9 @@ Limine loads `kernel.elf` and `initrd.tar`, answers the requests in
 `src/main.zig`, and jumps to `kmain`. `kmain` brings up, in order: serial, GDT,
 per-CPU data (GS base), IDT, framebuffer console, PMM, page tables, SMEP/SMAP, SSE/AVX and their save area, kernel symbols, ACPI, APIC, HPET,
 PCI (and NVMe if present), the APIC timer, syscalls and the initrd. The
-normal kernel then starts `/bin/sh` and becomes the idle thread; the test
-kernel runs the scenario QEMU asks for instead.
+normal kernel then starts `/bin/sh` and its boot thread blocks for good
+(there is no idle thread: with nothing to run, the CPU halts inside
+`thread.block`); the test kernel runs the scenario QEMU asks for instead.
 
 The initrd is a ustar archive built by `scripts/build.sh` from
 `zig-out/bin/` (`/bin/sh`, `/bin/hello`, `/etc/motd`, plus `/test/*` in the

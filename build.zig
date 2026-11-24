@@ -205,9 +205,18 @@ pub fn build(b: *std.Build) void {
     const frames_step = b.step("check-frames", "Check the stack frame sizes of the kernel and the test kernel");
     frames_step.dependOn(&run_frames.step);
 
-    const all = b.step("test", "Run host tests, the stack frame check and QEMU kernel tests");
+    // The normal kernel must call its syscall dispatcher directly; only the
+    // test kernel has a replaceable handler. Checks the installed kernels.
+    const run_dispatch = b.addSystemCommand(&.{ "bash", "scripts/check-dispatch.sh", "zig-out/bin/kernel.elf", "zig-out/bin/kernel-test.elf" });
+    run_dispatch.step.dependOn(&install_test_kernel.step);
+    run_dispatch.step.dependOn(b.getInstallStep());
+    const dispatch_step = b.step("check-dispatch", "Check that the normal kernel has no replaceable syscall handler");
+    dispatch_step.dependOn(&run_dispatch.step);
+
+    const all = b.step("test", "Run host tests, the stack frame and syscall dispatch checks and QEMU kernel tests");
     all.dependOn(&run_host_tests.step);
     all.dependOn(&run_frames.step);
+    all.dependOn(&run_dispatch.step);
     all.dependOn(&run_qemu.step);
 }
 

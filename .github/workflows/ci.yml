@@ -121,6 +121,9 @@ jobs:
       - name: Kernel stack frame sizes
         run: zig build check-frames -Doptimize=${{ matrix.optimize }}
 
+      - name: Syscall dispatch is direct in the normal kernel
+        run: zig build check-dispatch -Doptimize=${{ matrix.optimize }}
+
       - name: QEMU integration tests
         run: zig build test-qemu -Doptimize=${{ matrix.optimize }}
         env:

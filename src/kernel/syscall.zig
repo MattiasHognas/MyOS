@@ -168,7 +168,7 @@ fn sysClose(fd: u64) u64 {
     return 0;
 }
 
-/// Syscall handler registered with the arch layer: call the implementation
+/// Syscall handler, called by the arch layer's entry code: call the implementation
 /// selected by `f.rax` with the arguments from the frame and store its
 /// result in `f.rax`. Unknown numbers return `ENOSYS`.
 pub fn dispatch(f: *arch.Frame) void {
@@ -192,14 +192,15 @@ pub fn dispatch(f: *arch.Frame) void {
 /// A syscall is about to return to a state the CPU cannot return to (a
 /// return address outside user space, say): report it and kill the process,
 /// as a fault at that address would.
-fn badReturn(f: *const arch.Frame) noreturn {
+pub fn badReturn(f: *const arch.Frame) noreturn {
     const p = thread.current().process.?;
     root.print("\n*** thread {d} ({s}): invalid return state after syscall, killed\n", .{ thread.id(), p.name });
     root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x} CS=0x{x} SS=0x{x}\n", .{ f.rip, f.rsp, f.rflags, f.cs, f.ss });
     proc.exit(proc.EXIT_KILLED);
 }
 
-/// Enable the `syscall` instruction and route it to `dispatch`. Called once during boot.
+/// Enable the `syscall` instruction, which the arch layer routes to
+/// `dispatch`. Called once during boot.
 pub fn init() void {
-    arch.init(dispatch, badReturn);
+    arch.init();
 }
