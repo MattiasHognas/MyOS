@@ -26,6 +26,7 @@ pub const arch = struct {
         pub const meltdown = @import("arch/x86_64/meltdown.zig");
         pub const nospec = @import("arch/x86_64/nospec.zig");
         pub const percpu = @import("arch/x86_64/percpu.zig");
+        pub const smp = @import("arch/x86_64/smp.zig");
         pub const syscall = @import("arch/x86_64/syscall.zig");
         pub const sysret = @import("arch/x86_64/sysret.zig");
         pub const usercopy = @import("arch/x86_64/usercopy.zig");
@@ -73,6 +74,7 @@ pub const kernel = struct {
     /// Locks, wait queues and the timer queue.
     pub const sync = struct {
         pub const mutex = @import("kernel/sync/mutex.zig");
+        pub const lock_order = @import("kernel/sync/lock_order.zig");
         pub const raw_spinlock = @import("kernel/sync/raw_spinlock.zig");
         pub const spinlock = @import("kernel/sync/spinlock.zig");
         pub const timer_queue = @import("kernel/sync/timer_queue.zig");
@@ -142,6 +144,8 @@ export var hhdm_request linksection(".limine_requests") = limine.HhdmRequest{};
 export var kaddr_request linksection(".limine_requests") = limine.KernelAddressRequest{};
 /// Limine request for the ACPI RSDP address.
 export var rsdp_request linksection(".limine_requests") = limine.RsdpRequest{};
+/// Limine request to start the other CPUs and park them (`arch/x86_64/smp.zig`).
+export var mp_request linksection(".limine_requests") = limine.MpRequest{};
 /// Limine request for the kernel's own ELF file, used to symbolize backtraces.
 export var exec_file_request linksection(".limine_requests") = limine.ExecutableFileRequest{};
 
@@ -161,10 +165,11 @@ fn findModule(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Timer interrupt handler: let the scheduler preempt the current thread
-/// when its time slice is used up.
+/// Timer interrupt handler, on every CPU: the boot CPU advances time and
+/// runs the timers that are due, and each CPU lets the scheduler preempt
+/// its current thread when the time slice is used up.
 fn onTick(_: *idt.Frame) void {
-    kernel.timer.tick(); // first: a thread a timer wakes can run right away
+    if (arch.x86_64.percpu.current().id == 0) kernel.timer.tick(); // first: a thread a timer wakes can run right away
     thread.tick();
 }
 
@@ -275,6 +280,7 @@ export fn kmain() callconv(.c) noreturn {
     serial.init();
     gdt.init();
     arch.x86_64.percpu.init(); // after gdt.init: loading GS resets its base
+    thread.init();
     idt.init();
 
     const fb = response(&fb_request);
@@ -328,6 +334,10 @@ fn kmainOnStack() callconv(.c) noreturn {
     log.info("APIC timer: {d} ticks/ms, running at {d} Hz", .{ apic.ticks_per_ms, kernel.timer.HZ });
 
     syscall.init();
+
+    // The other CPUs, now that the boot CPU is set up the way each of them must be.
+    const mp: *volatile @TypeOf(mp_request) = &mp_request;
+    arch.x86_64.smp.init(mp.response);
 
     initrd_image = findModule("initrd.tar") orelse @panic("no initrd.tar module");
     vfs.mountRoot(tarfs.init(initrd_image));

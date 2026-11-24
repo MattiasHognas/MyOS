@@ -69,6 +69,15 @@ pub fn id() u8 {
     return @truncate(lapicReg(0x20).* >> 24);
 }
 
+/// Enable this CPU's local APIC: globally (MSR), accepting all priorities,
+/// software-enabled with the spurious vector. Every CPU runs this as it
+/// comes up; the boot CPU from `init`.
+pub fn initCpu() void {
+    cpu.wrmsr(0x1B, cpu.rdmsr(0x1B) | (1 << 11));
+    lapicReg(0x80).* = 0; // task priority: accept everything
+    lapicReg(0xF0).* = 0x100 | @as(u32, SPURIOUS); // bit 8 = enable
+}
+
 /// Initialize the interrupt controllers.
 ///
 /// Disables the legacy PIC (if ACPI reports one), enables and maps the local
@@ -77,11 +86,9 @@ pub fn id() u8 {
 pub fn init() void {
     if (acpi.has_8259) disablePic();
 
-    // Local APIC: enable globally (MSR), map, accept all priorities, software-enable.
-    cpu.wrmsr(0x1B, cpu.rdmsr(0x1B) | (1 << 11));
+    // Local APIC: map it (every CPU reaches its own at the same address), enable.
     lapic = vmm.mapMmio(acpi.lapic_addr, 0x1000);
-    lapicReg(0x80).* = 0; // task priority: accept everything
-    lapicReg(0xF0).* = 0x100 | @as(u32, SPURIOUS); // bit 8 = enable
+    initCpu();
 
     // I/O APIC: map, read how many inputs it has, start with all masked.
     if (acpi.ioapic_count == 0) @panic("no I/O APIC");
@@ -131,6 +138,14 @@ pub fn timerInit(hz: u32) void {
     const elapsed = 0xFFFF_FFFF - lapicReg(0x390).*;
     ticks_per_ms = elapsed / 10;
 
+    timerStart(hz);
+}
+
+/// Start this CPU's LAPIC timer firing `TIMER_VECTOR` `hz` times per second,
+/// at the rate `timerInit` measured on the boot CPU: the timers of all CPUs
+/// count the same clock.
+pub fn timerStart(hz: u32) void {
+    lapicReg(0x3E0).* = 0x3; // divide the bus clock by 16
     lapicReg(0x320).* = @as(u32, TIMER_VECTOR) | (1 << 17); // periodic, unmasked
     lapicReg(0x380).* = @intCast(@as(u64, ticks_per_ms) * 1000 / hz);
 }

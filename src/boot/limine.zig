@@ -102,3 +102,42 @@ pub const File = extern struct {
     string: [*:0]const u8,
     // more fields follow; not needed
 };
+
+/// One CPU, as the bootloader found it.
+pub const MpInfo = extern struct {
+    /// ACPI processor UID from the MADT.
+    processor_id: u32,
+    /// The CPU's local APIC ID.
+    lapic_id: u32,
+    /// The bootloader's own; must not be written.
+    reserved: u64,
+    /// An atomic write of a code address here makes the CPU, which the
+    /// bootloader has parked, jump to it: with a pointer to this structure
+    /// in RDI, on a 64 KiB stack of the bootloader's, in the state the boot
+    /// CPU entered the kernel in (the bootloader's page tables and GDT,
+    /// interrupts off). Unused for the boot CPU.
+    goto_address: ?*const fn (*MpInfo) callconv(.c) noreturn,
+    /// For the kernel's use.
+    extra_argument: u64,
+};
+
+/// Response to `MpRequest`.
+pub const MpResponse = extern struct {
+    revision: u64,
+    /// Bit 0: the bootloader enabled x2APIC.
+    flags: u32,
+    /// Local APIC ID of the boot CPU.
+    bsp_lapic_id: u32,
+    /// Number of CPUs, the boot CPU included.
+    cpu_count: u64,
+    cpus: [*]*MpInfo,
+};
+
+/// Ask the bootloader to start the other CPUs and park them. `flags` bit 0
+/// would ask for x2APIC; it stays clear (the kernel drives the xAPIC).
+pub const MpRequest = extern struct {
+    id: [4]u64 = .{ COMMON[0], COMMON[1], 0x95a67b819a1b857e, 0xa0b61b723b6a73e0 },
+    revision: u64 = 0,
+    response: ?*MpResponse = null,
+    flags: u64 = 0,
+};

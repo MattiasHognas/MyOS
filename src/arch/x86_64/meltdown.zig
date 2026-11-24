@@ -72,3 +72,10 @@ pub fn init() void {
     }
     @panic("this CPU is affected by Meltdown, and MyOS has no page-table isolation: any program could read all memory. Build with -Dallow-meltdown to run anyway.");
 }
+
+/// The same check on a CPU other than the boot CPU, without the log line:
+/// refuse to run programs on a machine where one CPU is affected.
+pub fn checkCpu() void {
+    if (affected(thisCpu()) and !build_options.allow_meltdown)
+        @panic("one of this machine's CPUs is affected by Meltdown, and MyOS has no page-table isolation. Build with -Dallow-meltdown to run anyway.");
+}

@@ -446,7 +446,8 @@ noinline fn backtraceInner() TestError!void {
 fn fwCfgScenario() TestError!void {
     var buf: [32]u8 = undefined;
     const scenario = fw_cfg.readFile("opt/myos/scenario", &buf) orelse return error.Failed;
-    try check(std.mem.eql(u8, scenario, if (expect_fxsave) "tests_fxsave" else "tests"));
+    const want = if (expect_fxsave) "tests_fxsave" else if (expect_cpus > 1) "tests_smp" else "tests";
+    try check(std.mem.eql(u8, scenario, want));
     try check(fw_cfg.readFile("opt/myos/does-not-exist", &buf) == null);
 }
 
@@ -851,6 +852,20 @@ fn debugTrapEntry() TestError!void {
 
 /// True in the `tests_fxsave` scenario, where QEMU hides XSAVE from the kernel.
 var expect_fxsave = false;
+/// CPUs the scenario's machine has.
+var expect_cpus: usize = 1;
+
+/// Every CPU of the machine is up, with state of its own, set up alike.
+fn cpus() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("CPU", helpers.cpuChecks(expect_cpus));
+}
+
+/// The CPU cannot run on past the conditional `swapgs` on a wrong guess.
+fn swapgsFences() TestError!void {
+    try expectChecks("swapgs fence", helpers.swapgsFences());
+}
 
 /// SSE is on, with XSAVE (or FXSAVE where the scenario says so) sized from CPUID.
 fn extendedStateSetup() TestError!void {
@@ -1284,7 +1299,9 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "lock_order")) scenarioLockOrder();
     if (std.mem.eql(u8, scenario, "sleep_with_lock")) scenarioSleepWithLock();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
-    if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave) panicFmt("unknown test scenario '{s}'", .{scenario});
+    const smp_run = std.mem.eql(u8, scenario, "tests_smp");
+    expect_cpus = if (smp_run) 4 else 1; // as `scripts/test-qemu.sh` starts QEMU
+    if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave and !smp_run) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
 }
 
@@ -1389,6 +1406,8 @@ fn runCases() noreturn {
         .{ .name = "kernel runs at a randomized address", .func = kernelRelocation },
         .{ .name = "spinlocks (interrupt state, nesting, exclusion under preemption)", .func = spinlocks },
         .{ .name = "wait queues (several waiters, order, timeouts)", .func = waitQueues },
+        .{ .name = "CPUs (all online, own per-CPU state, tables and stacks, same setup, timer interrupts)", .func = cpus },
+        .{ .name = "speculation barrier after the conditional swapgs at kernel entry", .func = swapgsFences },
         .{ .name = "locking model (locks held per CPU, idle wake-up in place, wake timers, unstarted threads)", .func = lockingModel },
         .{ .name = "kernel timers (order, expiry, cancel, sleep)", .func = timers },
         .{ .name = "mutex exclusion and hand-off under preemption", .func = mutexes },

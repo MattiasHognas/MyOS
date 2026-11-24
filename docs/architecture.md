@@ -26,8 +26,10 @@ The main objects:
   kernel's and the same in every address space; the lower half is the
   process's own.
 
-Everything runs on one CPU today. Milestone 3 changes that; the rules it
-follows are in [concurrency and locking](locking.md).
+Every CPU of the machine is started and has its own state, but threads run
+on the boot CPU only today; the others handle their interrupts and wait.
+Milestone 3 changes that; the rules it follows are in [concurrency and
+locking](locking.md).
 
 ## How a program runs
 
@@ -58,7 +60,10 @@ Limine loads the kernel and the initrd, answers the requests declared in
 4. a guarded kernel stack for the boot thread, which then leaves the
    bootloader's stack;
 5. kernel symbols, ACPI, the interrupt controllers, the HPET, PCI and NVMe,
-   the timer, system calls, and the initrd as the root filesystem.
+   the timer and system calls;
+6. the other CPUs, one at a time, each set up like the boot CPU and
+   checked against it (`src/arch/x86_64/smp.zig`);
+7. the initrd as the root filesystem.
 
 The normal kernel then starts `/bin/sh` and its boot thread blocks for good.
 The test kernel runs the test scenario QEMU asked for instead

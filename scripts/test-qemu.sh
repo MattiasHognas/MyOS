@@ -9,6 +9,8 @@
 #   tests  run the in-kernel test suite; must report MYOS_TEST_PASS
 #   tests_fxsave  the same suite on a CPU without XSAVE and AVX, so the
 #          kernel saves x87/SSE state with FXSAVE
+#   tests_smp  the same suite on a machine with four CPUs: all must come
+#          up, each with its own state, set up like the boot CPU
 #   panic  fail a subsystem assertion; must print a symbolized backtrace
 #   fault  page-fault in kernel mode; must print CR2 and a symbolized backtrace
 #   smap   read user memory from the kernel outside a user copy; must page-fault
@@ -23,6 +25,9 @@
 #          relocated; it is read-only once the kernel runs, so must page-fault
 #   text_alias  write to kernel code through the direct map of physical
 #          memory; it is read-only there too, so must page-fault
+#   lock_order  take two spinlocks against the lock order; must panic,
+#          naming both
+#   sleep_with_lock  sleep while holding a spinlock; must panic
 #
 # After the scenarios, the addresses the kernel was loaded at are compared:
 # with KASLR they must not be the same in every boot.
@@ -42,11 +47,12 @@ iso="$out/os.iso"
 timeout_s="${MYOS_QEMU_TIMEOUT:-45}"
 
 # Boot one scenario on the CPU model $2 (default: max, every feature QEMU
-# emulates); leaves the QEMU exit status in $status and the CR-stripped log
+# emulates) with $3 CPUs (default: 1); leaves the QEMU exit status in $status and the CR-stripped log
 # path in $log.
 boot() {
     local scenario="$1"
     local cpu="${2:-max}"
+    local cpus="${3:-1}"
     local dir="$out/$scenario"
     mkdir -p "$dir"
     local raw="$dir/serial.log"
@@ -61,7 +67,7 @@ boot() {
 
     set +e
     timeout --foreground "${timeout_s}s" qemu-system-x86_64 \
-        -machine q35 -cpu "$cpu" -smp 1 -m 256M \
+        -machine q35 -cpu "$cpu" -smp "$cpus" -m 256M \
         -cdrom "$iso" -boot d \
         -display none -monitor none -serial stdio \
         -no-reboot \
@@ -110,17 +116,23 @@ run_scenario() {
     case "$scenario" in
         # Without XSAVE there is no AVX either (and nothing that builds on it).
         tests_fxsave) boot "$scenario" max,xsave=off ;;
+        tests_smp) boot "$scenario" max 4 ;;
         *) boot "$scenario" ;;
     esac
     local before=${#failures[@]}
 
     case "$scenario" in
-        tests | tests_fxsave)
+        tests | tests_fxsave | tests_smp)
             expect_status 1
-            if [[ "$scenario" == tests ]]; then
-                expect_line 'extended state: XSAVE, 832 bytes, AVX on$'
-            else
+            if [[ "$scenario" == tests_fxsave ]]; then
                 expect_line 'extended state: FXSAVE, 512 bytes \(no XSAVE; AVX off\)$'
+            else
+                expect_line 'extended state: XSAVE, 832 bytes, AVX on$'
+            fi
+            if [[ "$scenario" == tests_smp ]]; then
+                expect_line 'info\(smp\): 4 of 4 CPUs online$'
+            else
+                expect_line 'info\(smp\): 1 of 1 CPUs online$'
             fi
             expect_line '^MyOS [^ ]+ booting$' # the banner names the version ("dev" unless -Dversion)
             expect_line '^MYOS_TEST_PASS$'
@@ -254,7 +266,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests tests_fxsave panic fault smap smep double_fault stack_overflow use_after_free relro text_alias lock_order sleep_with_lock)
+((${#scenarios[@]})) || scenarios=(tests tests_fxsave tests_smp panic fault smap smep double_fault stack_overflow use_after_free relro text_alias lock_order sleep_with_lock)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 # KASLR: the kernel reports where it was loaded in every boot. Seeing the

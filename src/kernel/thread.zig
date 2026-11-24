@@ -68,7 +68,17 @@
 //! and a third could run it while the first is still on its stack.
 //!
 //! The running thread and what is left of its time slice belong to the CPU
-//! (`current_thread`, `slice_left`): one of each today, per CPU from 3.2.
+//! and are kept in its `PerCpu` (`percpu.zig`), changed with interrupts
+//! off. `current` reads the running thread in one instruction, so it is
+//! right for code that can be preempted too.
+//!
+//! ## Several CPUs
+//!
+//! Each CPU starts in a context of its own, which `adoptCpu` makes a
+//! thread. Only CPUs with `PerCpu.runs_threads` take threads from the ready
+//! queue: the boot CPU today. The others are started and handle their
+//! interrupts, and join once an address space can be taken away from a CPU
+//! that still has it loaded (3.4).
 
 const std = @import("std");
 const root = @import("root");
@@ -90,10 +100,8 @@ const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
 
 const SLICE_TICKS = 5; // 50 ms at 100 Hz
 
-// What belongs to the CPU (one today): touched with interrupts off, no lock.
-var slice_left: u32 = SLICE_TICKS;
+/// The thread the boot CPU starts in.
 var boot_thread: Thread = .{ .id = 0, .stack = null, .state = .running, .on_cpu = true };
-var current_thread: *Thread = &boot_thread;
 
 /// The scheduler lock. Protects everything below, and in every `Thread`
 /// the fields `state`, `link`, `next`, `on_cpu` and `wake_pending`.
@@ -112,7 +120,6 @@ var zombies: ?*Thread = null;
 var switched_from: ?*Thread = null;
 var reaped: usize = 0;
 var switches: usize = 0;
-var halts: usize = 0;
 
 /// Append `t` to the tail of the ready queue. The scheduler lock must be held.
 fn enqueue(t: *Thread) void {
@@ -158,7 +165,7 @@ fn reap(list: ?*Thread) void {
     var rest = list;
     while (rest) |z| {
         rest = z.next;
-        assert.check(.thread, z != current_thread, "thread {d} reaps itself", .{z.id});
+        assert.check(.thread, z != current(), "thread {d} reaps itself", .{z.id});
         if (z.process) |p| proc.teardown(p);
         if (kstack.used(z.stack.?)) |bytes| kstack.record(z.id, bytes); // -Dstack-usage
         kstack.free(z.stack.?);
@@ -234,10 +241,10 @@ pub const Thread = struct {
 /// While no thread is ready the CPU sleeps here, with interrupts on, until
 /// an interrupt wakes this thread or makes another one ready.
 pub fn block() void {
-    assert.check(.thread, cpu.readFlags() & (1 << 9) == 0, "thread {d} blocks with interrupts on", .{current_thread.id});
+    assert.check(.thread, cpu.readFlags() & (1 << 9) == 0, "thread {d} blocks with interrupts on", .{current().id});
     spinlock.assertHeld(0, "blocking");
     lock.take();
-    const me = current_thread;
+    const me = current();
     if (me.wake_pending) { // the event already happened
         me.wake_pending = false;
         lock.drop();
@@ -262,7 +269,7 @@ pub fn block() void {
 /// an interrupt for that (3.4); until it does, the timer ends the halt.
 fn idleOnce() void {
     assert.check(.thread, ready_head == null, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
-    halts += 1;
+    percpu.current().halts += 1;
     lock.drop();
     asm volatile ("sti; hlt; cli");
     lock.take();
@@ -348,8 +355,38 @@ pub fn spawn(entry: *const fn () void, process: ?*Process) !*Thread {
 /// right before it moves off the bootloader's stack, so that the boot thread
 /// has a guard page like every other thread and fault reports know its stack.
 pub fn adoptBootStack(stack: []u8) void {
-    assert.check(.thread, current_thread == &boot_thread and boot_thread.stack == null, "adoptBootStack called twice or too late", .{});
+    assert.check(.thread, current() == &boot_thread and boot_thread.stack == null, "adoptBootStack called twice or too late", .{});
     boot_thread.stack = stack;
+}
+
+/// Make the boot thread the boot CPU's running thread. Called once, right
+/// after `percpu.init`.
+pub fn init() void {
+    const c = percpu.current();
+    c.thread = &boot_thread;
+    c.slice_left = SLICE_TICKS;
+}
+
+/// Create the thread that CPU `c` starts in: the context it runs on `stack`
+/// from its first instruction of kernel code. Called for a CPU that is
+/// about to be started, by the CPU that starts it. The thread is running
+/// from the outset and never in the ready queue until it is switched away
+/// from. Returns `error.OutOfMemory` if there is no memory for it.
+pub fn adoptCpu(c: *percpu.PerCpu, stack: []u8) !*Thread {
+    const t = try heap.allocator.create(Thread);
+    t.* = .{ .id = 0, .stack = stack, .state = .running, .on_cpu = true };
+    {
+        const held = lock.acquire();
+        defer lock.release(held);
+        t.id = next_id;
+        next_id += 1;
+    }
+    c.thread = t;
+    c.slice_left = SLICE_TICKS;
+    const top = @intFromPtr(stack.ptr) + stack.len;
+    c.kernel_rsp = top;
+    c.tables.?.tss.rsp0 = top;
+    return t;
 }
 
 /// Switch to the next ready thread, if there is one.
@@ -380,8 +417,10 @@ pub fn yield() void {
 /// one hands it over again.
 fn switchToNext() bool {
     spinlock.assertHeld(1, "switching threads");
+    const c = percpu.current();
+    assert.check(.thread, c.runs_threads, "CPU {d} switches threads, but does not run them yet", .{c.id});
     const next = dequeue() orelse return false;
-    const prev = current_thread;
+    const prev = current();
     assert.check(.thread, next != prev and !next.on_cpu, "thread {d} is in the ready queue while on a CPU", .{next.id});
 
     // Safe before the switch only because the lock is held across it:
@@ -392,8 +431,8 @@ fn switchToNext() bool {
     }
     next.state = .running;
     next.on_cpu = true;
-    current_thread = next;
-    slice_left = SLICE_TICKS;
+    c.thread = next;
+    c.slice_left = SLICE_TICKS;
     switches += 1;
 
     if (next.stack) |s| {
@@ -446,8 +485,11 @@ pub fn retire() noreturn {
 /// Timer tick: count down the current thread's time slice and preempt it with
 /// `yield` once the slice is used up. Called from the timer interrupt handler.
 pub fn tick() void {
-    if (slice_left > 0) slice_left -= 1;
-    if (slice_left == 0) yield();
+    const c = percpu.current();
+    c.ticks += 1;
+    if (!c.runs_threads) return;
+    if (c.slice_left > 0) c.slice_left -= 1;
+    if (c.slice_left == 0) yield();
 }
 
 /// Terminate the current thread. It is marked dead; the next thread to run
@@ -457,7 +499,7 @@ pub fn exit() noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: this thread is done
     spinlock.assertHeld(0, "exiting");
     lock.take(); // released by the thread that is switched to
-    const me = current_thread;
+    const me = current();
     assert.check(.thread, me.state == .running and me.link == .none, "thread {d} exits in state {t} ({t})", .{ me.id, me.state, me.link });
     assert.check(.thread, me.wait_queue == null, "thread {d} exits while on a wait queue", .{me.id});
     me.state = .dead;
@@ -492,9 +534,9 @@ pub fn switchCount() usize {
 
 /// Times the CPU was halted because no thread was ready, since boot.
 pub fn haltCount() usize {
-    const held = lock.acquire();
-    defer lock.release(held);
-    return halts;
+    var n: usize = 0;
+    for (0..percpu.count()) |i| n += @atomicLoad(u64, &percpu.get(i).halts, .monotonic);
+    return n;
 }
 
 /// Record how much of its kernel stack the current thread has used so far
@@ -502,20 +544,22 @@ pub fn haltCount() usize {
 /// thread has no stack of its own yet. Exited threads are recorded when they
 /// are reaped; this is for threads that never exit, like the boot thread.
 pub fn recordStackUsage() ?usize {
-    const stack = current_thread.stack orelse return null;
+    const me = current();
+    const stack = me.stack orelse return null;
     const bytes = kstack.used(stack) orelse return null;
-    kstack.record(current_thread.id, bytes);
+    kstack.record(me.id, bytes);
     return bytes;
 }
 
 /// Return the thread that is currently running.
 pub fn current() *Thread {
-    return current_thread;
+    const t = percpu.currentThread() orelse return &boot_thread; // before `init`
+    return @ptrCast(@alignCast(t));
 }
 
 /// Return the ID of the thread that is currently running. The boot thread has ID 0.
 pub fn id() usize {
-    return current_thread.id;
+    return current().id;
 }
 
 /// First code a new thread runs, reached through `thread_trampoline` (see

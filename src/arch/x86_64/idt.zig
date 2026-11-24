@@ -21,6 +21,18 @@
 //! last ones before `sysretq`/`iretq`. For them the saved CS proves nothing,
 //! so `isr_paranoid` reads the GS base MSR instead: a kernel address has the
 //! top bit set, and a user program cannot make its own base look like one.
+//!
+//! Both decisions are conditional branches, and the CPU may guess one wrong
+//! and run on for a while with the wrong GS base: the user's, at an address
+//! the program chose, with kernel code loading through it (the SWAPGS form
+//! of Spectre v1, CVE-2019-1125). An `lfence` where the two paths meet
+//! makes the CPU wait until the branch is decided, whichever way it was
+//! guessed. This is where Linux puts it (`FENCE_SWAPGS_KERNEL_ENTRY` at the
+//! join in `error_entry` and `paranoid_entry`); Linux leaves it out on CPUs
+//! where SMAP holds during speculation and programs cannot set the GS base
+//! to a kernel address, MyOS always has it. The conditional `swapgs` on the
+//! way out needs none: nothing loads through GS between it and `iretq`.
+//! `lfence` is written as bytes, because the kernel is built without SSE2.
 
 const std = @import("std");
 const root = @import("root");
@@ -109,7 +121,7 @@ fn stub(comptime vec: usize) *const fn () callconv(.naked) void {
 
 // Common path for all stubs: switch to the kernel GS base if the interrupt
 // came from ring 3 (the saved CS is at 24(%rsp) on entry and before the final
-// `add`), save registers, call interruptHandler, restore, switch GS back,
+// `add`), wait for that decision (`lfence`, see the top of the file), save registers, call interruptHandler, restore, switch GS back,
 // drop the vector and error code, iretq. With SMAP on, RFLAGS.AC is cleared
 // (`clac`, written as bytes) so an interrupt that arrives inside a user copy,
 // or from a user program that set AC, cannot run the handler (or a thread it
@@ -123,6 +135,9 @@ comptime {
         \\  jz 1f
         \\  swapgs
         \\1:
+        \\.global isr_common_fence
+        \\isr_common_fence:
+        \\  .byte 0x0f, 0xae, 0xe8
         \\  push %rax
         \\  push %rbx
         \\  push %rcx
@@ -195,6 +210,9 @@ comptime {
         \\  swapgs
         \\  mov $1, %ebx
         \\1:
+        \\.global isr_paranoid_fence
+        \\isr_paranoid_fence:
+        \\  .byte 0x0f, 0xae, 0xe8
         \\  cmpb $0, smap_enabled(%rip)
         \\  je 2f
         \\  .byte 0x0f, 0x01, 0xca
@@ -415,6 +433,20 @@ pub fn init() void {
         break :blk table;
     };
     for (stubs, 0..) |entry, i| setGate(i, @intFromPtr(entry), istFor(i));
+    load();
+}
+
+/// Addresses of the speculation barriers after the conditional `swapgs` in
+/// `isr_common` and `isr_paranoid`, for tests.
+extern const isr_common_fence: [3]u8;
+extern const isr_paranoid_fence: [3]u8;
+pub fn swapgsFences() [2]*const [3]u8 {
+    return .{ &isr_common_fence, &isr_paranoid_fence };
+}
+
+/// Make the IDT this CPU's, with `lidt`. Every CPU uses the same table; the
+/// stacks its gates name are looked up in the CPU's own TSS.
+pub fn load() void {
     const ptr = IdtPtr{ .limit = @sizeOf(@TypeOf(idt)) - 1, .base = @intFromPtr(&idt) };
     asm volatile ("lidt (%[p])"
         :

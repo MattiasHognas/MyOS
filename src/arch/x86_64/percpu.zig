@@ -7,22 +7,42 @@
 //! `enterUser` (`context.zig`). While the kernel runs, the user's value sits
 //! in the `KERNEL_GS_BASE` MSR.
 //!
-//! There is one CPU today, but the entry assembly already has its final
-//! shape; SMP (milestone 3) adds one `PerCpu` per CPU and moves the
-//! scheduler's per-CPU variables here.
+//! Every CPU has one `PerCpu`: the boot CPU's is static, the others are
+//! allocated when they are started (`smp.zig`). `get` finds them by number.
 //!
 //! What is here belongs to the CPU and is touched only by it, with
-//! interrupts off, so it needs no lock (`docs/locking.md`).
+//! interrupts off, so it needs no lock (`docs/locking.md`). Code that can
+//! be preempted must not keep the pointer from `current`: the thread may be
+//! on another CPU by the time it uses it. The one thing such code reads,
+//! the running thread, is read in a single instruction (`currentThread`).
 
 const std = @import("std");
 
 const cpu = @import("cpu.zig");
+const gdt = @import("gdt.zig");
 const lock_order = @import("../../kernel/sync/lock_order.zig");
 
 /// MSR holding the active GS base.
 pub const MSR_GS_BASE = 0xC0000101;
 /// MSR holding the inactive GS base; `swapgs` exchanges the two.
 pub const MSR_KERNEL_GS_BASE = 0xC0000102;
+
+/// Most CPUs the kernel can run on: one per local APIC ID the xAPIC has.
+pub const MAX_CPUS = 256;
+
+/// The control registers and MSRs that must be set the same on every CPU,
+/// as a CPU read them back after setting them up (`smp.readSetup`).
+pub const Setup = extern struct {
+    cr0: u64 = 0,
+    cr4: u64 = 0,
+    efer: u64 = 0,
+    star: u64 = 0,
+    lstar: u64 = 0,
+    sfmask: u64 = 0,
+    xcr0: u64 = 0,
+    gs_base: u64 = 0,
+    kernel_gs_base: u64 = 0,
+};
 
 /// State of one CPU. The assembly entry paths use the first fields by
 /// offset (`%gs:8`, `%gs:16`), so their order is fixed; see the checks below.
@@ -33,35 +53,95 @@ pub const PerCpu = extern struct {
     kernel_rsp: u64 = 0,
     /// Scratch slot for the user RSP during syscall entry (interrupts are off).
     user_rsp: u64 = 0,
-    /// CPU number, 0 for the boot CPU.
+    /// The thread this CPU runs (a `*thread.Thread`; `thread.zig` owns it).
+    thread: ?*anyopaque = null,
+    /// CPU number, 0 for the boot CPU, then in the order they were started.
     id: u32 = 0,
+    /// The CPU's local APIC ID.
+    apic_id: u32 = 0,
     /// The spinlocks this CPU holds (`sync/spinlock.zig` keeps it, in
     /// builds with assertions).
     locks: lock_order.Stack = .{},
+    /// This CPU's GDT, TSS and emergency stacks.
+    tables: ?*gdt.Tables = null,
+
+    // The scheduler's (`thread.zig`).
+    /// Timer ticks left of the running thread's time slice.
+    slice_left: u32 = 0,
+    /// Whether this CPU takes threads from the ready queue. A CPU that has
+    /// been started but only handles its interrupts does not (until 3.4).
+    runs_threads: bool = false,
+    /// Times this CPU halted because no thread was ready.
+    halts: u64 = 0,
+    /// Timer interrupts this CPU has taken.
+    ticks: u64 = 0,
+
+    // The VMM's (`vmm.zig`).
+    /// The PML4 in this CPU's CR3, as `vmm.loadRoot` last set it.
+    loaded_root: u64 = 0,
+    /// CR3 loads on this CPU. A statistic, read by tests.
+    root_loads: u64 = 0,
+
+    /// What this CPU's control registers held when it came up.
+    setup: Setup = .{},
 };
 
 comptime {
     std.debug.assert(@offsetOf(PerCpu, "self") == 0);
     std.debug.assert(@offsetOf(PerCpu, "kernel_rsp") == 8);
     std.debug.assert(@offsetOf(PerCpu, "user_rsp") == 16);
+    std.debug.assert(@offsetOf(PerCpu, "thread") == 24);
 }
 
 /// The boot CPU's state.
-var boot_cpu: PerCpu = .{ .self = undefined };
+var boot_cpu: PerCpu = .{ .self = undefined, .runs_threads = true };
 
 /// True once the boot CPU's GS base is set. Until then only the boot CPU
 /// runs, and `current` must not be called.
 var ready = false;
 
-/// Point GS at the boot CPU's `PerCpu` and clear the user GS base.
-///
-/// Must run after `gdt.init` (loading a selector into GS resets its base)
-/// and before the first entry to ring 3.
-pub fn init() void {
-    boot_cpu.self = &boot_cpu;
-    cpu.wrmsr(MSR_GS_BASE, @intFromPtr(&boot_cpu));
+/// Every CPU that has been started, by number. An entry is written once,
+/// before `online_count` is raised past it, and never changes afterwards.
+var cpus: [MAX_CPUS]?*PerCpu = @splat(null);
+var online_count: std.atomic.Value(u32) = .init(0);
+
+/// Point this CPU's GS base at `c` and clear the user GS base. Must run
+/// after the CPU's GDT is loaded (loading a selector into GS resets its
+/// base) and before its first entry to ring 3.
+pub fn install(c: *PerCpu) void {
+    c.self = c;
+    cpu.wrmsr(MSR_GS_BASE, @intFromPtr(c));
     cpu.wrmsr(MSR_KERNEL_GS_BASE, 0);
+}
+
+/// Set up the boot CPU's state. Must run after `gdt.init`.
+pub fn init() void {
+    boot_cpu.tables = gdt.bootTables();
+    install(&boot_cpu);
     ready = true;
+    register(&boot_cpu);
+}
+
+/// Count `c` as online and give it the next CPU number. Called by each CPU
+/// for itself, one at a time (`smp.zig` starts them one after the other).
+pub fn register(c: *PerCpu) void {
+    const n = online_count.load(.acquire);
+    c.id = n;
+    cpus[n] = c;
+    online_count.store(n + 1, .release);
+}
+
+/// Number of CPUs that are up.
+pub fn count() usize {
+    return online_count.load(.acquire);
+}
+
+/// The state of CPU number `n`, which must be below `count()`. Only its
+/// own CPU may change it; others may read what does not change, and
+/// statistics.
+pub fn get(n: usize) *PerCpu {
+    std.debug.assert(n < count());
+    return cpus[n].?;
 }
 
 /// The running CPU's state, or null this early in boot that there is none
@@ -70,7 +150,9 @@ pub inline fn currentIfReady() ?*PerCpu {
     return if (ready) current() else null;
 }
 
-/// The running CPU's state. Only valid in ring 0 after `init`.
+/// The running CPU's state. Only valid in ring 0 after `init`, and only
+/// for as long as the caller cannot be moved to another CPU: with
+/// interrupts off.
 pub inline fn current() *PerCpu {
     return asm volatile ("mov %%gs:0, %[ret]"
         : [ret] "=r" (-> *PerCpu),
@@ -81,4 +163,15 @@ pub inline fn current() *PerCpu {
 /// scheduler on every thread switch with the new thread's stack top.
 pub fn setKernelStack(top: u64) void {
     current().kernel_rsp = top;
+}
+
+/// The thread the running CPU runs (`PerCpu.thread`), or null before
+/// `init`. One instruction, so the answer is right even if the caller is
+/// preempted and moved to another CPU around it: it is the caller's own
+/// thread either way.
+pub inline fn currentThread() ?*anyopaque {
+    if (!ready) return null;
+    return asm volatile ("mov %%gs:24, %[ret]"
+        : [ret] "=r" (-> ?*anyopaque),
+    );
 }

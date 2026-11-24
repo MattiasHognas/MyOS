@@ -4,15 +4,17 @@ How kernel code stays correct when it can be interrupted, preempted and, from
 milestone 3 on, run on several CPUs at once. This is the model the SMP work
 follows ([roadmap 3.1](todo.md#31-synchronization)).
 
-**Status: the locks are in the code; there is still one CPU.** Everything
-under "Locks and what they protect", "Lock order", "Sleeping and waking" and
-"Checks in the code" is implemented and tested, as far as one CPU can test
-it: every critical section that relied on "interrupts off means nothing else
-runs" now takes a lock that other CPUs would take too. What waits for the
-CPUs themselves is marked "not yet" below: state that belongs to a CPU is
-still one global copy (3.2), and nothing is sent from one CPU to another
-(3.4), which the TLB rules and waking an idle CPU need. The blocking
-protocols have been model-checked (see [the end](#what-has-been-checked)).
+**Status: the locks are in the code, every CPU is started, and one runs
+threads.** Everything under "Locks and what they protect", "Lock order",
+"Sleeping and waking", "Per-CPU state" and "Checks in the code" is
+implemented and tested, as far as it can be while threads run on one CPU:
+every critical section that relied on "interrupts off means nothing else
+runs" takes a lock that other CPUs take too, and what belongs to a CPU is in
+its own structure. The other CPUs are up and take interrupts, but do not
+run threads until one CPU can interrupt another (3.4), which the TLB rules,
+tearing down an address space and waking an idle CPU need; those parts are
+marked "not yet" below. The blocking protocols have been model-checked (see
+[the end](#what-has-been-checked)).
 
 ## The model in one page
 
@@ -189,27 +191,41 @@ waiting for the spinning thread.
 
 ## Per-CPU state
 
-Reached through GS (`percpu.zig`); touched only with interrupts off, by the
-CPU it belongs to, without a lock.
-
-There today:
-
-- The kernel stack pointer for `syscall` entry.
-- The spinlocks the CPU holds (see [checks](#checks-in-the-code)).
-
-Still one global copy, to move there in 3.2:
+Each CPU has a `PerCpu` structure, reached through GS (`percpu.zig`). It is
+touched only by the CPU it belongs to, with interrupts off, without a lock.
+In it:
 
 - The running thread and what is left of its time slice.
+- The kernel stack pointer for `syscall` entry.
+- The CPU's own GDT, TSS and emergency stacks; the TSS holds the kernel
+  stack pointer for interrupts from ring 3.
 - The loaded address space (`vmm.loadedRoot`) and the count of CR3 loads.
-- The kernel stack pointer for interrupts from ring 3 (the TSS), so each CPU
-  gets its own GDT, TSS and emergency stacks.
-- The thread whose extended (x87/SSE/AVX) state is in the registers.
-- The count of halts.
+- The spinlocks the CPU holds (see [checks](#checks-in-the-code)).
+- Counts of halts and of timer interrupts.
 
-Each CPU starts in a boot context of its own, which becomes a thread and
-retires (`thread.retire`) once the CPU is up. There is still no idle thread:
-a CPU with nothing to run halts inside `block` of whichever thread it ran
-last.
+**Code that can be preempted must not hold on to the pointer to its CPU's
+structure**: by the time it uses it, the thread may be on another CPU. The
+one thing such code needs, the running thread, is read in a single
+instruction relative to GS (`thread.current`), and is the caller's own
+thread wherever it runs. Everything else is read with interrupts off.
+
+Extended (x87/SSE/AVX) state needs no entry here: it is saved into the
+thread whenever a user thread is switched away from, so the registers of a
+CPU never hold the only copy of a thread that is not running on it.
+
+Another CPU may read from a `PerCpu` what never changes once the CPU is up
+(its number, its tables) and the counts, as statistics.
+
+Each CPU starts in a context of its own, which becomes a thread
+(`thread.adoptCpu`). There is still no idle thread: a CPU with nothing to
+run halts inside `block` of whichever thread it ran last. Not yet: the CPUs
+other than the boot CPU do not run threads; their starting context stays
+their thread, and halts between interrupts.
+
+**Time is kept by one CPU.** Every CPU has a timer interrupt, for its own
+time slices; only the boot CPU's advances the tick count and runs the timer
+queue. So a timer callback runs on the boot CPU, while the thread that armed
+it may be anywhere.
 
 ## Address spaces and the TLB
 
@@ -293,9 +309,9 @@ with and are the first to split when measurements say so.
   The global scheduler lock above is the starting point because it makes the
   switch-out rule simple. Per-CPU queues replace the lock with one per
   queue; the per-thread `on_cpu` flag they need is already there.
-- **Who advances time.** One CPU counts ticks and runs the timer queue, or
-  every CPU has a queue of its own ([3.3](todo.md#33-bring-up-application-processors)).
-  The callbacks are safe either way.
+- **A timer queue per CPU.** One CPU counts ticks and runs the one queue,
+  which is enough until timers are armed often from every CPU (futex
+  timeouts, 7). The callbacks are safe either way.
 - **One process-tree lock or finer ones.** One lock is enough until `fork`
   or `wait4` make the tree hot.
 
@@ -325,4 +341,4 @@ neither; they follow from reading the code.
 What one CPU cannot show is two CPUs inside these protocols at the same
 moment. The tests that need that are listed in
 [roadmap 3.4](todo.md#34-smp-scheduling-and-memory) and run once the other
-CPUs are started.
+CPUs run threads.

@@ -211,7 +211,6 @@ pub fn heapInUse() usize {
 var sched_log: [8]u8 = undefined;
 var sched_len: usize = 0;
 var sched_done: usize = 0;
-var sched_waiter: ?*thread.Thread = null;
 
 /// Scheduler test worker: append `tag` to the log three times, yielding after
 /// Each, then report completion. Interrupts stay off so only the explicit
@@ -223,8 +222,7 @@ fn schedWorker(tag: u8) void {
         sched_len += 1;
         thread.yield();
     }
-    sched_done += 1;
-    if (sched_done == 2) thread.wake(sched_waiter.?);
+    signalDone(&sched_done, &done_queue);
 }
 
 /// First scheduler test worker.
@@ -248,11 +246,10 @@ pub fn schedulerRoundRobin() bool {
     defer cpu.restoreInterrupts(flags);
     sched_len = 0;
     sched_done = 0;
-    sched_waiter = thread.current();
     const a = thread.spawn(schedWorkerA, null) catch return false;
     const b = thread.spawn(schedWorkerB, null) catch return false;
     if (b.id <= a.id or a.state != .ready) return false;
-    while (sched_done < 2) thread.block();
+    waitForDone(&sched_done, 2, &done_queue);
     return sched_len == 6 and
         std.mem.eql(u8, sched_log[0..6], "ABABAB") and
         heap.stats().bytes_in_use == in_use and // both threads reaped,
@@ -663,7 +660,7 @@ noinline fn touchStack(comptime bytes: usize) usize {
 // State of the stack usage test's worker thread.
 var usage_needed: ?usize = null;
 var usage_measured: ?usize = null;
-var usage_waiter: ?*thread.Thread = null;
+var usage_done: usize = 0;
 
 /// Stack usage test worker: write to 1 KiB of stack and compare the measured
 /// usage with how deep that write really was. Nothing is assumed about how
@@ -675,7 +672,7 @@ fn stackUsageWorker() void {
     const lowest = touchStack(1024);
     usage_needed = @intFromPtr(mine.ptr) + mine.len - lowest;
     usage_measured = kstack.used(mine);
-    thread.wake(usage_waiter.?);
+    signalDone(&usage_done, &done_queue);
 }
 
 /// Check the stack high-water mark: a fresh stack counts as unused, writing
@@ -705,9 +702,9 @@ pub fn stackUsage() u32 {
     // A thread's usage is at least as deep as the lowest address it wrote to.
     usage_needed = null;
     usage_measured = null;
-    usage_waiter = thread.current();
+    usage_done = 0;
     _ = thread.spawn(stackUsageWorker, null) catch return 9;
-    thread.block();
+    waitForDone(&usage_done, 1, &done_queue);
     const needed = usage_needed orelse return 10;
     const measured = usage_measured orelse return 11;
     if (needed < 1024 or measured < needed or measured > kstack.STACK_SIZE) return 12;
@@ -775,7 +772,6 @@ pub fn doubleFaultInThread() void {
 // State shared by the PMM stress workers.
 var pmm_stress_done: usize = 0;
 var pmm_stress_errors: usize = 0;
-var pmm_stress_waiter: ?*thread.Thread = null;
 var pmm_stress_next_tag: u64 = 1;
 
 /// PMM stress worker: with interrupts on (so the timer preempts it), keep
@@ -783,10 +779,12 @@ var pmm_stress_next_tag: u64 = 1;
 /// checking that every stamp is still there before freeing the batch. A page
 /// handed to both workers shows up as a foreign stamp or a duplicate.
 fn pmmStressWorker() void {
-    const irq = cpu.saveAndDisableInterrupts();
-    const tag = pmm_stress_next_tag;
-    pmm_stress_next_tag += 1;
-    cpu.restoreInterrupts(irq);
+    const tag = blk: {
+        const held = test_lock.acquire();
+        defer test_lock.release(held);
+        pmm_stress_next_tag += 1;
+        break :blk pmm_stress_next_tag - 1;
+    };
 
     var pages: [32]u64 = undefined;
     var errors: usize = 0;
@@ -809,9 +807,12 @@ fn pmmStressWorker() void {
     }
 
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
-    pmm_stress_errors += errors;
-    pmm_stress_done += 1;
-    if (pmm_stress_done == 2) thread.wake(pmm_stress_waiter.?);
+    {
+        const held = test_lock.acquire();
+        defer test_lock.release(held);
+        pmm_stress_errors += errors;
+    }
+    signalDone(&pmm_stress_done, &done_queue);
 }
 
 /// Run two preemptible kernel threads that allocate and free pages at the
@@ -823,10 +824,9 @@ pub fn pmmConcurrentStress() bool {
     const before = pmm.free_pages;
     pmm_stress_done = 0;
     pmm_stress_errors = 0;
-    pmm_stress_waiter = thread.current();
     _ = thread.spawn(pmmStressWorker, null) catch return false;
     _ = thread.spawn(pmmStressWorker, null) catch return false;
-    while (pmm_stress_done < 2) thread.block();
+    waitForDone(&pmm_stress_done, 2, &done_queue);
     return pmm_stress_errors == 0 and pmm.free_pages == before and pmm.consistent();
 }
 
@@ -850,15 +850,13 @@ pub fn enterUserPageSpace() bool {
 var pair_path: []const u8 = "";
 var pair_codes: [2]?u64 = .{ null, null };
 var pair_done: usize = 0;
-var pair_waiter: ?*thread.Thread = null;
 
 /// Runner thread `index`: run the program and report its exit status.
 fn pairRunner(index: usize) void {
     const code = runProgram(pair_path);
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
     pair_codes[index] = code;
-    pair_done += 1;
-    if (pair_done == 2) thread.wake(pair_waiter.?);
+    signalDone(&pair_done, &done_queue);
 }
 
 fn pairRunnerA() void {
@@ -878,10 +876,9 @@ pub fn runPair(path: []const u8) bool {
     pair_path = path;
     pair_codes = .{ null, null };
     pair_done = 0;
-    pair_waiter = thread.current();
     _ = thread.spawn(pairRunnerA, null) catch return false;
     _ = thread.spawn(pairRunnerB, null) catch return false;
-    while (pair_done < 2) thread.block();
+    waitForDone(&pair_done, 2, &done_queue);
     return pair_codes[0] == 0 and pair_codes[1] == 0;
 }
 
@@ -1635,7 +1632,6 @@ var lock_overlaps: usize = 0;
 var lock_irq_on: usize = 0;
 var lock_errors: usize = 0;
 var lock_done: usize = 0;
-var lock_waiter: ?*thread.Thread = null;
 
 /// Longer than a time slice (50 ms), so a thread that could be preempted
 /// while it waits is preempted.
@@ -1664,8 +1660,7 @@ fn lockWorker() void {
         if (pmm.alloc()) |page| pmm.free(page) else lock_errors += 1;
     }
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
-    lock_done += 1;
-    if (lock_done == 2) thread.wake(lock_waiter.?);
+    signalDone(&lock_done, &done_queue);
 }
 
 /// Prove that the physical allocator's critical sections exclude other
@@ -1684,12 +1679,11 @@ pub fn pmmLockHolds() u32 {
     lock_irq_on = 0;
     lock_errors = 0;
     lock_done = 0;
-    lock_waiter = thread.current();
     const a = thread.spawn(lockWorker, null) catch return 1;
     const b = thread.spawn(lockWorker, null) catch return 1;
     lock_workers = .{ a.id, b.id };
     pmm.critical_hook = lockHook;
-    while (lock_done < 2) thread.block();
+    waitForDone(&lock_done, 2, &done_queue);
     pmm.critical_hook = null;
     lock_workers = .{ 0, 0 };
 
@@ -1730,9 +1724,12 @@ var spin_counter: u64 = 0;
 var spin_done: usize = 0;
 var spin_waiter: WaitQueue = .{};
 
-/// The lock of the conditions the tests in this section wait for: their
-/// counters of finished threads, and the wait queues that go with them.
+/// The lock of the conditions the tests wait for: their counters of
+/// finished threads, and the wait queues that go with them.
 var test_lock: SpinLock = .{};
+/// Where a test's main thread waits for its workers (`waitForDone`), for
+/// the tests that have no queue of their own.
+var done_queue: WaitQueue = .{};
 
 /// Count one more in `counter` and wake everyone on `queue`, under `test_lock`.
 fn signalDone(counter: *usize, queue: *WaitQueue) void {
@@ -2306,6 +2303,130 @@ pub fn sleepHoldingSpinlock() void {
 }
 
 // ---------------------------------------------------------------------------
+// Per-CPU state and the other CPUs (roadmap 3.2, 3.3)
+
+const smp = kernel_root.arch.x86_64.smp;
+
+/// True if the byte ranges `a` and `b` share a byte.
+fn overlap(a: []const u8, b: []const u8) bool {
+    const a_low = @intFromPtr(a.ptr);
+    const b_low = @intFromPtr(b.ptr);
+    return a_low < b_low + b.len and b_low < a_low + a.len;
+}
+
+/// Check the speculation barriers at kernel entry: where the two paths of
+/// the conditional `swapgs` meet, in the common and in the emergency entry
+/// path, the next instruction is `lfence`, and a `swapgs` comes right
+/// before it (so the barrier is on both paths, not after one of them).
+/// Returns 0, or the number of the first failing check.
+pub fn swapgsFences() u32 {
+    const lfence = [3]u8{ 0x0f, 0xae, 0xe8 };
+    const swapgs = [3]u8{ 0x0f, 0x01, 0xf8 };
+    for (idt.swapgsFences(), 0..) |fence, n| {
+        if (!std.mem.eql(u8, fence, &lfence)) return @intCast(1 + 2 * n);
+        // The bytes before the join are the skipped path: it ends in the
+        // `swapgs` (followed, in the emergency path, by a 5-byte `mov`).
+        const before = @as([*]const u8, @ptrCast(fence)) - 8;
+        var found = false;
+        for (0..6) |at| { // by hand: `std.mem.indexOf` has a frame of 2.5 KiB in Debug builds
+            if (std.mem.eql(u8, before[at..][0..3], &swapgs)) found = true;
+        }
+        if (!found) return @intCast(2 + 2 * n);
+    }
+    return 0;
+}
+
+/// Check the CPUs: `want` of them are up, which is all the machine has;
+/// each has its own per-CPU structure, reachable by its number, its own
+/// GDT, TSS and emergency stacks (guarded, except the boot CPU's), its own
+/// kernel stack and its own thread; the control registers and `syscall`
+/// MSRs every CPU must have are the same on all of them and each one's GS
+/// base points at its own structure; every CPU takes timer interrupts,
+/// with no lock left held; only the boot CPU runs threads, and time
+/// advances once per tick however many CPUs there are. Must be called with
+/// interrupts on. Returns 0, or the number of the first failing check.
+pub fn cpuChecks(want: usize) u32 {
+    if (!interruptsOn()) return 1;
+    const n = percpu.count();
+    if (n != want or smp.detectedCount() != want) return 2;
+
+    // This CPU, as its own code sees it.
+    const mine = blk: {
+        const flags = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(flags);
+        const c = percpu.current();
+        if (c != percpu.get(0) or c.id != 0 or !c.runs_threads) return 3; // the tests run on the boot CPU
+        if (c.thread != @as(?*anyopaque, thread.current())) return 4;
+        if (c.apic_id != apic.id()) return 5;
+        if (c.loaded_root != cpu.readCr3() & ~@as(u64, 0xFFF)) return 6;
+        break :blk smp.readSetup();
+    };
+    if (mine.gs_base != @intFromPtr(percpu.get(0))) return 7;
+
+    for (0..n) |i| {
+        const c = percpu.get(i);
+        const base: u32 = @intCast(100 * (i + 1));
+        if (c.self != c or c.id != i) return base + 1;
+        const tables = c.tables orelse return base + 2;
+        const t: *thread.Thread = @ptrCast(@alignCast(c.thread orelse return base + 3));
+        const stack = t.stack orelse return base + 4;
+        if (!t.on_cpu or t.state != .running or t.link != .none) return base + 5;
+        // Its kernel stack is where `syscall` and interrupts from ring 3 would land.
+        const top = @intFromPtr(stack.ptr) + stack.len;
+        if (i != 0 and (c.kernel_rsp != top or tables.tss.rsp0 != top)) return base + 6;
+        if (!kstack.owns(stack)) return base + 7;
+        // Its emergency stacks: where its TSS says, and guarded on every
+        // CPU that was started after memory management was up.
+        for (gdt.IST_INDEXES) |index| {
+            const ist = gdt.istStackOf(tables, index);
+            if (tables.tss.ist[index - 1] != @intFromPtr(ist.ptr) + ist.len) return base + 8;
+            if (i != 0 and (!kstack.owns(ist) or !kstack.isGuard(@intFromPtr(ist.ptr) - 1))) return base + 9;
+            if (overlap(ist, stack)) return base + 10;
+        }
+        // The same protections as the boot CPU, and its own GS base.
+        if (!smp.sameSetup(c.setup, mine)) return base + 11;
+        if (c.setup.gs_base != @intFromPtr(c) or c.setup.kernel_gs_base != 0) return base + 12;
+        if (c.loaded_root != vmm.kernel_root and i != 0) return base + 13;
+        if (c.runs_threads != (i == 0)) return base + 14;
+
+        // Nothing is shared with another CPU.
+        for (0..i) |j| {
+            const o = percpu.get(j);
+            if (o == c or o.apic_id == c.apic_id or o.tables == c.tables or o.thread == c.thread) return base + 15;
+            const other: *thread.Thread = @ptrCast(@alignCast(o.thread.?));
+            if (overlap(other.stack.?, stack)) return base + 16;
+            for (gdt.IST_INDEXES) |index| {
+                for (gdt.IST_INDEXES) |other_index| {
+                    if (overlap(gdt.istStackOf(tables, index), gdt.istStackOf(o.tables.?, other_index))) return base + 17;
+                }
+            }
+        }
+    }
+
+    // Every CPU takes its timer interrupt: from ring 0, through the common
+    // entry path, on its own stack, with its own GS base. Time itself
+    // advances once per tick, not once per CPU.
+    var ticks_before: [8]u64 = undefined;
+    if (n > ticks_before.len) return 8;
+    for (0..n) |i| ticks_before[i] = @atomicLoad(u64, &percpu.get(i).ticks, .monotonic);
+    const t0 = timer.now();
+    const ns0 = hpet.nanos();
+    timer.sleepTicks(10);
+    const ticks = timer.now() - t0;
+    const ms = (hpet.nanos() - ns0) / 1_000_000;
+    if (ticks < 10 or ticks > 13) return 9;
+    if (ms < 100 or ms > 100 + 10 * 5) return 10; // 10 ms a tick: nobody else advanced it
+    for (0..n) |i| {
+        const c = percpu.get(i);
+        const took = @atomicLoad(u64, &c.ticks, .monotonic) - ticks_before[i];
+        if (took < 8 or took > 15) return @intCast(20 + i);
+        if (i != 0 and c.locks.len != 0) return @intCast(30 + i); // idle between interrupts: nothing held
+        if (i != 0 and c.halts != 0) return @intCast(40 + i); // it has not been in the scheduler
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Process and scheduler lifecycle (roadmap 2.7)
 
 /// Sleep until `p` has exited and its thread has been reaped (its address
@@ -2800,10 +2921,9 @@ const PTE_PRESENT: u64 = vmm.PRESENT;
 /// A kernel address nothing else maps, for `kernelTlbFlush`.
 const SPARE_KERNEL_PAGE: u64 = 0xFFFF_B000_0010_0000;
 
-var hog_done = false;
+var hog_done: usize = 0;
 var hog_switches: usize = 0;
 var hog_halts: usize = 0;
-var hog_waiter: ?*thread.Thread = null;
 /// How long the CPU-bound thread of `idleChecks` runs: several time slices.
 const HOG_NS = 200_000_000;
 
@@ -2819,8 +2939,7 @@ fn hogWorker() void {
     defer cpu.restoreInterrupts(flags);
     hog_switches = thread.switchCount() - switches;
     hog_halts = thread.haltCount() - halts;
-    hog_done = true;
-    thread.wake(hog_waiter.?);
+    signalDone(&hog_done, &done_queue);
 }
 
 var retired_started = false;
@@ -2855,11 +2974,10 @@ pub fn idleChecks() u32 {
     thread.yield(); // let it run up to its `block`
     if (!retired_started or retired.state != .blocked or retired.link != .none) return 2;
 
-    hog_done = false;
-    hog_waiter = thread.current();
+    hog_done = 0;
     _ = thread.spawn(hogWorker, null) catch return 3;
     const t0 = hpet.nanos();
-    while (!hog_done) thread.block();
+    waitForDone(&hog_done, 1, &done_queue);
     const elapsed = hpet.nanos() - t0;
     if (hog_switches != 0) return 4; // something else was given the CPU
     if (hog_halts != 0) return 5; // the CPU slept while the thread was ready

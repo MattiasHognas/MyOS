@@ -107,36 +107,62 @@ pub fn detect(leaf1_ecx: u32, leaf_d_eax: u32) Config {
     return .{ .mode = .xsave, .xcr0 = features, .area_size = FXSAVE_SIZE + 64 };
 }
 
-/// Enable x87, SSE and (where supported) AVX for user code on this CPU and
-/// choose how their state is saved. Must run on every CPU before it enters
-/// ring 3. x86-64 guarantees FXSAVE and SSE2, so there is nothing to fall
-/// back to below that.
+/// Enable x87, SSE and (where supported) AVX for user code on the boot CPU
+/// and choose how their state is saved. x86-64 guarantees FXSAVE and SSE2,
+/// so there is nothing to fall back to below that. The other CPUs follow
+/// with `initCpu`.
 pub fn init() void {
-    // No emulation, no lazy-switching traps, native x87 error reporting.
-    cpu.writeCr0((cpu.readCr0() & ~(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE);
-    var cr4 = cpu.readCr4() | CR4_OSFXSR | CR4_OSXMMEXCPT;
-
     const leaf1 = cpu.cpuid(1, 0);
     const leaf_d_eax = if (cpu.cpuid(0, 0).eax >= 0xD) cpu.cpuid(0xD, 0).eax else 0;
     const config = detect(leaf1.ecx, leaf_d_eax);
     mode = config.mode;
     xcr0 = config.xcr0;
     area_size = config.area_size;
+    const size = enable();
     if (mode == .xsave) {
-        cpu.writeCr4(cr4 | CR4_OSXSAVE);
-        writeXcr0(xcr0);
-        // EBX: the area size for the features now enabled in XCR0.
-        const size = cpu.cpuid(0xD, 0).ebx;
         if (size < FXSAVE_SIZE + 64 or size > MAX_AREA_SIZE) @panic("fpu: unexpected XSAVE area size");
         area_size = size;
-    } else cpu.writeCr4(cr4);
-    cr4 = cpu.readCr4();
-
-    asm volatile ("fninit"); // the boot CPU's own registers: a defined state
+    }
     switch (mode) {
         .xsave => log.info("extended state: XSAVE, {d} bytes, AVX {s}", .{ area_size, if (avxEnabled()) "on" else "not supported" }),
         .fxsave => log.info("extended state: FXSAVE, {d} bytes (no XSAVE; AVX off)", .{area_size}),
     }
+}
+
+/// Enable on this CPU what `init` chose on the boot CPU. Must run on every
+/// CPU before it enters ring 3. A thread's saved state has one layout, so a
+/// CPU that would lay it out differently cannot be used: returns false then.
+pub fn initCpu() bool {
+    return enable() == area_size;
+}
+
+/// Set the control registers for the chosen mode and give the registers a
+/// defined state. Returns the size of the save area on this CPU.
+fn enable() usize {
+    // No emulation, no lazy-switching traps, native x87 error reporting.
+    cpu.writeCr0((cpu.readCr0() & ~(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE);
+    const cr4 = cpu.readCr4() | CR4_OSFXSR | CR4_OSXMMEXCPT;
+    var size: usize = FXSAVE_SIZE;
+    if (mode == .xsave) {
+        cpu.writeCr4(cr4 | CR4_OSXSAVE);
+        writeXcr0(xcr0);
+        // EBX: the area size for the features now enabled in XCR0.
+        size = cpu.cpuid(0xD, 0).ebx;
+    } else cpu.writeCr4(cr4);
+    asm volatile ("fninit");
+    return size;
+}
+
+/// Read extended control register 0. Only with XSAVE enabled.
+pub fn readXcr0() u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile (".byte 0x0f, 0x01, 0xd0" // xgetbv
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+        : [idx] "{ecx}" (@as(u32, 0)),
+    );
+    return (@as(u64, hi) << 32) | lo;
 }
 
 /// Fill `area` (at least `areaSize()` bytes) with the state a new thread

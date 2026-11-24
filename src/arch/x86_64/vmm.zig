@@ -42,6 +42,7 @@ const cpu = @import("cpu.zig");
 const assert = @import("../../kernel/debug/assert.zig");
 const panicFmt = @import("../../kernel/debug/panic.zig").panicFmt;
 const pmm = @import("../../kernel/pmm.zig");
+const percpu = @import("percpu.zig");
 const SpinLock = @import("../../kernel/sync/spinlock.zig").SpinLock;
 
 /// Page table entry flag: the mapping is valid.
@@ -71,10 +72,8 @@ var mmio_lock: SpinLock = .{ .rank = .kernel_region };
 /// Physical address of the kernel's PML4. Set by `init`.
 pub var kernel_root: u64 = 0;
 
-// The PML4 in CR3, as `loadRoot` last set it. One CPU today; per CPU with SMP (3.2).
-var loaded_root: u64 = 0;
-// CR3 loads since boot. A statistic, read by tests.
-var root_loads: usize = 0;
+// The PML4 in a CPU's CR3 and its count of CR3 loads are that CPU's
+// (`PerCpu.loaded_root`, `root_loads`).
 
 const CR4_PGE: u64 = 1 << 7;
 
@@ -275,35 +274,39 @@ pub fn createAddressSpace() error{OutOfMemory}!u64 {
     return root;
 }
 
-/// Switch to the address space whose PML4 is at physical address `root` by
-/// loading CR3. This flushes the TLB entries of user addresses; the kernel's
-/// are global and stay. Interrupts must be off, or the caller must otherwise
-/// know that no thread switch can happen in between.
+/// Switch this CPU to the address space whose PML4 is at physical address
+/// `root` by loading CR3. This flushes the TLB entries of user addresses;
+/// the kernel's are global and stay. Interrupts must be off.
 pub fn loadRoot(root: u64) void {
     asm volatile ("mov %[r], %%cr3"
         :
         : [r] "r" (root),
         : .{ .memory = true });
-    loaded_root = root;
-    root_loads += 1;
+    const c = percpu.current();
+    c.loaded_root = root;
+    c.root_loads += 1;
 }
 
-/// The PML4 that is loaded now.
+/// The PML4 that is loaded on this CPU now.
 pub fn loadedRoot() u64 {
-    return loaded_root;
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    return percpu.current().loaded_root;
 }
 
-/// CR3 loads since boot. Tests use it to see which switches reload it.
+/// CR3 loads on this CPU since boot. Tests use it to see which switches reload it.
 pub fn rootLoads() usize {
-    return root_loads;
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    return percpu.current().root_loads;
 }
 
-/// Make sure the address space `root` is not the loaded one, by switching
-/// to the kernel's own page tables if it is. Must be called before `root`
-/// is destroyed: a kernel thread may still be running on the address space
-/// of the last process that ran (`thread.zig`). Interrupts must be off.
+/// Make sure the address space `root` is not the one loaded on this CPU, by
+/// switching to the kernel's own page tables if it is. Must be called before
+/// `root` is destroyed: a kernel thread may still be running on the address
+/// space of the last process that ran (`thread.zig`). Interrupts must be off.
 pub fn unloadRoot(root: u64) void {
-    if (loaded_root == root) loadRoot(kernel_root);
+    if (percpu.current().loaded_root == root) loadRoot(kernel_root);
 }
 
 /// Count the page tables under the table at `phys`, itself included.
@@ -332,7 +335,7 @@ pub fn userTablePages(root: u64) usize {
 /// itself. The shared kernel half is left alone. `root` must not be the
 /// currently loaded address space (`unloadRoot`).
 pub fn destroyAddressSpace(root: u64) void {
-    assert.check(.vmm, root != loaded_root, "destroying the loaded address space 0x{x}", .{root});
+    assert.check(.vmm, root != loadedRoot(), "destroying the loaded address space 0x{x}", .{root});
     for (table(root)[0..256]) |e| {
         if (e & PRESENT != 0) freeTable(e & ADDR_MASK, 2);
     }
@@ -394,8 +397,6 @@ fn mapDirect(phys: u64, hhdm: u64, ro_start: u64, ro_end: u64) void {
 /// Requires `pmm.init` to have run. Panics if memory runs out: there is
 /// nothing to fall back to this early.
 pub fn init(mm: *const limine.MemmapResponse, k: *const limine.KernelAddressResponse, hhdm: u64) void {
-    cpu.wrmsr(0xC0000080, cpu.rdmsr(0xC0000080) | (1 << 11)); // EFER.NXE: allow the NX bit
-
     kernel_root = allocTable() catch @panic("vmm: no memory for the kernel page tables");
 
     const kh = table(kernel_root);
@@ -417,10 +418,30 @@ pub fn init(mm: *const limine.MemmapResponse, k: *const limine.KernelAddressResp
     mapKernelRange(&__relro_start, &__relro_end, NX, k); // the bootloader has relocated them
     mapKernelRange(&__data_start, &__data_end, WRITABLE | NX, k);
 
-    // 3. Switch. Global pages go off for the load, so that nothing the
-    //    bootloader's page tables left in the TLB survives it (changing
-    //    CR4.PGE flushes everything), and on again afterwards.
+    enterKernelTables();
+    noteKernelTables();
+}
+
+/// Move this CPU from the bootloader's page tables to the kernel's: allow
+/// the NX bit, which they use, and load them. Global pages go off for the
+/// load, so that nothing the bootloader's page tables left in the TLB
+/// survives it (changing CR4.PGE flushes everything), and on again
+/// afterwards. Uses nothing that is mapped only in the kernel's tables, so
+/// a CPU can run it as its first step, before its `PerCpu` is reachable;
+/// `noteKernelTables` follows once it is.
+pub fn enterKernelTables() void {
+    cpu.wrmsr(0xC0000080, cpu.rdmsr(0xC0000080) | (1 << 11)); // EFER.NXE
     cpu.writeCr4(cpu.readCr4() & ~CR4_PGE);
-    loadRoot(kernel_root);
+    asm volatile ("mov %[r], %%cr3"
+        :
+        : [r] "r" (kernel_root),
+        : .{ .memory = true });
     cpu.writeCr4(cpu.readCr4() | CR4_PGE);
+}
+
+/// Record in this CPU's `PerCpu` what `enterKernelTables` loaded.
+pub fn noteKernelTables() void {
+    const c = percpu.current();
+    c.loaded_root = kernel_root;
+    c.root_loads += 1;
 }

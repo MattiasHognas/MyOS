@@ -144,9 +144,9 @@ pub fn smapEnabled() bool {
 }
 
 /// Turn on write protection for ring 0 (so `copyToUser` faults on read-only
-/// user pages) and UMIP, SMEP and SMAP where the CPU has them. Called once during
-/// boot, after the kernel's own page tables are loaded.
-pub fn init() void {
+/// user pages) and UMIP, SMEP and SMAP where the CPU has them, on this CPU.
+/// Returns the CR4 it set. Every CPU runs this as it comes up.
+pub fn initCpu() u64 {
     cpu.writeCr0(cpu.readCr0() | CR0_WP);
 
     var features: u32 = 0; // CPUID leaf 7 EBX
@@ -161,6 +161,15 @@ pub fn init() void {
     if (features & (1 << 7) != 0) cr4 |= CR4_SMEP;
     if (features & (1 << 20) != 0) cr4 |= CR4_SMAP;
     cpu.writeCr4(cr4);
+    return cr4;
+}
+
+/// `initCpu` on the boot CPU, and note what it turned on: the entry
+/// assembly and the copy routines go by that. Called once during boot,
+/// after the kernel's own page tables are loaded. The other CPUs must turn
+/// on the same (`smp.zig` checks).
+pub fn init() void {
+    const cr4 = initCpu();
     smep_enabled = cr4 & CR4_SMEP != 0;
     umip_enabled = cr4 & CR4_UMIP != 0;
     smap_enabled = @intFromBool(cr4 & CR4_SMAP != 0);

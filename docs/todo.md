@@ -325,19 +325,23 @@ The primitives come from 2.8 and are already real locks; this section makes thei
 
 ### 3.2 Per-CPU state
 The per-CPU structure and the `swapgs` transitions come from 2.5.
-- [ ] Move current-thread, scheduler, syscall-stack, and interrupt state to per-CPU storage.
-- [ ] Initialize separate GDT/TSS, emergency (IST) stacks and guarded stacks for each CPU.
-- [ ] Add a speculation barrier (`lfence`) after the conditional `swapgs` in `isr_common`, on both branches, once kernel code reads through GS: the CPU can guess the branch wrong and run on with the wrong GS base (CVE-2019-1125). Check the details against Linux's entry code first; the note in `docs/research.md` was written from memory.
-- [ ] Test per-CPU state and `swapgs` transitions (syscalls, interrupts from ring 0 and ring 3) with one and several CPUs.
+- [x] Move current-thread, scheduler, syscall-stack, and interrupt state to per-CPU storage: the running thread, its time slice, the halt count, the loaded address space and the count of CR3 loads are in `PerCpu`, next to the `syscall` stack pointer and the record of locks held. The running thread is read in one instruction (`%gs:24`), so preemptible code gets the right answer wherever it runs.
+- [x] Initialize separate GDT/TSS, emergency (IST) stacks and guarded stacks for each CPU (`gdt.Tables`). A CPU that is started gets its four emergency stacks and its kernel stack from `kstack`, each with a guard page. The boot CPU's emergency stacks stay in `.bss`, unguarded: they are needed before there is memory management.
+  - To decide: an emergency stack is 16 KiB, as before, and there are now four per CPU. Linux's are 4 KiB. They can shrink once their real use is measured (the handlers print a report and a backtrace).
+- [x] Add a speculation barrier (`lfence`) after the conditional `swapgs` in `isr_common` and `isr_paranoid`, where the two paths meet, so it covers both. Checked against Linux's entry code (`FENCE_SWAPGS_KERNEL_ENTRY` at the join in `error_entry` and `paranoid_entry`; nothing on the way out). Linux enables it only where SMAP does not hold during speculation or programs can set the GS base themselves; MyOS always has it.
+- [x] Test per-CPU state and `swapgs` transitions (syscalls, interrupts from ring 0 and ring 3) with one and several CPUs: the existing entry and exit tests run in both the one-CPU and the four-CPU scenario, and the CPU test checks every CPU's structure, tables, stacks, GS base and timer interrupts (from ring 0).
+  - Left for 3.4: syscalls and interrupts from ring 3 on a CPU other than the boot CPU. No program runs there until those CPUs take threads.
 
 ### 3.3 Bring up application processors
-- [ ] Request SMP information through Limine.
-- [ ] Start APs and initialize CPU-local structures.
-- [ ] Apply the per-CPU control-register settings on every AP: SMEP, SMAP, UMIP, CR0.WP, the `syscall` MSRs and the extended-state setup from 2.5.
-- [ ] Configure local APIC/timer and interrupts per CPU.
-- [ ] Print and test online CPU counts.
+- [x] Request SMP information through Limine (the MP request; x2APIC is not asked for).
+- [x] Start APs and initialize CPU-local structures (`arch/x86_64/smp.zig`): one at a time, each onto the kernel's page tables, its own GDT, TSS, GS base and kernel stack, as a thread of its own.
+  - A started CPU handles its interrupts and halts in between; it does not take threads from the ready queue yet (`PerCpu.runs_threads`). That waits for 3.4: an address space must not be freed while another CPU has it loaded, and a kernel stack must not be unmapped while another CPU's TLB still maps it.
+- [x] Apply the per-CPU control-register settings on every AP: SMEP, SMAP, UMIP, CR0.WP, the `syscall` MSRs and the extended-state setup from 2.5, and the Meltdown check. Each CPU reads back what it set, and the kernel panics if it differs from the boot CPU's.
+- [x] Configure local APIC/timer and interrupts per CPU. Every CPU's timer runs at the rate measured on the boot CPU. Time is kept by the boot CPU alone: its tick advances the clock and runs the timers; the others' ticks drive only their own scheduling. Device interrupts all go to the boot CPU.
+- [x] Print and test online CPU counts (`N of M CPUs online`; QEMU scenario `tests_smp` with four CPUs, next to the one-CPU runs, in CI).
 
 ### 3.4 SMP scheduling and memory
+- [ ] Let the started CPUs run threads (`PerCpu.runs_threads`, `thread.retire` for the context each one starts in), once the two items below that need a cross-CPU interrupt are done: taking an address space away from a CPU before it is freed, and TLB shootdowns.
 - [ ] Protect shared scheduler state.
 - [ ] Choose per-CPU queues or a documented global-queue scheduling model.
 - [ ] Support cross-CPU wakeups and inter-processor interrupts.
@@ -352,9 +356,11 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [ ] Preempt on wake-up, or otherwise bound how long a woken thread waits: today it goes to the tail of the queue and waits for the running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
 - [ ] Stress-test simultaneous allocations, processes, interrupts, and I/O.
   - From 3.1, the cases one CPU cannot produce: a timer that fires on another CPU exactly as the waiter is woken (`WakeTimer.finish` then has to wait for the callback); a wake-up from another CPU between a waiter's check and its sleep; a thread woken while its CPU is still switching away from it; real contention on the scheduler, process-tree and console locks.
-  - The in-kernel tests keep their own shared state safe with interrupts off in many places, which is only enough on one CPU: give them locks (as the wait-queue, mutex and timer tests have) before running them on several.
+  - The in-kernel tests that hand results between threads now do it under a lock. What is left are tests that turn interrupts off to keep other threads from running at all (to make an order of events certain, or to measure something undisturbed); with several CPUs running threads they need another way to be alone, such as staying on one CPU.
 - [ ] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run.
+  - Started in 3.3 with `tests_smp`: the whole suite on four CPUs, of which one runs threads. The crash scenarios still run on one.
 - [ ] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
+  - A first run by hand (2026-11-25, `-enable-kvm -cpu host`): all four CPUs come up and the CPU test passes, but four tests fail, with one CPU as with four, and already at the commit before the other CPUs were started: "kernel state at syscalls and timer interrupts, preemption mid-syscall" (not every time), "x87/SSE/AVX registers survive process switches", "new process starts with clean x87/SSE/AVX state" and "kernel thread keeps the loaded address space" (check 3). Find out for each whether the test assumes the emulator's CPU and timing or the kernel is wrong on a real CPU, before this run goes into CI.
 
 **Milestone 3 done when:** Multiple cores safely execute user threads and syscalls concurrently, and CI runs the test suite on several CPUs.
 

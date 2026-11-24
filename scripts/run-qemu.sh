@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 # Run os.iso (built by scripts/build.sh) in QEMU with serial output on the terminal.
 #
-# Usage: scripts/run-qemu.sh [--gdb] [--bios] [--no-kvm] [-- extra QEMU args]
+# Usage: scripts/run-qemu.sh [--gdb] [--bios] [--no-kvm] [--smp N] [-- extra QEMU args]
 #   --gdb     start paused and wait for GDB on localhost:1234 (see docs/debugging.md)
 #   --bios    boot with legacy BIOS instead of UEFI (OVMF)
 #   --no-kvm  use software emulation even if KVM is available
+#   --smp N   give the machine N CPUs (default 1)
 set -euo pipefail
 cd "$(dirname "$0")/.."  # run from the repository root
 
 gdb=0
 bios=0
 kvm=1
+smp=1
 extra=()
 while (($#)); do
     case "$1" in
         --gdb) gdb=1 ;;
         --bios) bios=1 ;;
         --no-kvm) kvm=0 ;;
+        --smp) smp="${2:?--smp needs a number of CPUs}"; shift ;;
         --) shift; extra=("$@"); break ;;
         *) echo "unknown option: $1 (see the header of $0)" >&2; exit 2 ;;
     esac
@@ -27,7 +30,7 @@ done
 [[ -f disk.img ]] || { echo "disk.img not found; run scripts/build.sh first" >&2; exit 1; }
 
 args=(
-    -M q35 -m 2G -cdrom os.iso
+    -M q35 -m 2G -smp "$smp" -cdrom os.iso
     -serial stdio -no-reboot -no-shutdown
     -drive file=disk.img,if=none,id=nvm,format=raw
     -device nvme,serial=myos0001,drive=nvm
