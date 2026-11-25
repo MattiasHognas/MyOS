@@ -250,6 +250,16 @@ pub const Thread = struct {
     /// Where the thread's exit is to be announced (`set_tid_address`), a
     /// user address; 0 if nowhere. Used once there are threads to wait for.
     clear_child_tid: u64 = 0,
+    /// Link in its process's list of threads (`Process.thread_list`,
+    /// under the process-tree lock).
+    proc_next: ?*Thread = null,
+    /// For a thread made by `clone`: the user registers it starts with, a
+    /// heap block it frees when it has taken them. Null otherwise.
+    user_frame: ?*anyopaque = null,
+    /// Set while the thread reads user memory under a spinlock: a page
+    /// fault then fails the read instead of being resolved, which would
+    /// need the address-space lock (`futex.zig`).
+    no_fault: bool = false,
     /// Signals the thread has blocked (bit n-1 for signal n), and the
     /// stack it wants its handlers run on. Recorded for when signals are
     /// delivered (milestone 8); `SIGKILL` and `SIGSTOP` cannot be blocked.
@@ -398,15 +408,70 @@ pub fn destroy(t: *Thread) void {
     heap.allocator.destroy(t);
 }
 
-/// Give a thread from `create` its ID and put it in the ready queue. From
-/// here on it runs, exits and is freed on its own.
+/// Give a thread from `create` its ID, without starting it: for a caller
+/// that has to tell someone the ID before the thread runs (`clone`).
+/// `start` does this itself otherwise. A thread with an ID can no longer
+/// be taken back with `destroy`, only with `discard`.
+pub fn assignId(t: *Thread) usize {
+    const held = lock.acquire();
+    defer lock.release(held);
+    if (t.id == 0) {
+        t.id = next_id;
+        next_id += 1;
+    }
+    return t.id;
+}
+
+/// Free a thread that has an ID but was never started. It counts as a
+/// thread that came and went.
+pub fn discard(t: *Thread) void {
+    assert.check(.thread, t.link == .none and !t.on_cpu, "discarding thread {d}, which was started", .{t.id});
+    {
+        const held = lock.acquire();
+        defer lock.release(held);
+        exited += 1;
+    }
+    kstack.free(t.stack.?);
+    if (t.fpu_alloc) |a| heap.allocator.free(a);
+    heap.allocator.destroy(t);
+    _ = reaped.fetchAdd(1, .release);
+}
+
+/// Give a thread from `create` its ID (if it has none) and put it in the
+/// ready queue. From here on it runs, exits and is freed on its own.
 pub fn start(t: *Thread) void {
     const held = lock.acquire();
     defer lock.release(held);
-    t.id = next_id;
-    next_id += 1;
+    if (t.id == 0) {
+        t.id = next_id;
+        next_id += 1;
+    }
     enqueue(t);
     kickIdleCpu();
+}
+
+/// Make thread `t` notice, soon, that something has changed for it (its
+/// process is ending): a thread that sleeps is woken, and one that runs on
+/// another CPU is interrupted, so that it comes through the kernel and
+/// looks. A thread that waits for something else goes back to waiting
+/// unless the wait is one that ends for this (`WaitQueue.waitKillable`).
+pub fn interrupt(t: *Thread) void {
+    wake(t);
+    const held = lock.acquire();
+    defer lock.release(held);
+    if (t.on_cpu) {
+        if (t.cpu) |c| {
+            if (c != percpu.current()) ipi.wake(c);
+        }
+    }
+}
+
+/// True if the calling thread belongs to a process that is ending, so
+/// that the thread is to end too instead of waiting or returning to its
+/// program (`process.dieIfKilled`).
+pub fn dying() bool {
+    const p = current().process orelse return false;
+    return p.killed.load(.acquire);
 }
 
 /// Create a thread that runs `entry` and put it in the ready queue: `create`

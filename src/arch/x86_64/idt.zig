@@ -303,6 +303,8 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector >= 32) {
         apic.eoi(); // BEFORE the handler: it may switch threads
         if (handlers[f.vector]) |h| h(f) else root.print("unhandled vector {d}\n", .{f.vector});
+        // On the way back to a program whose process is ending: not there.
+        if (f.cs & 3 == 3) process.dieIfKilled();
         return;
     }
     const name = names[f.vector];
@@ -316,7 +318,7 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
     // That goes for a fault from ring 3, and for one inside a user copy
     // in a system call (reading into a buffer nothing was written to yet).
     var out_of_memory = false;
-    if (f.vector == VECTOR_PAGE_FAULT and (from_user or usercopy.inCopy(f.rip))) {
+    if (f.vector == VECTOR_PAGE_FAULT and (from_user or usercopy.inCopy(f.rip)) and !thread.current().no_fault) {
         if (thread.current().process) |p| {
             const access: user_memory.Access = .{
                 .write = f.error_code & 2 != 0,

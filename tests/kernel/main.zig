@@ -925,6 +925,40 @@ fn muslHello() TestError!void {
     try check(helpers.footprint().eql(memory));
 }
 
+/// Threads and futexes through the raw calls: a lock made of a futex,
+/// each thread's own FS base, join through the exit announcement, wake
+/// counts, timeouts, requeue; and the ways a threaded process ends.
+fn threadsAndFutexes() TestError!void {
+    _ = helpers.runProgram("/test/threads"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/threads") orelse return error.Failed;
+    if (code != 0) report("/test/threads failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/threads"));
+    // A thread ends the process while another sleeps for good; a thread's
+    // fault kills them all; the last thread's status is the process's.
+    inline for (.{ .{ "exitgroup", 7 }, .{ "fault", 255 }, .{ "mainexits", 5 } }) |mode| {
+        const status = helpers.runProgramArgs("/test/threads", &.{ "threads", mode[0] }, &.{}) orelse return error.Failed;
+        if (status != mode[1]) report("/test/threads " ++ mode[0] ++ " exit status", status);
+        try check(status == mode[1]);
+    }
+    try check(helpers.footprint().eql(memory)); // every thread, stack and futex waiter is gone
+}
+
+/// A multi-threaded C program built for Linux against musl runs: eight
+/// pthreads with a mutex, a condition variable, a barrier, thread-local
+/// storage, a timed wait and joins. It checks its own numbers and says
+/// so; the host script checks what it printed.
+fn muslThreads() TestError!void {
+    _ = helpers.runProgram("/fixtures/musl-threads-static"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/fixtures/musl-threads-static") orelse return error.Failed;
+    if (code != 0) report("musl threads exit status", code);
+    try check(code == 0);
+    try check(helpers.runPair("/fixtures/musl-threads-static")); // two processes of eight threads
+    try check(helpers.footprint().eql(memory));
+}
+
 /// A Rust program built for Linux against musl runs with its standard
 /// library: arguments, the environment, heap allocation, formatted
 /// output. The host script checks what it printed.
@@ -1570,6 +1604,8 @@ fn runCases() noreturn {
         .{ .name = "Linux startup: initial stack, FS and GS base, writev, ioctl, set_tid_address, exit_group", .func = linuxStartup },
         .{ .name = "memory on demand: mmap, munmap, mprotect, madvise, brk, stack growth, faults, the limit", .func = userMemory },
         .{ .name = "a static musl program built for Linux runs (arguments, environment, printf)", .func = muslHello },
+        .{ .name = "threads and futexes (clone, own FS base, join, wake counts, timeouts, requeue, how a threaded process ends)", .func = threadsAndFutexes },
+        .{ .name = "a multi-threaded musl program built for Linux runs (pthreads: mutex, condvar, barrier, TLS, join)", .func = muslThreads },
         .{ .name = "a static Rust program built for Linux runs (std: arguments, environment, allocation, println)", .func = rustHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },

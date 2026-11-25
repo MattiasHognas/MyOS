@@ -158,6 +158,23 @@ pub fn sleepTicks(n: u64) void {
     sleeper.finish();
 }
 
+/// Like `sleepTicks`, for a sleep a program asked for: it ends early if
+/// the calling thread's process is ending. Returns true if the whole time
+/// passed.
+pub fn sleepTicksKillable(n: u64) bool {
+    var sleeper = WakeTimer.init(thread.current());
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    {
+        const held = lock.acquire();
+        defer lock.release(held);
+        queue.add(&sleeper.timer, ticks + n + 1);
+    }
+    while (!sleeper.hasFired() and !thread.dying()) thread.block();
+    sleeper.finish();
+    return sleeper.hasFired();
+}
+
 /// Block the calling thread for at least `ms` milliseconds.
 pub fn sleepMs(ms: u64) void {
     sleepTicks(msToTicks(ms));

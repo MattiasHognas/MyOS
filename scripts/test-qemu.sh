@@ -204,6 +204,10 @@ run_scenario() {
             expect_line '^env GREETING=hi$'
             expect_line '^env EMPTY=$'
             expect_line '^linux_abi: writev works$'
+            # A pthreads program built for Linux checks its own numbers.
+            expect_line '^threads: 8 threads, counter 160000 of 160000, baton passed 24 times, timed wait timed out, main.s own count 0$'
+            expect_line '^threads: all correct$'
+            if grep -q '^threads: WRONG' "$log"; then fail "the pthreads program found a wrong result"; fi
             # A Rust program built for Linux, with its standard library.
             expect_line '^hello from rust: 3 args$'
             expect_line '^argv\[2\]=MyOS$'

@@ -19,14 +19,14 @@
 //! 2. `swapgs` makes the per-CPU area reachable; the user RSP is parked in
 //!    it and RSP becomes the top of the thread's kernel stack. Nothing is
 //!    ever pushed on the user's stack.
-//! 3. The user state is pushed as a `Frame` (12 words, so RSP is 16-byte
-//!    aligned at the `call`, as the C ABI requires).
+//! 3. The user state is pushed as a `Frame` (18 words, so RSP is 16-byte
+//!    aligned at the `call`, as the C ABI requires): every general-purpose
+//!    register, so the frame is the thread's whole user state.
 //! 4. `syscall_handler_c` turns interrupts on, runs the handler, turns them
 //!    off again and decides how to return (`sysret.zig`).
-//! 5. The registers are restored from the frame. RBX, RBP and R12-R15 are
-//!    never touched by this code and are preserved by the handler (C ABI),
-//!    so a program gets every register back except RAX (the result), RCX
-//!    and R11. No register holds a kernel value on exit.
+//! 5. The registers are restored from the frame, so a program gets every
+//!    register back except RAX (the result), RCX and R11. No register
+//!    holds a kernel value on exit.
 //! 6. `swapgs`, then `sysretq`, or `iretq` when `sysretq` cannot restore the
 //!    state (RF or TF set).
 //!
@@ -40,6 +40,7 @@ const root = @import("root");
 
 const assert = @import("../../kernel/debug/assert.zig");
 const dispatcher = @import("../../kernel/syscall.zig");
+const process = @import("../../kernel/process.zig");
 const cpu = @import("cpu.zig");
 const gdt = @import("gdt.zig");
 const sysret = @import("sysret.zig");
@@ -67,6 +68,16 @@ pub const Handler = *const fn (*Frame) void;
 /// `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` hold the arguments. The last
 /// five fields are laid out as `iretq` expects them.
 pub const Frame = extern struct {
+    // The registers a function call preserves. The handler does not change
+    // them either, but they are saved so that the whole user state is in
+    // one place: a new thread starts with a copy of its creator's
+    // (`clone`), and a signal handler's return puts a saved one back.
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
     r9: u64,
     r8: u64,
     r10: u64,
@@ -89,9 +100,9 @@ pub const Frame = extern struct {
 
 comptime {
     // The entry code pushes exactly this, and the stack must stay 16-byte aligned.
-    std.debug.assert(@sizeOf(Frame) == 12 * 8);
+    std.debug.assert(@sizeOf(Frame) == 18 * 8);
     std.debug.assert(@sizeOf(Frame) % 16 == 0);
-    std.debug.assert(@offsetOf(Frame, "rip") == 7 * 8);
+    std.debug.assert(@offsetOf(Frame, "rip") == 13 * 8);
     std.debug.assert(sysret.USER_CS == gdt.USER_CODE and sysret.USER_SS == gdt.USER_DATA);
 }
 
@@ -118,9 +129,21 @@ comptime {
         \\  push %r10
         \\  push %r8
         \\  push %r9
+        \\  push %rbx
+        \\  push %rbp
+        \\  push %r12
+        \\  push %r13
+        \\  push %r14
+        \\  push %r15
         \\  mov %rsp, %rdi
         \\  call syscall_handler_c
         \\  test %eax, %eax        # 0 = sysretq, otherwise iretq; pops keep the flags
+        \\  pop %r15
+        \\  pop %r14
+        \\  pop %r13
+        \\  pop %r12
+        \\  pop %rbp
+        \\  pop %rbx
         \\  pop %r9
         \\  pop %r8
         \\  pop %r10
@@ -158,6 +181,7 @@ export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     assert.check(.syscall, @intFromPtr(f) % 16 == 0, "syscall frame at 0x{x} is not 16-byte aligned", .{@intFromPtr(f)});
     asm volatile ("sti"); // long syscalls may be preempted
     if (comptime replaceable) handler(f) else dispatcher.dispatch(f);
+    process.dieIfKilled(); // its process is ending: no return to the program
     f.rflags = sysret.sanitizeFlags(f.rflags);
     const how = sysret.classify(f.rip, f.rflags, f.cs, f.ss);
     if (how == .invalid) dispatcher.badReturn(f);
@@ -191,4 +215,48 @@ pub fn initCpu() void {
 /// Enable the `syscall` instruction on the boot CPU. Called once during boot.
 pub fn init() void {
     initCpu();
+}
+
+// enter_user_frame(frame: rdi): leave the kernel for ring 3 with the user
+// state in `frame`, for a thread that starts in the middle of a system
+// call its creator made (`clone`). Interrupts go off before the GS base
+// is the user's. Always `iretq`: it restores anything.
+comptime {
+    asm (
+        \\.section .text
+        \\.global enter_user_frame
+        \\.type enter_user_frame, @function
+        \\enter_user_frame:
+        \\  cli
+        \\  mov %rdi, %rsp
+        \\  pop %r15
+        \\  pop %r14
+        \\  pop %r13
+        \\  pop %r12
+        \\  pop %rbp
+        \\  pop %rbx
+        \\  pop %r9
+        \\  pop %r8
+        \\  pop %r10
+        \\  pop %rdx
+        \\  pop %rsi
+        \\  pop %rdi
+        \\  pop %rax
+        \\  mov 0(%rsp), %rcx
+        \\  mov 16(%rsp), %r11
+        \\  swapgs
+        \\  iretq
+        \\.size enter_user_frame, . - enter_user_frame
+    );
+}
+
+extern fn enter_user_frame(frame: *const Frame) callconv(.c) noreturn;
+
+/// Start running user code with the registers in `frame`: for a thread
+/// that begins as a copy of another one in the middle of a system call
+/// (`clone`). The frame is read where it is, as the stack for a moment
+/// with interrupts off, so it must be kernel memory that stays; the
+/// caller keeps it on its own kernel stack. Never returns.
+pub fn enterUserFrame(frame: *const Frame) noreturn {
+    enter_user_frame(frame);
 }

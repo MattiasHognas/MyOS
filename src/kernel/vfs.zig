@@ -36,6 +36,10 @@ pub const Fs = struct {
 pub const OpenFile = struct {
     node: Node,
     offset: u64 = 0,
+    /// The descriptor's reference, and one for every system call that is
+    /// using the file right now: another thread may close the descriptor
+    /// meanwhile. Under the process's `files_lock`.
+    refs: u32 = 1,
 };
 
 /// Mount `fs` as the root filesystem, replacing any previous one. The kernel calls this once during boot.

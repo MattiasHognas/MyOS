@@ -514,12 +514,17 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 
 **Goal:** Run multi-threaded programs, with the threads of one process on different cores.
 
-- [ ] Support multiple threads per process, with shared address space and descriptor table; revisit the single-thread assumptions documented in 2.7.
-- [ ] Implement `clone` for threads (`CLONE_VM`, `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_CLEARTID`) and `exit` versus `exit_group`.
-- [ ] Implement `futex` wait and wake with timeouts (timers from 2.8), including the wake on thread exit that `pthread_join` relies on.
-- [ ] Wake futex waiters across CPUs, and keep TLB shootdowns (5) correct when threads of one process run on several cores.
-- [ ] Test thread creation and join, TLS isolation between threads, futex wake-before-wait and timeouts, and many threads under preemption on several CPUs.
-- [ ] Run a statically linked multi-threaded C program (pthreads, musl) built on Linux as a fixture.
+- [x] Support multiple threads per process, with shared address space and descriptor table; revisit the single-thread assumptions documented in 2.7.
+  - The assumptions from 2.7, one by one: a process ends when its last thread does or when one asks (`exit_group`, a fault); the descriptor table has a lock, and an open file a reference for each call using it; the address space had its lock since 5; a blocking call blocks one thread.
+- [x] Implement `clone` for threads (`CLONE_VM`, `CLONE_THREAD`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_CLEARTID`) and `exit` versus `exit_group`.
+  - A new thread starts with a copy of every register of its creator, which is why the syscall entry now saves them all. `exit_group` makes every other thread come through the kernel, where it ends, and waits for them; waits a program can stay in forever (a futex, a sleep, a key, a child) end for it.
+- [x] Implement `futex` wait and wake with timeouts (timers from 2.8), including the wake on thread exit that `pthread_join` relies on.
+  - Also `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`, which musl's condition variables and timed waits use. One lock for all futexes, to split when measurements say so.
+- [x] Wake futex waiters across CPUs, and keep TLB shootdowns (5) correct when threads of one process run on several cores.
+- [x] Test thread creation and join, TLS isolation between threads, futex wake-before-wait and timeouts, and many threads under preemption on several CPUs.
+  - `/test/threads` (raw calls) and the pthreads fixture, on one and four CPUs and under KVM; 40 boots in a row on four real cores without a failure.
+- [x] Run a statically linked multi-threaded C program (pthreads, musl) built on Linux as a fixture.
+  - `tests/fixtures/src/threads.c`: eight threads, a mutex, a condition variable, a barrier, thread-local storage, a timed wait, joins.
 
 **Milestone 7 done when:** An unmodified multi-threaded program built on Linux runs with its threads spread over several cores.
 

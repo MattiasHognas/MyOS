@@ -107,6 +107,19 @@ pub const WaitQueue = struct {
         while (me.wait_queue == self) sleep(lock);
     }
 
+    /// Like `wait`, for a wait that may last as long as a program likes
+    /// (for a key, for a child): it also ends when the calling thread's
+    /// process is ending (`thread.dying`). Returns true if the thread was
+    /// woken through the queue, false if it is to die; then it is off the
+    /// queue, and the caller gets out of the way without what it waited for.
+    pub fn waitKillable(self: *WaitQueue, lock: *SpinLock) bool {
+        assertOnlyLock(lock);
+        const me = thread.current();
+        self.append(me);
+        while (me.wait_queue == self and !thread.dying()) sleep(lock);
+        return !self.remove(me);
+    }
+
     /// Like `wait`, but give up after `ticks` timer ticks. Returns true if
     /// the thread was woken through the queue, false if time ran out.
     pub fn waitTimeout(self: *WaitQueue, lock: *SpinLock, ticks: u64) bool {

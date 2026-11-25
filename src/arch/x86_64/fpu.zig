@@ -191,6 +191,12 @@ fn save(area: [*]align(AREA_ALIGN) u8) void {
     }
 }
 
+/// Save the extended state that is in the registers now to `area`, without
+/// changing it: the copy a new thread starts with. Interrupts must be off.
+pub fn saveCurrent(area: [*]align(AREA_ALIGN) u8) void {
+    save(area);
+}
+
 /// Load extended state from `area`, replacing all of the CPU's.
 fn restore(area: [*]align(AREA_ALIGN) const u8) void {
     switch (mode) {

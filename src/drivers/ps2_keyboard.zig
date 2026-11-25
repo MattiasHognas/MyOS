@@ -36,13 +36,28 @@ var tail: u8 = 0; // next read
 
 /// Threads waiting for a key.
 var readers: WaitQueue = .{};
-/// Readers are served in the order they asked: each takes a number, and
-/// the reader whose number is `serving` gets the next key. Being woken
-/// first is not enough for that with several CPUs: two readers woken for
-/// two keys run at the same time, and the one that started waiting later
-/// could reach the buffer first.
-var next_ticket: u64 = 0;
-var serving: u64 = 0;
+/// Readers are served in the order they asked: each stands in a line
+/// (a record on its own stack), and the one at the front gets the next
+/// key. Being woken first is not enough for that with several CPUs: two
+/// readers woken for two keys run at the same time, and the one that
+/// started waiting later could reach the buffer first.
+const Reader = struct { next: ?*Reader = null };
+var first_reader: ?*Reader = null;
+var last_reader: ?*Reader = null;
+
+fn leaveLine(me: *Reader) void {
+    var link = &first_reader;
+    var prev: ?*Reader = null;
+    while (link.*) |r| : ({
+        prev = r;
+        link = &r.next;
+    }) {
+        if (r != me) continue;
+        link.* = me.next;
+        if (last_reader == me) last_reader = prev;
+        return;
+    }
+}
 
 /// Append `c` to the ring buffer and wake the waiting readers, of which
 /// the one whose turn it is takes it. Drops the character if the buffer is
@@ -119,27 +134,34 @@ pub fn inject(c: u8) void {
 pub fn getChar() ?u8 {
     const held = lock.acquire();
     defer lock.release(held);
-    if (serving != next_ticket) return null;
+    if (first_reader != null) return null;
     return pop();
 }
 
 /// Return the next character, sleeping until one is typed. Readers are
-/// served in the order they called. Not for interrupt handlers.
-pub fn read() u8 {
+/// served in the order they called. Returns null if the calling thread's
+/// process is ending while it waits. Not for interrupt handlers.
+pub fn read() ?u8 {
     const held = lock.acquire();
     defer lock.release(held);
-    const ticket = next_ticket;
-    next_ticket += 1;
+    var me: Reader = .{};
+    if (last_reader) |last| last.next = &me else first_reader = &me;
+    last_reader = &me;
     while (true) {
-        if (ticket == serving) {
+        if (first_reader == &me) {
             if (pop()) |c| {
-                serving += 1;
+                leaveLine(&me);
                 // The next reader's key may be there already.
                 if (tail != head) _ = readers.wakeAll();
                 return c;
             }
         }
-        readers.wait(&lock); // until a key arrives or it is this reader's turn
+        // Until a key arrives or it is this reader's turn.
+        if (!readers.waitKillable(&lock)) {
+            leaveLine(&me);
+            _ = readers.wakeAll(); // whoever is first now
+            return null;
+        }
     }
 }
 

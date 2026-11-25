@@ -35,9 +35,11 @@ var STACK_TOP: u64 = 0;
 const PAGE = 4096;
 
 const implemented = [_]u64{
-    Sys.read,        Sys.write,           Sys.open,   Sys.close, Sys.sched_yield, Sys.gettid,       Sys.myos_run,
-    Sys.arch_prctl,  Sys.set_tid_address, Sys.writev, Sys.ioctl, Sys.poll,        Sys.rt_sigaction, Sys.rt_sigprocmask,
-    Sys.sigaltstack, Sys.mmap,            Sys.brk,
+    Sys.read,        Sys.write,           Sys.open,              Sys.close,        Sys.sched_yield,   Sys.gettid,       Sys.myos_run,
+    Sys.arch_prctl,  Sys.set_tid_address, Sys.writev,            Sys.ioctl,        Sys.poll,          Sys.rt_sigaction, Sys.rt_sigprocmask,
+    Sys.sigaltstack, Sys.mmap,            Sys.brk,               Sys.futex,        Sys.clock_gettime, Sys.fstat,        Sys.lseek,
+    Sys.pread64,     Sys.openat,          Sys.fcntl,             Sys.getpid,       Sys.kill,          Sys.tgkill,       Sys.uname,
+    Sys.prlimit64,   Sys.getrandom,       Sys.sched_getaffinity, Sys.gettimeofday,
 };
 /// Paths a call may be given. Never this program or the shell: one would
 /// recurse, the other waits for the keyboard.
@@ -120,6 +122,12 @@ pub fn main() noreturn {
         if (nr == Sys.mmap) args[3] &= ~@as(u64, lib.abi.MAP.FIXED | lib.abi.MAP.FIXED_NOREPLACE);
         if (nr == Sys.brk and args[0] != 0) args[0] = 0; // only ask where the heap ends
         if (nr == Sys.poll) args[2] = 0; // do not wait
+        // Nor in a futex or a sleep; and a new thread started with random
+        // registers would be this program's end, as would a signal to itself.
+        if (nr == Sys.nanosleep or nr == Sys.clock_nanosleep or nr == Sys.clone) continue;
+        if (nr == Sys.futex) args[1] = (args[1] & ~@as(u64, 0x7F)) | lib.abi.FUTEX.WAKE;
+        if (nr == Sys.kill or nr == Sys.tkill) args[1] = 0;
+        if (nr == Sys.tgkill) args[2] = 0;
         if (nr == Sys.write and (args[0] == 1 or args[0] == 2) and (second_readable or args[1] >= STACK_TOP - 8)) {
             const off = next(&rng) % (text.len - 64);
             args[1] = @intFromPtr(text) + off;

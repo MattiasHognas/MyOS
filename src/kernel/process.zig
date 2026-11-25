@@ -40,13 +40,25 @@
 //! exits while it has children, they become children of its own parent, or
 //! of nobody if it had none, so `parent` always points at a live process.
 //!
-//! ## One thread per process
+//! ## Threads
 //!
-//! Everything here assumes it: a process "runs" when its thread does and
-//! exits when its thread does; `exit` ends the process; the descriptor
-//! table and the address space are used without locks because only that
-//! thread touches them; and blocking syscalls block the whole process.
-//! Milestone 7 (threads) has to revisit each of these.
+//! A process starts with one thread and may make more (`cloneThread`,
+//! behind `clone`). They share everything the process owns: its address
+//! space, its open files, what its signals do. Each has its own kernel
+//! stack, registers, FS and GS base and signal mask (`thread.zig`), and
+//! each holds a reference to the process for as long as it exists.
+//!
+//! - **A thread ends** with `exitThread` (`exit`). The others go on. The
+//!   last thread to end ends the process, with that thread's status.
+//! - **The process ends** with `exit` here (`exit_group`, or the kernel
+//!   killing it for a fault): the calling thread marks the process as
+//!   ending (`killed`), makes every other thread come through the kernel
+//!   (`thread.interrupt`), waits until they have all gone, and only then
+//!   gives up what the process owns. A thread finds out at the points
+//!   where it would return to its program, and in the waits a program can
+//!   stay in for as long as it likes (`dieIfKilled`, `thread.dying`).
+//! - What several threads use at once has a lock: the address space
+//!   (`user_memory.zig`) and the descriptor table (`files_lock`).
 //!
 //! ## Locking
 //!
@@ -62,11 +74,17 @@
 //! limits. They bound what one program and the programs it starts can take;
 //! they do not divide memory between unrelated programs.
 
+const std = @import("std");
+
+const arch_syscall = @import("../arch/x86_64/syscall.zig");
 const context = @import("../arch/x86_64/context.zig");
+const fpu = @import("../arch/x86_64/fpu.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const assert = @import("debug/assert.zig");
 const elf = @import("elf.zig");
+const futex = @import("futex.zig");
+const uaccess = @import("uaccess.zig");
 const elf_image = @import("elf_image.zig");
 const heap = @import("heap.zig");
 const kstack = @import("kstack.zig");
@@ -173,9 +191,21 @@ pub const Process = struct {
     parent: ?*Process = null,
     /// Processes alive below this one (see `Limits.max_descendants`).
     descendants: u32 = 0,
+    /// The ID programs know the process by (`getpid`): its first thread's.
+    pid: usize = 0,
+    /// Its threads, linked through `Thread.proc_next`, and how many there
+    /// are. Under the process-tree lock.
+    thread_list: ?*thread.Thread = null,
+    thread_count: u32 = 0,
+    /// Set, once, when the process is ending: its threads are to end too.
+    killed: std.atomic.Value(bool) = .init(false),
+    /// Where the thread that ends the process waits for the others to go.
+    /// Under the process-tree lock.
+    threads_gone: WaitQueue = .{},
+    /// Protects `files` and the reference counts of the open files.
+    files_lock: SpinLock = .{ .rank = .descriptor_table },
     /// What each signal does (`rt_sigaction`), by signal number minus
-    /// one. Recorded for when signals are delivered (milestone 8); used
-    /// by the process's own thread only.
+    /// one. Recorded for when signals are delivered (milestone 8).
     signal_actions: [abi.NSIG]abi.SigAction = @splat(.{}),
     /// Its regions of memory, `brk` heap and the lock for them and its
     /// page tables (`user_memory.zig`).
@@ -257,19 +287,34 @@ fn reparentChildren(p: *Process) void {
 }
 
 /// Terminate the current process with exit status `code` (0-255; the
-/// `exit` syscall masks it, as on Linux).
+/// `exit_group` syscall masks it, as on Linux), all its threads with it.
 ///
-/// Closes its files, frees its address space, hands its children to its
-/// parent, leaves the process tree, records the exit status, wakes every
-/// thread waiting for it and exits the current thread. Must be called from
-/// a thread that belongs to a process.
+/// Makes the other threads end and waits for them, closes its files,
+/// frees its address space, hands its children to its parent, leaves the
+/// process tree, records the exit status, wakes every thread waiting for
+/// it and exits the current thread. If another thread is already ending
+/// the process, this one just ends. Must be called from a thread that
+/// belongs to a process.
 pub fn exit(code: u64) noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: we're done
-    const p = thread.current().process.?;
-    closeFiles(p); // only this thread uses them
+    const me = thread.current();
+    const p = me.process.?;
+    if (p.killed.swap(true, .acq_rel)) die(); // another thread got there first
+
+    // The other threads: each ends as soon as it comes through the kernel.
+    tree_lock.take();
+    var t = p.thread_list;
+    while (t) |other| : (t = other.proc_next) {
+        if (other != me) thread.interrupt(other);
+    }
+    while (p.thread_count > 1) p.threads_gone.wait(&tree_lock);
+    tree_lock.drop();
+
+    closeFiles(p); // nothing else uses them now
     freeAddressSpace(p); // before anyone is told: the memory is back when they hear
     tree_lock.take();
     assert.check(.process, p.exit_code == null, "process '{s}' exits twice", .{p.name});
+    unlinkThread(p, me);
     reparentChildren(p);
     unlinkChild(p);
     releaseDescendant(p.parent);
@@ -278,6 +323,164 @@ pub fn exit(code: u64) noreturn {
     _ = p.exited.wakeAll(); // before the lock is released: the waiters are still there
     tree_lock.drop();
     thread.exit();
+}
+
+/// Take `t` out of the thread list of `p`. The tree lock must be held.
+fn unlinkThread(p: *Process, t: *thread.Thread) void {
+    var link = &p.thread_list;
+    while (link.*) |other| : (link = &other.proc_next) {
+        if (other != t) continue;
+        link.* = t.proc_next;
+        t.proc_next = null;
+        p.thread_count -= 1;
+        return;
+    }
+    assert.check(.process, false, "thread {d} is not in the thread list of '{s}'", .{ t.id, p.name });
+}
+
+/// End the calling thread because its process is ending: leave the
+/// process's list of threads, tell the thread that waits for that, and go.
+fn die() noreturn {
+    _ = cpu.saveAndDisableInterrupts();
+    const me = thread.current();
+    const p = me.process.?;
+    tree_lock.take();
+    unlinkThread(p, me);
+    _ = p.threads_gone.wakeAll();
+    tree_lock.drop();
+    thread.exit();
+}
+
+/// End the calling thread if its process is ending. Called where a thread
+/// is about to return to its program: after a system call and after an
+/// interrupt taken in ring 3. No lock may be held.
+pub fn dieIfKilled() void {
+    const p = thread.current().process orelse return;
+    if (p.killed.load(.acquire)) die();
+}
+
+/// Terminate the calling thread with status `code` (the `exit` syscall).
+/// The process's other threads go on; if there are none, the process ends
+/// with that status. A thread that asked for it (`set_tid_address`, or
+/// `CLONE_CHILD_CLEARTID`) has its exit announced: zero is written where
+/// it said, and one thread waiting on that address as a futex is woken.
+/// That is how `pthread_join` finds out.
+pub fn exitThread(code: u64) noreturn {
+    const me = thread.current();
+    const p = me.process.?;
+    {
+        const held = tree_lock.acquire();
+        const last = p.thread_count == 1;
+        if (!last and !p.killed.load(.acquire)) {
+            unlinkThread(p, me);
+            tree_lock.release(held);
+            // The process lives on: its memory is there to write to.
+            if (me.clear_child_tid != 0) {
+                const zero: u32 = 0;
+                uaccess.copyToUser(me.clear_child_tid, std.mem.asBytes(&zero)) catch {};
+                _ = futex.wake(p, me.clear_child_tid, 1, futex.ANY);
+            }
+            thread.exit();
+        }
+        tree_lock.release(held);
+    }
+    exit(code); // the last thread, or the process is ending anyway
+}
+
+/// Flags of `clone` (Linux's values).
+pub const CLONE = struct {
+    pub const VM = 0x100;
+    pub const FS = 0x200;
+    pub const FILES = 0x400;
+    pub const SIGHAND = 0x800;
+    pub const THREAD = 0x10000;
+    pub const SYSVSEM = 0x40000;
+    pub const SETTLS = 0x80000;
+    pub const PARENT_SETTID = 0x100000;
+    pub const CHILD_CLEARTID = 0x200000;
+    pub const DETACHED = 0x400000;
+    pub const CHILD_SETTID = 0x1000000;
+    /// What makes a `clone` a new thread of the calling process.
+    pub const THREAD_FLAGS = VM | SIGHAND | THREAD;
+};
+
+/// What `cloneThread` needs to know about the new thread.
+pub const CloneArgs = struct {
+    flags: u64,
+    /// The stack pointer it starts with; 0 for its creator's.
+    stack: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    tls: u64,
+};
+
+/// Make a new thread in the calling thread's process (`clone` with
+/// `CLONE_VM | CLONE_SIGHAND | CLONE_THREAD`). It starts as if it had just
+/// returned from the same `clone` call with result 0: with a copy of the
+/// caller's registers `frame` and extended state, on the stack `args.stack`,
+/// and with the caller's FS base unless `CLONE_SETTLS` gives it its own.
+/// Returns the new thread's ID.
+pub fn cloneThread(frame: *const arch_syscall.Frame, args: CloneArgs) error{ OutOfMemory, Fault, BadAddress, ProcessEnding }!usize {
+    const me = thread.current();
+    const p = me.process.?;
+    if (args.flags & CLONE.SETTLS != 0 and args.tls >= vmm.USER_END) return error.BadAddress;
+
+    // Until the thread has an ID, an error takes it back here; after that
+    // it is taken back by hand below (`discard`).
+    var unnumbered = true;
+    const t = try thread.create(cloneStart, p);
+    errdefer if (unnumbered) thread.destroy(t);
+    const start_frame = try heap.allocator.create(arch_syscall.Frame);
+    errdefer if (unnumbered) heap.allocator.destroy(start_frame);
+    start_frame.* = frame.*;
+    start_frame.rax = 0; // what `clone` returns in the new thread
+    if (args.stack != 0) start_frame.rsp = args.stack;
+    t.user_frame = start_frame;
+    t.fs_base = if (args.flags & CLONE.SETTLS != 0) args.tls else me.fs_base;
+    t.gs_base = me.gs_base;
+    t.signal_mask = me.signal_mask;
+    if (args.flags & CLONE.CHILD_CLEARTID != 0) t.clear_child_tid = args.child_tid;
+    // The extended state as it is now, in the registers.
+    if (t.fpuArea()) |area| {
+        const flags = cpu.saveAndDisableInterrupts();
+        fpu.saveCurrent(area);
+        cpu.restoreInterrupts(flags);
+    }
+
+    // The ID is needed before the thread runs: both may be told it in memory.
+    const tid = thread.assignId(t);
+    unnumbered = false;
+    const tid32: u32 = @truncate(tid);
+    const told = blk: {
+        if (args.flags & CLONE.PARENT_SETTID != 0) uaccess.copyToUser(args.parent_tid, std.mem.asBytes(&tid32)) catch break :blk false;
+        if (args.flags & CLONE.CHILD_SETTID != 0) uaccess.copyToUser(args.child_tid, std.mem.asBytes(&tid32)) catch break :blk false;
+        break :blk true;
+    };
+    const held = tree_lock.acquire();
+    if (!told or p.killed.load(.acquire)) {
+        tree_lock.release(held);
+        heap.allocator.destroy(start_frame);
+        thread.discard(t);
+        return if (!told) error.Fault else error.ProcessEnding;
+    }
+    p.refs += 1; // the thread's, given up when it is freed
+    t.proc_next = p.thread_list;
+    p.thread_list = t;
+    p.thread_count += 1;
+    thread.start(t);
+    tree_lock.release(held);
+    return tid;
+}
+
+/// First kernel code of a thread made by `cloneThread`: take the registers
+/// it was given and go to ring 3 with them.
+fn cloneStart() void {
+    const me = thread.current();
+    const given: *arch_syscall.Frame = @ptrCast(@alignCast(me.user_frame.?));
+    const frame = given.*; // on this thread's kernel stack, which stays
+    heap.allocator.destroy(given);
+    me.user_frame = null;
+    arch_syscall.enterUserFrame(&frame);
 }
 
 /// Wait for `p` to exit and return its exit status, giving up the caller's
@@ -289,6 +492,22 @@ pub fn wait(p: *Process) u64 {
         const held = tree_lock.acquire();
         defer tree_lock.release(held);
         while (p.exit_code == null) p.exited.wait(&tree_lock);
+        break :blk p.exit_code.?;
+    };
+    release(p);
+    return code;
+}
+
+/// `wait` for a thread of a program, which may itself be told to end
+/// while it waits: then this returns null, and the caller still has its
+/// reference to `p`.
+pub fn waitKillable(p: *Process) ?u64 {
+    const code = blk: {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        while (p.exit_code == null) {
+            if (!p.exited.waitKillable(&tree_lock)) return null;
+        }
         break :blk p.exit_code.?;
     };
     release(p);
@@ -370,11 +589,10 @@ fn freeAddressSpace(p: *Process) void {
     user_memory.deinit(p);
 }
 
-/// Called by the scheduler when the thread of `p` has been reaped: nothing
-/// runs in `p` any more, and its memory went when it exited. Gives up the
-/// thread's reference.
+/// Called by the scheduler when a thread of `p` has been freed: gives up
+/// that thread's reference. The process itself may be running on (it has
+/// other threads) or long gone.
 pub fn teardown(p: *Process) void {
-    assert.check(.process, p.exit_code != null and p.root == 0, "tearing down process '{s}', which has not exited", .{p.name});
     release(p);
 }
 
@@ -477,6 +695,8 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     // tree lock, which is held for the few lines that put the process in
     // the tree: it is in the tree exactly when its thread is started.
     const t = try thread.create(userStart, p);
+    // (Taken back with `destroy` on an error below: it has no ID until
+    // the last step, after which nothing fails.)
     errdefer thread.destroy(t);
 
     const held = tree_lock.acquire();
@@ -487,6 +707,9 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     try chargeDescendant(options.parent);
     linkChild(p);
     live += 1;
+    p.pid = thread.assignId(t);
+    p.thread_list = t;
+    p.thread_count = 1;
     thread.start(t);
     return p;
 }

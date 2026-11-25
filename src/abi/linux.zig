@@ -16,8 +16,12 @@ pub const Sys = struct {
     pub const open = 2;
     /// `close(fd) -> 0`.
     pub const close = 3;
+    /// `fstat(fd, statbuf) -> 0`.
+    pub const fstat = 5;
     /// `poll(fds, nfds, timeout_ms) -> number of descriptors with events`.
     pub const poll = 7;
+    /// `lseek(fd, offset, whence) -> new offset`.
+    pub const lseek = 8;
     /// `mmap(addr, length, prot, flags, fd, offset) -> address`: anonymous
     /// memory, given page by page as it is touched.
     pub const mmap = 9;
@@ -31,6 +35,8 @@ pub const Sys = struct {
     pub const rt_sigaction = 13;
     /// `rt_sigprocmask(how, set, oldset, sigsetsize) -> 0`: the thread's blocked signals.
     pub const rt_sigprocmask = 14;
+    /// `pread64(fd, buf, count, offset) -> bytes read`, leaving the file's offset.
+    pub const pread64 = 17;
     /// `ioctl(fd, request, arg)`: no device has requests yet, so `ENOTTY`.
     pub const ioctl = 16;
     /// `writev(fd, iov, iovcnt) -> bytes written`: `write` from several buffers.
@@ -39,19 +45,52 @@ pub const Sys = struct {
     pub const sched_yield = 24;
     /// `madvise(addr, length, advice) -> 0`.
     pub const madvise = 28;
-    /// `exit(status)`: terminate the calling process. Does not return.
+    /// `nanosleep(request, remaining) -> 0`.
+    pub const nanosleep = 35;
+    /// `getpid() -> id` of the calling process.
+    pub const getpid = 39;
+    /// `clone(flags, stack, parent_tid, child_tid, tls) -> thread id`: a new thread.
+    pub const clone = 56;
+    /// `exit(status)`: terminate the calling thread; the process with it
+    /// if it was the last. Does not return.
     pub const exit = 60;
+    /// `kill(pid, signal)`.
+    pub const kill = 62;
+    /// `uname(buf) -> 0`.
+    pub const uname = 63;
+    /// `fcntl(fd, command, arg)`.
+    pub const fcntl = 72;
+    /// `gettimeofday(tv, tz) -> 0`.
+    pub const gettimeofday = 96;
     /// `sigaltstack(ss, old_ss) -> 0`: the stack signal handlers may run on.
     pub const sigaltstack = 131;
     /// `arch_prctl(code, addr)`: get or set the thread's FS or GS base (`ARCH`).
     pub const arch_prctl = 158;
     /// `gettid() -> id` of the calling thread.
     pub const gettid = 186;
+    /// `tkill(tid, signal)`.
+    pub const tkill = 200;
+    /// `futex(addr, op, value, timeout, addr2, value3)`.
+    pub const futex = 202;
+    /// `sched_getaffinity(pid, size, mask) -> bytes written`.
+    pub const sched_getaffinity = 204;
     /// `set_tid_address(ptr) -> id` of the calling thread; `ptr` is where
-    /// the thread's exit is to be announced (with threads, milestone 7).
+    /// the thread's exit is to be announced.
     pub const set_tid_address = 218;
+    /// `clock_gettime(clock, timespec) -> 0`.
+    pub const clock_gettime = 228;
+    /// `clock_nanosleep(clock, flags, request, remaining) -> 0`.
+    pub const clock_nanosleep = 230;
     /// `exit_group(status)`: terminate the calling process, all threads.
     pub const exit_group = 231;
+    /// `tgkill(pid, tid, signal)`.
+    pub const tgkill = 234;
+    /// `openat(dirfd, path, flags, mode) -> fd`.
+    pub const openat = 257;
+    /// `prlimit64(pid, resource, new, old) -> 0`.
+    pub const prlimit64 = 302;
+    /// `getrandom(buf, length, flags) -> bytes written`.
+    pub const getrandom = 318;
 
     /// First private (non-Linux) syscall number, far above Linux's range
     /// (under 500) and below the x32 bit (0x4000_0000). Milestone 6 replaces
@@ -72,6 +111,10 @@ pub const E = enum(u16) {
     PERM = 1,
     /// No such file or directory.
     NOENT = 2,
+    /// No such process.
+    SRCH = 3,
+    /// Interrupted: the call was cut short.
+    INTR = 4,
     /// Argument list too long.
     @"2BIG" = 7,
     /// Exec format error: not a program MyOS can load.
@@ -100,6 +143,10 @@ pub const E = enum(u16) {
     NAMETOOLONG = 36,
     /// Function not implemented: unknown syscall number.
     NOSYS = 38,
+    /// Illegal seek: the descriptor has no position.
+    SPIPE = 29,
+    /// The time ran out.
+    TIMEDOUT = 110,
 };
 
 /// Largest error number a syscall result can encode, as on Linux: results
@@ -276,4 +323,89 @@ pub const POLL = struct {
     pub const IN = 0x001;
     pub const OUT = 0x004;
     pub const NVAL = 0x020;
+};
+
+/// `struct timespec`.
+pub const TimeSpec = extern struct {
+    sec: i64,
+    nsec: i64,
+};
+
+pub const CLOCK = struct {
+    pub const REALTIME = 0;
+    pub const MONOTONIC = 1;
+    pub const PROCESS_CPUTIME_ID = 2;
+    pub const THREAD_CPUTIME_ID = 3;
+    pub const MONOTONIC_RAW = 4;
+    pub const REALTIME_COARSE = 5;
+    pub const MONOTONIC_COARSE = 6;
+    pub const BOOTTIME = 7;
+};
+
+/// `futex` operations: the low bits of `op`, and its flags.
+pub const FUTEX = struct {
+    pub const WAIT = 0;
+    pub const WAKE = 1;
+    pub const REQUEUE = 3;
+    pub const CMP_REQUEUE = 4;
+    pub const WAIT_BITSET = 9;
+    pub const WAKE_BITSET = 10;
+    pub const CMD_MASK = 0x7F;
+    pub const PRIVATE = 0x80;
+    pub const CLOCK_REALTIME = 0x100;
+};
+
+/// `openat`'s "relative to the current directory".
+pub const AT_FDCWD: i32 = -100;
+
+/// `struct stat`.
+pub const Stat = extern struct {
+    dev: u64 = 0,
+    ino: u64 = 0,
+    nlink: u64 = 1,
+    mode: u32 = 0,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    _pad0: u32 = 0,
+    rdev: u64 = 0,
+    size: i64 = 0,
+    blksize: i64 = 4096,
+    blocks: i64 = 0,
+    atime: TimeSpec = .{ .sec = 0, .nsec = 0 },
+    mtime: TimeSpec = .{ .sec = 0, .nsec = 0 },
+    ctime: TimeSpec = .{ .sec = 0, .nsec = 0 },
+    _unused: [3]i64 = .{ 0, 0, 0 },
+};
+
+/// File types in `Stat.mode`.
+pub const S = struct {
+    pub const IFCHR = 0o020000;
+    pub const IFREG = 0o100000;
+};
+
+pub const SEEK = struct {
+    pub const SET = 0;
+    pub const CUR = 1;
+    pub const END = 2;
+};
+
+/// `struct utsname`: six strings of 65 bytes.
+pub const UtsName = extern struct {
+    sysname: [65]u8 = @splat(0),
+    nodename: [65]u8 = @splat(0),
+    release: [65]u8 = @splat(0),
+    version: [65]u8 = @splat(0),
+    machine: [65]u8 = @splat(0),
+    domainname: [65]u8 = @splat(0),
+};
+
+/// `struct rlimit`.
+pub const RLimit = extern struct {
+    cur: u64,
+    max: u64,
+};
+pub const RLIM_INFINITY: u64 = ~@as(u64, 0);
+pub const RLIMIT = struct {
+    pub const STACK = 3;
+    pub const NOFILE = 7;
 };

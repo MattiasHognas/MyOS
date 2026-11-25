@@ -76,7 +76,9 @@ Linux calls, with Linux's numbers:
 | 1 | `write(fd, buf, count)` | Descriptors 1 and 2 only, both the console (serial port and screen). Files cannot be written (`EBADF`). |
 | 2 | `open(path, flags, mode)` | Read-only: the access mode in `flags` must be `O_RDONLY`. Other flags and `mode` are ignored, except that `O_CREAT` on a missing file gives `EROFS`. |
 | 3 | `close(fd)` | Closing 0, 1 or 2 succeeds and does nothing. |
+| 5 | `fstat(fd, statbuf)` | The standard streams are character devices; an open file is a regular file with its size. |
 | 7 | `poll(fds, nfds, timeout)` | Console output is always writable, open files always readable, descriptor 0 never; a descriptor that is not open gets `POLLNVAL`. With nothing ready it waits out the timeout and returns 0. |
+| 8 | `lseek(fd, offset, whence)` | Open files; `ESPIPE` for the standard streams. |
 | 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory only (`MAP_ANONYMOUS` with `MAP_PRIVATE` or `MAP_SHARED`; a file is `ENODEV`). `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, and an address hint that is used if it is free; otherwise placed top down. `MAP_NORESERVE` and `MAP_STACK` are accepted. The memory is given page by page as it is touched. |
 | 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
 | 11 | `munmap(addr, length)` | Any part of any mappings; unmapping what is not mapped succeeds. |
@@ -84,15 +86,30 @@ Linux calls, with Linux's numbers:
 | 13 | `rt_sigaction(sig, act, oldact, size)` | Recorded and read back. No signal is delivered yet (milestone 8): a fault still ends the process. |
 | 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals, recorded. |
 | 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for the standard streams and open files (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
+| 17 | `pread64(fd, buf, count, offset)` | |
 | 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. Descriptors 1 and 2 only. |
 | 24 | `sched_yield()` | |
 | 28 | `madvise(addr, length, advice)` | `MADV_DONTNEED` and `MADV_FREE` give the pages back at once: they read as zeroes afterwards. Other advice is accepted and ignored. |
-| 60 | `exit(status)` | The parent sees `status & 0xff`. Ends the process (which has one thread). |
+| 35 | `nanosleep(req, rem)` | Resolution is one timer tick (10 ms), rounded up. `rem` is never written: nothing interrupts a sleep yet. |
+| 39 | `getpid()` | The ID of the process's first thread. |
+| 56 | `clone(flags, stack, ptid, ctid, tls)` | New threads only: `flags` must include `CLONE_VM`, `CLONE_SIGHAND` and `CLONE_THREAD` (`EINVAL` otherwise; there is no `fork` yet). `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. |
+| 60 | `exit(status)` | Ends the calling thread. The last thread's status is the process's: the parent sees `status & 0xff`. |
+| 62 | `kill(pid, sig)` | The calling process only. Signals are not delivered yet: signal 0 checks; a signal with no handler whose default is to end the process ends it with status 128 + the signal (that is `abort`); anything else is dropped. `tkill` (200) and `tgkill` (234) likewise. |
+| 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
+| 72 | `fcntl(fd, cmd, arg)` | `F_GETFD`, `F_GETFL`; `F_SETFD` and `F_SETFL` are accepted and change nothing. |
+| 96 | `gettimeofday(tv, tz)` | |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, recorded. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
-| 218 | `set_tid_address(ptr)` | Returns the thread ID. The address is kept for when threads exist (milestone 7). |
-| 231 | `exit_group(status)` | The same as `exit`: a process has one thread. |
+| 202 | `futex(addr, op, val, timeout, addr2, val3)` | `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, with or without `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`. Only within one process. Timeouts have the timer's resolution and never end early. |
+| 204 | `sched_getaffinity(pid, size, mask)` | Every CPU that is up; 8 bytes. |
+| 218 | `set_tid_address(ptr)` | Returns the thread ID. When the thread exits, zero is written to `ptr` and one futex waiter on it is woken. |
+| 228 | `clock_gettime(clock, ts)` | Monotonic clocks count from boot. The real-time clock is time since boot counted from 2026-01-01: there is no clock chip driver yet. CPU-time clocks return time since boot. |
+| 230 | `clock_nanosleep(clock, flags, req, rem)` | With `TIMER_ABSTIME` too. |
+| 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
+| 257 | `openat(dirfd, path, flags, mode)` | `AT_FDCWD` or an absolute path. |
+| 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
+| 318 | `getrandom(buf, len, flags)` | Never blocks. |
 
 MyOS calls with no Linux equivalent yet. Their numbers start at
 `0x4D5900`, far above Linux's (which end below 500) and below the x32 bit
@@ -109,6 +126,9 @@ Every other number returns `ENOSYS`.
 
 - **Paths** are NUL-terminated strings of at most 255 bytes (`PATH_MAX` is
   256 here, 4096 on Linux). They are absolute; there is no current directory.
+- **Threads** share their process's address space, descriptors and signal
+  handlers, and each has its own registers, FS and GS base and signal
+  mask. `getpid` is the same in all of them, `gettid` different.
 - **Descriptors.** A process has 16: 0, 1 and 2 are the standard streams,
   so 13 files can be open at once. `open` returns the lowest free one from 3
   up. Descriptors are not inherited by programs started with `myos_run`.

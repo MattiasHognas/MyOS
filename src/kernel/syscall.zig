@@ -19,6 +19,10 @@ const keyboard = @import("../drivers/ps2_keyboard.zig");
 const heap = @import("heap.zig");
 const proc = @import("process.zig");
 const thread = @import("thread.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
+const kfutex = @import("futex.zig");
+const futex = kfutex; // its clock helpers read better by this name
+const random = @import("random.zig");
 const timer = @import("timer.zig");
 const uaccess = @import("uaccess.zig");
 const user_memory = @import("user_memory.zig");
@@ -33,7 +37,7 @@ const FIRST_FILE_FD = 3;
 /// `myos_getchar`: return the next key from the keyboard buffer, blocking
 /// the calling thread until one is typed.
 fn sysGetChar() u64 {
-    return keyboard.read();
+    return keyboard.read() orelse err(.INTR); // the process is ending: the result goes nowhere
 }
 
 /// Copy the NUL-terminated path at the user address `ptr` into `buf` and
@@ -141,7 +145,12 @@ fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
         error.ArgumentsTooLong => err(.@"2BIG"),
         else => err(.NOEXEC), // unreadable, or refused by the ELF loader
     };
-    return proc.wait(child); // whether it is still running or already gone
+    // Whether it is still running or already gone. If this process is
+    // ended meanwhile, the child runs on with nobody waiting for it.
+    return proc.waitKillable(child) orelse {
+        proc.release(child);
+        return err(.INTR);
+    };
 }
 
 /// `write`: print `count` bytes at the user address `ptr` to the console.
@@ -206,7 +215,7 @@ fn readIoVec(iov: u64, index: usize) ?abi.IoVec {
 /// library asks whether to buffer its output by line); anything else is
 /// `EBADF`.
 fn sysIoctl(fd: u64) u64 {
-    if (fd <= abi.STDERR or fileOf(fd) != null) return err(.NOTTY);
+    if (fd <= abi.STDERR or isOpen(fd)) return err(.NOTTY);
     return err(.BADF);
 }
 
@@ -241,12 +250,37 @@ fn sysSetTidAddress(ptr: u64) u64 {
     return me.id;
 }
 
-/// Return the open file for descriptor `fd` of the current process, or null
-/// if `fd` is out of range, not open, or the thread has no process.
-fn fileOf(fd: u64) ?*vfs.OpenFile {
+/// The open file behind descriptor `fd` of the current process, with a
+/// reference taken for the caller, who gives it back with `putFile`; null
+/// if `fd` is out of range, not open, or the thread has no process. The
+/// reference keeps the file there while another thread closes the descriptor.
+fn getFile(fd: u64) ?*vfs.OpenFile {
     const p = thread.current().process orelse return null;
     if (fd >= p.files.len) return null;
-    return p.files[nospec.index(fd, p.files.len)];
+    const held = p.files_lock.acquire();
+    defer p.files_lock.release(held);
+    const of = p.files[nospec.index(fd, p.files.len)] orelse return null;
+    of.refs += 1;
+    return of;
+}
+
+/// Give back a reference from `getFile`; the file is freed with its last one.
+fn putFile(of: *vfs.OpenFile) void {
+    const p = thread.current().process.?;
+    const last = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        of.refs -= 1;
+        break :blk of.refs == 0;
+    };
+    if (last) heap.allocator.destroy(of);
+}
+
+/// True if `fd` is an open file.
+fn isOpen(fd: u64) bool {
+    const of = getFile(fd) orelse return false;
+    putFile(of);
+    return true;
 }
 
 /// `open`: look up the user path `ptr` and store an `OpenFile` for it in the
@@ -267,14 +301,58 @@ fn sysOpen(ptr: u64, flags: u64) u64 {
     const p = thread.current().process orelse return err(.BADF);
     const max_files = @min(p.files.len, p.limits.max_files);
     if (max_files <= FIRST_FILE_FD) return err(.MFILE);
-    for (p.files[FIRST_FILE_FD..max_files], FIRST_FILE_FD..) |*slot, fd| {
-        if (slot.* != null) continue;
-        const of = heap.allocator.create(vfs.OpenFile) catch return err(.NOMEM);
-        of.* = .{ .node = node };
-        slot.* = of;
-        return fd;
+    // Allocated before the table is locked, and freed again if it is full.
+    const of = heap.allocator.create(vfs.OpenFile) catch return err(.NOMEM);
+    of.* = .{ .node = node };
+    const fd: ?usize = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        for (p.files[FIRST_FILE_FD..max_files], FIRST_FILE_FD..) |*slot, i| {
+            if (slot.* != null) continue;
+            slot.* = of;
+            break :blk i;
+        }
+        break :blk null;
+    };
+    return fd orelse {
+        heap.allocator.destroy(of);
+        return err(.MFILE);
+    };
+}
+
+/// `openat`: `open` for a path that is absolute, or relative to the
+/// current directory (`AT_FDCWD`), which is the root: there are no other
+/// directories to be relative to yet (`EBADF` for one).
+fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
+    const dir: i32 = @truncate(@as(i64, @bitCast(dirfd)));
+    if (dir != abi.AT_FDCWD) {
+        // An absolute path ignores the directory, as on Linux.
+        const first = fromUser(u8, ptr) orelse return err(.FAULT);
+        if (first != '/') return err(.BADF);
     }
-    return err(.MFILE);
+    return sysOpen(ptr, flags);
+}
+
+/// Read up to `len` bytes of the open file `of` from `offset` into the
+/// user buffer at `ptr`. Returns the number of bytes read, short if a
+/// later part of the buffer cannot be written, or `EFAULT` if none could.
+fn readAt(of: *vfs.OpenFile, offset: u64, ptr: u64, len: u64) u64 {
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
+    var chunk: [CHUNK]u8 = undefined;
+    var done: u64 = 0;
+    var faulted = false;
+    while (done < len) {
+        const want: usize = @intCast(@min(CHUNK, len - done));
+        const n = vfs.read(&of.node, offset + done, chunk[0..want]);
+        if (n == 0) break; // end of file
+        uaccess.copyToUser(ptr + done, chunk[0..n]) catch {
+            faulted = true;
+            break;
+        };
+        done += n;
+    }
+    if (faulted and done == 0) return err(.FAULT);
+    return done;
 }
 
 /// `read`: read up to `count` bytes from descriptor `fd` into the user
@@ -284,25 +362,81 @@ fn sysOpen(ptr: u64, flags: u64) u64 {
 /// (descriptor 0 has no input yet: milestone 6); `EFAULT` if nothing could
 /// be stored. On `EFAULT` the offset is unchanged.
 fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
-    const of = fileOf(fd) orelse return err(.BADF);
-    const len = @min(count, abi.MAX_RW_COUNT);
-    if (!user_range.valid(ptr, len)) return err(.FAULT);
-    var chunk: [CHUNK]u8 = undefined;
-    var done: u64 = 0;
-    var faulted = false;
-    while (done < len) {
-        const want: usize = @intCast(@min(CHUNK, len - done));
-        const n = vfs.read(&of.node, of.offset + done, chunk[0..want]);
-        if (n == 0) break; // end of file
-        uaccess.copyToUser(ptr + done, chunk[0..n]) catch {
-            faulted = true;
-            break;
-        };
-        done += n;
-    }
-    if (faulted and done == 0) return err(.FAULT);
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    const p = thread.current().process.?;
+    const start = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        break :blk of.offset;
+    };
+    const done = readAt(of, start, ptr, @min(count, abi.MAX_RW_COUNT));
+    if (abi.isError(done)) return done;
+    // Two threads reading one descriptor at once each get data, and the
+    // offset moves by both amounts; which of them gets which part is not
+    // defined, as on Linux.
+    const held = p.files_lock.acquire();
+    defer p.files_lock.release(held);
     of.offset += done;
     return done;
+}
+
+/// `pread64`: `read` from `offset`, leaving the file's own offset alone.
+fn sysPread(fd: u64, ptr: u64, count: u64, offset: u64) u64 {
+    const of = getFile(fd) orelse return if (fd <= abi.STDERR) err(.SPIPE) else err(.BADF);
+    defer putFile(of);
+    if (offset > std.math.maxInt(i64)) return err(.INVAL);
+    return readAt(of, offset, ptr, @min(count, abi.MAX_RW_COUNT));
+}
+
+/// `lseek`: move the offset of the open file `fd` and return it. `ESPIPE`
+/// for the standard streams, `EINVAL` for a position before the start or
+/// an unknown `whence`.
+fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
+    const of = getFile(fd) orelse return if (fd <= abi.STDERR) err(.SPIPE) else err(.BADF);
+    defer putFile(of);
+    const p = thread.current().process.?;
+    const held = p.files_lock.acquire();
+    defer p.files_lock.release(held);
+    const base: i64 = switch (whence) {
+        abi.SEEK.SET => 0,
+        abi.SEEK.CUR => @intCast(of.offset),
+        abi.SEEK.END => @intCast(of.node.size),
+        else => return err(.INVAL),
+    };
+    const new = std.math.add(i64, base, @bitCast(offset)) catch return err(.INVAL);
+    if (new < 0) return err(.INVAL);
+    of.offset = @intCast(new);
+    return of.offset;
+}
+
+/// `fstat`: what kind of thing `fd` is and, for a file, how large. The
+/// standard streams are character devices.
+fn sysFstat(fd: u64, ptr: u64) u64 {
+    var st: abi.Stat = .{};
+    if (fd <= abi.STDERR) {
+        st.mode = abi.S.IFCHR | 0o620;
+        st.rdev = 0x8800; // a pseudo-terminal's device number
+        st.blksize = 1024;
+    } else {
+        const of = getFile(fd) orelse return err(.BADF);
+        defer putFile(of);
+        st.mode = abi.S.IFREG | 0o555;
+        st.size = @intCast(of.node.size);
+        st.blocks = @intCast((of.node.size + 511) / 512);
+    }
+    return if (toUser(ptr, st)) 0 else err(.FAULT);
+}
+
+/// `fcntl`: the descriptor and status flags can be read; setting them is
+/// accepted and changes nothing (there is nothing they would change yet).
+fn sysFcntl(fd: u64, command: u64) u64 {
+    if (fd > abi.STDERR and !isOpen(fd)) return err(.BADF);
+    return switch (command) {
+        1, 2, 4 => 0, // F_GETFD, F_SETFD, F_SETFL
+        3 => if (fd == abi.STDOUT or fd == abi.STDERR) abi.O.WRONLY else abi.O.RDONLY, // F_GETFL
+        else => err(.INVAL),
+    };
 }
 
 /// `close`: free the open file behind descriptor `fd` and clear its slot.
@@ -310,10 +444,17 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
 /// stream succeeds and changes nothing, since they cannot be reopened yet.
 fn sysClose(fd: u64) u64 {
     if (fd < FIRST_FILE_FD) return 0;
-    const of = fileOf(fd) orelse return err(.BADF);
-    heap.allocator.destroy(of);
-    const files = &thread.current().process.?.files;
-    files[nospec.index(fd, files.len)] = null;
+    const p = thread.current().process orelse return err(.BADF);
+    if (fd >= p.files.len) return err(.BADF);
+    const of = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        const slot = &p.files[nospec.index(fd, p.files.len)];
+        const of = slot.* orelse return err(.BADF);
+        slot.* = null;
+        break :blk of;
+    };
+    putFile(of); // the descriptor's reference; a call in flight keeps its own
     return 0;
 }
 
@@ -420,7 +561,7 @@ fn sysPoll(fds: u64, count: u64, timeout_ms: u64) u64 {
                 entry.revents = entry.events & abi.POLL.OUT;
             } else if (fd == abi.STDIN) {
                 // Nothing to read from descriptor 0 yet.
-            } else if (fileOf(fd) != null) {
+            } else if (isOpen(fd)) {
                 entry.revents = entry.events & abi.POLL.IN;
             } else entry.revents = abi.POLL.NVAL;
         }
@@ -429,10 +570,232 @@ fn sysPoll(fds: u64, count: u64, timeout_ms: u64) u64 {
     }
     if (ready == 0) {
         const timeout: i32 = @truncate(@as(i64, @bitCast(timeout_ms)));
-        if (timeout < 0) while (true) timer.sleepMs(1000);
-        if (timeout > 0) timer.sleepMs(@intCast(timeout));
+        if (timeout < 0) while (timer.sleepTicksKillable(timer.HZ)) {};
+        if (timeout > 0) _ = timer.sleepTicksKillable(timer.msToTicks(@intCast(timeout)));
     }
     return ready;
+}
+
+/// Seconds between 1970 and the moment the wall clock is taken to have
+/// started at boot: 2026-01-01. There is no clock chip driver yet, so
+/// "real" time is time since boot from there.
+const BOOT_EPOCH_SECONDS: u64 = 1_767_225_600;
+const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// Nanoseconds on `clock`, or null if there is no such clock.
+fn clockNanos(clock: u64) ?u64 {
+    return switch (clock) {
+        abi.CLOCK.MONOTONIC, abi.CLOCK.MONOTONIC_RAW, abi.CLOCK.MONOTONIC_COARSE, abi.CLOCK.BOOTTIME => futex.monotonicNanos(),
+        abi.CLOCK.REALTIME, abi.CLOCK.REALTIME_COARSE => futex.monotonicNanos() + BOOT_EPOCH_SECONDS * NS_PER_SEC,
+        // CPU time used is not counted yet; time since boot is an upper bound.
+        abi.CLOCK.PROCESS_CPUTIME_ID, abi.CLOCK.THREAD_CPUTIME_ID => futex.monotonicNanos(),
+        else => null,
+    };
+}
+
+fn timeSpec(ns: u64) abi.TimeSpec {
+    return .{ .sec = @intCast(ns / NS_PER_SEC), .nsec = @intCast(ns % NS_PER_SEC) };
+}
+
+/// The nanoseconds in the `timespec` at the user address `ptr`, or an
+/// error value: `EFAULT`, or `EINVAL` if it is not a valid time.
+fn userNanos(ptr: u64) union(enum) { ns: u64, fail: u64 } {
+    const ts = fromUser(abi.TimeSpec, ptr) orelse return .{ .fail = err(.FAULT) };
+    if (ts.sec < 0 or ts.nsec < 0 or ts.nsec >= NS_PER_SEC) return .{ .fail = err(.INVAL) };
+    const sec: u64 = @intCast(ts.sec);
+    if (sec > std.math.maxInt(u64) / NS_PER_SEC / 2) return .{ .ns = std.math.maxInt(u64) / 2 }; // as good as forever
+    return .{ .ns = sec * NS_PER_SEC + @as(u64, @intCast(ts.nsec)) };
+}
+
+/// `clock_gettime`.
+fn sysClockGetTime(clock: u64, ptr: u64) u64 {
+    const ns = clockNanos(clock) orelse return err(.INVAL);
+    return if (toUser(ptr, timeSpec(ns))) 0 else err(.FAULT);
+}
+
+/// `gettimeofday`: seconds and microseconds; the time zone is not filled in.
+fn sysGetTimeOfDay(tv: u64) u64 {
+    if (tv == 0) return 0;
+    const ns = clockNanos(abi.CLOCK.REALTIME).?;
+    const value = [2]i64{ @intCast(ns / NS_PER_SEC), @intCast(ns % NS_PER_SEC / 1000) };
+    return if (toUser(tv, value)) 0 else err(.FAULT);
+}
+
+/// Sleep until `deadline` (nanoseconds since boot). Returns 0, or `EINTR`
+/// if the process is ending.
+fn sleepUntil(deadline: u64) u64 {
+    while (true) {
+        const now = futex.monotonicNanos();
+        if (now >= deadline) return 0;
+        // In ticks, rounded up; a tick more than needed is slept by `sleepTicks`.
+        const ticks = futex.nanosToTicks(deadline - now);
+        if (!timer.sleepTicksKillable(ticks -| 1)) return err(.INTR);
+    }
+}
+
+/// `nanosleep` and `clock_nanosleep`: sleep for the time at `request`, or
+/// with `absolute` until that time on `clock`. Nothing interrupts a sleep
+/// yet, so `remaining` is never written.
+fn sysSleep(clock: u64, absolute: bool, request: u64) u64 {
+    const now = clockNanos(clock) orelse return err(.INVAL);
+    const ns = switch (userNanos(request)) {
+        .ns => |n| n,
+        .fail => |e| return e,
+    };
+    const wait_ns = if (absolute) ns -| now else ns;
+    return sleepUntil(futex.monotonicNanos() +| wait_ns);
+}
+
+/// `futex`: wait on, wake, or move the waiters of the 32-bit word at
+/// `addr` (`futex.zig`). `EINVAL` for an operation that does not exist
+/// here, and for an empty bit set.
+fn sysFutex(f: *const arch.Frame) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    const addr = f.rdi;
+    const op = f.rsi;
+    const value: u32 = @truncate(f.rdx);
+    if (addr % 4 != 0) return err(.INVAL);
+    if (!user_range.valid(addr, 4)) return err(.FAULT);
+    const command = op & abi.FUTEX.CMD_MASK;
+    switch (command) {
+        abi.FUTEX.WAIT, abi.FUTEX.WAIT_BITSET => {
+            const bitset: u32 = if (command == abi.FUTEX.WAIT) kfutex.ANY else @truncate(f.r9);
+            if (bitset == 0) return err(.INVAL);
+            var ticks: ?u64 = null;
+            if (f.r10 != 0) {
+                const ns = switch (userNanos(f.r10)) {
+                    .ns => |n| n,
+                    .fail => |e| return e,
+                };
+                // WAIT takes how long; WAIT_BITSET takes until when.
+                const left = if (command == abi.FUTEX.WAIT) ns else blk: {
+                    const clock: u64 = if (op & abi.FUTEX.CLOCK_REALTIME != 0) abi.CLOCK.REALTIME else abi.CLOCK.MONOTONIC;
+                    break :blk ns -| clockNanos(clock).?;
+                };
+                if (left == 0) {
+                    // No time to wait: only the comparison is left to do.
+                    const now = fromUser(u32, addr) orelse return err(.FAULT);
+                    return if (now != value) err(.AGAIN) else err(.TIMEDOUT);
+                }
+                ticks = kfutex.nanosToTicks(left);
+            }
+            kfutex.wait(p, addr, value, bitset, ticks) catch |e| return futexError(e);
+            return 0;
+        },
+        abi.FUTEX.WAKE, abi.FUTEX.WAKE_BITSET => {
+            const bitset: u32 = if (command == abi.FUTEX.WAKE) kfutex.ANY else @truncate(f.r9);
+            if (bitset == 0) return err(.INVAL);
+            return kfutex.wake(p, addr, value, bitset);
+        },
+        abi.FUTEX.REQUEUE, abi.FUTEX.CMP_REQUEUE => {
+            if (f.r8 % 4 != 0) return err(.INVAL);
+            if (!user_range.valid(f.r8, 4)) return err(.FAULT);
+            const expected: ?u32 = if (command == abi.FUTEX.CMP_REQUEUE) @as(u32, @truncate(f.r9)) else null;
+            return kfutex.requeue(p, addr, value, @truncate(f.r10), f.r8, expected) catch |e| futexError(e);
+        },
+        else => return err(.NOSYS),
+    }
+}
+
+fn futexError(e: kfutex.WaitError) u64 {
+    return switch (e) {
+        error.Again => err(.AGAIN),
+        error.TimedOut => err(.TIMEDOUT),
+        error.Fault => err(.FAULT),
+        error.Interrupted => err(.INTR),
+    };
+}
+
+/// `clone`: a new thread of the calling process. Only that: the flags must
+/// say that it shares the address space and the signal handlers and is
+/// part of the same thread group (`EINVAL` otherwise; there is no `fork`
+/// yet). Returns the new thread's ID in the caller, 0 in the new thread.
+fn sysClone(f: *const arch.Frame) u64 {
+    const flags = f.rdi;
+    if (flags & proc.CLONE.THREAD_FLAGS != proc.CLONE.THREAD_FLAGS) return err(.INVAL);
+    if (thread.current().process == null) return err(.NOSYS);
+    // The order of the last arguments is x86-64's: child_tid, then tls.
+    const tid = proc.cloneThread(f, .{ .flags = flags, .stack = f.rsi, .parent_tid = f.rdx, .child_tid = f.r10, .tls = f.r8 }) catch |e| return switch (e) {
+        error.OutOfMemory => err(.NOMEM),
+        error.Fault => err(.FAULT),
+        error.BadAddress => err(.PERM),
+        error.ProcessEnding => err(.INTR),
+    };
+    return tid;
+}
+
+/// `sched_getaffinity`: the CPUs the thread may run on, which is all that
+/// are up. Runtimes count the bits to learn how many CPUs there are.
+/// Returns the bytes written (8); `EINVAL` if the buffer is smaller.
+fn sysSchedGetAffinity(size: u64, ptr: u64) u64 {
+    if (size < 8) return err(.INVAL);
+    const n = percpu.count();
+    const mask: u64 = if (n >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
+    return if (toUser(ptr, mask)) 8 else err(.FAULT);
+}
+
+/// `getrandom`: fill the user buffer with random bytes. Never blocks: the
+/// generator is seeded at boot.
+fn sysGetRandom(ptr: u64, count: u64) u64 {
+    const len = @min(count, abi.MAX_RW_COUNT);
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
+    var chunk: [CHUNK]u8 = undefined;
+    var done: u64 = 0;
+    while (done < len) {
+        const part = chunk[0..@intCast(@min(CHUNK, len - done))];
+        random.bytes(part);
+        uaccess.copyToUser(ptr + done, part) catch return if (done == 0) err(.FAULT) else done;
+        done += part.len;
+    }
+    return done;
+}
+
+/// `uname`: programs written for Linux ask, and some refuse a kernel that
+/// does not say Linux or that claims a version older than they need.
+fn sysUname(ptr: u64) u64 {
+    var u: abi.UtsName = .{};
+    const fields = .{ .{ &u.sysname, "Linux" }, .{ &u.nodename, "myos" }, .{ &u.release, "6.1.0-myos" }, .{ &u.version, "MyOS" }, .{ &u.machine, "x86_64" } };
+    inline for (fields) |field| @memcpy(field[0][0..field[1].len], field[1]);
+    return if (toUser(ptr, u)) 0 else err(.FAULT);
+}
+
+/// `prlimit64`: read a resource limit of the calling process. The stack
+/// may grow to its reservation, a process has a fixed number of
+/// descriptors, and nothing else is limited through this call. Limits
+/// cannot be changed with it yet (`EPERM`).
+fn sysPrlimit(pid: u64, resource: u64, new: u64, old: u64) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    if (pid != 0 and pid != p.pid) return err(.SRCH);
+    if (new != 0) return err(.PERM);
+    if (old == 0) return 0;
+    const limit: abi.RLimit = switch (resource) {
+        abi.RLIMIT.STACK => .{ .cur = proc.STACK_RESERVE, .max = abi.RLIM_INFINITY },
+        abi.RLIMIT.NOFILE => .{ .cur = p.limits.max_files, .max = proc.MAX_FILES },
+        0...2, 4...6, 8...15 => .{ .cur = abi.RLIM_INFINITY, .max = abi.RLIM_INFINITY },
+        else => return err(.INVAL),
+    };
+    return if (toUser(old, limit)) 0 else err(.FAULT);
+}
+
+/// `kill`, `tkill` and `tgkill`. Signals are not delivered yet (milestone
+/// 8), so this does what can be done without that: signal 0 only checks
+/// that the target exists; a signal whose default is to end the process,
+/// sent to the calling process when no handler is set for it, ends it
+/// (that is how `abort` works); anything else is accepted and dropped.
+/// Only the calling process can be signalled (`ESRCH` for another).
+fn sysKill(pid: u64, sig: u64) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    if (sig > abi.NSIG) return err(.INVAL);
+    if (pid != p.pid) return err(.SRCH);
+    if (sig == 0) return 0;
+    const action = p.signal_actions[nospec.index(sig - 1, abi.NSIG)];
+    const ignored_by_default = switch (sig) {
+        17, 18, 23, 28 => true, // SIGCHLD, SIGCONT, SIGURG, SIGWINCH
+        else => false,
+    };
+    const unhandled = action.handler == 0 or sig == abi.SIGKILL; // SIG_DFL
+    if (unhandled and !ignored_by_default) proc.exit(128 + sig);
+    return 0;
 }
 
 /// The memory calls (`user_memory.zig`), for the calling thread's process.
@@ -461,6 +824,25 @@ pub fn dispatch(f: *arch.Frame) void {
             thread.yield();
             break :blk 0;
         },
+        Sys.fstat => sysFstat(f.rdi, f.rsi),
+        Sys.lseek => sysLseek(f.rdi, f.rsi, f.rdx),
+        Sys.pread64 => sysPread(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.openat => sysOpenAt(f.rdi, f.rsi, f.rdx),
+        Sys.fcntl => sysFcntl(f.rdi, f.rsi),
+        Sys.nanosleep => sysSleep(abi.CLOCK.MONOTONIC, false, f.rdi),
+        Sys.clock_nanosleep => sysSleep(f.rdi, f.rsi & 1 != 0, f.rdx),
+        Sys.clock_gettime => sysClockGetTime(f.rdi, f.rsi),
+        Sys.gettimeofday => sysGetTimeOfDay(f.rdi),
+        Sys.getpid => if (thread.current().process) |p| p.pid else err(.NOSYS),
+        Sys.clone => sysClone(f),
+        Sys.futex => sysFutex(f),
+        Sys.sched_getaffinity => sysSchedGetAffinity(f.rsi, f.rdx),
+        Sys.getrandom => sysGetRandom(f.rdi, f.rsi),
+        Sys.uname => sysUname(f.rdi),
+        Sys.prlimit64 => sysPrlimit(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.kill => sysKill(f.rdi, f.rsi),
+        Sys.tgkill => sysKill(f.rdi, f.rdx),
+        Sys.tkill => if (thread.current().process) |p| sysKill(p.pid, f.rsi) else err(.NOSYS),
         Sys.poll => sysPoll(f.rdi, f.rsi, f.rdx),
         Sys.rt_sigaction => sysSigAction(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.rt_sigprocmask => sysSigProcMask(f.rdi, f.rsi, f.rdx, f.r10),
@@ -474,8 +856,8 @@ pub fn dispatch(f: *arch.Frame) void {
         Sys.writev => sysWritev(f.rdi, f.rsi, f.rdx),
         Sys.arch_prctl => sysArchPrctl(f.rdi, f.rsi),
         Sys.set_tid_address => sysSetTidAddress(f.rdi),
-        // One thread per process: leaving the group is leaving.
-        Sys.exit, Sys.exit_group => proc.exit(abi.exitStatus(f.rdi)),
+        Sys.exit => proc.exitThread(abi.exitStatus(f.rdi)),
+        Sys.exit_group => proc.exit(abi.exitStatus(f.rdi)),
         Sys.gettid => thread.id(),
         Sys.myos_getchar => sysGetChar(),
         Sys.myos_run => sysRun(f.rdi, f.rsi, f.rdx),

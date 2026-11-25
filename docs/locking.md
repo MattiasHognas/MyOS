@@ -45,9 +45,9 @@ belongs to this CPU.
 | Lock | Rank | Protects | Where |
 | --- | --- | --- | --- |
 | Process-tree lock (one, global) | `process_tree` | Parent and child links, descendant counts, reference counts, exit statuses and the threads waiting for them | `process.zig` |
-| A process's address-space lock | `address_space` | Its user page tables and, from milestone 5, its regions | Not yet needed: one thread per process |
-| A process's descriptor-table lock | `descriptor_table` | Its open files | Not yet needed: one thread per process |
-| A condition's lock | `condition` | A condition some thread waits for, together with the wait queue for it: the keyboard buffer and its readers, a mutex's owner and its waiters | `ps2_keyboard.zig`, `sync/mutex.zig` |
+| A process's address-space lock | `address_space` | Its regions, its `brk` heap and its user page tables | `user_memory.zig` |
+| A process's descriptor-table lock | `descriptor_table` | Its open files and their reference counts | `syscall.zig` |
+| A condition's lock | `condition` | A condition some thread waits for, together with the wait queue for it: the keyboard buffer and its readers, a mutex's owner and its waiters, every futex and its waiters (one lock for all of them) | `ps2_keyboard.zig`, `sync/mutex.zig`, `futex.zig` |
 | Timer lock | `timer` | The timer queue and the tick count | `timer.zig` |
 | Scheduler lock (one, global, to begin with) | `scheduler` | The ready queue, every thread's `state`, `link`, `on_cpu` and wake-up permit, the zombie list | `thread.zig` |
 | Heap lock | `kernel_region` | The kernel heap, and the page tables of the heap's region | `heap.zig` |
@@ -197,6 +197,21 @@ prevent it, and `timer.WakeTimer` is the one place that implements them:
 The wait for "finished" is a short spin, with the condition's lock held if
 there is one: the callback takes only the scheduler lock, so it cannot be
 waiting for the spinning thread.
+
+**A thread whose process is ending ends too**, wherever it is. The thread
+that ends the process marks it, makes every other thread come through the
+kernel (a sleeping one is woken, a running one interrupted), and waits
+until they have gone before it gives up the process's memory. A thread
+looks at the mark where it would return to its program, and in the waits a
+program may stay in for as long as it likes (`WaitQueue.waitKillable`, a
+futex wait, a sleep). Waits inside the kernel that are over in a moment (a
+mutex) are not ended early: their callers could not cope, and need not.
+
+**A futex is read under its lock with page faults off.** The comparison
+"is the word still what the caller saw" and going to sleep must be one
+step against a waker, so the word is read with the futex lock held; a
+fault there would want the address-space lock, which ranks before it. The
+word is read once without the lock first, to bring the page in.
 
 ## Per-CPU state
 

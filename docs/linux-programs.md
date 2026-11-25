@@ -68,8 +68,9 @@ for the time.
 | --- | --- |
 | C, static, musl | Runs (`tests/fixtures/bin/musl-hello-static`) |
 | Rust with std, static, musl, fixed address | Runs (`tests/fixtures/bin/rust-hello-static`) |
+| C with pthreads, static, musl | Runs, its threads on several CPUs (`tests/fixtures/bin/musl-threads-static`) |
 | The same as position-independent executables | Needs `ET_DYN` loading (4.1) |
-| Go | Needs threads and futexes (7) |
+| Go | Has its threads and futexes now; needs signals delivered (8) |
 | .NET Native AOT | Not measured yet |
 
 ## What this means for the order of work
