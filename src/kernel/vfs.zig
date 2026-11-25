@@ -23,6 +23,23 @@ pub const Error = error{
     IsDirectory,
     /// The path or one of its parts is too long.
     NameTooLong,
+    /// Something has that name already.
+    Exists,
+    /// A directory that still holds something.
+    NotEmpty,
+    /// The filesystem is full, or there is no memory for it.
+    NoSpace,
+    /// The filesystem cannot be changed.
+    ReadOnly,
+    /// What cannot be done to this file or directory at all: a directory
+    /// moved into itself, the root removed.
+    Invalid,
+    /// Larger than a file can be.
+    TooLarge,
+    /// A mount point, or what leads to one, cannot be removed or renamed.
+    Busy,
+    /// A rename from one filesystem to another.
+    CrossDevice,
 };
 
 /// Longest name of one file or directory, as on Linux.
@@ -61,6 +78,20 @@ pub const Ops = struct {
     /// Copy up to `buf.len` bytes starting at `offset` into `buf`. Returns the
     /// number of bytes copied, or 0 at or past the end of the file.
     read: *const fn (node: *const Node, offset: u64, buf: []u8) usize,
+    /// Write `data` at `offset`, growing the file as needed, and return
+    /// the bytes written. Null for a file that cannot be written.
+    write: ?*const fn (node: *const Node, offset: u64, data: []const u8) Error!usize = null,
+    /// Make the file exactly `size` bytes.
+    truncate: ?*const fn (node: *const Node, size: u64) Error!void = null,
+    /// The file's size now, for a file whose size changes (`Node.size`
+    /// is what it was when the node was made).
+    size: ?*const fn (node: *const Node) u64 = null,
+    /// A file that can go away while someone uses it is counted: every
+    /// node `Fs.lookup` or `Fs.create` hands out holds the file until it
+    /// is given to `release`; `retain` makes a second holder of one. Null
+    /// where files stay for good.
+    retain: ?*const fn (node: *const Node) void = null,
+    release: ?*const fn (node: *const Node) void = null,
 };
 
 /// A mounted filesystem: turns paths into nodes.
@@ -78,6 +109,14 @@ pub const Fs = struct {
     /// the filesystem's business, as long as it stays below 2^63. A
     /// filesystem without the function has only empty directories.
     next: ?*const fn (ctx: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?DirEntry = null,
+    /// The functions that change the filesystem; all null for one that
+    /// cannot be changed. `create` makes an empty file and returns its
+    /// node (to be released, like one from `lookup`).
+    create: ?*const fn (ctx: *anyopaque, path: []const u8) Error!Node = null,
+    mkdir: ?*const fn (ctx: *anyopaque, path: []const u8) Error!void = null,
+    unlink: ?*const fn (ctx: *anyopaque, path: []const u8) Error!void = null,
+    rmdir: ?*const fn (ctx: *anyopaque, path: []const u8) Error!void = null,
+    rename: ?*const fn (ctx: *anyopaque, old: []const u8, new: []const u8) Error!void = null,
 };
 
 /// Mount `fs` as the root filesystem, replacing any previous one. The
@@ -131,10 +170,111 @@ fn resolve(path: []const u8) ?struct { fs: Fs, rest: []const u8, skipped: usize 
 }
 
 /// Look up the file at `path`. Returns null if there is none (or it is a
-/// directory, or nothing is mounted).
+/// directory, or nothing is mounted). The node holds the file until it is
+/// given to `release`.
 pub fn lookup(path: []const u8) ?Node {
     const at = resolve(path) orelse return null;
     return at.fs.lookup(at.fs.ctx, at.rest);
+}
+
+/// Let go of a node from `lookup` or `create`.
+pub fn release(node: *const Node) void {
+    if (node.ops.release) |f| f(node);
+}
+
+/// A second holder of the file behind `node`, to be released as well.
+pub fn retain(node: *const Node) void {
+    if (node.ops.retain) |f| f(node);
+}
+
+/// Whether the file can go away while it is in use (and so is counted).
+pub fn isCounted(node: *const Node) bool {
+    return node.ops.release != null;
+}
+
+/// The size of the file now.
+pub fn sizeOf(node: *const Node) u64 {
+    return if (node.ops.size) |f| f(node) else node.size;
+}
+
+pub fn isWritable(node: *const Node) bool {
+    return node.ops.write != null;
+}
+
+/// Write `data` to the file at `offset`: see `Ops.write`.
+pub fn write(node: *const Node, offset: u64, data: []const u8) Error!usize {
+    const f = node.ops.write orelse return error.ReadOnly;
+    return f(node, offset, data);
+}
+
+/// Make the file exactly `size` bytes.
+pub fn truncate(node: *const Node, size: u64) Error!void {
+    const f = node.ops.truncate orelse return error.ReadOnly;
+    return f(node, size);
+}
+
+/// Whether `path` is a mount point or has one below it: such a directory
+/// stays where and what it is.
+fn holdsMount(path: []const u8) bool {
+    for (mounts) |slot| {
+        const m = slot orelse continue;
+        if (m.path.len > 1 and within(m.path, path)) return true;
+    }
+    return false;
+}
+
+/// Whether the filesystem `path` belongs to can be changed.
+pub fn isWritablePath(path: []const u8) bool {
+    const at = resolve(path) orelse return false;
+    return at.fs.create != null;
+}
+
+/// Make an empty file at `path`; `error.Exists` if anything is there.
+/// The node is to be released like one from `lookup`.
+pub fn create(path: []const u8) Error!Node {
+    const at = resolve(path) orelse return error.NotFound;
+    const f = at.fs.create orelse return error.ReadOnly;
+    if (at.rest.len == 1) return error.Exists; // a mount point is a directory
+    return f(at.fs.ctx, at.rest);
+}
+
+pub fn mkdir(path: []const u8) Error!void {
+    const at = resolve(path) orelse return error.NotFound;
+    if (at.rest.len == 1 or isDirectory(path)) return error.Exists;
+    const f = at.fs.mkdir orelse return error.ReadOnly;
+    return f(at.fs.ctx, at.rest);
+}
+
+/// Remove the file at `path`.
+pub fn unlink(path: []const u8) Error!void {
+    const at = resolve(path) orelse return error.NotFound;
+    if (holdsMount(path)) return error.IsDirectory;
+    const f = at.fs.unlink orelse return if (lookupExists(path)) error.ReadOnly else if (isDirectory(path)) error.IsDirectory else error.NotFound;
+    return f(at.fs.ctx, at.rest);
+}
+
+/// Remove the empty directory at `path`.
+pub fn rmdir(path: []const u8) Error!void {
+    const at = resolve(path) orelse return error.NotFound;
+    if (holdsMount(path)) return error.Busy;
+    const f = at.fs.rmdir orelse return if (isDirectory(path)) error.ReadOnly else if (lookupExists(path)) error.NotDirectory else error.NotFound;
+    return f(at.fs.ctx, at.rest);
+}
+
+/// Give what is at `old` the name `new`, within one filesystem.
+pub fn rename(old: []const u8, new: []const u8) Error!void {
+    const from = resolve(old) orelse return error.NotFound;
+    const to = resolve(new) orelse return error.NotFound;
+    if (holdsMount(old) or holdsMount(new)) return error.Busy;
+    if (from.fs.ctx != to.fs.ctx or from.skipped != to.skipped) return error.CrossDevice;
+    const f = from.fs.rename orelse return if (lookupExists(old) or isDirectory(old)) error.ReadOnly else error.NotFound;
+    return f(from.fs.ctx, from.rest, to.rest);
+}
+
+fn lookupExists(path: []const u8) bool {
+    const node = lookup(path) orelse return false;
+    release(&node);
+    return true;
 }
 
 /// Whether `path` is a directory: a mount point, something a mount point

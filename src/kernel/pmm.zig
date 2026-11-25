@@ -73,6 +73,11 @@ pub const FreeError = page_bitmap.FreeError || error{
 };
 
 /// Return a pointer to physical address `phys` through the HHDM. Requires `init`.
+/// The physical address behind an address `physToVirt` gave.
+pub fn virtToPhys(virt: u64) u64 {
+    return virt - hhdm;
+}
+
 pub fn physToVirt(phys: u64) [*]u8 {
     return @ptrFromInt(phys + hhdm);
 }

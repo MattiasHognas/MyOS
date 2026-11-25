@@ -113,6 +113,14 @@ fn vfsError(e: vfs.Error) u64 {
         error.NotDirectory => err(.NOTDIR),
         error.IsDirectory => err(.ISDIR),
         error.NameTooLong => err(.NAMETOOLONG),
+        error.Exists => err(.EXIST),
+        error.NotEmpty => err(.NOTEMPTY),
+        error.NoSpace => err(.NOSPC),
+        error.ReadOnly => err(.ROFS),
+        error.Invalid => err(.INVAL),
+        error.TooLarge => err(.FBIG),
+        error.Busy => err(.BUSY),
+        error.CrossDevice => err(.XDEV),
     };
 }
 
@@ -315,6 +323,164 @@ fn sysPipe(fds_ptr: u64, flags: u64) u64 {
     return 0;
 }
 
+/// `write` and `pwrite64` to a file: at `at`, or (null) at the
+/// descriptor's offset, which moves on, or at the file's end for a
+/// descriptor opened with `O_APPEND`. Short only if the space runs out
+/// or part of the buffer cannot be read; `ENOSPC`, `EFBIG`, `EFAULT` if
+/// nothing could be written.
+///
+/// Two threads appending through one descriptor at once may write over
+/// each other: the end is looked at and written to in two steps.
+fn fileWrite(of: *OpenFile, ptr: u64, len: u64, at: ?u64) u64 {
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
+    const p = thread.current().process.?;
+    var offset = at orelse blk: {
+        if (of.append) break :blk vfs.sizeOf(&of.node);
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        break :blk of.offset;
+    };
+    var chunk: [CHUNK]u8 = undefined;
+    var done: u64 = 0;
+    var failure: ?u64 = null;
+    while (done < len) {
+        const part = chunk[0..@intCast(@min(CHUNK, len - done))];
+        uaccess.copyFromUser(part, ptr + done) catch {
+            failure = err(.FAULT);
+            break;
+        };
+        const n = vfs.write(&of.node, offset, part) catch |e| {
+            failure = vfsError(e);
+            break;
+        };
+        done += n;
+        offset += n;
+        if (n < part.len) {
+            failure = err(.NOSPC);
+            break;
+        }
+    }
+    if (at == null) {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        of.offset = offset;
+    }
+    return if (done == 0) failure orelse 0 else done;
+}
+
+/// `pwrite64`: `write` to a file at `offset`, leaving the descriptor's
+/// own offset alone. `ESPIPE` for what has no offsets, `EBADF` if it is
+/// not open for writing.
+fn sysPwrite(fd: u64, ptr: u64, count: u64, offset: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind != .file) return err(.SPIPE);
+    if (!of.writable) return err(.BADF);
+    if (offset > std.math.maxInt(i64)) return err(.INVAL);
+    return fileWrite(of, ptr, @min(count, abi.MAX_RW_COUNT), offset);
+}
+
+/// `ftruncate` and `truncate`: make a file exactly `length` bytes, cutting
+/// it short or letting it end in zeroes. `EINVAL` for a descriptor that
+/// is not a file open for writing, or a negative length; `EFBIG`;
+/// for a path also `EISDIR`, `ENOENT`, `EROFS`.
+fn sysFtruncate(fd: u64, length: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind != .file or !of.writable or length > std.math.maxInt(i64)) return err(.INVAL);
+    vfs.truncate(&of.node, length) catch |e| return vfsError(e);
+    return 0;
+}
+
+fn sysTruncate(path_ptr: u64, length: u64) u64 {
+    var given = switch (Path.from(CWD, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    if (length > std.math.maxInt(i64)) return err(.INVAL);
+    switch (named(given.text)) {
+        .none => return err(.NOENT),
+        .directory => return err(.ISDIR),
+        .file => {},
+        else => return err(.INVAL),
+    }
+    const node = fileAt(given.text) orelse return err(.NOENT);
+    defer vfs.release(&node);
+    vfs.truncate(&node, length) catch |e| return vfsError(e);
+    return 0;
+}
+
+/// `mkdir` and `mkdirat`: make an empty directory. `EEXIST`, `ENOENT` or
+/// `ENOTDIR` for the directory it is to go into, `EROFS`, `ENOSPC`.
+fn sysMkdir(dirfd: u64, path_ptr: u64) u64 {
+    var given = switch (Path.from(dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    if (named(given.text) != .none) return err(.EXIST);
+    vfs.mkdir(given.text) catch |e| return vfsError(e);
+    return 0;
+}
+
+/// `unlink`, `rmdir` and `unlinkat`: take a file's name away (the file
+/// lives while it is open), or remove an empty directory. `ENOENT`,
+/// `EISDIR` and `ENOTDIR` for the wrong one of the two, `ENOTEMPTY`,
+/// `EROFS`, `EBUSY` for a mount point, `EINVAL` for unknown flags.
+fn sysUnlink(dirfd: u64, path_ptr: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, abi.AT_REMOVEDIR) != 0) return err(.INVAL);
+    var given = switch (Path.from(dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    const directory = flags & abi.AT_REMOVEDIR != 0;
+    switch (named(given.text)) {
+        .none => return err(.NOENT),
+        .file => if (directory or given.directory_wanted) return err(.NOTDIR),
+        .directory => if (!directory) return err(.ISDIR),
+        // What this kernel itself puts into /proc and /dev stays.
+        else => return err(.PERM),
+    }
+    (if (directory) vfs.rmdir(given.text) else vfs.unlink(given.text)) catch |e| return vfsError(e);
+    return 0;
+}
+
+/// `rename`, `renameat` and `renameat2`: give a file or directory another
+/// name, replacing a file of that name or an empty directory. Within one
+/// filesystem (`EXDEV`). `ENOENT`, `EISDIR`, `ENOTDIR`, `ENOTEMPTY`,
+/// `EINVAL` for a directory moved into itself or for flags (none is
+/// supported), `EROFS`, `EBUSY`, `ENOSPC`.
+fn sysRename(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: u64) u64 {
+    if (flags != 0) return err(.INVAL);
+    var old = switch (Path.from(old_dirfd, old_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer old.deinit();
+    var new = switch (Path.from(new_dirfd, new_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer new.deinit();
+    switch (named(old.text)) {
+        .none => return err(.NOENT),
+        .file, .directory => {},
+        else => return err(.PERM),
+    }
+    vfs.rename(old.text, new.text) catch |e| return vfsError(e);
+    return 0;
+}
+
+/// `fchmod`: there are no permissions; a file that can be written
+/// accepts any, the rest is `EROFS`.
+fn sysFchmod(fd: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    return if (of.kind == .file and of.generated == null and vfs.isWritable(&of.node)) 0 else err(.ROFS);
+}
+
 fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
     {
         const of = getFile(fd) orelse return err(.BADF);
@@ -327,7 +493,11 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
                 const len = @min(count, abi.MAX_RW_COUNT);
                 return if (user_range.valid(ptr, len)) len else err(.FAULT);
             },
-            .file, .pipe_read, .directory => return err(.BADF), // files are read-only
+            .file => {
+                if (!of.writable) return err(.BADF);
+                return fileWrite(of, ptr, @min(count, abi.MAX_RW_COUNT), null);
+            },
+            .pipe_read, .directory => return err(.BADF),
         }
     }
     const len = @min(count, abi.MAX_RW_COUNT);
@@ -344,6 +514,32 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
     return done;
 }
 
+/// `readv`: `read` into up to 1024 buffers, one after the other; a
+/// buffer that is not filled ends it, as it would end a single `read`.
+/// `EINVAL` for too many buffers or lengths that do not add up, `EFAULT`
+/// for a vector that cannot be read, and the errors of `read` if nothing
+/// was read before they happened.
+fn sysReadv(fd: u64, iov: u64, count: u64) u64 {
+    if (count > abi.IOV_MAX) return err(.INVAL);
+    if (!isOpen(fd)) return err(.BADF);
+    var total: u64 = 0;
+    for (0..count) |i| {
+        const v = readIoVec(iov, i) orelse return err(.FAULT);
+        total = std.math.add(u64, total, v.len) catch return err(.INVAL);
+        if (total > abi.MAX_RW_COUNT) return err(.INVAL);
+    }
+    var done: u64 = 0;
+    for (0..count) |i| {
+        const v = readIoVec(iov, i) orelse break;
+        if (v.len == 0) continue;
+        const n = sysRead(fd, v.base, v.len);
+        if (abi.isError(n)) return if (done == 0) n else done;
+        done += n;
+        if (n < v.len) break;
+    }
+    return done;
+}
+
 /// `writev`: `write` from the `count` buffers described by the `iovec`
 /// array at the user address `iov`, in order. Returns the total written,
 /// short if a buffer cannot be read; `EINVAL` for more than `IOV_MAX`
@@ -354,7 +550,7 @@ fn sysWritev(fd: u64, iov: u64, count: u64) u64 {
     {
         const of = getFile(fd) orelse return err(.BADF);
         defer putFile(of);
-        if (of.kind == .file or of.kind == .pipe_read or of.kind == .directory) return err(.BADF);
+        if ((of.kind == .file and !of.writable) or of.kind == .pipe_read or of.kind == .directory) return err(.BADF);
     }
     if (count > abi.IOV_MAX) return err(.INVAL);
     var total: u64 = 0;
@@ -458,9 +654,12 @@ fn isOpen(fd: u64) bool {
 }
 
 /// `open` and `openat`: open the file or directory at a path and return
-/// the lowest free descriptor for it. Files are read-only: `EROFS` for
-/// another access mode or `O_CREAT` of what does not exist; the devices
-/// in `/dev` may be opened for writing. A directory can be opened for
+/// the lowest free descriptor for it. Where the filesystem can be
+/// written (`/tmp`), `O_CREAT` makes a file that is not there (`EEXIST`
+/// with `O_EXCL` if it is), `O_TRUNC` empties one opened for writing and
+/// `O_APPEND` sends every write to its end; elsewhere opening for
+/// writing or creating is `EROFS`. The devices in `/dev` may be opened
+/// for writing. A directory can be opened for
 /// reading only (`EISDIR`), to be listed (`getdents64`) or to open what
 /// is in it. `ENOTDIR` for `O_DIRECTORY` or a path ending in a slash that
 /// names something else. `ENOENT`, `EMFILE`, `ENOMEM`, and what `Path.from`
@@ -476,10 +675,24 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
     const what = named(path);
     const directory_wanted = given.directory_wanted or flags & abi.O.DIRECTORY != 0;
     var opened: OpenFile = .{};
+    const access = flags & abi.O.ACCMODE;
+    if (access == abi.O.ACCMODE) return err(.INVAL);
+    if (what != .none and flags & (abi.O.CREAT | abi.O.EXCL) == abi.O.CREAT | abi.O.EXCL) return err(.EXIST);
     switch (what) {
-        .none => return if (flags & abi.O.CREAT != 0) err(.ROFS) else err(.NOENT),
+        .none => {
+            if (flags & abi.O.CREAT == 0) return err(.NOENT);
+            if (directory_wanted) return err(.ISDIR); // Linux's answer to creating "name/"
+            opened.node = vfs.create(path) catch |e| switch (e) {
+                // Another thread made it between the look and now.
+                error.Exists => if (flags & abi.O.EXCL != 0) return err(.EXIST) else vfs.lookup(path) orelse return err(.NOENT),
+                else => return vfsError(e),
+            };
+            opened.readable = access != abi.O.WRONLY;
+            opened.writable = access != abi.O.RDONLY;
+            opened.append = flags & abi.O.APPEND != 0;
+        },
         .directory => {
-            if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ISDIR);
+            if (access != abi.O.RDONLY) return err(.ISDIR);
             opened.kind = .directory;
             opened.path = heap.allocator.dupe(u8, path) catch return err(.NOMEM);
         },
@@ -489,18 +702,32 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
         },
         .file, .exe_link, .generated => {
             if (directory_wanted) return err(.NOTDIR);
-            if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ROFS);
             if (what == .generated) {
+                if (access != abi.O.RDONLY) return err(.ROFS);
                 const text = procfs.generate(what.generated, p) catch return err(.NOMEM);
                 opened.generated = text;
                 opened.node = open_file.memoryNode(text);
-            } else opened.node = fileAt(path) orelse return err(.NOENT);
+            } else {
+                opened.node = fileAt(path) orelse return err(.NOENT);
+                if (access != abi.O.RDONLY and !vfs.isWritable(&opened.node)) {
+                    vfs.release(&opened.node);
+                    return err(.ROFS);
+                }
+                opened.readable = access != abi.O.WRONLY;
+                opened.writable = access != abi.O.RDONLY;
+                opened.append = flags & abi.O.APPEND != 0;
+                if (flags & abi.O.TRUNC != 0 and opened.writable) vfs.truncate(&opened.node, 0) catch |e| {
+                    vfs.release(&opened.node);
+                    return vfsError(e);
+                };
+            }
         },
     }
     opened.nonblock = flags & abi.O.NONBLOCK != 0;
 
     // Allocated before the table is locked, and freed again if it is full.
     const of = heap.allocator.create(OpenFile) catch {
+        if (opened.kind == .file and opened.generated == null) vfs.release(&opened.node);
         open_file.freeContents(&opened);
         return err(.NOMEM);
     };
@@ -612,7 +839,7 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
     const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
     switch (of.kind) {
-        .file => {},
+        .file => if (!of.readable) return err(.BADF),
         .pipe_read => return pipeRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
         .null_device => return 0,
         .random_device => return sysGetRandom(ptr, count),
@@ -642,6 +869,7 @@ fn sysPread(fd: u64, ptr: u64, count: u64, offset: u64) u64 {
     const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
     if (of.kind != .file) return err(.SPIPE);
+    if (!of.readable) return err(.BADF);
     if (offset > std.math.maxInt(i64)) return err(.INVAL);
     return readAt(of, offset, ptr, @min(count, abi.MAX_RW_COUNT));
 }
@@ -662,12 +890,15 @@ fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
         return 0;
     }
     if (of.kind != .file) return err(.SPIPE);
+    // The size is asked for before the lock is taken: a filesystem may
+    // sleep to answer.
+    const end: i64 = if (whence == abi.SEEK.END) @intCast(vfs.sizeOf(&of.node)) else 0;
     const held = p.files_lock.acquire();
     defer p.files_lock.release(held);
     const base: i64 = switch (whence) {
         abi.SEEK.SET => 0,
         abi.SEEK.CUR => @intCast(of.offset),
-        abi.SEEK.END => @intCast(of.node.size),
+        abi.SEEK.END => end,
         else => return err(.INVAL),
     };
     const new = std.math.add(i64, base, @bitCast(offset)) catch return err(.INVAL);
@@ -682,7 +913,7 @@ fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
 const Named = union(enum) {
     /// Nothing.
     none,
-    file: vfs.Node,
+    file,
     directory,
     /// A symbolic link to the program the calling process runs
     /// (`/proc/self/exe`): the only links there are.
@@ -702,7 +933,10 @@ fn named(path: []const u8) Named {
     if (std.mem.eql(u8, path, "/dev/null")) return .{ .device = .null_device };
     if (std.mem.eql(u8, path, "/dev/urandom") or std.mem.eql(u8, path, "/dev/random")) return .{ .device = .random_device };
     if (std.mem.eql(u8, std.mem.trimEnd(u8, path, "/"), "/dev")) return .directory;
-    if (vfs.lookup(path)) |node| return .{ .file = node };
+    if (vfs.lookup(path)) |node| {
+        vfs.release(&node); // only asked whether it is there
+        return .file;
+    }
     return if (vfs.isDirectory(path)) .directory else .none;
 }
 
@@ -729,10 +963,10 @@ fn procEntry(path: []const u8) ?Named {
 }
 
 /// The file `path` names, following the link if it is one. Null if it
-/// names nothing or a directory.
+/// names nothing or a directory. The node holds the file: `vfs.release`.
 fn fileAt(path: []const u8) ?vfs.Node {
     return switch (named(path)) {
-        .file => |node| node,
+        .file => vfs.lookup(path), // null if it was removed just now
         .exe_link => vfs.lookup(thread.current().process.?.name),
         .none, .directory, .generated, .device => null,
     };
@@ -771,9 +1005,10 @@ fn deviceStat() abi.Stat {
 /// What `stat` says about a file of the filesystem.
 fn fileStat(node: vfs.Node) abi.Stat {
     var st: abi.Stat = .{};
-    st.mode = abi.S.IFREG | 0o555;
-    st.size = @intCast(node.size);
-    st.blocks = @intCast((node.size + 511) / 512);
+    const size = vfs.sizeOf(&node);
+    st.mode = abi.S.IFREG | @as(u32, if (vfs.isWritable(&node)) 0o644 else 0o555);
+    st.size = @intCast(size);
+    st.blocks = @intCast((size + 511) / 512);
     st.blksize = 4096;
     st.nlink = 1;
     // Two files are the same file if these two are equal: a dynamic
@@ -803,7 +1038,11 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
     const st = switch (what) {
         .none => return err(.NOENT),
         .directory => directoryStat(),
-        .file => |node| fileStat(node),
+        .file => blk: {
+            const node = fileAt(path) orelse return err(.NOENT);
+            defer vfs.release(&node);
+            break :blk fileStat(node);
+        },
         .generated => generatedStat(),
         .device => deviceStat(),
         .exe_link => blk: {
@@ -814,25 +1053,25 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
                 link.ino = 3;
                 break :blk link;
             }
-            break :blk fileStat(fileAt(path) orelse return err(.NOENT));
+            const node = fileAt(path) orelse return err(.NOENT);
+            defer vfs.release(&node);
+            break :blk fileStat(node);
         },
     };
     return if (toUser(stat_ptr, st)) 0 else err(.FAULT);
 }
 
-/// A call that would change the filesystem, at a path: `ENOENT` and the
-/// other errors of a path that cannot be found come first, as on Linux
-/// with a read-only filesystem; then `EROFS`. With `must_exist` false
-/// (the call would make the file) a missing file is `EROFS` too.
-fn sysReadOnlyPath(dirfd: u64, path_ptr: u64, must_exist: bool) u64 {
+/// `mknodat`: devices and FIFOs cannot be made anywhere: `EROFS` where
+/// nothing can be made at all, `EPERM` otherwise (after the errors of
+/// the path, and `EEXIST`).
+fn sysMknod(dirfd: u64, path_ptr: u64) u64 {
     var given = switch (Path.from(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
     defer given.deinit();
-    const path = given.text;
-    if (must_exist and named(path) == .none) return err(.NOENT);
-    return err(.ROFS);
+    if (named(given.text) != .none) return err(.EXIST);
+    return if (vfs.isWritablePath(given.text)) err(.PERM) else err(.ROFS);
 }
 
 /// `access`, `faccessat` and `faccessat2`: files can be read and run,
@@ -846,7 +1085,7 @@ fn sysAccess(dirfd: u64, path_ptr: u64, mode: u64) u64 {
     defer given.deinit();
     const path = given.text;
     if (named(path) == .none) return err(.NOENT);
-    return if (mode & abi.ACCESS.W_OK != 0) err(.ROFS) else 0;
+    return if (mode & abi.ACCESS.W_OK != 0 and !vfs.isWritablePath(path)) err(.ROFS) else 0;
 }
 
 /// `readlink` and `readlinkat`: what a symbolic link points to, without
@@ -1080,7 +1319,9 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
         3 => { // F_GETFL
             const access: u64 = switch (of.kind) {
                 .console, .null_device, .random_device => abi.O.RDWR,
-                .file, .pipe_read => abi.O.RDONLY,
+                .file => (if (!of.readable) @as(u64, abi.O.WRONLY) else if (of.writable) @as(u64, abi.O.RDWR) else abi.O.RDONLY) |
+                    (if (of.append) @as(u64, abi.O.APPEND) else 0),
+                .pipe_read => abi.O.RDONLY,
                 .directory => abi.O.RDONLY | abi.O.DIRECTORY,
                 .pipe_write => abi.O.WRONLY,
             };
@@ -1243,7 +1484,7 @@ fn pollState(of: *OpenFile, events: i16) i16 {
         .null_device, .random_device => return events & (abi.POLL.IN | abi.POLL.OUT),
         .directory => return events & abi.POLL.IN,
         // A file can always be read.
-        .file => return events & abi.POLL.IN,
+        .file => return events & (abi.POLL.IN | abi.POLL.OUT),
         .pipe_read => {
             const st = kpipe.state(of.pipe);
             var r: i16 = 0;
@@ -1654,7 +1895,10 @@ fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, 
             if (f.r10 & abi.MAP.ANONYMOUS != 0) break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, null);
             const of = getFile(f.r8) orelse break :blk err(.BADF);
             defer putFile(of); // the mapping keeps the file, not the descriptor
-            if (of.kind != .file or of.generated != null) break :blk err(.NODEV);
+            // A file that can change or go away cannot be mapped: a page
+            // fault is handled where its filesystem's lock cannot be taken.
+            if (of.kind != .file or of.generated != null or vfs.isCounted(&of.node)) break :blk err(.NODEV);
+            if (!of.readable) break :blk err(.ACCES);
             break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, .{ .node = of.node, .offset = f.r9 });
         },
         .mprotect => user_memory.mprotect(p, f.rdi, f.rsi, f.rdx),
@@ -1704,13 +1948,22 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.newfstatat => sysNewfstatat(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.stat => sysNewfstatat(CWD, f.rdi, f.rsi, 0),
         Sys.lstat => sysNewfstatat(CWD, f.rdi, f.rsi, abi.AT_SYMLINK_NOFOLLOW),
-        Sys.unlink => sysReadOnlyPath(CWD, f.rdi, true),
-        Sys.unlinkat => sysReadOnlyPath(f.rdi, f.rsi, true),
-        Sys.mknodat => sysReadOnlyPath(f.rdi, f.rsi, false),
-        Sys.fchmod => if (isOpen(f.rdi)) err(.ROFS) else err(.BADF),
-        // No descriptor can be open for writing a file, which is what
-        // Linux says `EINVAL` for.
-        Sys.ftruncate => if (isOpen(f.rdi)) err(.INVAL) else err(.BADF),
+        Sys.unlink => sysUnlink(CWD, f.rdi, 0),
+        Sys.rmdir => sysUnlink(CWD, f.rdi, abi.AT_REMOVEDIR),
+        Sys.unlinkat => sysUnlink(f.rdi, f.rsi, f.rdx),
+        Sys.mkdir => sysMkdir(CWD, f.rdi),
+        Sys.mkdirat => sysMkdir(f.rdi, f.rsi),
+        Sys.rename => sysRename(CWD, f.rdi, CWD, f.rsi, 0),
+        Sys.renameat => sysRename(f.rdi, f.rsi, f.rdx, f.r10, 0),
+        Sys.renameat2 => sysRename(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        Sys.mknodat => sysMknod(f.rdi, f.rsi),
+        Sys.fchmod => sysFchmod(f.rdi),
+        Sys.pwrite64 => sysPwrite(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.readv => sysReadv(f.rdi, f.rsi, f.rdx),
+        Sys.truncate => sysTruncate(f.rdi, f.rsi),
+        // Nothing is ever waiting to be written.
+        Sys.fsync, Sys.fdatasync => if (isOpen(f.rdi)) 0 else err(.BADF),
+        Sys.ftruncate => sysFtruncate(f.rdi, f.rsi),
         // No networking yet (12): every address family is unsupported.
         Sys.socket => err(.AFNOSUPPORT),
         // Not offered yet; a runtime that wants one for mapping its

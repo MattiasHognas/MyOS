@@ -94,6 +94,7 @@ pub const kernel = struct {
     /// Filesystem implementations.
     pub const fs = struct {
         pub const tarfs = @import("kernel/fs/tarfs.zig");
+        pub const tmpfs = @import("kernel/fs/tmpfs.zig");
     };
 };
 
@@ -118,6 +119,7 @@ const syscall = kernel.syscall;
 const process = kernel.process;
 const vfs = kernel.vfs;
 const tarfs = kernel.fs.tarfs;
+const tmpfs = kernel.fs.tmpfs;
 const pci = drivers.pci;
 const nvme = drivers.nvme;
 const assert = kernel.debug.assert;
@@ -345,6 +347,8 @@ fn kmainOnStack() callconv(.c) noreturn {
 
     initrd_image = findModule("initrd.tar") orelse @panic("no initrd.tar module");
     vfs.mountRoot(tarfs.init(initrd_image));
+    // The image cannot be written to; /tmp can, and forgets at power-off.
+    vfs.mount("/tmp", tmpfs.init()) catch unreachable; // the second of eight mounts
 
     // The test kernel runs an integration-test scenario (tests/kernel/) instead of the shell.
     if (comptime build_options.is_test) @import("kernel_tests").run();

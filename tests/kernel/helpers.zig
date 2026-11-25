@@ -179,6 +179,11 @@ pub fn spawnFailsCleanly(image: []const u8) bool {
     return false;
 }
 
+/// Blocks the filesystem at `/tmp` holds.
+pub fn tmpBlocksUsed() usize {
+    return kernel_root.kernel.fs.tmpfs.blocksUsed();
+}
+
 /// Whether the filesystem has a file at `path`.
 pub fn fileExists(path: []const u8) bool {
     return vfs.lookup(path) != null;

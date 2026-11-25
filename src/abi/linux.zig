@@ -80,15 +80,31 @@ pub const Sys = struct {
     /// `socket(domain, type, protocol)`: there is no networking yet
     /// (`EAFNOSUPPORT`).
     pub const socket = 41;
-    /// `ftruncate(fd, length)`: files cannot be written (`EINVAL`, as
-    /// for a descriptor not open for writing).
+    /// `readv(fd, iov, iovcnt) -> bytes read`: `read` into several buffers.
+    pub const readv = 19;
+    /// `pwrite64(fd, buf, count, offset)`: `write` at an offset.
+    pub const pwrite64 = 18;
+    /// `fsync(fd)` and `fdatasync(fd)`: nothing is ever unwritten.
+    pub const fsync = 74;
+    pub const fdatasync = 75;
+    /// `truncate(path, length)` and `ftruncate(fd, length)`.
+    pub const truncate = 76;
     pub const ftruncate = 77;
-    /// `unlink(path)`, `mknodat(dirfd, path, mode, dev)`, `fchmod(fd,
-    /// mode)`: the filesystem is read-only (`EROFS`).
+    /// `rename(old, new)`, `mkdir(path, mode)`, `rmdir(path)`,
+    /// `unlink(path)`, and the same relative to directory descriptors.
+    pub const rename = 82;
+    pub const mkdir = 83;
+    pub const rmdir = 84;
     pub const unlink = 87;
-    pub const fchmod = 91;
-    pub const mknodat = 259;
+    pub const mkdirat = 258;
     pub const unlinkat = 263;
+    pub const renameat = 264;
+    pub const renameat2 = 316;
+    /// `fchmod(fd, mode)`: there are no permissions to change; accepted
+    /// for a file that can be written, `EROFS` otherwise.
+    pub const fchmod = 91;
+    /// `mknodat(dirfd, path, mode, dev)`: no devices or FIFOs can be made.
+    pub const mknodat = 259;
     /// `memfd_create(name, flags)`: files that exist only in memory are
     /// not offered yet (`ENOSYS`).
     pub const memfd_create = 319;
@@ -224,6 +240,10 @@ pub const E = enum(u16) {
     /// Already exists.
     EXIST = 17,
     /// No such device: the object cannot be mapped.
+    /// Device or resource busy: a mount point cannot be removed.
+    BUSY = 16,
+    /// A rename from one filesystem to another.
+    XDEV = 18,
     NODEV = 19,
     /// Not a directory.
     NOTDIR = 20,
@@ -231,6 +251,8 @@ pub const E = enum(u16) {
     ISDIR = 21,
     /// The result does not fit the buffer.
     RANGE = 34,
+    /// Directory not empty.
+    NOTEMPTY = 39,
     /// Address family not supported.
     AFNOSUPPORT = 97,
     /// Invalid argument.
@@ -246,6 +268,10 @@ pub const E = enum(u16) {
     /// Function not implemented: unknown syscall number.
     NOSYS = 38,
     /// Illegal seek: the descriptor has no position.
+    /// File too large.
+    FBIG = 27,
+    /// No space left on the device.
+    NOSPC = 28,
     SPIPE = 29,
     /// Broken pipe: nobody is left to read what is written.
     PIPE = 32,
@@ -298,6 +324,7 @@ pub const O = struct {
     /// Mask of the access mode bits.
     pub const ACCMODE = 3;
     pub const CREAT = 0o100;
+    pub const EXCL = 0o200;
     pub const TRUNC = 0o1000;
     pub const APPEND = 0o2000;
     pub const NONBLOCK = 0o4000;
@@ -621,3 +648,6 @@ pub const SCHED = struct {
     pub const FIFO = 1;
     pub const RR = 2;
 };
+
+/// `unlinkat`: remove a directory, as `rmdir` does.
+pub const AT_REMOVEDIR = 0x200;

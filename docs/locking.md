@@ -18,7 +18,12 @@ protocols have also been model-checked (see
   never preempted and never interrupted. There is one kind of spinlock; every
   one may be taken from an interrupt handler.
 - **Nothing blocks while it holds a spinlock.** Code that has to wait while
-  it holds something uses a `Mutex`.
+  it holds something uses a `Mutex`. The first is the one around the
+  filesystem in memory (`fs/tmpfs.zig`): an operation on it may allocate
+  and copy, so it is never called with a spinlock held. That is why a
+  file's size is asked for before a descriptor table's lock is taken, and
+  why such a file cannot be mapped (a page fault is handled under the
+  address space's spinlock).
 - **Interrupt handlers do not block.** They may take spinlocks and wake
   threads.
 - **Each piece of shared state has one lock**, named below. State that

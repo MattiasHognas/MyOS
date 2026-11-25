@@ -73,15 +73,15 @@ Linux calls, with Linux's numbers:
 | Number | Call | Notes |
 | --- | --- | --- |
 | 0 | `read(fd, buf, count)` | Files and pipes. A pipe gives what it holds, waiting only while it is empty and has a writer; 0 at its end. `/dev/null` is at its end at once, the random devices give random bytes. The console is not readable yet (`EBADF`); use `myos_getchar`. |
-| 1 | `write(fd, buf, count)` | The console (serial port and screen), which descriptors 0, 1 and 2 start out as, pipes, and `/dev/null` and the random devices, which throw it away. A pipe takes all of it, waiting for room; `EPIPE` when no reader is left (no `SIGPIPE` yet). Files are read-only (`EBADF`). |
-| 2 | `open(path, flags, mode)` | Files read-only: the access mode in `flags` must be `O_RDONLY` (`EROFS` otherwise). `/dev/null`, `/dev/urandom` and `/dev/random` may be opened for writing. The text files of `/proc` (see below) are made when they are opened. A directory is opened for reading only (`EISDIR`), to be listed or to start paths from; `O_DIRECTORY` or a slash at the end of the path on anything else is `ENOTDIR`. `O_NONBLOCK` is kept; other flags are ignored. |
+| 1 | `write(fd, buf, count)` | The console (serial port and screen), which descriptors 0, 1 and 2 start out as; files opened for writing (in `/tmp`), at the descriptor's offset or at the end with `O_APPEND`; pipes; `/dev/null` and the random devices, which throw it away. A pipe takes all of it, waiting for room; `EPIPE` when no reader is left (no `SIGPIPE` yet). `ENOSPC`, `EFBIG`. |
+| 2 | `open(path, flags, mode)` | In `/tmp`, which can be written: `O_CREAT` (with `O_EXCL`: `EEXIST`), `O_TRUNC`, `O_APPEND`, any access mode. Elsewhere opening for writing or creating is `EROFS`. `/dev/null`, `/dev/urandom` and `/dev/random` may be opened for writing. The text files of `/proc` (see below) are made when they are opened. A directory is opened for reading only (`EISDIR`), to be listed or to start paths from; `O_DIRECTORY` or a slash at the end of the path on anything else is `ENOTDIR`. `O_NONBLOCK` is kept; `mode` and other flags are ignored: there are no permissions. |
 | 3 | `close(fd)` | Any open descriptor, the standard ones too. What it referred to goes with its last descriptor. |
 | 4 | `stat(path, statbuf)` | `newfstatat` for a path. |
 | 5 | `fstat(fd, statbuf)` | The console is a character device, a pipe a FIFO, an open file a regular file with its size. Two descriptors or paths are the same file if device and inode number are equal. |
 | 6 | `lstat(path, statbuf)` | `stat` without following a link at the end. |
 | 7 | `poll(fds, nfds, timeout)` | The console is writable, a file readable, a pipe when it has bytes or room; `POLLHUP` and `POLLERR` for a pipe whose other end is closed, `POLLNVAL` for a descriptor that is not open. Waits by looking again every tick. |
 | 8 | `lseek(fd, offset, whence)` | Open files; a directory only back to its start (`SEEK_SET`, 0); `ESPIPE` for the console and pipes. |
-| 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory, and files: a private mapping gets each page from the file when it is first touched and keeps its changes to itself; a shared one may only be read (files cannot be written: `EACCES`). A page wholly past the end of the file kills the program that touches it. `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`; `MAP_DENYWRITE` is ignored. `ENODEV` for a descriptor that is not a file. |
+| 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory, and files of the image: a private mapping gets each page from the file when it is first touched and keeps its changes to itself; a shared one may only be read (`EACCES`). A page wholly past the end of the file kills the program that touches it. `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`; `MAP_DENYWRITE` is ignored. `ENODEV` for a descriptor that is not a file, and for a file in `/tmp`: what can change cannot be mapped yet. |
 | 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
 | 11 | `munmap(addr, length)` | Any part of any mappings; unmapping what is not mapped succeeds. |
 | 12 | `brk(addr)` | Returns the new end of the heap, or the old one if it cannot move. |
@@ -89,6 +89,8 @@ Linux calls, with Linux's numbers:
 | 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals, recorded. |
 | 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for every open descriptor (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
 | 17 | `pread64(fd, buf, count, offset)` | |
+| 18 | `pwrite64(fd, buf, count, offset)` | `write` to a file at an offset; the descriptor's own stays. |
+| 19 | `readv(fd, iov, iovcnt)` | `read` into up to 1024 buffers. |
 | 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. |
 | 21 | `access(path, mode)` | Files can be read and run, not written (`EROFS`). |
 | 22 | `pipe(fds)` | See `pipe2`. |
@@ -105,13 +107,19 @@ Linux calls, with Linux's numbers:
 | 62 | `kill(pid, sig)` | The calling process only. Signals are not delivered yet: signal 0 checks; a signal with no handler whose default is to end the process ends it with status 128 + the signal (that is `abort`); anything else is dropped. `tkill` (200) and `tgkill` (234) likewise. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
-| 77 | `ftruncate(fd, length)` | No descriptor is open for writing a file: `EINVAL`. |
+| 74 | `fsync(fd)` | Nothing is ever waiting to be written: 0. |
+| 75 | `fdatasync(fd)` | The same. |
+| 76 | `truncate(path, length)` | `ftruncate` by path. |
+| 77 | `ftruncate(fd, length)` | A file open for writing: cut short, or grown with zeroes that take no memory. `EINVAL` otherwise; `EFBIG` past 1 GiB. |
 | 79 | `getcwd(buf, size)` | The working directory, with its NUL; returns the length including it. `ERANGE` if it does not fit. |
 | 80 | `chdir(path)` | `ENOTDIR` for what is no directory. A program started with `myos_run` starts in the directory of the one that started it. |
 | 81 | `fchdir(fd)` | To the directory a descriptor is open on. |
-| 87 | `unlink(path)` | The filesystem is read-only: `EROFS`, or `ENOENT` if there is nothing to remove. |
+| 82 | `rename(old, new)` | A file or a directory with all in it; a file of the new name, or an empty directory, is replaced. Within one filesystem (`EXDEV`); `EINVAL` into itself; `EBUSY` for a mount point. |
+| 83 | `mkdir(path, mode)` | `EEXIST`, `ENOENT`, `ENOTDIR`, `EROFS`. |
+| 84 | `rmdir(path)` | An empty directory: `ENOTEMPTY`, `ENOTDIR`, `EBUSY` for a mount point. |
+| 87 | `unlink(path)` | Takes the name away; the file lives while it is open. `EISDIR`, `EROFS`, `ENOENT`. |
 | 89 | `readlink(path, buf, size)` | The one symbolic link is `/proc/self/exe` (also `/proc/<own pid>/exe`): the path of the program the process runs, cut to `size`. `EINVAL` for anything else that exists, `ENOENT` otherwise. |
-| 91 | `fchmod(fd, mode)` | `EROFS`. |
+| 91 | `fchmod(fd, mode)` | No permissions exist: accepted for a file that can be written, `EROFS` otherwise. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
 | 124 | `getsid(pid)` | Every process is its own session. |
@@ -139,15 +147,18 @@ Linux calls, with Linux's numbers:
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
 | 239 | `get_mempolicy(mode, nodemask, maxnode, addr, flags)` | One memory node, the default policy: mode 0 and an empty mask. No flags. |
 | 257 | `openat(dirfd, path, flags, mode)` | `open` with a relative path starting at the directory `dirfd` is open on, or at the working directory for `AT_FDCWD`. `ENOTDIR` if `dirfd` is open on something else, `EBADF` if it is not open; neither matters for an absolute path. |
-| 259 | `mknodat(dirfd, path, mode, dev)` | `EROFS`. |
+| 258 | `mkdirat(dirfd, path, mode)` | As `mkdir`. |
+| 259 | `mknodat(dirfd, path, mode, dev)` | Devices and FIFOs cannot be made: `EPERM`, or `EROFS` where nothing can. |
 | 262 | `newfstatat(dirfd, path, statbuf, flags)` | `stat` by path, relative as for `openat`; of the descriptor itself with an empty path and `AT_EMPTY_PATH`. Files, directories, the `/proc` and `/dev` entries; `AT_SYMLINK_NOFOLLOW` shows `/proc/self/exe` as the link it is. |
-| 263 | `unlinkat(dirfd, path, flags)` | As `unlink`. |
+| 263 | `unlinkat(dirfd, path, flags)` | `unlink`, or `rmdir` with `AT_REMOVEDIR`. |
+| 264 | `renameat(olddirfd, old, newdirfd, new)` | As `rename`. |
 | 267 | `readlinkat(dirfd, path, buf, size)` | As `readlink`. |
 | 269 | `faccessat(dirfd, path, mode)` | As `access`. |
 | 273 | `set_robust_list(head, size)` | Accepted and not used: a thread that dies takes its process with it. |
 | 292 | `dup3(old, new, flags)` | `dup2`, with `EINVAL` if `old` is `new`. |
 | 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
 | 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
+| 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | As `rename`; no flags (`EINVAL`). |
 | 318 | `getrandom(buf, len, flags)` | Never blocks. |
 | 319 | `memfd_create(name, flags)` | Not offered yet: `ENOSYS`, on purpose. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
@@ -187,7 +198,10 @@ Every other number returns `ENOSYS`.
 - **Directories** are not stored in the image's filesystem: a path is a
   directory if a file is somewhere below it. They are opened, listed
   (`getdents64`), and made the working directory. Filesystems are mounted
-  at paths (`vfs.mount`); so far there is the one at the root.
+  at paths (`vfs.mount`): the image at the root, which cannot be changed,
+  and a filesystem in memory at `/tmp`, which can, holds at most half the
+  machine's memory, and is empty again after a restart. A file there is
+  at most 1 GiB. There are no owners and no permissions.
 - **`/proc` and `/dev`.** A process finds a few things about itself and
   the machine as files, in Linux's format: `/proc/self/exe` (a link to
   its program), `/proc/self/maps` (its mappings; a C library finds the

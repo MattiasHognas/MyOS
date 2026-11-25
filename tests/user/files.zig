@@ -305,7 +305,7 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.unlink, @intFromPtr("/etc/motd"), 0, 0) == lib.err(.ROFS), 70);
     expect(lib.syscall(Sys.unlink, @intFromPtr("/tmp/nothing"), 0, 0) == lib.err(.NOENT), 71);
     expect(lib.syscall(Sys.unlinkat, CWD, @intFromPtr("/etc/motd"), 0) == lib.err(.ROFS), 72);
-    expect(lib.syscall6(Sys.mknodat, CWD, @intFromPtr("/tmp/pipe"), S.IFIFO | 0o600, 0, 0, 0) == lib.err(.ROFS), 73);
+    expect(lib.syscall6(Sys.mknodat, CWD, @intFromPtr("/etc/pipe"), S.IFIFO | 0o600, 0, 0, 0) == lib.err(.ROFS), 73);
     expect(lib.syscall(Sys.unlink, 8, 0, 0) == lib.err(.FAULT), 74);
     const motd = lib.open("/etc/motd");
     expect(lib.syscall(Sys.fchmod, motd, 0o600, 0) == lib.err(.ROFS) and lib.syscall(Sys.fchmod, 99, 0o600, 0) == lib.err(.BADF), 75);

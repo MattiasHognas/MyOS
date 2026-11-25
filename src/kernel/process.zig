@@ -632,9 +632,11 @@ pub fn growFiles(p: *Process, slots: usize) bool {
 /// can't be read completely, or any error from `spawn`.
 pub fn spawnPath(path: []const u8, options: SpawnOptions) !*Process {
     const node = vfs.lookup(path) orelse return error.FileNotFound;
-    const image = try heap.allocator.alloc(u8, node.size);
+    defer vfs.release(&node);
+    const size = vfs.sizeOf(&node);
+    const image = try heap.allocator.alloc(u8, size);
     defer heap.allocator.free(image); // elf.load copies it into the process's pages
-    if (vfs.read(&node, 0, image) != node.size) return error.ReadFailed;
+    if (vfs.read(&node, 0, image) != size) return error.ReadFailed;
     return spawn(path, image, options);
 }
 
@@ -726,9 +728,11 @@ noinline fn loadProgram(root: u64, image: []const u8, limits: elf_image.Limits, 
 /// headers off the stack frame of `spawn`.
 noinline fn loadInterpreter(root: u64, path: []const u8, limits: elf_image.Limits, regions: *vm_regions.Regions, mmap_top: u64) !elf.Loaded {
     const node = vfs.lookup(path) orelse return error.FileNotFound;
-    const image = try heap.allocator.alloc(u8, node.size);
+    defer vfs.release(&node);
+    const size = vfs.sizeOf(&node);
+    const image = try heap.allocator.alloc(u8, size);
     defer heap.allocator.free(image);
-    if (vfs.read(&node, 0, image) != node.size) return error.ReadFailed;
+    if (vfs.read(&node, 0, image) != size) return error.ReadFailed;
     const img = try elf_image.parse(image, limits);
     if (img.interp != null) return error.Unsupported;
     const bias = if (img.dynamic) blk: {

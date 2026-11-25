@@ -13,9 +13,15 @@ const vfs = @import("vfs.zig");
 pub const OpenFile = struct {
     /// What the descriptor is for.
     kind: Kind = .file,
-    /// The file, for `kind == .file`.
+    /// The file, for `kind == .file`. The open file holds it
+    /// (`vfs.release` when it goes), unless its text is `generated`.
     node: vfs.Node = undefined,
     offset: u64 = 0,
+    /// What the descriptor was opened for (`O_RDONLY`, `O_WRONLY`,
+    /// `O_RDWR`), and `O_APPEND`: every write goes to the end.
+    readable: bool = true,
+    writable: bool = false,
+    append: bool = false,
     /// For a file whose contents were made when it was opened (the text
     /// files of `/proc`): the memory `node` reads from, freed with the
     /// open file. Such a file cannot be mapped, since a mapping would
@@ -77,7 +83,8 @@ pub fn destroy(of: *OpenFile) void {
     switch (of.kind) {
         .pipe_read => pipe.closeEnd(of.pipe, .read),
         .pipe_write => pipe.closeEnd(of.pipe, .write),
-        .file, .console, .null_device, .random_device, .directory => {},
+        .file => if (of.generated == null) vfs.release(&of.node),
+        .console, .null_device, .random_device, .directory => {},
     }
     freeContents(of);
     heap.allocator.destroy(of);

@@ -1128,6 +1128,20 @@ fn filesAndProc() TestError!void {
     try expectFootprint(memory); // generated files and grown tables are freed
 }
 
+/// A filesystem that can be written, at `/tmp`: files, directories,
+/// renames, a program copied there and run, from two processes at once;
+/// and nothing of it left when they are done.
+fn writableFiles() TestError!void {
+    _ = helpers.runProgram("/test/tmp"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/tmp") orelse return error.Failed;
+    if (code != 0) report("/test/tmp failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/tmp"));
+    try check(helpers.tmpBlocksUsed() == 0);
+    try expectFootprint(memory);
+}
+
 /// The heap of MyOS's own programs: the standard library's containers on
 /// the user library's allocator, which sits on `mmap`.
 fn programHeap() TestError!void {
@@ -1841,6 +1855,7 @@ fn runCases() noreturn {
         .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
+        .{ .name = "a writable filesystem at /tmp: files, directories, rename, a program run from it (ring 3)", .func = writableFiles },
         .{ .name = "the program heap: standard containers on the user library's allocator (ring 3)", .func = programHeap },
         .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
