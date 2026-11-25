@@ -342,6 +342,9 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
         else => {},
     }
     if (!from_user) backtrace.print(.{ .pc = f.rip }, f.rbp);
+    // Measured builds say how much of an emergency stack a report takes
+    // (this one, if it is on one): what their size is decided by.
+    if (gdt.istPeak()) |peak| root.print("emergency stacks: deepest use {d} of {d} bytes\n", .{ peak, gdt.IST_STACK_SIZE });
 
     if (f.vector == VECTOR_BREAKPOINT) return; // breakpoint: resume after int3
     root.halt();

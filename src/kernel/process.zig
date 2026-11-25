@@ -19,9 +19,15 @@
 //!
 //! | When | What |
 //! | --- | --- |
-//! | `exit` | open files; its place in the process tree; its exit status becomes available and waiters wake |
-//! | its thread is reaped | the address space, the kernel stack, the thread |
+//! | `exit` | open files; the address space (all the process's memory); its place in the process tree; then its exit status becomes available and waiters wake |
+//! | its thread is reaped | the kernel stack, the thread |
 //! | the last reference is released | the `Process` structure and its name |
+//!
+//! The memory goes before the waiters are woken, so whoever waited for a
+//! process can use what it had: a parent that runs one child after another
+//! close to its memory limit never finds the last one's memory still
+//! taken. Only the thread and its kernel stack follow a moment later, when
+//! the CPU has left that stack.
 //!
 //! So a process that has exited but has not been waited for costs one small
 //! structure, and its exit status stays available for as long as anyone
@@ -235,14 +241,15 @@ fn reparentChildren(p: *Process) void {
 /// Terminate the current process with exit status `code` (0-255; the
 /// `exit` syscall masks it, as on Linux).
 ///
-/// Closes its files, hands its children to its parent, leaves the process
-/// tree, records the exit status, wakes every thread waiting for it and
-/// exits the current thread. The address space is freed when the scheduler
-/// reaps the thread. Must be called from a thread that belongs to a process.
+/// Closes its files, frees its address space, hands its children to its
+/// parent, leaves the process tree, records the exit status, wakes every
+/// thread waiting for it and exits the current thread. Must be called from
+/// a thread that belongs to a process.
 pub fn exit(code: u64) noreturn {
     _ = cpu.saveAndDisableInterrupts(); // never restored: we're done
     const p = thread.current().process.?;
     closeFiles(p); // only this thread uses them
+    freeAddressSpace(p); // before anyone is told: the memory is back when they hear
     tree_lock.take();
     assert.check(.process, p.exit_code == null, "process '{s}' exits twice", .{p.name});
     reparentChildren(p);
@@ -329,19 +336,26 @@ pub fn spawnPath(path: []const u8, options: SpawnOptions) !*Process {
     return spawn(path, image, options);
 }
 
-/// Called by the scheduler when the thread of `p` has been reaped: nothing
-/// runs in `p` any more. Its address space may still be loaded, if only
-/// kernel threads ran since, so it is switched away from first. Frees the
-/// address space and gives up the thread's reference. Interrupts are off
-/// and no lock is held. The address space may also be loaded on other
-/// CPUs that only ran kernel threads since: `unloadRoot` has them all
-/// switch away first.
-pub fn teardown(p: *Process) void {
-    assert.check(.process, p.exit_code != null, "tearing down process '{s}', which has not exited", .{p.name});
-    assert.check(.process, p.root != 0, "process '{s}' torn down twice", .{p.name});
+/// Free the address space of `p`, whose only thread is the caller and is
+/// exiting. The thread is in the kernel for good and uses kernel addresses
+/// only from here on, so it moves to the kernel's own page tables; every
+/// other CPU that still has the address space loaded (because it ran this
+/// thread once and only kernel threads since) is made to do the same; then
+/// nothing uses it and it is freed. Interrupts are off and stay off until
+/// the thread is gone, so the scheduler cannot put the thread, and with it
+/// the address space, back on a CPU.
+fn freeAddressSpace(p: *Process) void {
+    assert.check(.process, p.root != 0, "process '{s}' frees its address space twice", .{p.name});
     vmm.unloadRoot(p.root);
     vmm.destroyAddressSpace(p.root);
     p.root = 0;
+}
+
+/// Called by the scheduler when the thread of `p` has been reaped: nothing
+/// runs in `p` any more, and its memory went when it exited. Gives up the
+/// thread's reference.
+pub fn teardown(p: *Process) void {
+    assert.check(.process, p.exit_code != null and p.root == 0, "tearing down process '{s}', which has not exited", .{p.name});
     release(p);
 }
 

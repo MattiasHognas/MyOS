@@ -190,7 +190,22 @@ pub fn runProgram(path: []const u8) ?u64 {
 /// everything it starts).
 pub fn runProgramLimited(path: []const u8, limits: Limits) ?u64 {
     const p = process.spawnPath(path, .{ .limits = limits, .randomize = randomize_layout }) catch return null;
-    return process.wait(p);
+    return waitUntilGone(p);
+}
+
+/// Wait for `p` like `process.wait`, giving up the caller's reference, and
+/// then until its thread has been freed as well. A process's memory is back
+/// when `wait` returns; its thread and kernel stack follow when the CPU
+/// that ran it has left that stack, which on another CPU is a moment
+/// later. Tests that compare memory before and after wait for that too.
+pub fn waitUntilGone(p: *process.Process) u64 {
+    process.retain(p); // to look at it after `wait` has given up one reference
+    const code = process.wait(p);
+    // The thread holds one reference until it is freed; then ours is the last.
+    var tries: usize = 0;
+    while (@atomicLoad(u32, &p.refs, .monotonic) != 1 and tries < 100_000) : (tries += 1) thread.yield();
+    process.release(p);
+    return code;
 }
 
 /// Try to start the program at `path` with `limits` and return the error
@@ -200,6 +215,12 @@ pub fn spawnError(path: []const u8, limits: Limits) ?anyerror {
     const p = process.spawnPath(path, .{ .limits = limits, .randomize = randomize_layout }) catch |e| return e;
     process.release(p);
     return null;
+}
+
+/// Size of an emergency stack, and the most any of them has been used.
+pub const IST_STACK_SIZE = gdt.IST_STACK_SIZE;
+pub fn istPeak() ?usize {
+    return gdt.istPeak();
 }
 
 /// Nanoseconds since boot, by the HPET.
@@ -1663,7 +1684,10 @@ fn lockHook() void {
 
 /// Worker for `pmmLockHolds`: allocate and free with interrupts on, so the
 /// timer can preempt it anywhere the allocator lets it.
+var lock_go: std.atomic.Value(bool) = .init(false);
+
 fn lockWorker() void {
+    while (!lock_go.load(.acquire)) thread.yield(); // until the hook knows this thread
     for (0..2) |_| {
         if (pmm.alloc()) |page| pmm.free(page) else lock_errors += 1;
     }
@@ -1691,7 +1715,9 @@ pub fn pmmLockHolds() u32 {
     const b = thread.spawn(lockWorker, null) catch return 1;
     lock_workers = .{ a.id, b.id };
     pmm.critical_hook = lockHook;
+    lock_go.store(true, .release);
     waitForDone(&lock_done, 2, &done_queue);
+    lock_go.store(false, .release);
     pmm.critical_hook = null;
     lock_workers = .{ 0, 0 };
 
@@ -1747,11 +1773,49 @@ fn signalDone(counter: *usize, queue: *WaitQueue) void {
     _ = queue.wakeAll();
 }
 
-/// Sleep on `queue` until `counter` has reached `n`. The other side is `signalDone`.
+/// Sleep on `queue` until `counter` has reached `n`, and then until the
+/// threads that counted have gone (`quiesce`). The other side is `signalDone`.
 fn waitForDone(counter: *const usize, n: usize, queue: *WaitQueue) void {
-    const held = test_lock.acquire();
-    defer test_lock.release(held);
-    while (counter.* < n) queue.wait(&test_lock);
+    {
+        const held = test_lock.acquire();
+        defer test_lock.release(held);
+        while (counter.* < n) queue.wait(&test_lock);
+    }
+    quiesce();
+}
+
+/// Threads that exist: created and not yet freed.
+fn threadsAlive() usize {
+    return thread.spawnedCount() - thread.reapedCount();
+}
+
+/// What `threadsAlive` was when the running test case began.
+var alive_at_start: usize = 0;
+
+/// Note the threads that exist now as the ones that are not this test's.
+/// The test runner calls it before each case.
+pub fn beginCase() void {
+    alive_at_start = threadsAlive();
+}
+
+/// Let other threads run until every thread this test case started has
+/// been freed, with its stack and (for a process) what was left of the
+/// process. A thread that has finished its work is not gone yet: it still
+/// has to exit, its CPU has to leave its stack, and some CPU has to free
+/// it at its next thread switch. On one CPU all of that has happened by
+/// the time the thread that waited for it runs again; with several it
+/// takes a moment longer, and a test that compares memory before and
+/// after has to wait for it. Gives up after about half a second, for the
+/// test that leaves a thread behind on purpose.
+pub fn quiesce() void {
+    for (0..5000) |_| {
+        if (threadsAlive() <= alive_at_start) return;
+        thread.yield();
+    }
+    for (0..50) |_| {
+        if (threadsAlive() <= alive_at_start) return;
+        timer.sleepTicks(1);
+    }
 }
 
 /// Let other threads run until `count` returns `n`. False if it never happens.
@@ -1961,7 +2025,7 @@ pub fn waitQueueChecks() u32 {
     if (!wqWaitTimeout(3)) return 23;
     if (timer.pending() != timers_before or wqWaiting() != 0) return 24;
 
-    for (0..10) |_| thread.yield(); // let the waiters be reaped
+    quiesce();
     return if (footprint().eql(before)) 0 else 22;
 }
 
@@ -2053,7 +2117,7 @@ pub fn timerChecks() u32 {
     waitForDone(&sleep_len, 2, &sleep_done);
     if (!std.mem.eql(u8, &sleep_order, "SL")) return 12;
     if (timer.pending() != pending_before) return 13;
-    timer.sleepTicks(1); // let the sleepers be reaped
+    quiesce();
     return if (footprint().eql(before)) 0 else 14;
 }
 
@@ -2153,7 +2217,7 @@ pub fn mutexChecks() u32 {
     waitForDone(&mx_done, 3, &mx_finished);
     if (!std.mem.eql(usize, &mx_order, &queued)) return 13; // longest wait first
     if (mx.owner != null) return 14;
-    for (0..10) |_| thread.yield(); // let the threads be reaped
+    quiesce();
     return if (footprint().eql(before)) 0 else 15;
 }
 
@@ -2186,8 +2250,13 @@ pub fn keyboardReaders() u32 {
     const late = process.spawnPath("/test/getchar", .{}) catch return 8;
     if (process.wait(late) != 'd') return 9;
     if (keyboard.getChar() != null) return 10;
-    for (0..10) |_| thread.yield();
-    return if (footprint().eql(before)) 0 else 11;
+    quiesce();
+    if (!footprint().eql(before)) {
+        const now = footprint();
+        kernel_root.print("  keyboard readers: before {any}, after {any}\n", .{ before, now });
+        return 11;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2410,7 +2479,7 @@ pub fn cpuChecks(want: usize) u32 {
         for (gdt.IST_INDEXES) |index| {
             const ist = gdt.istStackOf(tables, index);
             if (tables.tss.ist[index - 1] != @intFromPtr(ist.ptr) + ist.len) return base + 8;
-            if (i != 0 and (!kstack.owns(ist) or !kstack.isGuard(@intFromPtr(ist.ptr) - 1))) return base + 9;
+            if (i != 0 and (!kstack.owns(ist) or kernelMapped(@intFromPtr(ist.ptr) - 1))) return base + 9;
             if (overlap(ist, stack)) return base + 10;
         }
         // The same protections as the boot CPU, and its own GS base.
@@ -2834,11 +2903,12 @@ pub fn startChatter() ?usize {
 // ---------------------------------------------------------------------------
 // Process and scheduler lifecycle (roadmap 2.7)
 
-/// Sleep until `p` has exited and its thread has been reaped (its address
-/// space is gone). False if that takes more than a few seconds.
+/// Sleep until `p` has exited and its thread has been freed, so that the
+/// caller's reference is the only one left. False if that takes more than
+/// a few seconds.
 fn untilTornDown(p: *const process.Process) bool {
     for (0..500) |_| {
-        if (p.exit_code != null and p.root == 0) return true;
+        if (p.exit_code != null and p.root == 0 and @atomicLoad(u32, &p.refs, .monotonic) == 1) return true;
         timer.sleepTicks(1);
     }
     return false;
@@ -2887,7 +2957,10 @@ pub fn processWaiting() u32 {
     }
     // All it still holds is the structure and its name: no pages, no stack.
     const zombie = footprint();
-    if (zombie.pages != before.pages or zombie.stacks != before.stacks) return 6;
+    if (zombie.pages != before.pages or zombie.stacks != before.stacks) {
+        kernel_root.print("  process wait: before {any}, with the exited process {any}\n", .{ before, zombie });
+        return 6;
+    }
     if (zombie.heap_bytes <= before.heap_bytes) return 7;
     if (thread.spawnedCount() - thread.reapedCount() != threads_alive) return 8; // its thread was reaped
     if (early.refs != 1 or early.parent != null) return 9;
@@ -2932,29 +3005,25 @@ pub fn orphanedChild() u32 {
     const live = process.liveCount();
     var grandparent: process.Process = .{ .root = 0, .entry = 0, .name = "test grandparent" };
 
-    // The parent finishes at once; the child waits for a key.
-    const flags = cpu.saveAndDisableInterrupts();
+    // Parent and child each wait for a key; the parent has waited longer,
+    // so the first key is its, and it exits first.
     while (keyboard.getChar() != null) {}
-    const parent = process.spawnPath("/test/entry_regs", .{ .parent = &grandparent }) catch return 1;
+    const parent = process.spawnPath("/test/getchar", .{ .parent = &grandparent }) catch return 1;
+    if (!untilCount(keyboard.waitingReaders, 1)) return 13;
     const child = process.spawnPath("/test/getchar", .{ .parent = parent }) catch return 2;
-    const ok_before = grandparent.descendants == 2 and parent.descendants == 1 and
-        grandparent.first_child == parent and parent.first_child == child and child.parent == parent;
-    cpu.restoreInterrupts(flags);
-    if (!ok_before) return 3;
+    if (!untilCount(keyboard.waitingReaders, 2)) return 13;
+    if (grandparent.descendants != 2 or parent.descendants != 1 or
+        grandparent.first_child != parent or parent.first_child != child or child.parent != parent) return 3;
 
-    if (process.wait(parent) != 0) return 4; // `parent` is gone after this
+    keyboard.inject('p');
+    if (process.wait(parent) != 'p') return 4; // `parent` is gone after this
     // The child is still running, and is now the grandparent's.
     if (child.exit_code != null) return 5; // it should have outlived its parent
     if (child.parent != &grandparent) return 6;
     if (grandparent.first_child != child or child.next_sibling != null) return 7;
     if (grandparent.descendants != 1) return 8;
 
-    {
-        const irq = cpu.saveAndDisableInterrupts();
-        defer cpu.restoreInterrupts(irq);
-        if (!untilCount(keyboard.waitingReaders, 1)) return 13;
-        keyboard.inject('k');
-    }
+    keyboard.inject('k');
     if (process.wait(child) != 'k') return 9;
     if (grandparent.descendants != 0 or grandparent.first_child != null) return 10;
     if (!untilLive(live)) return 11;
@@ -3378,6 +3447,7 @@ pub fn idleChecks() u32 {
     const retired = thread.spawn(retiredWorker, null) catch return 1;
     thread.yield(); // let it run up to its `block`
     if (!retired_started or retired.state != .blocked or retired.link != .none) return 2;
+    alive_at_start += 1; // it stays: `quiesce` is not to wait for it
 
     hog_done = 0;
     _ = thread.spawn(hogWorker, null) catch return 3;

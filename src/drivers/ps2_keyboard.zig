@@ -34,17 +34,24 @@ var buf: [256]u8 = undefined;
 var head: u8 = 0; // next write (u8 wraps at 256 by itself)
 var tail: u8 = 0; // next read
 
-/// Threads waiting for a key. The IRQ handler wakes the one that has
-/// waited longest for each key.
+/// Threads waiting for a key.
 var readers: WaitQueue = .{};
+/// Readers are served in the order they asked: each takes a number, and
+/// the reader whose number is `serving` gets the next key. Being woken
+/// first is not enough for that with several CPUs: two readers woken for
+/// two keys run at the same time, and the one that started waiting later
+/// could reach the buffer first.
+var next_ticket: u64 = 0;
+var serving: u64 = 0;
 
-/// Append `c` to the ring buffer and wake a waiting reader. Drops the
-/// character if the buffer is full. The lock must be held.
+/// Append `c` to the ring buffer and wake the waiting readers, of which
+/// the one whose turn it is takes it. Drops the character if the buffer is
+/// full. The lock must be held.
 fn push(c: u8) void {
     if (head +% 1 == tail) return; // full: drop the key
     buf[head] = c;
     head +%= 1;
-    _ = readers.wakeOne();
+    _ = readers.wakeAll();
 }
 
 /// Take the next character out of the ring buffer, or return null if it is
@@ -107,21 +114,32 @@ pub fn inject(c: u8) void {
 }
 
 /// Take the next character from the ring buffer, or return null if it is
-/// empty. Never blocks.
+/// empty or a thread is waiting in `read`, whose key it would be. Never
+/// blocks.
 pub fn getChar() ?u8 {
     const held = lock.acquire();
     defer lock.release(held);
+    if (serving != next_ticket) return null;
     return pop();
 }
 
 /// Return the next character, sleeping until one is typed. Readers are
-/// served in the order they started waiting. Not for interrupt handlers.
+/// served in the order they called. Not for interrupt handlers.
 pub fn read() u8 {
     const held = lock.acquire();
     defer lock.release(held);
+    const ticket = next_ticket;
+    next_ticket += 1;
     while (true) {
-        if (pop()) |c| return c;
-        readers.wait(&lock); // until a key arrives; then look again
+        if (ticket == serving) {
+            if (pop()) |c| {
+                serving += 1;
+                // The next reader's key may be there already.
+                if (tail != head) _ = readers.wakeAll();
+                return c;
+            }
+        }
+        readers.wait(&lock); // until a key arrives or it is this reader's turn
     }
 }
 

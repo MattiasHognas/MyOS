@@ -50,9 +50,10 @@ const vmm = @import("vmm.zig");
 
 const log = std.log.scoped(.smp);
 
+/// Pages in an emergency stack, which is a small kernel stack slot.
+const IST_PAGES = gdt.IST_STACK_SIZE / 4096;
 comptime {
-    // An emergency stack is a kernel stack slot, guard page and all.
-    std.debug.assert(gdt.IST_STACK_SIZE == kstack.STACK_SIZE);
+    std.debug.assert(gdt.IST_STACK_SIZE % 4096 == 0 and IST_PAGES <= kstack.STACK_PAGES);
 }
 
 /// How long a CPU gets to come up before it is given up on.
@@ -130,7 +131,7 @@ fn start(info: *limine.MpInfo) !void {
     var allocated: usize = 0;
     errdefer for (stacks[0..allocated]) |s| kstack.free(s);
     for (&stacks) |*s| {
-        s.* = kstack.alloc() orelse return error.OutOfMemory;
+        s.* = kstack.allocSized(IST_PAGES) orelse return error.OutOfMemory;
         allocated += 1;
     }
     const stack = kstack.alloc() orelse return error.OutOfMemory;

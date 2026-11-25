@@ -138,7 +138,10 @@ var zombies: ?*Thread = null;
 /// until `finishSwitch` on the other side. The lock is held all that time,
 /// so one variable does for every CPU.
 var switched_from: ?*Thread = null;
-var reaped: usize = 0;
+/// Threads freed: counted when their memory is back, which is after the
+/// lock has been released, so not under it.
+var reaped: std.atomic.Value(usize) = .init(0);
+var exited: usize = 0;
 var switches: usize = 0;
 
 /// Append `t` to the tail of the ready queue. The scheduler lock must be held.
@@ -172,7 +175,6 @@ fn takeZombies() ?*Thread {
     while (z) |t| : (z = t.next) {
         assert.check(.thread, t.state == .dead and t.link == .zombie_list and !t.on_cpu, "reaping thread {d} in state {t} ({t})", .{ t.id, t.state, t.link });
         t.link = .none;
-        reaped += 1;
     }
     return list;
 }
@@ -186,11 +188,15 @@ fn reap(list: ?*Thread) void {
     while (rest) |z| {
         rest = z.next;
         assert.check(.thread, z != current(), "thread {d} reaps itself", .{z.id});
-        if (z.process) |p| proc.teardown(p);
+        const process = z.process;
         if (kstack.used(z.stack.?)) |bytes| kstack.record(z.id, bytes); // -Dstack-usage
         kstack.free(z.stack.?);
         if (z.fpu_alloc) |a| heap.allocator.free(a);
         heap.allocator.destroy(z);
+        // After the thread's own memory: when its reference to its
+        // process is gone, nothing of the thread is left either.
+        if (process) |p| proc.teardown(p);
+        _ = reaped.fetchAdd(1, .release); // counted when everything is back
     }
 }
 
@@ -525,9 +531,10 @@ fn switchToNext() bool {
 
     // A kernel thread uses kernel addresses only, and those are mapped the
     // same in every address space: it runs on whichever is loaded, and CR3
-    // (and the TLB) is left alone. `process.teardown` switches away from an
-    // address space before it is destroyed.
+    // (and the TLB) is left alone. `process.exit` takes an address space
+    // away from every CPU before it is destroyed.
     if (next.process) |p| {
+        assert.check(.thread, p.root != 0, "thread {d} is to run in a process that has exited", .{next.id});
         if (p.root != vmm.loadedRoot()) vmm.loadRoot(p.root);
     }
 
@@ -589,6 +596,7 @@ pub fn exit() noreturn {
     assert.check(.thread, me.state == .running and me.link == .none, "thread {d} exits in state {t} ({t})", .{ me.id, me.state, me.link });
     assert.check(.thread, me.wait_queue == null, "thread {d} exits while on a wait queue", .{me.id});
     me.state = .dead;
+    exited += 1;
     // Never comes back from the switch. If nothing is ready (every other
     // thread sleeps), idle on this stack until an interrupt wakes one.
     while (true) {
@@ -623,9 +631,16 @@ pub fn isParked(n: usize) bool {
 /// Threads freed since boot. With `spawnedCount`, tests use it to see that
 /// every thread that exited was reaped, once.
 pub fn reapedCount() usize {
+    return reaped.load(.acquire);
+}
+
+/// Threads that have exited since boot. The difference to `reapedCount` is
+/// the threads that are gone but not freed yet: on the way off their CPU,
+/// or waiting for the next thread switch on any CPU.
+pub fn exitedCount() usize {
     const held = lock.acquire();
     defer lock.release(held);
-    return reaped;
+    return exited;
 }
 
 /// Threads created since boot (not counting the boot thread).

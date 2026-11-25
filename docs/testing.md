@@ -22,9 +22,9 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 
 | Scenario | What the kernel does | What the script checks (kernel exit code; QEMU reports `code*2+1`) |
 | --- | --- | --- |
-| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, the peak kernel stack usage (`MYOS_STACK_PEAK`) under the warning level, the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2), the reports of syscall returns to invalid states, and the fuzzer finishing |
+| `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, the peak kernel stack usage (`MYOS_STACK_PEAK`) and the peak use of an emergency stack (`MYOS_IST_PEAK`) under their warning levels, the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2), the reports of syscall returns to invalid states, and the fuzzer finishing |
 | `tests_fxsave` | Runs the same suite on a CPU without XSAVE and AVX (`-cpu max,xsave=off`), so extended state is saved with FXSAVE | As `tests`, and the boot log names FXSAVE (`tests` requires XSAVE with AVX) |
-| `tests_smp` | Runs the same suite on a machine with four CPUs (`-smp 4`). The three "on every CPU at once" tests run with all four taking threads; for the others the three other CPUs are parked (see [below](#tests-and-several-cpus)) | As `tests`, and the boot log says `4 of 4 CPUs online` (`tests` and `tests_fxsave` require `1 of 1`) |
+| `tests_smp` | Runs the same suite on a machine with four CPUs (`-smp 4`), all taking threads, except during the six tests that must be alone (see [below](#tests-and-several-cpus)) | As `tests`, and the boot log says `4 of 4 CPUs online` (`tests` and `tests_fxsave` require `1 of 1`) |
 | `tests_kvm` | The same as `tests_smp`, on the host's own CPU with KVM (`-enable-kvm -cpu host`): real hardware and real parallelism instead of the emulator | As `tests_smp`, with whatever extended state the host has. Skipped, with a notice, if `/dev/kvm` cannot be used or the kernel refuses the host's CPU (Meltdown) |
 | `panic_smp` | Panics on a machine with four CPUs while a thread on each prints without end | Exit code 1, the panic message and a backtrace through `scenarioPanicSmp`, and no other output after the panic began (the panicking CPU halts the others first) |
 | `panic` | Fails a subsystem assertion two calls deep | Exit code 1, the panic message, a symbolized backtrace through `scenarioPanicInner` and `scenarioPanic` |
@@ -56,15 +56,29 @@ In the test kernel, `root.halt()` and the panic handler exit QEMU with status
 
 ### Tests and several CPUs
 
-Most in-kernel tests check exact orders and counts ("this thread was never
-switched away from", "memory is back the moment the thread is gone") that
-hold only if nothing else runs. So the test runner parks the other CPUs
-(`thread.setParked`): they give up their threads and halt until unparked.
-A test case that can share the machine says so with `.parallel = true` in
-the case list of `tests/kernel/main.zig`; the runner unparks the other
-CPUs for it. Such a test may be anywhere when it runs, and so may its
-threads: everything they share must be atomic or under a lock, and what
-it measures must not depend on timing. Three do so today:
+An in-kernel test runs with every CPU taking threads: the threads it
+starts, and the programs, are spread over the machine, and the test itself
+may be on a different CPU after every switch. So:
+
+- What a test's threads share is atomic or under a lock; turning
+  interrupts off protects nothing from another CPU.
+- A thread that has finished its work is not gone yet. It still has to
+  exit, its CPU has to leave its stack, and some CPU has to free it at its
+  next switch. A test that compares memory before and after waits for that
+  first: `helpers.quiesce()` (which `waitForDone` and `runProgram` include)
+  returns when every thread the test case started has been freed.
+- A thread or program that was just started may already be running, or
+  finished, on another CPU. A test that needs an order of events arranges
+  it (a program that waits for a key, a flag the threads wait for).
+
+Six tests cannot work that way, and say so with `.alone = true` and the
+reason in the case list of `tests/kernel/main.zig`: the runner parks the
+other CPUs while they run (`thread.setParked`). They check the exact
+interleaving of two threads, the order woken threads run in, one CPU's CR3
+loads, switches and halts, the state of the other CPUs while parked, and
+what happens when every page allocation in the machine fails.
+
+Three tests exist for several CPUs in particular:
 
 - programs on every CPU at once (extended state, long syscalls, a crash,
   fresh memory), ending with memory as it was;
@@ -73,7 +87,7 @@ it measures must not depend on timing. Three do so today:
 - a kernel page read on every CPU, then unmapped and replaced: no CPU may
   see the old page.
 
-On one CPU they run too, and check the same things without the parallelism.
+With one CPU everything runs the same way, without the parallelism.
 
 Tests that pass under the emulator can fail on a real CPU, and the other
 way round: the emulator runs one instruction at a time per CPU and lets

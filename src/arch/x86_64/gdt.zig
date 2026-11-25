@@ -25,6 +25,7 @@
 
 const std = @import("std");
 
+const kstack = @import("../../kernel/kstack.zig");
 const percpu = @import("percpu.zig");
 
 /// The entries of a GDT: the same on every CPU except for the TSS descriptor.
@@ -38,8 +39,13 @@ const gdt_template = [_]u64{
     0, // 0x30 TSS high
 };
 
-/// Size of each emergency stack. Their handlers only print diagnostics and halt.
-pub const IST_STACK_SIZE = 16 * 1024;
+/// Size of each emergency stack. What runs on them is a crash report
+/// that ends in a halt, or, for a debug trap from a program, the end of
+/// that process. Measured (`istPeak`, printed by the tests and by every
+/// crash report of a measured build): at most 4.4 KiB in a Debug build,
+/// 2.8 KiB in an optimized one. Linux has 4 KiB, which it can do because
+/// its handlers move to the thread's own stack before they do any work.
+pub const IST_STACK_SIZE = 8 * 1024;
 
 /// IST index (1-7, as used in IDT gates) of the double-fault stack.
 pub const IST_DOUBLE_FAULT = 1;
@@ -146,6 +152,21 @@ pub fn istStackOf(t: *const Tables, index: u3) []u8 {
     unreachable;
 }
 
+/// The most any emergency stack of any CPU has ever been used, in bytes,
+/// or null if stack usage is not measured (`-Dstack-usage`). Includes the
+/// stack the caller may be running on, as far as it has got.
+pub fn istPeak() ?usize {
+    if (!kstack.track_usage) return null;
+    var peak: usize = 0;
+    const n = if (percpu.currentIfReady() != null) percpu.count() else 0;
+    if (n == 0) {
+        for (boot_tables.ist_stacks) |stack| peak = @max(peak, kstack.used(stack).?);
+    } else for (0..n) |i| {
+        for (percpu.get(i).tables.?.ist_stacks) |stack| peak = @max(peak, kstack.used(stack).?);
+    }
+    return peak;
+}
+
 /// The stack top this CPU's TSS holds for IST index `index` (1-7); 0 if unused.
 pub fn istTop(index: u3) u64 {
     return tables().tss.ist[index - 1];
@@ -206,6 +227,7 @@ pub fn load(t: *Tables) void {
 
 /// Install the boot CPU's GDT and TSS. Must run before `idt.init`.
 pub fn init() void {
+    inline for (.{ &double_fault_stack, &nmi_stack, &debug_stack, &machine_check_stack }) |stack| kstack.markUnused(stack);
     prepare(&boot_tables, .{ &double_fault_stack, &nmi_stack, &debug_stack, &machine_check_stack });
     load(&boot_tables);
 }

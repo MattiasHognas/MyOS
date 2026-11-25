@@ -98,12 +98,21 @@ fn unmapPages(low: usize, count: usize) void {
 /// initial stack pointer is its end. The contents are not zeroed. Returns
 /// null if there is no free slot or no physical memory, leaving nothing behind.
 pub fn alloc() ?[]u8 {
+    return allocSized(STACK_PAGES);
+}
+
+/// Allocate a smaller stack of `pages` pages (at most `STACK_PAGES`), for a
+/// stack whose use is known and small: an emergency stack. It takes a slot
+/// like any other and has the top `pages` pages of it; everything below
+/// stays unmapped, so it is guarded just the same. Free it with `free`.
+pub fn allocSized(pages: usize) ?[]u8 {
+    assert.check(.kstack, pages >= 1 and pages <= STACK_PAGES, "a kernel stack of {d} pages", .{pages});
     const held = lock.acquire();
     defer lock.release(held);
 
     const slot = firstFreeSlot() orelse return null;
-    const low = REGION_START + slot * SLOT_SIZE + pmm.PAGE_SIZE;
-    for (0..STACK_PAGES) |i| {
+    const low = REGION_START + (slot + 1) * SLOT_SIZE - pages * pmm.PAGE_SIZE;
+    for (0..pages) |i| {
         const phys = pmm.alloc() orelse {
             unmapPages(low, i);
             return null;
@@ -115,8 +124,17 @@ pub fn alloc() ?[]u8 {
         };
     }
     setSlotFree(slot, false);
-    if (track_usage) @memset(@as([*]u64, @ptrFromInt(low))[0 .. STACK_SIZE / 8], FILL);
-    return @as([*]u8, @ptrFromInt(low))[0..STACK_SIZE];
+    const stack = @as([*]u8, @ptrFromInt(low))[0 .. pages * pmm.PAGE_SIZE];
+    markUnused(stack);
+    return stack;
+}
+
+/// Mark all of `stack` as never used, for `used` to measure from. For a
+/// stack that does not come from `alloc`, which does this itself. Does
+/// nothing if usage is not measured.
+pub fn markUnused(stack: []u8) void {
+    if (!track_usage) return;
+    @memset(@as([*]u64, @ptrCast(@alignCast(stack.ptr)))[0 .. stack.len / 8], FILL);
 }
 
 /// How many bytes of `stack` (from `alloc`) have ever been used: the
@@ -153,14 +171,13 @@ pub fn peak() usize {
 /// PMM and release the slot for reuse. No thread may be running on it.
 pub fn free(stack: []u8) void {
     const low = @intFromPtr(stack.ptr);
-    assert.check(.kstack, stack.len == STACK_SIZE and low >= REGION_START and low < REGION_END and
-        (low - REGION_START) % SLOT_SIZE == pmm.PAGE_SIZE, "freeing 0x{x}+{d}, which is not a kernel stack", .{ low, stack.len });
+    assert.check(.kstack, owns(stack), "freeing 0x{x}+{d}, which is not a kernel stack", .{ low, stack.len });
     const slot = (low - REGION_START) / SLOT_SIZE;
 
     const held = lock.acquire();
     defer lock.release(held);
     assert.check(.kstack, !slotFree(slot), "double free of kernel stack 0x{x}", .{low});
-    unmapPages(low, STACK_PAGES);
+    unmapPages(low, stack.len / pmm.PAGE_SIZE);
     setSlotFree(slot, true);
 }
 
@@ -172,11 +189,13 @@ pub fn isGuard(addr: u64) bool {
     return (addr - REGION_START) % SLOT_SIZE < pmm.PAGE_SIZE;
 }
 
-/// True if `stack` is a kernel stack handed out by `alloc`.
+/// True if `stack` is a kernel stack handed out by `alloc` or
+/// `allocSized`: whole pages, ending where a slot ends.
 pub fn owns(stack: []const u8) bool {
     const low = @intFromPtr(stack.ptr);
-    return stack.len == STACK_SIZE and low >= REGION_START and low < REGION_END and
-        (low - REGION_START) % SLOT_SIZE == pmm.PAGE_SIZE;
+    const end = low + stack.len;
+    return stack.len >= pmm.PAGE_SIZE and stack.len <= STACK_SIZE and stack.len % pmm.PAGE_SIZE == 0 and
+        low >= REGION_START and end <= REGION_END and (end - REGION_START) % SLOT_SIZE == 0;
 }
 
 /// Number of stacks currently allocated.

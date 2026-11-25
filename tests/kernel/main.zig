@@ -194,6 +194,7 @@ fn processLimits() TestError!void {
     try check(helpers.runProgramLimited("/test/run_many", .{ .max_descendants = 1 }) == 8);
     try check(helpers.runProgramLimited("/test/run_many", .{ .max_descendants = 0 }) == 0);
 
+    helpers.quiesce(); // the processes that nobody waited for
     const after = helpers.footprint();
     try check(after.eql(before));
     try check(pmm.consistent());
@@ -208,6 +209,7 @@ fn recursionUntilOutOfMemory() TestError!void {
     // Leave 4 MiB, so the chain is dozens of processes rather than thousands.
     if (helpers.drainMemory(1024) != 1024) return error.Failed;
     const code = helpers.runProgram("/test/recurse");
+    helpers.quiesce(); // the chain's last threads
     const low_water = pmm.free_pages;
     helpers.releaseDrained();
     const status = code orelse return error.Failed;
@@ -726,15 +728,14 @@ fn userSyscalls() TestError!void {
 /// and nothing else, checked from ring 3; no memory is leaked.
 fn userPointers() TestError!void {
     _ = helpers.runProgram("/test/user_pointers"); // warm up: the heap may grow
-    const pages = pmm.free_pages;
-    const heap_bytes = helpers.heapInUse();
+    const memory = helpers.footprint();
     const code = helpers.runProgram("/test/user_pointers") orelse return error.Failed;
     if (code != 0) {
         var buf: [64]u8 = undefined;
         serial.puts(std.fmt.bufPrint(&buf, "  /test/user_pointers failed check {d}\n", .{code}) catch "");
     }
     try check(code == 0);
-    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+    try check(helpers.footprint().eql(memory));
 }
 
 /// `copyFromUser`/`copyToUser` against mapped, unmapped, partly mapped and
@@ -815,8 +816,7 @@ fn syscallReturnStates() TestError!void {
     try check(helpers.runProgram("/test/bad_return") == 90);
     const iret_before = helpers.iretReturns();
     var via_iret: usize = 0;
-    const pages = pmm.free_pages;
-    const heap_bytes = helpers.heapInUse();
+    const memory = helpers.footprint();
     defer helpers.removeProbes();
     inline for (.{ .noncanonical_rip, .kernel_rip, .kernel_cs, .kernel_ss }) |state| {
         helpers.installProbes(state);
@@ -831,7 +831,7 @@ fn syscallReturnStates() TestError!void {
     // one with privileged flags included) used sysretq.
     try check(via_iret == 16 and helpers.iretReturns() - iret_before == via_iret);
     try expectProgram("/bin/hello"); // the kernel is fine
-    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+    try check(helpers.footprint().eql(memory));
 }
 
 /// The kernel's GS base never reaches ring 3, and is back after every entry.
@@ -856,7 +856,6 @@ fn debugTrapEntry() TestError!void {
 
 /// True in the `tests_fxsave` scenario, where QEMU hides XSAVE from the kernel.
 var expect_fxsave = false;
-var all_parallel = false;
 /// CPUs the scenario's machine has.
 var expect_cpus: usize = 1;
 
@@ -908,8 +907,7 @@ fn extendedStateSetup() TestError!void {
 /// areas are freed with their threads.
 fn extendedStateSwitching() TestError!void {
     _ = helpers.runPair("/test/fpu"); // warm up: the heap may grow
-    const pages = pmm.free_pages;
-    const heap_bytes = helpers.heapInUse();
+    const memory = helpers.footprint();
     helpers.installProbes(.noncanonical_rip);
     defer helpers.removeProbes();
     // 10 timer interrupts in ring 3 are two full time slices: at least one
@@ -922,7 +920,7 @@ fn extendedStateSwitching() TestError!void {
     if (helpers.probes.user_ticks < 10) report("timer interrupts in ring 3:", helpers.probes.user_ticks);
     try check(helpers.probes.user_ticks >= 10 and helpers.probes.violation == 0);
     helpers.removeProbes();
-    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+    try check(helpers.footprint().eql(memory));
 }
 
 /// A new process gets clean x87, SSE and AVX registers, not the previous
@@ -936,10 +934,9 @@ fn extendedStateClean() TestError!void {
 /// kernel keeps working and no memory is lost.
 fn syscallFuzz() TestError!void {
     try expectProgram("/test/fuzz"); // also the warm-up: the heap may grow
-    const pages = pmm.free_pages;
-    const heap_bytes = helpers.heapInUse();
+    const memory = helpers.footprint();
     try expectProgram("/test/fuzz");
-    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+    try check(helpers.footprint().eql(memory));
     try expectProgram("/bin/hello");
 }
 
@@ -967,8 +964,7 @@ fn userIsolation() TestError!void {
 /// The host script checks the diagnostics these print.
 fn userFaults() TestError!void {
     _ = helpers.runProgram("/test/div_zero"); // warm up: the heap may grow
-    const pages = pmm.free_pages;
-    const heap_bytes = helpers.heapInUse();
+    const memory = helpers.footprint();
     try check(helpers.runProgram("/test/div_zero") == 255);
     try check(helpers.runProgram("/test/invalid_opcode") == 255);
     // Single-stepping into a syscall: the trap arrives in ring 3, after the
@@ -977,7 +973,7 @@ fn userFaults() TestError!void {
     try check(helpers.runProgram("/test/single_step") == 255);
     try check(helpers.iretReturns() == iret_before + 1);
     try check(helpers.runProgram("/bin/hello") == 0);
-    try check(pmm.free_pages == pages and helpers.heapInUse() == heap_bytes);
+    try check(helpers.footprint().eql(memory));
 }
 
 /// Double faults, NMIs and debug exceptions have their own stacks, and the CPU switches to them.
@@ -1017,12 +1013,10 @@ fn processLifecycle() TestError!void {
     try check(helpers.runProgram("/does/not/exist") == null);
 
     // The first runs above may have grown the heap; measure from here.
-    const pages = pmm.free_pages;
-    const heap_bytes = helpers.heapInUse();
+    const memory = helpers.footprint();
     try check(helpers.runProgram("/bin/hello") == 0);
     try check(helpers.runProgram("/test/kernel_read") == 255);
-    try check(pmm.free_pages == pages);
-    try check(helpers.heapInUse() == heap_bytes);
+    try check(helpers.footprint().eql(memory));
 }
 
 /// Kernel threads take turns in FIFO order and are reaped after exiting.
@@ -1339,27 +1333,25 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "lock_order")) scenarioLockOrder();
     if (std.mem.eql(u8, scenario, "sleep_with_lock")) scenarioSleepWithLock();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
-    all_parallel = std.mem.eql(u8, scenario, "tests_all_parallel"); // an experiment: nothing is parked
-    const smp_run = std.mem.eql(u8, scenario, "tests_smp") or all_parallel;
+    const smp_run = std.mem.eql(u8, scenario, "tests_smp");
     expect_cpus = if (smp_run) 4 else 1; // as `scripts/test-qemu.sh` starts QEMU
     if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave and !smp_run) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
 }
 
-/// Run one test case and return whether it passed. A case that can share
-/// the machine (`parallel`) runs with every CPU taking threads; the other
-/// CPUs are parked again before the next case. A function of its own, not
-/// part of the loop in `runCases`: unrolled over every case, its locals
-/// would make that function's stack frame larger than a page.
-noinline fn runCase(func: *const fn () TestError!void, parallel: bool) bool {
-    const share = parallel or all_parallel;
-    if (share) _ = helpers.setOthersParked(false);
+/// Run one test case and return whether it passed. Unless the case must
+/// be `alone`, it runs with every CPU taking threads; the other CPUs are
+/// parked again before the next case. A function of its own, not part of
+/// the loop in `runCases`: unrolled over every case, its locals would make
+/// that function's stack frame larger than a page.
+noinline fn runCase(func: *const fn () TestError!void, alone: bool) bool {
+    if (!alone) _ = helpers.setOthersParked(false);
+    helpers.beginCase();
     const ok = if (func()) |_| true else |_| false;
-    if (share) {
-        const irq = helpers.enableInterrupts();
-        defer helpers.restoreInterrupts(irq);
-        if (!helpers.setOthersParked(true)) @panic("tests: the other CPUs did not park");
-    }
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    helpers.quiesce(); // the next case starts with this one's threads gone
+    if (!alone and !helpers.setOthersParked(true)) @panic("tests: the other CPUs did not park");
     return ok;
 }
 
@@ -1446,7 +1438,8 @@ fn runCases() noreturn {
         .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
         .{ .name = "PMM critical sections exclude other threads", .func = pmmLock },
         .{ .name = "memory exhaustion fails cleanly (page tables, stacks, heap, processes)", .func = memoryExhaustion },
-        .{ .name = "process, kernel stack and heap growth fail cleanly at every allocation", .func = spawnAllocationFailures },
+        // Alone: makes page allocation fail for the whole machine, and counts on which allocation is which.
+        .{ .name = "process, kernel stack and heap growth fail cleanly at every allocation", .func = spawnAllocationFailures, .alone = true },
         .{ .name = "per-process limits (memory, open files, descendants)", .func = processLimits },
         .{ .name = "recursive spawning until memory runs out (ring 3)", .func = recursionUntilOutOfMemory },
         .{ .name = "user/kernel isolation (ring 3 faults)", .func = userIsolation },
@@ -1463,12 +1456,14 @@ fn runCases() noreturn {
         .{ .name = "user stack address randomization", .func = stackRandomization },
         .{ .name = "kernel runs at a randomized address", .func = kernelRelocation },
         .{ .name = "spinlocks (interrupt state, nesting, exclusion under preemption)", .func = spinlocks },
-        .{ .name = "wait queues (several waiters, order, timeouts)", .func = waitQueues },
-        .{ .name = "CPUs (all online, own per-CPU state, tables and stacks, same setup, timer interrupts)", .func = cpus },
+        // Alone: checks the order in which woken threads run.
+        .{ .name = "wait queues (several waiters, order, timeouts)", .func = waitQueues, .alone = true },
+        // Alone: looks at the other CPUs while they are parked.
+        .{ .name = "CPUs (all online, own per-CPU state, tables and stacks, same setup, timer interrupts)", .func = cpus, .alone = true },
         .{ .name = "speculation barrier after the conditional swapgs at kernel entry", .func = swapgsFences },
-        .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown, .parallel = true },
-        .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress, .parallel = true },
-        .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms, .parallel = true },
+        .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
+        .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },
+        .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms },
         .{ .name = "locking model (locks held per CPU, idle wake-up in place, wake timers, unstarted threads)", .func = lockingModel },
         .{ .name = "kernel timers (order, expiry, cancel, sleep)", .func = timers },
         .{ .name = "mutex exclusion and hand-off under preemption", .func = mutexes },
@@ -1476,10 +1471,13 @@ fn runCases() noreturn {
         .{ .name = "process exit status outlives the process; early exit, shared and no waiters", .func = processWaiting },
         .{ .name = "orphaned child is handed to its grandparent", .func = orphanedChild },
         .{ .name = "lifecycle stress (spawn, exit, wait, orphan, failures)", .func = lifecycleStress },
-        .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin },
+        // Alone: checks the exact interleaving of two threads.
+        .{ .name = "scheduler round robin and reaping", .func = schedulerRoundRobin, .alone = true },
         .{ .name = "wake before block", .func = wakeBeforeBlock },
-        .{ .name = "kernel thread keeps the loaded address space (no CR3 load)", .func = kernelThreadAddressSpace },
-        .{ .name = "no idling while a thread is ready; a retired thread never runs", .func = idleOnlyWhenNothingIsReady },
+        // Alone: counts one CPU's CR3 loads while two threads take turns on it.
+        .{ .name = "kernel thread keeps the loaded address space (no CR3 load)", .func = kernelThreadAddressSpace, .alone = true },
+        // Alone: counts one CPU's switches and halts.
+        .{ .name = "no idling while a thread is ready; a retired thread never runs", .func = idleOnlyWhenNothingIsReady, .alone = true },
         .{ .name = "syscall handler is replaceable in the test kernel only", .func = syscallHandlerReplaceable },
         .{ .name = "tarfs lookup and normalization", .func = tarfsLookup },
         .{ .name = "tarfs offsets and partial reads", .func = tarfsBoundaries },
@@ -1498,16 +1496,17 @@ fn runCases() noreturn {
         },
     };
 
-    // A test has the machine to itself unless it says it can share it
-    // (`.parallel = true`): most of them check exact counts and orders that
-    // hold only if nothing else runs. The other CPUs are parked meanwhile.
+    // A test runs with every CPU taking threads, so its threads and the
+    // programs it starts are spread over the machine, unless it is marked
+    // `.alone = true` (with the reason, above): then the other CPUs are
+    // parked while it runs. They start out parked.
     const irq = helpers.enableInterrupts();
     if (!helpers.setOthersParked(true)) @panic("tests: the other CPUs did not park");
     helpers.restoreInterrupts(irq);
 
     inline for (cases) |case| {
-        const parallel = @hasField(@TypeOf(case), "parallel") and case.parallel;
-        if (runCase(case.func, parallel)) {
+        const alone = @hasField(@TypeOf(case), "alone") and case.alone;
+        if (runCase(case.func, alone)) {
             passed += 1;
             serial.puts("[PASS] " ++ case.name ++ "\n");
         } else {
@@ -1526,6 +1525,16 @@ fn runCases() noreturn {
         failed += 1;
         serial.puts("[FAIL] kernel stack usage below the warning level\n");
     } else serial.puts("[PASS] kernel stack usage below the warning level\n");
+
+    if (helpers.istPeak()) |ist_peak| {
+        var ist_line: [96]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&ist_line, "MYOS_IST_PEAK bytes={d} of={d}\n", .{ ist_peak, helpers.IST_STACK_SIZE }) catch unreachable);
+        // Past three quarters the run fails: too tight, though nothing overflowed.
+        if (ist_peak > helpers.IST_STACK_SIZE / 4 * 3) {
+            failed += 1;
+            serial.puts("[FAIL] emergency stack usage below the warning level\n");
+        } else serial.puts("[PASS] emergency stack usage below the warning level\n");
+    }
 
     var summary: [128]u8 = undefined;
 
