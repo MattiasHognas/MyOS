@@ -912,7 +912,7 @@ fn userMemory() TestError!void {
     try check(helpers.runPair("/test/vm")); // two address spaces at once
     try check(helpers.runProgramArgs("/test/vm", &.{ "vm", "deep" }, &.{}) == 0);
     // What a program is killed for.
-    inline for (.{ "none", "readonly", "unmapped", "stack" }) |mode| {
+    inline for (.{ "none", "readonly", "unmapped", "stack", "pasteof", "filereadonly" }) |mode| {
         const status = helpers.runProgramArgs("/test/vm", &.{ "vm", mode }, &.{}) orelse return error.Failed;
         if (status != 255) report("/test/vm " ++ mode ++ " exit status", status);
         try check(status == 255);
@@ -986,6 +986,28 @@ fn elfInterpreter() TestError!void {
     try check(helpers.runImage(buildElf(.{ .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static" })) == 1);
     // And a position-independent program with an interpreter.
     try check(helpers.runImage(buildElf(.{ .typ = 3, .vaddr = 0, .entry = 0, .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static-pie" })) == 1);
+    try check(helpers.footprint().eql(memory));
+}
+
+/// A dynamically linked C program runs: the kernel loads the dynamic
+/// loader the program names, and the loader maps the C library from its
+/// file and starts the program. The loader and the library are glibc's
+/// (`scripts/fetch-sysroot.sh`); an image built without them has nothing
+/// to load the program with, and the test says so.
+fn dynamicHello() TestError!void {
+    const path = "/fixtures/glibc-hello-dynamic";
+    if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
+        root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
+        return;
+    }
+    _ = helpers.runProgram(path); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    helpers.traceUnknownSyscalls(true);
+    defer helpers.traceUnknownSyscalls(false);
+    const code = helpers.runProgramArgs(path, &.{ "hello-dynamic", "linked", "at run time" }, &.{"GREETING=hi dynamic"}) orelse return error.Failed;
+    if (code != 3) report("dynamically linked hello exit status", code);
+    try check(code == 3);
+    try check(helpers.runPairExpect(path, 1)); // two at once
     try check(helpers.footprint().eql(memory));
 }
 
@@ -1721,6 +1743,7 @@ fn runCases() noreturn {
         .{ .name = "a Go program built for Linux runs (runtime threads, goroutines, channel, GC)", .func = goHello },
         .{ .name = "position-independent programs built for Linux run, at a random address", .func = positionIndependent },
         .{ .name = "a program's ELF interpreter is loaded and started in its place", .func = elfInterpreter },
+        .{ .name = "a dynamically linked C program runs with its loader and C library from files", .func = dynamicHello },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },

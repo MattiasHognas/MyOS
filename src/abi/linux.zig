@@ -48,6 +48,9 @@ pub const Sys = struct {
     /// `dup(fd) -> new fd`, and `dup2(old, new)`.
     pub const dup = 32;
     pub const dup2 = 33;
+    /// `access(path, mode) -> 0`: whether the file is there and may be
+    /// used that way.
+    pub const access = 21;
     /// `pipe(fds) -> 0`: a pipe's reading and writing descriptors.
     pub const pipe = 22;
     /// `nanosleep(request, remaining) -> 0`.
@@ -65,6 +68,10 @@ pub const Sys = struct {
     pub const uname = 63;
     /// `fcntl(fd, command, arg)`.
     pub const fcntl = 72;
+    /// `getcwd(buf, size) -> length with the NUL`: always "/".
+    pub const getcwd = 79;
+    /// `readlink(path, buf, size)`: there are no symbolic links (`EINVAL`).
+    pub const readlink = 89;
     /// `gettimeofday(tv, tz) -> 0`.
     pub const gettimeofday = 96;
     /// `sysinfo(info) -> 0`: memory and uptime.
@@ -104,6 +111,19 @@ pub const Sys = struct {
     pub const tgkill = 234;
     /// `openat(dirfd, path, flags, mode) -> fd`.
     pub const openat = 257;
+    /// `newfstatat(dirfd, path, statbuf, flags) -> 0`: `stat` by path, or
+    /// of `dirfd` itself with `AT_EMPTY_PATH`.
+    pub const newfstatat = 262;
+    /// `readlinkat(dirfd, path, buf, size)`.
+    pub const readlinkat = 267;
+    /// `faccessat(dirfd, path, mode)` and `faccessat2(..., flags)`.
+    pub const faccessat = 269;
+    pub const faccessat2 = 439;
+    /// `set_robust_list(head, size) -> 0`: the list of locks to release
+    /// if the thread dies holding them. Recorded only.
+    pub const set_robust_list = 273;
+    /// `rseq(...)`: restartable sequences are not offered (`ENOSYS`).
+    pub const rseq = 334;
     /// `pipe2(fds, flags) -> 0`: `pipe` with `O_NONBLOCK` and `O_CLOEXEC`.
     pub const pipe2 = 293;
     /// `dup3(old, new, flags) -> new`.
@@ -150,6 +170,8 @@ pub const E = enum(u16) {
     BADF = 9,
     /// Resource temporarily unavailable: a limit on processes was reached.
     AGAIN = 11,
+    /// Permission denied.
+    ACCES = 13,
     /// Out of memory.
     NOMEM = 12,
     /// Bad address: a pointer argument is outside user space or not mapped.
@@ -158,6 +180,10 @@ pub const E = enum(u16) {
     EXIST = 17,
     /// No such device: the object cannot be mapped.
     NODEV = 19,
+    /// Not a directory.
+    NOTDIR = 20,
+    /// The result does not fit the buffer.
+    RANGE = 34,
     /// Invalid argument.
     INVAL = 22,
     /// Not a terminal: the descriptor has no such `ioctl`.
@@ -301,6 +327,8 @@ pub const MAP = struct {
     pub const PRIVATE = 0x02;
     pub const FIXED = 0x10;
     pub const ANONYMOUS = 0x20;
+    /// Ignored, as on Linux.
+    pub const DENYWRITE = 0x0800;
     pub const NORESERVE = 0x4000;
     pub const STACK = 0x20000;
     pub const FIXED_NOREPLACE = 0x100000;
@@ -497,3 +525,15 @@ pub const StatFs = extern struct {
 /// The magic number of a RAM-backed filesystem (`TMPFS_MAGIC`), which is
 /// the nearest thing to the initrd.
 pub const TMPFS_MAGIC = 0x01021994;
+
+/// `access` modes and `AT_*` flags of the path calls.
+pub const ACCESS = struct {
+    pub const F_OK = 0;
+    pub const X_OK = 1;
+    pub const W_OK = 2;
+    pub const R_OK = 4;
+};
+pub const AT_EMPTY_PATH = 0x1000;
+pub const AT_SYMLINK_NOFOLLOW = 0x100;
+/// Size of the structure `set_robust_list` registers.
+pub const ROBUST_LIST_HEAD_SIZE = 24;

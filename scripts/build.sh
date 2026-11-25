@@ -47,6 +47,15 @@ cp zig-out/bin/hello.elf "$initrd/bin/hello"
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
 # Programs built for Linux by other toolchains (tests/fixtures), to run by hand.
 cp tests/fixtures/bin/* "$initrd/bin/"
+# The C library dynamically linked Linux programs expect on the system:
+# the loader and shared libraries of scripts/fetch-sysroot.sh, if they have
+# been fetched. Not in a release image: passing them on has licence terms
+# of its own (see that script).
+if [[ "$mode" != --release && -f sysroot/.complete ]]; then
+    cp -r sysroot/lib64 sysroot/lib "$initrd/"
+elif [[ "$mode" != --release ]]; then
+    echo "note: no sysroot/ (scripts/fetch-sysroot.sh): dynamically linked programs will not start" >&2
+fi
 if [[ "$mode" == --package-test ]]; then
     # User-mode test programs: zig-out/bin/test-<name>.elf -> /test/<name>
     mkdir -p "$initrd/test"

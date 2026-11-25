@@ -46,6 +46,7 @@ const proc = @import("process.zig");
 const Process = proc.Process;
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const vm_regions = @import("vm_regions.zig");
+const vfs = @import("vfs.zig");
 const Prot = vm_regions.Prot;
 
 const PAGE = pmm.PAGE_SIZE;
@@ -147,7 +148,22 @@ pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
     if (vmm.leafEntry(p.root, page) != null) return; // given meanwhile
 
     if (p.pages + 1 > p.limits.max_pages) return error.OutOfMemory;
+    // A page of a file is filled from it, and what is past the file's end
+    // within its last page is zero. A page wholly past the end is not
+    // there (Linux: SIGBUS).
+    var node: vfs.Node = undefined;
+    var file_offset: u64 = 0;
+    if (region.kind == .file) {
+        node = nodeOf(region.backing);
+        file_offset = region.fileOffset(page);
+        if (file_offset >= node.size) return error.BadAccess;
+    }
     const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
+    if (region.kind == .file) {
+        // (The file is in memory, so reading it cannot wait; a file on a
+        // disk will have to be read before this lock is taken.)
+        _ = node.ops.read(&node, file_offset, pmm.physToVirt(phys)[0..PAGE]);
+    }
     var tables: usize = 0;
     vmm.mapCounting(p.root, page, phys, pteFlags(region.prot), &tables) catch |e| {
         pmm.free(phys);
@@ -188,15 +204,22 @@ fn mappable(addr: u64, len: u64) bool {
 }
 
 /// `mmap`: anonymous memory only. Returns the address, or an error value.
-pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fd: u64) u64 {
-    _ = fd; // ignored with MAP_ANONYMOUS, as on Linux
+pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, file: ?FileMap) u64 {
     const prot = protFromAbi(prot_bits) orelse return abi.err(.INVAL);
     if (length == 0) return abi.err(.INVAL);
     if (length > MAP_MAX) return abi.err(.NOMEM); // more than an address space holds
     const len = std.mem.alignForward(u64, length, PAGE);
-    if (flags & abi.MAP.ANONYMOUS == 0) return abi.err(.NODEV); // no file mappings yet
     const sharing = flags & (abi.MAP.SHARED | abi.MAP.PRIVATE);
     if (sharing == 0 or sharing == (abi.MAP.SHARED | abi.MAP.PRIVATE)) return abi.err(.INVAL);
+    const anonymous = flags & abi.MAP.ANONYMOUS != 0;
+    if (!anonymous) {
+        const f = file orelse return abi.err(.BADF);
+        if (f.offset % PAGE != 0) return abi.err(.INVAL);
+        if (f.offset > MAP_MAX or len > MAP_MAX - f.offset) return abi.err(.INVAL); // Linux: EOVERFLOW
+        // Files cannot be written: a shared mapping may only be read, and
+        // is then the same as a private one.
+        if (sharing == abi.MAP.SHARED and prot.write) return abi.err(.ACCES);
+    }
     const fixed = flags & (abi.MAP.FIXED | abi.MAP.FIXED_NOREPLACE) != 0;
 
     const held = p.mem.lock.acquire();
@@ -218,11 +241,27 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fd:
         else
             p.mem.regions.findFree(len, MAP_MIN, p.mem.mmap_top) orelse return abi.err(.NOMEM);
     }
-    p.mem.regions.add(heap.allocator, addr, len, prot, .anon) catch |e| return mapError(e);
+    if (anonymous) {
+        p.mem.regions.add(heap.allocator, addr, len, prot, .anon) catch |e| return mapError(e);
+    } else {
+        const f = file.?;
+        const backing: vm_regions.Backing = .{ .file = .{ f.node.size, f.node.ctx, @intFromPtr(f.node.ops) }, .offset = f.offset };
+        p.mem.regions.addBacked(heap.allocator, addr, len, prot, .file, backing) catch |e| return mapError(e);
+    }
     return addr;
 }
 
-/// `munmap`.
+/// The file behind a mapping and where in it the mapping starts.
+pub const FileMap = struct {
+    node: vfs.Node,
+    offset: u64,
+};
+
+/// The file a region was made for: its three words are the node's fields.
+fn nodeOf(backing: vm_regions.Backing) vfs.Node {
+    return .{ .size = backing.file[0], .ctx = backing.file[1], .ops = @ptrFromInt(backing.file[2]) };
+}
+
 /// `mremap`: change the size of the mapping at `addr` from `old_length`
 /// to `new_length` and return its address.
 ///
@@ -256,12 +295,15 @@ pub fn mremap(p: *Process, addr: u64, old_length: u64, new_length: u64, flags: u
     // Only the end of a mapping can grow, into free addresses.
     const tail = addr + old_len;
     const more = new_len - old_len;
-    if (tail != region.end or !mappable(tail, more) or tail + more > p.mem.mmap_top or
+    // (Anonymous ones: growing a file's mapping would have to continue
+    // the file, which nothing needs yet.)
+    if (tail != region.end or region.kind != .anon or !mappable(tail, more) or tail + more > p.mem.mmap_top or
         !p.mem.regions.isFree(tail, more)) return abi.err(.NOMEM);
     p.mem.regions.add(heap.allocator, tail, more, region.prot, .anon) catch |e| return mapError(e);
     return addr;
 }
 
+/// `munmap`.
 pub fn munmap(p: *Process, addr: u64, length: u64) u64 {
     if (length == 0 or addr % PAGE != 0 or length > MAP_MAX) return abi.err(.INVAL);
     const len = std.mem.alignForward(u64, length, PAGE);

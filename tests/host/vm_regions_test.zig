@@ -66,6 +66,34 @@ test "find says which region an address is in" {
     try expect(r.find(0) == null);
 }
 
+test "a file's region knows the file offset of each of its parts" {
+    var r: Regions = .{};
+    defer r.deinit(gpa);
+    const file: [3]u64 = .{ 111, 222, 333 };
+    try r.addBacked(gpa, 10 * P, 8 * P, ro, .file, .{ .file = file, .offset = 4 * P });
+    try expectEqual(4 * P, r.find(10 * P).?.fileOffset(10 * P));
+    try expectEqual(9 * P, r.find(15 * P).?.fileOffset(15 * P));
+
+    // Cut in three by a change of permissions, and one part removed: every
+    // part still reads the bytes it read before.
+    try r.protect(gpa, 12 * P, 2 * P, Prot.rw);
+    try r.remove(gpa, 16 * P, P);
+    try expectRegions(&r, &.{ .{ 10, 12 }, .{ 12, 14 }, .{ 14, 16 }, .{ 17, 18 } });
+    for (r.items()) |part| {
+        try expectEqual(vm.Kind.file, part.kind);
+        try expectEqual(file, part.backing.file);
+        try expectEqual(4 * P + (part.start - 10 * P), part.backing.offset);
+        try expectEqual(part.backing.offset + P, part.fileOffset(part.start + P));
+    }
+    // Parts of a file are not joined again, nor with anonymous memory
+    // beside them: each is known by its own offset.
+    try r.protect(gpa, 12 * P, 2 * P, ro);
+    try expectEqual(4, r.items().len);
+    try r.add(gpa, 18 * P, P, ro, .anon);
+    try expectEqual(5, r.items().len);
+    try expectEqual(0, r.find(18 * P).?.backing.offset);
+}
+
 test "anonymous neighbours with the same permissions become one region" {
     var r: Regions = .{};
     defer r.deinit(gpa);

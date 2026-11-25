@@ -10,3 +10,6 @@ disk.img
 
 # assets
 font.psf
+
+# The C library for dynamically linked programs (scripts/fetch-sysroot.sh)
+sysroot/

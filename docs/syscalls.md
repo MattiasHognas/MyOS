@@ -76,10 +76,10 @@ Linux calls, with Linux's numbers:
 | 1 | `write(fd, buf, count)` | The console (serial port and screen), which descriptors 0, 1 and 2 start out as, and pipes. A pipe takes all of it, waiting for room; `EPIPE` when no reader is left (no `SIGPIPE` yet). Files are read-only (`EBADF`). |
 | 2 | `open(path, flags, mode)` | Read-only: the access mode in `flags` must be `O_RDONLY`. Other flags and `mode` are ignored, except that `O_CREAT` on a missing file gives `EROFS`. |
 | 3 | `close(fd)` | Any open descriptor, the standard ones too. What it referred to goes with its last descriptor. |
-| 5 | `fstat(fd, statbuf)` | The console is a character device, a pipe a FIFO, an open file a regular file with its size. |
+| 5 | `fstat(fd, statbuf)` | The console is a character device, a pipe a FIFO, an open file a regular file with its size. Two descriptors or paths are the same file if device and inode number are equal. |
 | 7 | `poll(fds, nfds, timeout)` | The console is writable, a file readable, a pipe when it has bytes or room; `POLLHUP` and `POLLERR` for a pipe whose other end is closed, `POLLNVAL` for a descriptor that is not open. Waits by looking again every tick. |
 | 8 | `lseek(fd, offset, whence)` | Open files; `ESPIPE` for the console and pipes. |
-| 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory only (`MAP_ANONYMOUS` with `MAP_PRIVATE` or `MAP_SHARED`; a file is `ENODEV`). `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, and an address hint that is used if it is free; otherwise placed top down. `MAP_NORESERVE` and `MAP_STACK` are accepted. The memory is given page by page as it is touched. |
+| 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory, and files: a private mapping gets each page from the file when it is first touched and keeps its changes to itself; a shared one may only be read (files cannot be written: `EACCES`). A page wholly past the end of the file kills the program that touches it. `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`; `MAP_DENYWRITE` is ignored. `ENODEV` for a descriptor that is not a file. |
 | 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
 | 11 | `munmap(addr, length)` | Any part of any mappings; unmapping what is not mapped succeeds. |
 | 12 | `brk(addr)` | Returns the new end of the heap, or the old one if it cannot move. |
@@ -88,6 +88,7 @@ Linux calls, with Linux's numbers:
 | 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for every open descriptor (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
 | 17 | `pread64(fd, buf, count, offset)` | |
 | 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. |
+| 21 | `access(path, mode)` | Files can be read and run, not written (`EROFS`). |
 | 22 | `pipe(fds)` | See `pipe2`. |
 | 24 | `sched_yield()` | |
 | 25 | `mremap(old, old_size, new_size, flags, new)` | Shrinks a mapping, or grows it into free addresses after it. Never moves one: `ENOMEM` where Linux would (`MREMAP_MAYMOVE`), as when there is no room. `EFAULT` if the old range is not mapped. |
@@ -101,6 +102,8 @@ Linux calls, with Linux's numbers:
 | 62 | `kill(pid, sig)` | The calling process only. Signals are not delivered yet: signal 0 checks; a signal with no handler whose default is to end the process ends it with status 128 + the signal (that is `abort`); anything else is dropped. `tkill` (200) and `tgkill` (234) likewise. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
+| 79 | `getcwd(buf, size)` | Always `/`: there are no directories to change to. |
+| 89 | `readlink(path, buf, size)` | There are no symbolic links: `EINVAL` for a file, `ENOENT` otherwise. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, recorded. |
@@ -118,11 +121,17 @@ Linux calls, with Linux's numbers:
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
 | 239 | `get_mempolicy(mode, nodemask, maxnode, addr, flags)` | One memory node, the default policy: mode 0 and an empty mask. No flags. |
 | 257 | `openat(dirfd, path, flags, mode)` | `AT_FDCWD` or an absolute path. |
+| 262 | `newfstatat(dirfd, path, statbuf, flags)` | `stat` by path; of the descriptor itself with an empty path and `AT_EMPTY_PATH`. Paths are absolute, or relative to `AT_FDCWD` (`ENOTDIR` for another descriptor). Only files exist: a directory is `ENOENT`. |
+| 267 | `readlinkat(dirfd, path, buf, size)` | As `readlink`. |
+| 269 | `faccessat(dirfd, path, mode)` | As `access`. |
+| 273 | `set_robust_list(head, size)` | Accepted and not used: a thread that dies takes its process with it. |
 | 292 | `dup3(old, new, flags)` | `dup2`, with `EINVAL` if `old` is `new`. |
 | 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
 | 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
 | 318 | `getrandom(buf, len, flags)` | Never blocks. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
+| 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
+| 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`. |
 
 MyOS calls with no Linux equivalent yet. Their numbers start at
 `0x4D5900`, far above Linux's (which end below 500) and below the x32 bit

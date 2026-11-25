@@ -58,6 +58,18 @@ pub const Kind = enum(u8) {
     heap,
     /// An anonymous `mmap`.
     anon,
+    /// A private mapping of a file: a page is filled from the file when
+    /// it is first touched, and is the program's own from then on.
+    file,
+};
+
+/// Where a file-backed region reads its pages from.
+pub const Backing = struct {
+    /// The file, in whatever terms the owner of the regions uses (the
+    /// kernel keeps a `vfs.Node` here). Copied with the region.
+    file: [3]u64 = .{ 0, 0, 0 },
+    /// Offset in the file of the region's first byte. Page aligned.
+    offset: u64 = 0,
 };
 
 pub const Region = struct {
@@ -67,6 +79,13 @@ pub const Region = struct {
     end: u64,
     prot: Prot,
     kind: Kind,
+    /// For `kind == .file`.
+    backing: Backing = .{},
+
+    /// The file offset of the page at `addr`, which is in this region.
+    pub fn fileOffset(r: Region, addr: u64) u64 {
+        return r.backing.offset + (addr - r.start);
+    }
 
     pub fn pages(r: Region) u64 {
         return (r.end - r.start) / PAGE_SIZE;
@@ -173,9 +192,15 @@ pub const Regions = struct {
 
     /// Add the region `[start, start + len)`, which must be free.
     pub fn add(self: *Regions, gpa: std.mem.Allocator, start: u64, len: u64, prot: Prot, kind: Kind) Error!void {
+        return self.addBacked(gpa, start, len, prot, kind, .{});
+    }
+
+    /// `add` for a region of a file (`kind` `.file`), with where its
+    /// pages come from.
+    pub fn addBacked(self: *Regions, gpa: std.mem.Allocator, start: u64, len: u64, prot: Prot, kind: Kind, backing: Backing) Error!void {
         const end = try checkRange(start, len);
         if (!self.isFree(start, len)) return error.Overlap;
-        const new: Region = .{ .start = start, .end = end, .prot = prot, .kind = kind };
+        const new: Region = .{ .start = start, .end = end, .prot = prot, .kind = kind, .backing = backing };
         const i = self.lowerBound(start);
         const list = self.list.items;
         const joins_before = i > 0 and list[i - 1].mergeable(new);
@@ -203,6 +228,7 @@ pub const Regions = struct {
         if (self.list.items.len >= MAX_REGIONS) return error.TooManyRegions;
         var upper = r;
         upper.start = addr;
+        if (r.kind == .file) upper.backing.offset = r.fileOffset(addr);
         self.list.insert(gpa, i + 1, upper) catch return error.OutOfMemory;
         self.list.items[i].end = addr;
     }

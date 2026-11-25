@@ -235,6 +235,51 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.mlock, @intFromPtr(&mode), 4, 0) == 0 and lib.syscall(Sys.munlock, @intFromPtr(&mode), 4, 0) == 0, 120);
     expect(lib.syscall(Sys.mlock, 0xFFFF_8000_0000_0000, 4096, 0) == lib.err(.NOMEM), 121);
 
+    // The path calls a dynamic loader finds its libraries with.
+    var st: abi.Stat = undefined;
+    const cwd: u64 = @bitCast(@as(i64, abi.AT_FDCWD));
+    expect(lib.syscall6(Sys.newfstatat, cwd, @intFromPtr("/etc/motd"), @intFromPtr(&st), 0, 0, 0) == 0, 130);
+    expect(st.mode & abi.S.IFMT == abi.S.IFREG and st.size == 17 and st.ino != 0, 131);
+    const motd_ino = st.ino;
+    expect(lib.syscall6(Sys.newfstatat, cwd, @intFromPtr("/bin/hello"), @intFromPtr(&st), 0, 0, 0) == 0 and st.ino != motd_ino, 132);
+    expect(lib.syscall6(Sys.newfstatat, cwd, @intFromPtr("/etc/nothing"), @intFromPtr(&st), 0, 0, 0) == lib.err(.NOENT), 133);
+    expect(lib.syscall6(Sys.newfstatat, cwd, @intFromPtr("/etc/motd"), 8, 0, 0, 0) == lib.err(.FAULT), 134);
+    expect(lib.syscall6(Sys.newfstatat, cwd, 8, @intFromPtr(&st), 0, 0, 0) == lib.err(.FAULT), 135);
+    expect(lib.syscall6(Sys.newfstatat, cwd, @intFromPtr("/etc/motd"), @intFromPtr(&st), 0x4000_0000, 0, 0) == lib.err(.INVAL), 136);
+    // Of a descriptor itself, with an empty path: the same file as by its path.
+    const motd_fd = lib.open("/etc/motd");
+    expect(lib.syscall6(Sys.newfstatat, motd_fd, @intFromPtr(""), @intFromPtr(&st), abi.AT_EMPTY_PATH, 0, 0) == 0 and st.ino == motd_ino, 137);
+    expect(lib.syscall6(Sys.newfstatat, 1, @intFromPtr(""), @intFromPtr(&st), abi.AT_EMPTY_PATH, 0, 0) == 0 and st.mode & abi.S.IFMT == abi.S.IFCHR, 138);
+    expect(lib.syscall6(Sys.newfstatat, 99, @intFromPtr(""), @intFromPtr(&st), abi.AT_EMPTY_PATH, 0, 0) == lib.err(.BADF), 139);
+    // A relative path needs a directory, and there are none.
+    expect(lib.syscall6(Sys.newfstatat, motd_fd, @intFromPtr("motd"), @intFromPtr(&st), 0, 0, 0) == lib.err(.NOTDIR), 140);
+    expect(lib.syscall6(Sys.newfstatat, 99, @intFromPtr("motd"), @intFromPtr(&st), 0, 0, 0) == lib.err(.BADF), 141);
+    expect(lib.syscall6(Sys.newfstatat, motd_fd, @intFromPtr("/etc/motd"), @intFromPtr(&st), 0, 0, 0) == 0, 142); // absolute: the descriptor does not matter
+    _ = lib.close(motd_fd);
+
+    expect(lib.syscall(Sys.access, @intFromPtr("/etc/motd"), abi.ACCESS.R_OK, 0) == 0, 143);
+    expect(lib.syscall(Sys.access, @intFromPtr("/bin/hello"), abi.ACCESS.R_OK | abi.ACCESS.X_OK, 0) == 0, 144);
+    expect(lib.syscall(Sys.access, @intFromPtr("/etc/motd"), abi.ACCESS.W_OK, 0) == lib.err(.ROFS), 145);
+    expect(lib.syscall(Sys.access, @intFromPtr("/etc/ld.so.preload"), abi.ACCESS.R_OK, 0) == lib.err(.NOENT), 146);
+    expect(lib.syscall(Sys.access, @intFromPtr("/etc/motd"), 8, 0) == lib.err(.INVAL), 147);
+    expect(lib.syscall(Sys.access, 8, 0, 0) == lib.err(.FAULT), 148);
+    expect(lib.syscall(Sys.faccessat, cwd, @intFromPtr("/etc/motd"), abi.ACCESS.F_OK) == 0, 149);
+    expect(lib.syscall6(Sys.faccessat2, cwd, @intFromPtr("/nothing"), abi.ACCESS.F_OK, 0, 0, 0) == lib.err(.NOENT), 150);
+
+    var link: [16]u8 = undefined;
+    expect(lib.syscall(Sys.readlink, @intFromPtr("/etc/motd"), @intFromPtr(&link), link.len) == lib.err(.INVAL), 151); // not a link
+    expect(lib.syscall(Sys.readlink, @intFromPtr("/proc/self/exe"), @intFromPtr(&link), link.len) == lib.err(.NOENT), 152);
+    expect(lib.syscall6(Sys.readlinkat, cwd, @intFromPtr("/etc/motd"), @intFromPtr(&link), link.len, 0, 0) == lib.err(.INVAL), 153);
+
+    expect(lib.syscall(Sys.getcwd, @intFromPtr(&link), link.len, 0) == 2 and link[0] == '/' and link[1] == 0, 154);
+    expect(lib.syscall(Sys.getcwd, @intFromPtr(&link), 1, 0) == lib.err(.RANGE), 155);
+    expect(lib.syscall(Sys.getcwd, 8, 16, 0) == lib.err(.FAULT), 156);
+
+    // What a C library registers for its threads at startup.
+    expect(lib.syscall(Sys.set_robust_list, @intFromPtr(&link), abi.ROBUST_LIST_HEAD_SIZE, 0) == 0, 157);
+    expect(lib.syscall(Sys.set_robust_list, @intFromPtr(&link), 8, 0) == lib.err(.INVAL), 158);
+    expect(lib.syscall6(Sys.rseq, @intFromPtr(&link), 32, 0, 0, 0, 0) == lib.err(.NOSYS), 159); // not offered
+
     // prctl: no option is known.
     expect(lib.syscall(Sys.prctl, 15, 0, 0) == lib.err(.INVAL), 122);
 

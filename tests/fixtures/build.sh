@@ -16,6 +16,10 @@
 #                       the C and the Rust program as static PIEs: loaded
 #                       at a random address, relocated by their own startup
 #                       code
+#   glibc-hello-dynamic the C program linked the ordinary way: dynamically,
+#                       against glibc (Zig's stand-in for glibc 2.36 at
+#                       link time; the real one comes from
+#                       scripts/fetch-sysroot.sh when it runs)
 #   go-hello-static     Go (no cgo): goroutines, a channel, the garbage
 #                       collector
 #   rust-hello-static   Rust with its standard library, statically linked
@@ -45,6 +49,9 @@ zig cc -target x86_64-linux-musl -static -fPIE -pie -O2 -s \
     -o bin/musl-hello-static-pie src/hello.c
 rustc -O --target x86_64-unknown-linux-musl -C strip=symbols \
     -o bin/rust-hello-static-pie src/hello.rs
+
+zig cc -target x86_64-linux-gnu.2.36 -O2 -s \
+    -o bin/glibc-hello-dynamic src/hello.c
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' \
     -o bin/go-hello-static src/hello.go

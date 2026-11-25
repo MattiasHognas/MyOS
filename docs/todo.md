@@ -427,7 +427,7 @@ Designed once, demand-paged from the start, instead of an eager `mmap` first and
 - [x] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults. Tested on the host against a page-by-page model.
 - [x] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
 - [ ] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
-  - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations; `mremap` that shrinks and grows in place. Open: private file-backed mappings; `mremap` that moves a mapping (`MREMAP_MAYMOVE` gets `ENOMEM` today, and allocators copy instead).
+  - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations; `mremap` that shrinks and grows in place. Private file-backed mappings since 9.3. Open: `mremap` that moves a mapping (`MREMAP_MAYMOVE` gets `ENOMEM` today, and allocators copy instead).
 - [x] Implement `mprotect`, `munmap` of partial ranges, `madvise(MADV_DONTNEED)` and `brk`, with resource reclamation.
 - [x] Charge every page a process gets after it has started against its memory limit (`process.Limits.max_pages`, 2.6): pages given on demand to `mmap`, `brk` and stack growth, and the page tables they need; give the charge back on `munmap`. Today the limit is only checked when the program is loaded, because nothing else can allocate. A request over the limit fails with `ENOMEM`; a page fault over it follows the out-of-memory policy below. Test that the charge always equals what left the allocator, as the 2.6 test does at start.
 - [x] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes). The stack's region is 8 MiB, Linux's default limit; below it 1 MiB is kept free of mappings.
@@ -595,10 +595,12 @@ These are dynamically linked against glibc, so MyOS loads the dynamic loader, ma
 ### 9.3 Dynamic linking and the JIT runtime
 Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
 - [x] Load position-independent executables (`ET_DYN`, 4.1) and the ELF interpreter named by `PT_INTERP`, with `AT_BASE`, `AT_PHDR` and `AT_ENTRY` in the auxiliary vector, so dynamically linked programs run with the unmodified loader and shared libraries from the filesystem. The interpreter goes where `mmap` would put it, the highest free place below the stack; one that names an interpreter itself is refused, as on Linux. Tested with a C program standing in for the loader; malformed `PT_INTERP` headers on the host, missing and unusable interpreters in the kernel tests.
-- [ ] File-backed `mmap` (5), private and copy-on-write, with the permissions of each segment.
-- [ ] The calls a loader finds libraries with: `openat`, `fstat`, `pread64`, `readlink`, `access`, `getdents64`, `getcwd`.
-- [ ] Ship glibc's loader and libraries (`ld-linux-x86-64.so.2`, `libc.so.6`, `libm`, `libstdc++`, `libgcc_s`) in the image.
-- [ ] Run a dynamically linked hello-world built on Linux with plain `gcc`; test malformed `PT_INTERP` headers.
+- [x] File-backed `mmap` (5), private, with the permissions of each segment: a page is read from the file when it is first touched and is the program's own from then on (`user_memory.zig`, regions of kind `file`). Read-only shared mappings are the same thing; writable shared ones are refused, files being read-only.
+  - Open: pages of a file that nobody has written are copied per process instead of shared. Sharing them (a page cache, copy-on-write) saves the memory of one C library per process; it is in 13.
+- [x] The calls a loader finds libraries with: `openat`, `fstat`, `newfstatat`, `pread64`, `readlink`, `access`/`faccessat`, `getcwd`; and `set_robust_list`, with `rseq` refused on purpose.
+  - Open: `getdents64` and directories as such (the filesystem only knows files; a loader does not list directories).
+- [x] Ship glibc's loader and libraries (`ld-linux-x86-64.so.2`, `libc.so.6`, `libm`, `libstdc++`, `libgcc_s`) in the image: `scripts/fetch-sysroot.sh` takes them from Debian 13, pinned by checksum, and `scripts/build.sh` packs them. Not in release images until the licence side of passing them on is decided.
+- [x] Run a dynamically linked hello-world built for Linux against glibc; test malformed `PT_INTERP` headers. (`tests/fixtures/bin/glibc-hello-dynamic`, on one and four CPUs, two at once, memory back afterwards.)
 - [ ] Run the JIT-based runtime: a self-contained `dotnet publish -r linux-x64` hello-world. It needs the above, signal delivery (8), and memory that changes from writable to executable (see the permission item in 2.4); the rest comes from tracing it.
 - [ ] The same published as a single file.
 - [ ] A script that puts a published folder into the image, until there is a writable disk (11) or a network (12).

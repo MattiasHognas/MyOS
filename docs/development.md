@@ -51,7 +51,18 @@ The console font is not in the repository. Put it in place once:
 
 ```bash
 scripts/fetch-font.sh
+scripts/fetch-sysroot.sh   # optional: the C library for dynamically linked programs
 ```
+
+`scripts/fetch-sysroot.sh` downloads Debian 13's glibc, libgcc and
+libstdc++ packages (pinned by checksum) and unpacks the dynamic loader and
+the shared libraries to `sysroot/`, which is not in the repository.
+`scripts/build.sh` puts them into the image at the paths Linux programs
+expect (`/lib64/ld-linux-x86-64.so.2`, `/lib/x86_64-linux-gnu/`). Without
+it everything builds and statically linked programs run; dynamically linked
+ones do not start, and the kernel test for them reports that it was
+skipped. Release images are built without them: they are other projects'
+binaries under the LGPL, and passing them on has terms of its own.
 
 It copies kbd's `default8x16` font from `/usr/share/kbd/consolefonts/` to
 `src/assets/font.psf`, or downloads the same file (checksum verified) if kbd

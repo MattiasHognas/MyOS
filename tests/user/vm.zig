@@ -10,6 +10,8 @@
 //!   none      read a page of a `PROT_NONE` reservation
 //!   readonly  write to a read-only page
 //!   unmapped  read a page that was unmapped
+//!   pasteof   read a page of a file's mapping past the end of the file
+//!   filereadonly  write to a read-only mapping of a file
 //!   stack     recurse until the stack's reservation (8 MiB) is used up
 //!   oom       touch more memory than the process's limit allows
 //!
@@ -78,6 +80,17 @@ pub fn main() noreturn {
             _ = bytes(a + PAGE, 1)[0];
         } else if (eql(mode, "stack")) {
             _ = recurse(16 * 1024); // 16 MiB: past the reservation
+        } else if (eql(mode, "pasteof")) {
+            // A page of a file's mapping that lies wholly past the file's end.
+            const fd = lib.open("/etc/motd");
+            const m = lib.syscall6(Sys.mmap, 0, 2 * PAGE, PROT.READ, MAP.PRIVATE, fd, 0);
+            if (lib.isError(m) or bytes(m, 1)[0] != 'W') lib.exit(1);
+            _ = bytes(m + PAGE, 1)[0];
+        } else if (eql(mode, "filereadonly")) {
+            const fd = lib.open("/etc/motd");
+            const m = lib.syscall6(Sys.mmap, 0, PAGE, PROT.READ, MAP.PRIVATE, fd, 0);
+            if (lib.isError(m)) lib.exit(1);
+            bytes(m, 1)[0] = 'x';
         } else if (eql(mode, "oom")) {
             const a = lib.mmap(0, GIB, RW, 0);
             var at: u64 = 0;
@@ -175,7 +188,7 @@ pub fn main() noreturn {
 
     // --- What is refused.
     expect(lib.mmap(0, 0, RW, 0) == lib.err(.INVAL), 50);
-    expect(lib.syscall6(Sys.mmap, 0, PAGE, RW, MAP.PRIVATE, 3, 0) == lib.err(.NODEV), 51); // a file
+    expect(lib.syscall6(Sys.mmap, 0, PAGE, RW, MAP.PRIVATE, 99, 0) == lib.err(.BADF), 51); // a file that is not open
     expect(lib.syscall6(Sys.mmap, 0, PAGE, RW, MAP.ANONYMOUS, 0, 0) == lib.err(.INVAL), 52); // neither private nor shared
     expect(lib.mmap(0, PAGE, 8, 0) == lib.err(.INVAL), 53); // unknown permission
     expect(lib.mmap(123, PAGE, RW, MAP.FIXED) == lib.err(.INVAL), 54); // not page aligned
@@ -188,6 +201,55 @@ pub fn main() noreturn {
     expect(lib.mprotect(hint, PAGE, RW) == lib.err(.NOMEM), 61); // nothing there
     expect(lib.mprotect(a + 15 * PAGE, 2 * PAGE, RW) == lib.err(.NOMEM) or lib.mprotect(a + 15 * PAGE, 2 * PAGE, RW) == 0, 62);
     expect(lib.syscall(Sys.madvise, hint, PAGE, abi.MADV.DONTNEED) == lib.err(.NOMEM), 63);
+
+    // --- A file mapped privately: its bytes, read when a page is first
+    // touched; zeroes after its end; changes that stay the program's own.
+    const motd = "Welcome to MyOS!\n";
+    const small = lib.open("/etc/motd");
+    const fm = lib.syscall6(Sys.mmap, 0, PAGE, RW, MAP.PRIVATE, small, 0);
+    expect(!lib.isError(fm), 81);
+    expect(lib.close(small) == 0, 82); // the mapping outlives the descriptor
+    expect(std.mem.eql(u8, @volatileCast(bytes(fm, motd.len)), motd), 83);
+    expect(allZero(fm + motd.len, PAGE - motd.len), 84);
+    bytes(fm, 1)[0] = 'w';
+    var back: [32]u8 = undefined;
+    const again = lib.open("/etc/motd");
+    expect(lib.read(again, &back) == motd.len and back[0] == 'W', 85); // the file is as it was
+    // Given back, the page comes from the file again.
+    expect(lib.syscall(Sys.madvise, fm, PAGE, abi.MADV.DONTNEED) == 0 and bytes(fm, 1)[0] == 'W', 86);
+    expect(lib.munmap(fm, PAGE) == 0, 87);
+
+    // A larger file, from an offset: one_page for one_page what `pread` gives,
+    // also after the mapping has been cut up.
+    const elf = lib.open("/fixtures/rust-hello-static"); // 400 KiB in every build
+    const file_span = 6 * PAGE;
+    const file_at = 3 * PAGE;
+    const bm = lib.syscall6(Sys.mmap, 0, file_span, PROT.READ, MAP.PRIVATE, elf, file_at);
+    expect(!lib.isError(bm), 88);
+    expect(lib.mprotect(bm + 2 * PAGE, PAGE, RW) == 0, 89); // three regions now
+    expect(lib.munmap(bm + 4 * PAGE, PAGE) == 0, 90); // and a hole
+    var one_page: [PAGE]u8 = undefined;
+    for ([_]u64{ 5, 0, 2, 3, 1 }) |nth| { // in no particular order
+        expect(lib.syscall6(Sys.pread64, elf, @intFromPtr(&one_page), PAGE, file_at + nth * PAGE, 0, 0) == PAGE, 91);
+        expect(std.mem.eql(u8, @volatileCast(bytes(bm + nth * PAGE, PAGE)), &one_page), 92);
+    }
+    bytes(bm + 2 * PAGE, 1)[0] +%= 1; // the writable page takes a write
+    // The same file read-only and shared, which is no different here; and
+    // put at a chosen address over part of the first mapping, as a
+    // dynamic loader places a library's segments.
+    const sm = lib.syscall6(Sys.mmap, 0, PAGE, PROT.READ, MAP.SHARED, elf, 0);
+    expect(!lib.isError(sm) and std.mem.eql(u8, @volatileCast(bytes(sm, 4)), "\x7fELF"), 93);
+    expect(lib.syscall6(Sys.mmap, bm, PAGE, PROT.READ, MAP.PRIVATE | MAP.FIXED, elf, 0) == bm, 94);
+    expect(std.mem.eql(u8, @volatileCast(bytes(bm, 4)), "\x7fELF"), 95);
+    // What is refused.
+    expect(lib.syscall6(Sys.mmap, 0, PAGE, RW, MAP.SHARED, elf, 0) == lib.err(.ACCES), 96); // files cannot be written
+    expect(lib.syscall6(Sys.mmap, 0, PAGE, PROT.READ, MAP.PRIVATE, elf, 123) == lib.err(.INVAL), 97); // offset not a page
+    expect(lib.syscall6(Sys.mmap, 0, PAGE, PROT.READ, MAP.PRIVATE, 1, 0) == lib.err(.NODEV), 98); // the console
+    expect(lib.syscall6(Sys.mmap, 0, PAGE, PROT.READ, MAP.PRIVATE, elf, ~@as(u64, 0xFFF)) == lib.err(.INVAL), 99);
+    expect(lib.syscall6(Sys.mremap, sm, PAGE, 2 * PAGE, 0, 0, 0) == lib.err(.NOMEM), 100); // a file's mapping does not grow
+    expect(lib.munmap(bm, file_span) == 0 and lib.munmap(sm, PAGE) == 0, 101);
+    _ = lib.close(elf);
+    _ = lib.close(again);
 
     // --- mremap: a mapping shrinks and grows where it is.
     const m = lib.mmap(0, 8 * PAGE, RW, 0);

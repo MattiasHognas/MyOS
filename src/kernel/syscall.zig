@@ -565,6 +565,95 @@ fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
 
 /// `fstat`: what kind of thing `fd` is and, for a file, how large. The
 /// standard streams are character devices.
+/// What `stat` says about a file of the filesystem.
+fn fileStat(node: vfs.Node) abi.Stat {
+    var st: abi.Stat = .{};
+    st.mode = abi.S.IFREG | 0o555;
+    st.size = @intCast(node.size);
+    st.blocks = @intCast((node.size + 511) / 512);
+    st.blksize = 4096;
+    st.nlink = 1;
+    // Two files are the same file if these two are equal: a dynamic
+    // loader tells by them whether it has a library already.
+    st.dev = 1;
+    st.ino = node.ctx;
+    return st;
+}
+
+/// The path at `ptr`, which must be absolute unless `dirfd` is
+/// `AT_FDCWD`: there are no directories to be relative to (`ENOTDIR`),
+/// and the working directory is always "/".
+fn pathAt(buf: *[abi.PATH_MAX]u8, dirfd: u64, ptr: u64) union(enum) { path: []const u8, fail: u64 } {
+    const path = switch (userPath(buf, ptr)) {
+        .path => |p| p,
+        .fail => |e| return .{ .fail = e },
+    };
+    const dir: i32 = @truncate(@as(i64, @bitCast(dirfd)));
+    if (path[0] != '/' and dir != abi.AT_FDCWD) return .{ .fail = if (isOpen(dirfd)) err(.NOTDIR) else err(.BADF) };
+    return .{ .path = path };
+}
+
+/// `newfstatat`: `stat` of the file at a path, or of the descriptor
+/// itself with an empty path and `AT_EMPTY_PATH`. `ENOENT`, `EINVAL`
+/// for unknown flags, `EFAULT`.
+fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, abi.AT_EMPTY_PATH | abi.AT_SYMLINK_NOFOLLOW | 0x800) != 0) return err(.INVAL); // 0x800: AT_NO_AUTOMOUNT
+    if (flags & abi.AT_EMPTY_PATH != 0) {
+        const first = fromUser(u8, path_ptr) orelse return err(.FAULT);
+        if (first == 0) return sysFstat(dirfd, stat_ptr);
+    }
+    var path_buf: [abi.PATH_MAX]u8 = undefined;
+    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    const node = vfs.lookup(path) orelse return err(.NOENT);
+    return if (toUser(stat_ptr, fileStat(node))) 0 else err(.FAULT);
+}
+
+/// `access`, `faccessat` and `faccessat2`: files can be read and run,
+/// never written (`EROFS`). `ENOENT`, `EINVAL` for an unknown mode.
+fn sysAccess(dirfd: u64, path_ptr: u64, mode: u64) u64 {
+    if (mode & ~@as(u64, abi.ACCESS.R_OK | abi.ACCESS.W_OK | abi.ACCESS.X_OK) != 0) return err(.INVAL);
+    var path_buf: [abi.PATH_MAX]u8 = undefined;
+    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    if (vfs.lookup(path) == null) return err(.NOENT);
+    return if (mode & abi.ACCESS.W_OK != 0) err(.ROFS) else 0;
+}
+
+/// `readlink` and `readlinkat`: there are no symbolic links, so a file
+/// that exists is not one (`EINVAL`) and anything else is `ENOENT`.
+fn sysReadlink(dirfd: u64, path_ptr: u64) u64 {
+    var path_buf: [abi.PATH_MAX]u8 = undefined;
+    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    return if (vfs.lookup(path) == null) err(.NOENT) else err(.INVAL);
+}
+
+/// `getcwd`: the working directory is always "/". Returns the length
+/// with the NUL, as the system call does; `ERANGE` if the buffer is
+/// shorter, `EFAULT`.
+fn sysGetcwd(buf: u64, size: u64) u64 {
+    const cwd = [2]u8{ '/', 0 };
+    if (size < cwd.len) return err(.RANGE);
+    return if (toUser(buf, cwd)) cwd.len else err(.FAULT);
+}
+
+/// `set_robust_list`: a thread's list of locks to mark as abandoned if it
+/// dies holding them. The address is checked and otherwise ignored: a
+/// thread that dies takes its process with it (there is no shared memory
+/// between processes for another one to wait on such a lock in).
+fn sysSetRobustList(head: u64, size: u64) u64 {
+    if (size != abi.ROBUST_LIST_HEAD_SIZE) return err(.INVAL);
+    _ = head;
+    return 0;
+}
+
 fn sysFstat(fd: u64, ptr: u64) u64 {
     var st: abi.Stat = .{};
     const of = getFile(fd) orelse return err(.BADF);
@@ -579,11 +668,7 @@ fn sysFstat(fd: u64, ptr: u64) u64 {
             st.mode = abi.S.IFIFO | 0o600;
             st.blksize = kpipe.SIZE;
         },
-        .file => {
-            st.mode = abi.S.IFREG | 0o555;
-            st.size = @intCast(of.node.size);
-            st.blocks = @intCast((of.node.size + 511) / 512);
-        },
+        .file => st = fileStat(of.node),
     }
     return if (toUser(ptr, st)) 0 else err(.FAULT);
 }
@@ -1075,8 +1160,14 @@ fn sysMlock(addr: u64, len: u64) u64 {
 fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, f: *const arch.Frame) u64 {
     const p = thread.current().process orelse return err(.NOSYS);
     return switch (call) {
-        // The offset (`f.r9`) only means something for a file.
-        .mmap => user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        .mmap => blk: {
+            // The descriptor and the offset only mean something for a file.
+            if (f.r10 & abi.MAP.ANONYMOUS != 0) break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, null);
+            const of = getFile(f.r8) orelse break :blk err(.BADF);
+            defer putFile(of); // the mapping keeps the file, not the descriptor
+            if (of.kind != .file) break :blk err(.NODEV);
+            break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, .{ .node = of.node, .offset = f.r9 });
+        },
         .mprotect => user_memory.mprotect(p, f.rdi, f.rsi, f.rdx),
         .munmap => user_memory.munmap(p, f.rdi, f.rsi),
         .mremap => user_memory.mremap(p, f.rdi, f.rsi, f.rdx, f.r10),
@@ -1121,6 +1212,16 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.pread64 => sysPread(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.openat => sysOpenAt(f.rdi, f.rsi, f.rdx),
         Sys.fcntl => sysFcntl(f.rdi, f.rsi, f.rdx),
+        Sys.newfstatat => sysNewfstatat(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.access => sysAccess(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi),
+        Sys.faccessat, Sys.faccessat2 => sysAccess(f.rdi, f.rsi, f.rdx),
+        Sys.readlink => sysReadlink(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi),
+        Sys.readlinkat => sysReadlink(f.rdi, f.rsi),
+        Sys.getcwd => sysGetcwd(f.rdi, f.rsi),
+        Sys.set_robust_list => sysSetRobustList(f.rdi, f.rsi),
+        // Restartable sequences are not offered; a C library asks once
+        // and does without.
+        Sys.rseq => err(.NOSYS),
         Sys.pipe => sysPipe(f.rdi, 0),
         Sys.pipe2 => sysPipe(f.rdi, f.rsi),
         Sys.dup => sysDup(f.rdi, 0),

@@ -100,6 +100,17 @@ jobs:
       - name: Fetch console font
         run: scripts/fetch-font.sh
 
+      # The C library dynamically linked test programs are loaded with
+      # (pinned Debian packages, checked by checksum).
+      - name: Cache sysroot
+        uses: actions/cache@v6
+        with:
+          path: sysroot
+          key: sysroot-${{ hashFiles('scripts/fetch-sysroot.sh') }}
+
+      - name: Fetch sysroot
+        run: scripts/fetch-sysroot.sh
+
       - name: Build kernel and apps
         run: zig build -Doptimize=${{ matrix.optimize }}
 

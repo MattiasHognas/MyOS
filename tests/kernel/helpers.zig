@@ -179,6 +179,11 @@ pub fn spawnFailsCleanly(image: []const u8) bool {
     return false;
 }
 
+/// Whether the filesystem has a file at `path`.
+pub fn fileExists(path: []const u8) bool {
+    return vfs.lookup(path) != null;
+}
+
 /// Start the program in `image` and wait for it. Returns its exit status,
 /// or null if it could not be started.
 pub fn runImage(image: []const u8) ?u64 {

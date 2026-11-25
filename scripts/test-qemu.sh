@@ -222,6 +222,11 @@ run_scenario() {
             expect_line '^argv\[2\]=MyOS$'
             expect_line '^sum of squares below 100000: 333328333350000$'
             expect_line '^GREETING=hi rust$'
+            # A dynamically linked C program, if the image has one.
+            if [[ -f zig-out/test/initrd/lib64/ld-linux-x86-64.so.2 ]]; then
+                expect_line '^env GREETING=hi dynamic$'
+                expect_line '^argv\[2\]=at run time$'
+            fi
             # The same C and Rust programs as position-independent executables.
             expect_line '^env GREETING=hi pie$'
             expect_line '^GREETING=hi rust pie$'
