@@ -11,6 +11,9 @@ const std = @import("std");
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 const regs = @import("fpu_regs.zig");
 
@@ -61,7 +64,7 @@ var in: regs.State = undefined;
 var out: regs.State = undefined;
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     const avx = regs.avxUsable();
     var rng: u64 = 0x9E3779B97F4A7C15 *% (lib.gettid() + 1);
 

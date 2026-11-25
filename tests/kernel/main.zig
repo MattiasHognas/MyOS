@@ -866,6 +866,38 @@ fn cpus() TestError!void {
     try expectChecks("CPU", helpers.cpuChecks(expect_cpus));
 }
 
+/// What a Linux program relies on at startup and in its first calls: the
+/// initial stack, the FS and GS base (kept apart for two programs running
+/// at once), `writev`, `ioctl`, `set_tid_address`, `exit_group`.
+fn linuxStartup() TestError!void {
+    const code = helpers.runProgramArgs("/test/linux_abi", &.{ "abi", "x y", "" }, &.{"A=1"}) orelse return error.Failed;
+    if (code != 0) report("/test/linux_abi failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/linux_abi"));
+    // Arguments that do not fit are refused, and nothing is started.
+    const memory = helpers.footprint();
+    try check(helpers.argumentsTooLong());
+    try check(helpers.footprint().eql(memory));
+}
+
+/// A C program built for Linux and linked against musl, with nothing of
+/// MyOS in it, runs: it finds its arguments and environment, prints them
+/// through its own `printf`, and exits with its number of arguments. The
+/// host script checks what it printed.
+fn muslHello() TestError!void {
+    const memory = helpers.footprint();
+    const code = helpers.runProgramArgs(
+        "/fixtures/musl-hello-static",
+        &.{ "musl-hello", "one", "two words" },
+        &.{ "GREETING=hi", "EMPTY=" },
+    ) orelse return error.Failed;
+    if (code != 3) report("musl hello exit status", code);
+    try check(code == 3);
+    // With no arguments given it gets its path as the only one.
+    try check(helpers.runProgram("/fixtures/musl-hello-static") == 1);
+    try check(helpers.footprint().eql(memory));
+}
+
 /// Programs run, are preempted, crash and are torn down on every CPU at once.
 fn parallelPrograms() TestError!void {
     const irq = helpers.enableInterrupts();
@@ -1355,6 +1387,36 @@ noinline fn runCase(func: *const fn () TestError!void, alone: bool) bool {
     return ok;
 }
 
+/// Print the deepest use of any kernel stack and of any emergency stack in
+/// this run, and return how many of them were past their warning level
+/// (each counts as a failed check). Not part of `runCases`, whose stack
+/// frame is large enough.
+noinline fn reportStackPeaks() usize {
+    var too_deep: usize = 0;
+    // The deepest any kernel stack got in this run (every thread that exited,
+    // and this one). Past the warning level the run fails: the stack is too
+    // tight, even though nothing overflowed.
+    const peak = helpers.stackPeak();
+    var peak_line: [96]u8 = undefined;
+    serial.puts(std.fmt.bufPrint(&peak_line, "MYOS_STACK_PEAK bytes={d} of={d} limit={d}\n", .{ peak, helpers.STACK_SIZE, helpers.STACK_WARN_BYTES }) catch unreachable);
+    if (peak > helpers.STACK_WARN_BYTES) {
+        too_deep += 1;
+        serial.puts("[FAIL] kernel stack usage below the warning level\n");
+    } else serial.puts("[PASS] kernel stack usage below the warning level\n");
+
+    if (helpers.istPeak()) |ist_peak| {
+        var ist_line: [96]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&ist_line, "MYOS_IST_PEAK bytes={d} of={d}\n", .{ ist_peak, helpers.IST_STACK_SIZE }) catch unreachable);
+        // Past three quarters the run fails: too tight, though nothing overflowed.
+        if (ist_peak > helpers.IST_STACK_SIZE / 4 * 3) {
+            too_deep += 1;
+            serial.puts("[FAIL] emergency stack usage below the warning level\n");
+        } else serial.puts("[PASS] emergency stack usage below the warning level\n");
+    }
+
+    return too_deep;
+}
+
 /// Run every test case, log the results and exit QEMU with 0 if all passed, 1 otherwise.
 fn runCases() noreturn {
     serial.puts("MYOS_TEST_BEGIN\n");
@@ -1461,6 +1523,8 @@ fn runCases() noreturn {
         // Alone: looks at the other CPUs while they are parked.
         .{ .name = "CPUs (all online, own per-CPU state, tables and stacks, same setup, timer interrupts)", .func = cpus, .alone = true },
         .{ .name = "speculation barrier after the conditional swapgs at kernel entry", .func = swapgsFences },
+        .{ .name = "Linux startup: initial stack, FS and GS base, writev, ioctl, set_tid_address, exit_group", .func = linuxStartup },
+        .{ .name = "a static musl program built for Linux runs (arguments, environment, printf)", .func = muslHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },
         .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms },
@@ -1515,26 +1579,7 @@ fn runCases() noreturn {
         }
     }
 
-    // The deepest any kernel stack got in this run (every thread that exited,
-    // and this one). Past the warning level the run fails: the stack is too
-    // tight, even though nothing overflowed.
-    const peak = helpers.stackPeak();
-    var peak_line: [96]u8 = undefined;
-    serial.puts(std.fmt.bufPrint(&peak_line, "MYOS_STACK_PEAK bytes={d} of={d} limit={d}\n", .{ peak, helpers.STACK_SIZE, helpers.STACK_WARN_BYTES }) catch unreachable);
-    if (peak > helpers.STACK_WARN_BYTES) {
-        failed += 1;
-        serial.puts("[FAIL] kernel stack usage below the warning level\n");
-    } else serial.puts("[PASS] kernel stack usage below the warning level\n");
-
-    if (helpers.istPeak()) |ist_peak| {
-        var ist_line: [96]u8 = undefined;
-        serial.puts(std.fmt.bufPrint(&ist_line, "MYOS_IST_PEAK bytes={d} of={d}\n", .{ ist_peak, helpers.IST_STACK_SIZE }) catch unreachable);
-        // Past three quarters the run fails: too tight, though nothing overflowed.
-        if (ist_peak > helpers.IST_STACK_SIZE / 4 * 3) {
-            failed += 1;
-            serial.puts("[FAIL] emergency stack usage below the warning level\n");
-        } else serial.puts("[PASS] emergency stack usage below the warning level\n");
-    }
+    failed += reportStackPeaks();
 
     var summary: [128]u8 = undefined;
 

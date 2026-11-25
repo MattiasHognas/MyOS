@@ -11,9 +11,12 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     const status = lib.run("/test/recurse");
     if (status == lib.err(.AGAIN)) lib.exit(100);
     if (status == lib.err(.NOMEM)) lib.exit(200);

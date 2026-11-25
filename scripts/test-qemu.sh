@@ -197,6 +197,13 @@ run_scenario() {
             expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x8 SS=0x1b$'
             expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x10$'
             expect_line '^fuzz done$'
+            # A C program built for Linux against musl prints what it was started with.
+            expect_line '^hello from musl: 3 args$'
+            expect_line '^argv\[0\]=musl-hello$'
+            expect_line '^argv\[2\]=two words$'
+            expect_line '^env GREETING=hi$'
+            expect_line '^env EMPTY=$'
+            expect_line '^linux_abi: writev works$'
             ;;
         panic)
             expect_status 3

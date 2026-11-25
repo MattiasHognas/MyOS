@@ -76,6 +76,9 @@ const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
 const thread = @import("thread.zig");
 const vfs = @import("vfs.zig");
 const random = @import("random.zig");
+const startup_stack = @import("startup_stack.zig");
+const timer = @import("timer.zig");
+const abi = @import("abi");
 
 /// Highest address a user stack can end at. Each process's stack ends at
 /// a random page up to `STACK_RANDOM_PAGES` below this (`Process.stack_top`).
@@ -144,8 +147,9 @@ pub const Process = struct {
     entry: u64,
     /// First address above the user stack; page aligned, chosen at random.
     stack_top: u64 = STACK_TOP_MAX,
-    /// Stack pointer the program starts with.
-    entry_rsp: u64 = STACK_TOP_MAX - 8,
+    /// Stack pointer the program starts with: it points at `argc`, on a
+    /// 16-byte boundary, as on Linux.
+    entry_rsp: u64 = STACK_TOP_MAX,
     /// Heap-allocated copy of the name the process was spawned with.
     name: []const u8,
     /// File descriptor table, indexed by fd. Slots 0-2 are the standard
@@ -186,6 +190,11 @@ pub const SpawnOptions = struct {
     /// Put the stack at a random address. Off only where a test or a
     /// debugging session needs the same layout every time.
     randomize: bool = true,
+    /// The program's arguments; `argv[0]` is by convention its name. Empty
+    /// means the name it is started under, alone.
+    argv: []const []const u8 = &.{},
+    /// Its environment: strings of the form `NAME=value`.
+    envp: []const []const u8 = &.{},
 };
 
 /// Count a new process against every ancestor from `parent` up. Fails,
@@ -379,18 +388,44 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
 
     const loaded = try elf.load(root, image, imageLimits(limits));
 
-    // Where the stack goes, and where in its top page the program starts:
-    // 8 below a 16-byte boundary, as if the entry point had been called.
+    // Where the stack goes, and how far below its top the program's
+    // startup data ends (a multiple of 16 bytes), so that nothing on the
+    // stack is at a fixed offset within its page either.
     const stack_top = if (options.randomize) STACK_TOP_MAX - random.below(STACK_RANDOM_PAGES) * pmm.PAGE_SIZE else STACK_TOP_MAX;
-    const entry_rsp = stack_top - 8 - (if (options.randomize) random.below(STACK_RANDOM_OFFSET / 16) * 16 else 0);
+    const data_top = stack_top - (if (options.randomize) random.below(STACK_RANDOM_OFFSET / 16) * 16 else 0);
 
-    for (1..STACK_PAGES + 1) |i| {
+    var stack_pages: [STACK_PAGES]u64 = undefined; // physical; [0] is the highest page
+    for (0..STACK_PAGES) |i| {
         const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
-        vmm.map(root, stack_top - i * pmm.PAGE_SIZE, phys, vmm.USER | vmm.WRITABLE | vmm.NX, false) catch |e| {
+        vmm.map(root, stack_top - (i + 1) * pmm.PAGE_SIZE, phys, vmm.USER | vmm.WRITABLE | vmm.NX, false) catch |e| {
             pmm.free(phys); // not mapped, so destroying the address space would not free it
             return e;
         };
+        stack_pages[i] = phys;
     }
+
+    // What the program finds on its stack: arguments, environment and the
+    // auxiliary vector, laid out as on Linux (`startup_stack.zig`).
+    var random_bytes: [16]u8 = undefined;
+    random.bytes(&random_bytes);
+    const start_args: startup_stack.Args = .{
+        .argv = if (options.argv.len != 0) options.argv else &.{name},
+        .envp = options.envp,
+        .execfn = name,
+        .random = random_bytes,
+        .phdr = loaded.phdr,
+        .phent = elf_image.PHDR_SIZE,
+        .phnum = loaded.phnum,
+        .entry = loaded.entry,
+        .hwcap = cpu.cpuid(1, 0).edx,
+        .clktck = timer.HZ,
+    };
+    const start_size = startup_stack.size(start_args) catch return error.ArgumentsTooLong;
+    if (start_size > abi.ARG_MAX) return error.ArgumentsTooLong;
+    const start_block = try heap.allocator.alloc(u8, start_size);
+    defer heap.allocator.free(start_block);
+    const entry_rsp = startup_stack.build(start_block, data_top, start_args) catch unreachable; // it has the size asked for
+    copyToStack(&stack_pages, stack_top, entry_rsp, start_block);
 
     // Everything the process takes, now that its page tables exist.
     const pages = loaded.pages + STACK_PAGES + vmm.userTablePages(root) + kstack.STACK_PAGES;
@@ -428,6 +463,22 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     live += 1;
     thread.start(t);
     return p;
+}
+
+/// Copy `data` to the address `addr` of a new process's stack, whose pages
+/// are `pages` (physical addresses, highest page first) below `stack_top`.
+/// The address space is not loaded, so the pages are written through the
+/// kernel's own mapping of them.
+fn copyToStack(pages: *const [STACK_PAGES]u64, stack_top: u64, addr: u64, data: []const u8) void {
+    var done: usize = 0;
+    while (done < data.len) {
+        const at = addr + done;
+        const page = (stack_top - 1 - at) / pmm.PAGE_SIZE;
+        const offset: usize = @intCast(at % pmm.PAGE_SIZE);
+        const n = @min(data.len - done, pmm.PAGE_SIZE - offset);
+        @memcpy(pmm.physToVirt(pages[page])[offset..][0..n], data[done..][0..n]);
+        done += n;
+    }
 }
 
 /// Thread entry point for a new process: jump to the process's entry point in

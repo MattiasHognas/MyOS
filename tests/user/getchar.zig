@@ -5,8 +5,11 @@
 const lib = @import("lib");
 
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     lib.exit(lib.getChar());
 }

@@ -1,10 +1,16 @@
-//! `/bin/sh`: a tiny shell. Runs each entered name as `/bin/<name>` (or as a
-//! path if it contains a slash) and waits for it; `exit` leaves the shell.
+//! `/bin/sh`: a tiny shell. Runs the first word of each line as `/bin/<name>`
+//! (or as a path if it contains a slash) with the rest as its arguments
+//! (`cmdline.zig` says how a line is split) and its own environment, and
+//! waits for it; `exit` leaves the shell.
 
 const std = @import("std");
 
+const cmdline = @import("cmdline.zig");
 const lib = @import("lib.zig");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 /// Read one line from the keyboard into `buf`, echoing it and handling
 /// backspace. Ctrl+C discards the line. Returns the line without the newline.
@@ -35,15 +41,25 @@ fn readLine(buf: []u8) []u8 {
 }
 
 /// Program entry point: the read-run loop.
-export fn _start() callconv(.c) noreturn {
-    lib.write("MyOS shell. Type a program name (e.g. hello), or exit.\n");
+pub fn main() noreturn {
+    lib.write("MyOS shell. Type a program name and its arguments (e.g. hello), or exit.\n");
     var line: [128]u8 = undefined;
+    var words: [192]u8 = undefined;
+    var argv: [17]?[*:0]const u8 = undefined;
     var path: [160]u8 = undefined;
 
     while (true) {
         lib.write("$ ");
-        const cmd = std.mem.trim(u8, readLine(&line), " ");
-        if (cmd.len == 0) continue;
+        const argc = cmdline.split(readLine(&line), &words, &argv) catch |e| {
+            lib.print("sh: {s}\n", .{switch (e) {
+                error.Unterminated => "a quote is not closed",
+                error.TooManyArguments => "too many arguments",
+                error.TooLong => "command too long",
+            }});
+            continue;
+        };
+        if (argc == 0) continue;
+        const cmd = std.mem.span(argv[0].?);
         if (std.mem.eql(u8, cmd, "exit")) lib.exit(0);
 
         // "hello" -> "/bin/hello"; anything with a slash is used as-is
@@ -53,7 +69,7 @@ export fn _start() callconv(.c) noreturn {
         else
             std.fmt.bufPrintSentinel(&path, "/bin/{s}", .{cmd}, 0) catch continue;
 
-        const code = lib.run(full);
+        const code = lib.runArgs(full, &argv, lib.environPointers());
         if (code == lib.err(.NOENT)) {
             lib.print("sh: {s}: not found\n", .{cmd});
         } else if (lib.isError(code)) {

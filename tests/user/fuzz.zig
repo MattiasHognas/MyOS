@@ -9,7 +9,7 @@
 //! pointers, addresses at the edges of user space, small descriptors, huge
 //! lengths.
 //!
-//! Left out on purpose: `exit` (the run would end early) and `myos_getchar`
+//! Left out on purpose: `exit` and `exit_group` (the run would end early) and `myos_getchar`
 //! (it would wait for a key forever). Console writes of readable memory are
 //! steered to a block of text, to keep the serial log printable.
 //!
@@ -19,6 +19,9 @@ const std = @import("std");
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 const Sys = lib.Sys;
 
 const ITERATIONS = 20_000;
@@ -29,7 +32,10 @@ const UNMAPPED: u64 = 0x1000_0000;
 var STACK_TOP: u64 = 0;
 const PAGE = 4096;
 
-const implemented = [_]u64{ Sys.read, Sys.write, Sys.open, Sys.close, Sys.sched_yield, Sys.gettid, Sys.myos_run };
+const implemented = [_]u64{
+    Sys.read,       Sys.write,           Sys.open,   Sys.close, Sys.sched_yield, Sys.gettid, Sys.myos_run,
+    Sys.arch_prctl, Sys.set_tid_address, Sys.writev, Sys.ioctl,
+};
 /// Paths a call may be given. Never this program or the shell: one would
 /// recurse, the other waits for the keyboard.
 const paths = [_][*:0]const u8{ "/etc/motd", "/bin/hello", "/test/entry_regs", "/does/not/exist", "" };
@@ -90,7 +96,7 @@ fn pickArg(rng: *u64, readable: *bool) u64 {
 }
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     // The frame pointer of the entry function is in the stack's last page.
     STACK_TOP = std.mem.alignForward(u64, @frameAddress(), PAGE);
     var rng: u64 = SEED;
@@ -104,7 +110,7 @@ export fn _start() callconv(.c) noreturn {
             a.* = pickArg(&rng, &readable);
             if (n == 1) second_readable = readable;
         }
-        if (nr == Sys.exit or nr == Sys.myos_getchar) continue;
+        if (nr == Sys.exit or nr == Sys.exit_group or nr == Sys.myos_getchar) continue;
         if (nr == Sys.write and (args[0] == 1 or args[0] == 2) and (second_readable or args[1] >= STACK_TOP - 8)) {
             const off = next(&rng) % (text.len - 64);
             args[1] = @intFromPtr(text) + off;

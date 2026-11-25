@@ -16,6 +16,9 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 const checked = @import("checked.zig");
 
@@ -25,7 +28,7 @@ const BAD_FLAGS = lib.Sys.PRIVATE_BASE + 0x101;
 const BAD_STATE = lib.Sys.PRIVATE_BASE + 0x102;
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     if (lib.syscall(VIA_IRET, 0, 0, 0) == lib.err(.NOSYS)) lib.exit(90);
     for ([_]u64{ 0, checked.FLAGS_MASK, 0x4C1 }) |flags| {
         if (checked.call3(VIA_IRET, 1, 2, 3, .{ .flags = flags, .misalign = 8 }) != 0x1234) lib.exit(1);

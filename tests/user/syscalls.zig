@@ -9,6 +9,9 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 const Sys = lib.Sys;
 const err = lib.err;
 
@@ -35,7 +38,7 @@ fn longPath(len: usize) u64 {
 }
 
 /// Program entry point: run the checks in order.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     var buf: [64]u8 = undefined;
     const path = "/etc/motd";
     const bufp = @intFromPtr(&buf);

@@ -193,6 +193,34 @@ pub fn runProgramLimited(path: []const u8, limits: Limits) ?u64 {
     return waitUntilGone(p);
 }
 
+/// Run the program at `path` with the arguments `argv` and the environment
+/// `envp`, and wait for it. Returns its exit status, or null if it could
+/// not be started.
+pub fn runProgramArgs(path: []const u8, argv: []const []const u8, envp: []const []const u8) ?u64 {
+    const p = process.spawnPath(path, .{ .argv = argv, .envp = envp, .randomize = randomize_layout }) catch return null;
+    return waitUntilGone(p);
+}
+
+/// True if starting a program with more argument bytes, or more
+/// arguments, than fit on its stack is refused as such.
+pub fn argumentsTooLong() bool {
+    const long = heap.allocator.alloc(u8, abi.ARG_MAX) catch return false;
+    defer heap.allocator.free(long);
+    @memset(long, 'x');
+    const many = heap.allocator.alloc([]const u8, abi.ARG_COUNT_MAX + 1) catch return false;
+    defer heap.allocator.free(many);
+    @memset(many, "y");
+    for ([_][]const []const u8{ &.{ "p", long }, many }) |argv| {
+        if (process.spawnPath("/bin/hello", .{ .argv = argv })) |p| {
+            _ = waitUntilGone(p);
+            return false;
+        } else |e| {
+            if (e != error.ArgumentsTooLong) return false;
+        }
+    }
+    return true;
+}
+
 /// Wait for `p` like `process.wait`, giving up the caller's reference, and
 /// then until its thread has been freed as well. A process's memory is back
 /// when `wait` returns; its thread and kernel stack follow when the CPU
@@ -3299,9 +3327,10 @@ pub fn meltdownDecision() u32 {
 
 /// Check address randomization of user stacks: each new process gets a
 /// page-aligned stack top somewhere in the 16 GiB range, a different one
-/// nearly every time, and starts with a stack pointer that is 8 below a
-/// 16-byte boundary within the top half page; with randomization off, the
-/// stack is at the fixed top. Returns 0, or the number of the first
+/// nearly every time, and starts with a stack pointer on a 16-byte
+/// boundary a varying distance below it, within the top page; with
+/// randomization off, the stack is at the fixed top and the distance is
+/// always the same. Returns 0, or the number of the first
 /// failing check.
 pub fn stackRandomization() u32 {
     const flags = cpu.saveAndDisableInterrupts(); // read each process before it runs
@@ -3316,7 +3345,7 @@ pub fn stackRandomization() u32 {
         const range = process.STACK_RANDOM_PAGES * pmm.PAGE_SIZE;
         const ok = p.stack_top % pmm.PAGE_SIZE == 0 and
             p.stack_top <= process.STACK_TOP_MAX and p.stack_top > process.STACK_TOP_MAX - range and
-            p.entry_rsp % 16 == 8 and offset >= 8 and offset <= 2048 and
+            p.entry_rsp % 16 == 0 and offset >= 16 and offset < pmm.PAGE_SIZE and
             vmm.translate(p.root, p.stack_top - 1) != null and vmm.translate(p.root, p.stack_top) == null;
         if (n == 0) first_offset = offset else if (offset != first_offset) offsets_differ = true;
         if (process.wait(p) != 0) return 2; // the program runs with that stack
@@ -3338,10 +3367,15 @@ pub fn stackRandomization() u32 {
     }
     if (high - low < 1 << 30) return 6; // 24 draws spanning under 1 GiB of 16
 
-    const fixed = process.spawnPath("/test/entry_regs", .{ .randomize = false }) catch return 7;
-    const fixed_ok = fixed.stack_top == process.STACK_TOP_MAX and fixed.entry_rsp == process.STACK_TOP_MAX - 8;
-    if (process.wait(fixed) != 0) return 8;
-    return if (fixed_ok) 0 else 9;
+    var fixed_rsp: [2]u64 = undefined;
+    for (&fixed_rsp) |*rsp| {
+        const fixed = process.spawnPath("/test/entry_regs", .{ .randomize = false }) catch return 7;
+        rsp.* = fixed.entry_rsp;
+        const fixed_ok = fixed.stack_top == process.STACK_TOP_MAX and fixed.entry_rsp % 16 == 0 and fixed.entry_rsp < process.STACK_TOP_MAX;
+        if (process.wait(fixed) != 0) return 8;
+        if (!fixed_ok) return 9;
+    }
+    return if (fixed_rsp[0] == fixed_rsp[1]) 0 else 10;
 }
 
 /// How far the kernel was loaded from its link address.

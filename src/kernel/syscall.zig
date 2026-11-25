@@ -6,9 +6,10 @@
 //! the calls. User memory is never dereferenced directly: data is copied to
 //! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
+const std = @import("std");
 const root = @import("root");
 
-const abi = @import("../abi/linux.zig");
+const abi = @import("abi");
 const Sys = abi.Sys;
 const err = abi.err;
 const cpu = @import("../arch/x86_64/cpu.zig");
@@ -46,22 +47,96 @@ fn userPath(buf: *[abi.PATH_MAX]u8, ptr: u64) union(enum) { path: []const u8, fa
     return .{ .path = buf[0..len] };
 }
 
-/// `myos_run`: spawn the program at the user path `ptr` as a child process
-/// and block until it exits. Returns the child's exit status (0-255), or an
-/// error: those of `userPath`, `ENOENT` (no such file), `ENOEXEC` (not a
-/// loadable program), `ENOMEM` (no memory, or the program is larger than
-/// the caller's memory limit) or `EAGAIN` (the caller, or a process above
-/// it, has as many descendants as it may).
-fn sysRun(ptr: u64) u64 {
+/// The strings of an argument or environment list copied from user
+/// space: the strings themselves in one block, and a slice for each.
+const StringList = struct {
+    storage: []u8,
+    /// Room for the most strings allowed; the first `len` are set.
+    slots: [][]const u8,
+    len: usize = 0,
+
+    fn items(self: StringList) []const []const u8 {
+        return self.slots[0..self.len];
+    }
+
+    fn deinit(self: StringList) void {
+        heap.allocator.free(self.slots);
+        heap.allocator.free(self.storage);
+    }
+};
+
+/// Copy the NULL-terminated array of NUL-terminated strings at the user
+/// address `ptr` (as `execve` takes them). A null `ptr` is an empty list.
+/// `budget` is how many bytes and how many strings are still allowed; both
+/// are reduced by what was used. Errors are syscall results: `EFAULT`,
+/// `E2BIG` (too many strings, or too long together), `ENOMEM`.
+fn copyStringList(ptr: u64, bytes_left: *usize, count_left: *usize) union(enum) { list: StringList, fail: u64 } {
+    const storage = heap.allocator.alloc(u8, bytes_left.*) catch return .{ .fail = err(.NOMEM) };
+    const items = heap.allocator.alloc([]const u8, count_left.*) catch {
+        heap.allocator.free(storage);
+        return .{ .fail = err(.NOMEM) };
+    };
+    const list: StringList = .{ .storage = storage, .slots = items };
+    var used: usize = 0;
+    var n: usize = 0;
+    while (ptr != 0) : (n += 1) {
+        var word: [8]u8 = undefined;
+        const fail: ?u64 = blk: {
+            const at = std.math.add(u64, ptr, n * 8) catch break :blk err(.FAULT);
+            uaccess.copyFromUser(&word, at) catch break :blk err(.FAULT);
+            const string = std.mem.readInt(u64, &word, .little);
+            if (string == 0) break :blk null;
+            if (n == items.len) break :blk err(.@"2BIG");
+            const len = uaccess.copyStringFromUser(storage[used..], string) catch |e| break :blk switch (e) {
+                error.Fault => err(.FAULT),
+                error.TooLong => err(.@"2BIG"),
+            };
+            items[n] = storage[used..][0..len];
+            used += len + 1;
+            continue;
+        };
+        if (fail) |e| {
+            list.deinit();
+            return .{ .fail = e };
+        }
+        break;
+    }
+    bytes_left.* -= used;
+    count_left.* -= n;
+    return .{ .list = .{ .storage = storage, .slots = items, .len = n } };
+}
+
+/// `myos_run`: spawn the program at the user path `ptr` as a child process,
+/// with the arguments `argv` and the environment `envp` (user arrays as for
+/// `execve`; null for none), and block until it exits. Returns the child's
+/// exit status (0-255), or an error: those of `userPath`, `ENOENT` (no such
+/// file), `ENOEXEC` (not a loadable program), `E2BIG` (arguments and
+/// environment too long), `EFAULT`, `ENOMEM` (no memory, or the program is
+/// larger than the caller's memory limit) or `EAGAIN` (the caller, or a
+/// process above it, has as many descendants as it may).
+fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
     var path_buf: [abi.PATH_MAX]u8 = undefined;
     const path = switch (userPath(&path_buf, ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
-    const child = proc.spawnPath(path, .{ .parent = thread.current().process }) catch |e| return switch (e) {
+    var bytes_left: usize = abi.ARG_MAX;
+    var count_left: usize = abi.ARG_COUNT_MAX;
+    const args = switch (copyStringList(argv, &bytes_left, &count_left)) {
+        .list => |l| l,
+        .fail => |e| return e,
+    };
+    defer args.deinit();
+    const env = switch (copyStringList(envp, &bytes_left, &count_left)) {
+        .list => |l| l,
+        .fail => |e| return e,
+    };
+    defer env.deinit();
+    const child = proc.spawnPath(path, .{ .parent = thread.current().process, .argv = args.items(), .envp = env.items() }) catch |e| return switch (e) {
         error.FileNotFound => err(.NOENT),
         error.OutOfMemory, error.TooLarge => err(.NOMEM),
         error.TooManyProcesses => err(.AGAIN),
+        error.ArgumentsTooLong => err(.@"2BIG"),
         else => err(.NOEXEC), // unreadable, or refused by the ELF loader
     };
     return proc.wait(child); // whether it is still running or already gone
@@ -85,6 +160,83 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
     }
     if (done == 0 and len != 0) return err(.FAULT);
     return done;
+}
+
+/// `writev`: `write` from the `count` buffers described by the `iovec`
+/// array at the user address `iov`, in order. Returns the total written,
+/// short if a buffer cannot be read; `EINVAL` for more than `IOV_MAX`
+/// buffers or lengths that add up past what one call may transfer;
+/// `EFAULT` if the array, or the first buffer with anything in it, cannot
+/// be read; `EBADF` as for `write`.
+fn sysWritev(fd: u64, iov: u64, count: u64) u64 {
+    if (fd != abi.STDOUT and fd != abi.STDERR) return err(.BADF);
+    if (count > abi.IOV_MAX) return err(.INVAL);
+    var total: u64 = 0;
+    // First pass: the lengths, before anything is written.
+    for (0..count) |i| {
+        const v = readIoVec(iov, i) orelse return err(.FAULT);
+        total = std.math.add(u64, total, v.len) catch return err(.INVAL);
+        if (total > abi.MAX_RW_COUNT) return err(.INVAL);
+    }
+    var done: u64 = 0;
+    for (0..count) |i| {
+        const v = readIoVec(iov, i) orelse break;
+        if (v.len == 0) continue;
+        const n = sysWrite(fd, v.base, v.len);
+        if (abi.isError(n)) return if (done == 0) n else done;
+        done += n;
+        if (n < v.len) break; // a short write ends the call
+    }
+    return done;
+}
+
+/// Entry `index` of the `iovec` array at the user address `iov`, or null
+/// if it cannot be read.
+fn readIoVec(iov: u64, index: usize) ?abi.IoVec {
+    var v: abi.IoVec = undefined;
+    const at = std.math.add(u64, iov, index * @sizeOf(abi.IoVec)) catch return null;
+    uaccess.copyFromUser(std.mem.asBytes(&v), at) catch return null;
+    return v;
+}
+
+/// `ioctl`: no descriptor has device requests yet. The standard streams
+/// and open files answer `ENOTTY` ("not a terminal", which is how a C
+/// library asks whether to buffer its output by line); anything else is
+/// `EBADF`.
+fn sysIoctl(fd: u64) u64 {
+    if (fd <= abi.STDERR or fileOf(fd) != null) return err(.NOTTY);
+    return err(.BADF);
+}
+
+/// `arch_prctl`: set or read the FS or GS base of the calling thread,
+/// where a program keeps its thread-local data. A base must be an address
+/// in user space (`EPERM` otherwise, as on Linux): the kernel tells its own
+/// GS base from a program's by exactly that (`idt.zig`). `EINVAL` for an
+/// unknown code, `EFAULT` if the result cannot be stored.
+fn sysArchPrctl(code: u64, addr: u64) u64 {
+    const me = thread.current();
+    switch (code) {
+        abi.ARCH.SET_FS, abi.ARCH.SET_GS => {
+            if (!user_range.valid(addr, 1)) return err(.PERM); // below the end of user space
+            thread.setUserBase(if (code == abi.ARCH.SET_FS) .fs else .gs, addr);
+            return 0;
+        },
+        abi.ARCH.GET_FS, abi.ARCH.GET_GS => {
+            const value = if (code == abi.ARCH.GET_FS) me.fs_base else me.gs_base;
+            uaccess.copyToUser(addr, std.mem.asBytes(&value)) catch return err(.FAULT);
+            return 0;
+        },
+        else => return err(.INVAL),
+    }
+}
+
+/// `set_tid_address`: remember where the thread's exit is to be announced
+/// and return its ID. Nothing waits for a thread yet (milestone 7), so the
+/// address is only kept.
+fn sysSetTidAddress(ptr: u64) u64 {
+    const me = thread.current();
+    me.clear_child_tid = ptr;
+    return me.id;
 }
 
 /// Return the open file for descriptor `fd` of the current process, or null
@@ -176,10 +328,15 @@ pub fn dispatch(f: *arch.Frame) void {
             thread.yield();
             break :blk 0;
         },
-        Sys.exit => proc.exit(abi.exitStatus(f.rdi)),
+        Sys.ioctl => sysIoctl(f.rdi),
+        Sys.writev => sysWritev(f.rdi, f.rsi, f.rdx),
+        Sys.arch_prctl => sysArchPrctl(f.rdi, f.rsi),
+        Sys.set_tid_address => sysSetTidAddress(f.rdi),
+        // One thread per process: leaving the group is leaving.
+        Sys.exit, Sys.exit_group => proc.exit(abi.exitStatus(f.rdi)),
         Sys.gettid => thread.id(),
         Sys.myos_getchar => sysGetChar(),
-        Sys.myos_run => sysRun(f.rdi),
+        Sys.myos_run => sysRun(f.rdi, f.rsi, f.rdx),
         else => err(.NOSYS),
     };
 }

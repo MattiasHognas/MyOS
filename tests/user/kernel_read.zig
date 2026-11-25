@@ -8,9 +8,12 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     const kernel_memory: *const volatile u64 = @ptrFromInt(0xFFFF_8000_0010_0000);
     _ = kernel_memory.*;
     lib.exit(0);

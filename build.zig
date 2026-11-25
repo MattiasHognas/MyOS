@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
         "entry_regs", "umip",        "div_zero",   "invalid_opcode", "syscall_abi",
         "preempt",    "gs_base",     "fpu",        "fpu_clean",      "fuzz",
         "bad_return", "single_step", "recurse",    "open_count",     "run_many",
-        "getchar",    "zero_pages",
+        "getchar",    "zero_pages",  "linux_abi",
     }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, user_target, optimize);
         exe.root_module.addImport("lib", user_lib);
@@ -273,6 +273,8 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "random_core", "src/kernel/random_core.zig" },
         .{ "meltdown_rule", "src/arch/x86_64/meltdown_rule.zig" },
         .{ "timer_queue", "src/kernel/sync/timer_queue.zig" },
+        .{ "startup_stack", "src/kernel/startup_stack.zig" },
+        .{ "cmdline", "app/cmdline.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),
@@ -280,6 +282,9 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
             .optimize = .Debug,
         }));
     }
+    // Modules that use the ABI definitions import the same module the tests do.
+    const imports = tests.root_module.import_table;
+    imports.get("startup_stack").?.addImport("abi", imports.get("abi").?);
     return tests;
 }
 
@@ -334,6 +339,18 @@ fn kernelArtifact(
     options.addOption(bool, "allow_meltdown", kopts.allow_meltdown);
     options.addOption([]const u8, "version", kopts.version);
     kernel.root_module.addOptions("build_options", options);
+    // The user/kernel ABI, as a module of its own: the kernel's files that
+    // are also tested on the host import it by name there too. Built like
+    // the kernel itself (no red zone: interrupts use the same stack).
+    kernel.root_module.addImport("abi", b.createModule(.{
+        .root_source_file = b.path("src/abi/linux.zig"),
+        .target = target,
+        .optimize = optimize,
+        .red_zone = false,
+        .pic = true,
+        .sanitize_c = .off,
+        .omit_frame_pointer = false,
+    }));
     return kernel;
 }
 

@@ -384,28 +384,31 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 This is the smallest end-to-end slice of Linux compatibility. It comes early on purpose: from here on, new kernel features are checked against real foreign binaries instead of only against MyOS's own programs.
 
 ### 4.1 Process startup
-- [ ] Build the initial user stack the way Linux does: `argc`, `argv`, `envp`, then the auxiliary vector (`AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`, `AT_PAGESZ`, `AT_RANDOM`, ...). `AT_RANDOM` needs the random-number generator from 2.9.
-- [ ] Pass arguments and environment to spawned programs.
-- [ ] Update the Zig user startup code to read arguments/environment.
-- [ ] Parse command lines with arguments and basic quoting.
+- [x] Build the initial user stack the way Linux does (`startup_stack.zig`, tested on the host by reading the block back the way a C library does): `argc`, `argv`, `envp`, then the auxiliary vector (`AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`, `AT_PAGESZ`, `AT_RANDOM`, ...). `AT_RANDOM` needs the random-number generator from 2.9.
+- [x] Pass arguments and environment to spawned programs (`process.SpawnOptions`, and `myos_run(path, argv, envp)` from user space; at most 8 KiB and 256 strings together, `E2BIG` beyond).
+- [x] Update the Zig user startup code to read arguments/environment: programs are entered as Linux programs are (`rsp` at `argc`, on a 16-byte boundary), `app/lib.zig` has the `_start` that calls `main`, and `lib.argv`, `lib.environ` and `lib.auxValue`.
+- [x] Parse command lines with arguments and basic quoting (`app/cmdline.zig`, tested on the host; the shell passes the arguments and its own environment).
 - [ ] Load position-independent executables (`ET_DYN`) at a chosen load bias.
 - [ ] Choose that load bias at random for each process (moved from 2.9, which randomized the stack and the kernel), with `process.SpawnOptions.randomize` turning it off as it does for the stack. Fixed-address executables (`ET_EXEC`) cannot be moved. Test that two runs of a PIE get different bases.
 - [ ] Give each thread its own FS base: `arch_prctl(ARCH_SET_FS)`, saved and restored on context switch; enable FSGSBASE when the CPU has it.
+  - Done: `arch_prctl` with all four codes, FS and GS base per thread, loaded when the thread gets a CPU, and refused outside user space. Open: FSGSBASE stays off (programs fall back to `arch_prctl`), until `isr_paranoid` is changed as the next point says.
   - Before FSGSBASE is enabled, change `isr_paranoid` (`src/arch/x86_64/idt.zig`): it takes a GS base with the top bit set to be the kernel's, and with `wrgsbase` a program can load such a value, so an NMI or debug exception would run on the user's GS base. Save the GS base on entry, load this CPU's own unconditionally, and restore the saved one on exit, as Linux does. Test from ring 3: set a kernel-looking GS base, single-step into a syscall, and expect the kernel to survive.
   - `arch_prctl(ARCH_SET_GS)` and `ARCH_SET_FS` must refuse addresses outside user space.
   - The kernel does not set up the TLS block from `PT_TLS`: on Linux the C library does that itself, from the program headers it finds through `AT_PHDR`.
-- [ ] Extend the syscall ABI document from 2.5 with the startup stack, the auxiliary vector and TLS.
+- [x] Extend the syscall ABI document from 2.5 with the startup stack, the auxiliary vector and TLS.
 - [ ] Test empty, long, invalid, and multi-argument commands, and check the stack layout from ring 3.
 
 ### 4.2 Minimal syscall set
 - [ ] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs.
-- [ ] Record what the target programs really ask for: run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
+- [ ] Record what the target programs really ask for (musl C, Rust and Go are in `docs/linux-programs.md`; the .NET program and the Loupe runs are open): run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
   - Run them under Loupe as well (`docs/research.md`): it finds which of those calls must really work, which may return `ENOSYS` and which may pretend to succeed. That, not the bare list, is the work order.
 - [ ] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
+  - Done: `writev`, `exit_group`, `set_tid_address`, `ioctl` and `arch_prctl`, which is all the hello-world calls. Open: `brk` and `mmap`, which a program needs as soon as it allocates.
 
 ### 4.3 Fixtures
-- [ ] Keep prebuilt fixture binaries (with the commands that built them) and run them as QEMU tests, checking their output.
+- [x] Keep prebuilt fixture binaries (with the commands that built them) and run them as QEMU tests, checking their output: `tests/fixtures/` (`build.sh` has the commands), packaged as `/fixtures/` in the test image and `/bin/` in the normal one.
 - [ ] Run a static and a static-PIE musl hello-world built on Linux, with arguments and environment.
+  - The static one runs, on one and on four CPUs: it prints its arguments and environment through musl's `printf` and exits with its argument count. The static-PIE one waits for `ET_DYN` loading.
 - [ ] Test malformed `ET_DYN` images and an unknown syscall number from ring 3.
 
 **Milestone 4 done when:** An unmodified static musl hello-world built on Linux prints its arguments on MyOS, as a CI test on several CPUs.

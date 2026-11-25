@@ -45,6 +45,8 @@ mkdir -p "$iso_root/boot/limine" "$iso_root/EFI/BOOT" "$initrd/bin" "$initrd/etc
 cp zig-out/bin/sh.elf "$initrd/bin/sh"
 cp zig-out/bin/hello.elf "$initrd/bin/hello"
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
+# Programs built for Linux by other toolchains (tests/fixtures), to run by hand.
+cp tests/fixtures/bin/* "$initrd/bin/"
 if [[ "$mode" == --package-test ]]; then
     # User-mode test programs: zig-out/bin/test-<name>.elf -> /test/<name>
     mkdir -p "$initrd/test"
@@ -52,6 +54,9 @@ if [[ "$mode" == --package-test ]]; then
         name="$(basename "$f" .elf)"
         cp "$f" "$initrd/test/${name#test-}"
     done
+    # Programs built for Linux by other toolchains (tests/fixtures): /fixtures/<name>
+    mkdir -p "$initrd/fixtures"
+    cp tests/fixtures/bin/* "$initrd/fixtures/"
 fi
 tar --format=ustar -cf "$iso_root/boot/initrd.tar" -C "$initrd" .
 

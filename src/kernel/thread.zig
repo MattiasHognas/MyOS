@@ -241,6 +241,14 @@ pub const Thread = struct {
     /// to until the CPU that switches away from it has left the stack. A
     /// blocked thread with this set is idling in `block`.
     on_cpu: bool = false,
+    /// The FS and GS base the thread's user code runs with (`arch_prctl`):
+    /// where a program keeps its thread-local data. Loaded whenever the
+    /// thread gets a CPU.
+    fs_base: u64 = 0,
+    gs_base: u64 = 0,
+    /// Where the thread's exit is to be announced (`set_tid_address`), a
+    /// user address; 0 if nowhere. Used once there are threads to wait for.
+    clear_child_tid: u64 = 0,
     /// The CPU that runs the thread, or ran it last. Null until it has run.
     cpu: ?*percpu.PerCpu = null,
     /// Heap block holding the saved x87/SSE/AVX state while the thread is
@@ -539,6 +547,7 @@ fn switchToNext() bool {
     }
 
     fpu.switchState(prev.fpuArea(), next.fpuArea());
+    if (next.process != null) percpu.setUserBases(next.fs_base, next.gs_base);
 
     switched_from = prev;
     context.switchTo(&prev.rsp, next.rsp);
@@ -626,6 +635,19 @@ pub fn isParked(n: usize) bool {
     const held = lock.acquire();
     defer lock.release(held);
     return !c.runs_threads and c.thread == c.idle_thread;
+}
+
+/// Set the FS or GS base of the calling thread's user code, now and
+/// whenever it runs again.
+pub fn setUserBase(which: enum { fs, gs }, value: u64) void {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const me = current();
+    switch (which) {
+        .fs => me.fs_base = value,
+        .gs => me.gs_base = value,
+    }
+    percpu.setUserBases(me.fs_base, me.gs_base);
 }
 
 /// Threads freed since boot. With `spawnedCount`, tests use it to see that

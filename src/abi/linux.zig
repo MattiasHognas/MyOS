@@ -16,12 +16,23 @@ pub const Sys = struct {
     pub const open = 2;
     /// `close(fd) -> 0`.
     pub const close = 3;
+    /// `ioctl(fd, request, arg)`: no device has requests yet, so `ENOTTY`.
+    pub const ioctl = 16;
+    /// `writev(fd, iov, iovcnt) -> bytes written`: `write` from several buffers.
+    pub const writev = 20;
     /// `sched_yield() -> 0`: give the CPU to another ready thread.
     pub const sched_yield = 24;
     /// `exit(status)`: terminate the calling process. Does not return.
     pub const exit = 60;
+    /// `arch_prctl(code, addr)`: get or set the thread's FS or GS base (`ARCH`).
+    pub const arch_prctl = 158;
     /// `gettid() -> id` of the calling thread.
     pub const gettid = 186;
+    /// `set_tid_address(ptr) -> id` of the calling thread; `ptr` is where
+    /// the thread's exit is to be announced (with threads, milestone 7).
+    pub const set_tid_address = 218;
+    /// `exit_group(status)`: terminate the calling process, all threads.
+    pub const exit_group = 231;
 
     /// First private (non-Linux) syscall number, far above Linux's range
     /// (under 500) and below the x32 bit (0x4000_0000). Milestone 6 replaces
@@ -29,15 +40,21 @@ pub const Sys = struct {
     pub const PRIVATE_BASE = 0x4D59_00; // "MY"
     /// `getchar() -> character`: block until a key is pressed.
     pub const myos_getchar = PRIVATE_BASE + 0;
-    /// `run(path) -> exit status`: start the program at the NUL-terminated
-    /// `path` and wait for it to exit.
+    /// `run(path, argv, envp) -> exit status`: start the program at the
+    /// NUL-terminated `path` and wait for it to exit. `argv` and `envp` are
+    /// NULL-terminated arrays of NUL-terminated strings, as for `execve`;
+    /// either may be NULL (no environment; the path as the only argument).
     pub const myos_run = PRIVATE_BASE + 1;
 };
 
 /// Error numbers. A failing syscall returns the negated value in RAX.
 pub const E = enum(u16) {
+    /// Operation not permitted.
+    PERM = 1,
     /// No such file or directory.
     NOENT = 2,
+    /// Argument list too long.
+    @"2BIG" = 7,
     /// Exec format error: not a program MyOS can load.
     NOEXEC = 8,
     /// Bad file descriptor.
@@ -50,6 +67,8 @@ pub const E = enum(u16) {
     FAULT = 14,
     /// Invalid argument.
     INVAL = 22,
+    /// Not a terminal: the descriptor has no such `ioctl`.
+    NOTTY = 25,
     /// Too many open files in this process.
     MFILE = 24,
     /// Read-only file system.
@@ -108,3 +127,55 @@ pub fn exitStatus(code: u64) u64 {
 pub const STDIN = 0;
 pub const STDOUT = 1;
 pub const STDERR = 2;
+
+/// `arch_prctl` codes.
+pub const ARCH = struct {
+    pub const SET_GS = 0x1001;
+    pub const SET_FS = 0x1002;
+    pub const GET_FS = 0x1003;
+    pub const GET_GS = 0x1004;
+};
+
+/// One buffer of a `writev`: `struct iovec`.
+pub const IoVec = extern struct {
+    base: u64,
+    len: u64,
+};
+/// Most buffers one `writev` takes (Linux's `IOV_MAX`).
+pub const IOV_MAX = 1024;
+
+/// Keys of the auxiliary vector a program finds on its initial stack, above
+/// the environment: pairs of key and value, ended by `NULL`.
+pub const AT = struct {
+    pub const NULL = 0;
+    /// Address of the program headers in memory, their size and number.
+    pub const PHDR = 3;
+    pub const PHENT = 4;
+    pub const PHNUM = 5;
+    pub const PAGESZ = 6;
+    /// Where the interpreter was loaded; 0 without one.
+    pub const BASE = 7;
+    pub const FLAGS = 8;
+    pub const ENTRY = 9;
+    pub const UID = 11;
+    pub const EUID = 12;
+    pub const GID = 13;
+    pub const EGID = 14;
+    /// Address of the string "x86_64".
+    pub const PLATFORM = 15;
+    /// CPUID.1:EDX.
+    pub const HWCAP = 16;
+    /// Clock ticks per second for `times`.
+    pub const CLKTCK = 17;
+    pub const SECURE = 23;
+    /// Address of 16 random bytes.
+    pub const RANDOM = 25;
+    /// Address of the path the program was started with.
+    pub const EXECFN = 31;
+};
+
+/// Most bytes the arguments, environment and auxiliary vector of a new
+/// program may take on its stack together.
+pub const ARG_MAX = 8192;
+/// Most arguments and environment strings together.
+pub const ARG_COUNT_MAX = 256;

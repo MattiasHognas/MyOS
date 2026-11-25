@@ -22,10 +22,9 @@ var entry_rsp: u64 = 0;
 
 /// Program entry point. Naked: the stack is inspected before any
 /// compiler-generated code has pushed anything.
-export fn _start() callconv(.naked) noreturn {
+pub export fn _start() callconv(.naked) noreturn {
     asm volatile (
         \\ mov %%rsp, entry_rsp(%%rip)
-        \\ sub $8, %%rsp
         \\ call zeroPagesMain
         \\ ud2
     );
@@ -51,12 +50,11 @@ export fn zeroPagesMain() callconv(.c) noreturn {
     for (0..here - 1024 - low) |i| {
         if (stack[i] != 0) lib.exit(2);
     }
-    // And above the entry stack pointer, up to the top, except the eight
-    // bytes the kernel leaves for a return address.
-    const above: [*]const volatile u8 = @ptrFromInt(entry_rsp + 8);
-    for (0..top - (entry_rsp + 8)) |i| {
-        if (above[i] != 0) lib.exit(2);
-    }
+    // Above the entry stack pointer is what the kernel put there for the
+    // program: its arguments, environment and auxiliary vector, and above
+    // those, up to the top, the strings they point to and then zeroes.
+    const words: [*]const usize = @ptrFromInt(entry_rsp);
+    if (words[0] != 1 or words[1] <= entry_rsp or words[1] >= top or words[2] != 0) lib.exit(3);
 
     lib.exit(0);
 }

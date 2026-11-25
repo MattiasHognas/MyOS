@@ -8,6 +8,9 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 const Sys = lib.Sys;
 const err = lib.err;
 
@@ -24,7 +27,7 @@ fn expect(ok: bool) void {
 var buf: [64]u8 = undefined;
 
 /// Program entry point: run the checks in order.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     const tid = lib.gettid();
     const path = "/etc/motd";
 

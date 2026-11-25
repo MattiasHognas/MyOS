@@ -11,7 +11,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 /// The user/kernel ABI shared with user programs: Linux's syscall numbers and error values.
-pub const abi = @import("abi/linux.zig");
+pub const abi = @import("abi");
 
 /// CPU-architecture specific code.
 pub const arch = struct {

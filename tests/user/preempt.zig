@@ -8,6 +8,9 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 const Sys = lib.Sys;
 
 const checked = @import("checked.zig");
@@ -40,7 +43,7 @@ fn readAll(total: *u64) u64 {
 }
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     var total: u64 = 0;
     const first = readAll(&total);
     if (total == 0) fail(6);

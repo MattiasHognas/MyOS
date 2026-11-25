@@ -5,9 +5,12 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
+pub fn main() noreturn {
     var count: u64 = 0;
     while (count < 100) : (count += 1) {
         const fd = lib.open("/etc/motd");

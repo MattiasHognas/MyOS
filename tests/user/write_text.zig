@@ -4,10 +4,13 @@
 
 const lib = @import("lib");
 pub const panic = lib.panic;
+comptime {
+    _ = lib; // its `_start` calls `main`
+}
 
 /// Program entry point.
-export fn _start() callconv(.c) noreturn {
-    const code: *volatile u8 = @ptrFromInt(@intFromPtr(&_start));
+pub fn main() noreturn {
+    const code: *volatile u8 = @ptrFromInt(@intFromPtr(&main));
     code.* = 0xCC;
     lib.exit(0);
 }

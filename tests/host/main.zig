@@ -15,6 +15,8 @@ test {
     std.testing.refAllDecls(@import("page_bitmap_test.zig"));
     std.testing.refAllDecls(@import("raw_spinlock_test.zig"));
     std.testing.refAllDecls(@import("lock_order_test.zig"));
+    std.testing.refAllDecls(@import("startup_stack_test.zig"));
+    std.testing.refAllDecls(@import("cmdline_test.zig"));
     std.testing.refAllDecls(@import("timer_queue_test.zig"));
     std.testing.refAllDecls(@import("random_core_test.zig"));
     std.testing.refAllDecls(@import("meltdown_rule_test.zig"));

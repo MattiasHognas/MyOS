@@ -38,10 +38,10 @@ fn expect(ok: bool) void {
 /// Program entry point. The checks use the top of the stack as memory
 /// that ends at an unmapped page, so the program's own frames start a page
 /// below it (and 16-byte aligned for the call).
-export fn _start() callconv(.naked) noreturn {
+pub export fn _start() callconv(.naked) noreturn {
     asm volatile (
         \\ mov %%rsp, %%rdi
-        \\ sub $4104, %%rsp
+        \\ sub $4096, %%rsp
         \\ call userPointersMain
         \\ ud2
     );

@@ -76,9 +76,14 @@ Linux calls, with Linux's numbers:
 | 1 | `write(fd, buf, count)` | Descriptors 1 and 2 only, both the console (serial port and screen). Files cannot be written (`EBADF`). |
 | 2 | `open(path, flags, mode)` | Read-only: the access mode in `flags` must be `O_RDONLY`. Other flags and `mode` are ignored, except that `O_CREAT` on a missing file gives `EROFS`. |
 | 3 | `close(fd)` | Closing 0, 1 or 2 succeeds and does nothing. |
+| 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for the standard streams and open files (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
+| 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. Descriptors 1 and 2 only. |
 | 24 | `sched_yield()` | |
 | 60 | `exit(status)` | The parent sees `status & 0xff`. Ends the process (which has one thread). |
+| 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
+| 218 | `set_tid_address(ptr)` | Returns the thread ID. The address is kept for when threads exist (milestone 7). |
+| 231 | `exit_group(status)` | The same as `exit`: a process has one thread. |
 
 MyOS calls with no Linux equivalent yet. Their numbers start at
 `0x4D5900`, far above Linux's (which end below 500) and below the x32 bit
@@ -87,7 +92,7 @@ MyOS calls with no Linux equivalent yet. Their numbers start at
 | Number | Call | Notes |
 | --- | --- | --- |
 | `0x4D5900` | `myos_getchar()` | Block until a key is pressed; returns the character. |
-| `0x4D5901` | `myos_run(path)` | Start the program at `path` and wait for it. Returns its exit status (0-255; 255 if the kernel killed it), or an error. |
+| `0x4D5901` | `myos_run(path, argv, envp)` | Start the program at `path` with the arguments and environment given as for `execve` (either may be null: then the path is the only argument, and the environment is empty), and wait for it. Returns its exit status (0-255; 255 if the kernel killed it), or an error; `E2BIG` if arguments and environment do not fit. |
 
 Every other number returns `ENOSYS`.
 
@@ -104,6 +109,9 @@ Every other number returns `ENOSYS`.
   stack), 16 descriptors,
   and 1024 processes alive below it. There are no calls to read or change
   them yet (`getrlimit`, `prlimit`).
+- **Arguments and environment** of a new program may take 8 KiB on its
+  stack together, the auxiliary vector included, and be 256 strings (on
+  Linux: a quarter of the stack limit, 2 MiB by default).
 - **Running out of memory** fails the call that needed it with `ENOMEM`.
   Nothing is killed to make room.
 - **A process the kernel kills** (a fault in ring 3) ends with status 255.
@@ -111,21 +119,61 @@ Every other number returns `ENOSYS`.
 
 ## Program start
 
-A program is entered at its ELF entry point in ring 3 with:
+A program is entered at its ELF entry point in ring 3 the way Linux enters
+one, with:
 
 - all general-purpose registers zero, RFLAGS `0x202` (interrupts on);
 - a 16 KiB stack whose top is at a random page in a 16 GiB range below
-  `0x7fffffff0000`, different for every process. `rsp` is 8 below a
-  16-byte boundary in the stack's last page, as if the entry point had
-  been called. Linux's initial stack (`argc`, `argv`, the environment and
-  the auxiliary vector) comes with milestone 4;
-- memory that holds nothing from before: `.bss` and the stack are zero;
+  `0x7fffffff0000`, different for every process;
+- `rsp` on a 16-byte boundary, pointing at the initial stack described
+  below, which ends a random distance below the top of the stack;
+- FS and GS base zero, until the program sets them with `arch_prctl`;
+- memory that holds nothing from before: `.bss` and the rest of the stack
+  are zero;
 - clean extended state: x87 control word `0x37f`, MXCSR `0x1f80`, all x87,
   SSE and AVX registers zero.
 
 SSE and SSE2 are always available. AVX is available when CPUID reports
 `OSXSAVE` and AVX and `xgetbv` shows bits 1 and 2 of XCR0 set: the usual
 check, which `tests/user/fpu_regs.zig` shows. AVX-512 is never enabled.
+
+### The initial stack
+
+From `rsp` upwards, in 8-byte words, as on Linux:
+
+| What | |
+| --- | --- |
+| `argc` | number of arguments |
+| `argv[0]` ... `argv[argc-1]`, `NULL` | pointers to the argument strings |
+| `envp[0]` ..., `NULL` | pointers to the environment strings (`NAME=value`) |
+| auxiliary vector | pairs of key and value, ended by `AT_NULL` (0) |
+| ... | the strings and data the above point to |
+
+A program started without arguments gets the path it was started under as
+`argv[0]`. The auxiliary vector has:
+
+| Key | Value |
+| --- | --- |
+| `AT_PHDR` (3), `AT_PHENT` (4), `AT_PHNUM` (5) | address, entry size and number of the program headers in memory. `AT_PHDR` is 0 if the program was linked so that its headers are not part of a loaded segment. A C library finds its thread-local data through these; the kernel does not set that up |
+| `AT_PAGESZ` (6) | 4096 |
+| `AT_BASE` (7) | 0: there is no ELF interpreter |
+| `AT_FLAGS` (8) | 0 |
+| `AT_ENTRY` (9) | the entry point |
+| `AT_UID` (11), `AT_EUID` (12), `AT_GID` (13), `AT_EGID` (14) | 0: there are no users yet |
+| `AT_PLATFORM` (15) | address of the string `x86_64` |
+| `AT_HWCAP` (16) | CPUID leaf 1, EDX |
+| `AT_CLKTCK` (17) | 100 |
+| `AT_SECURE` (23) | 0 |
+| `AT_RANDOM` (25) | address of 16 random bytes, new for every process |
+| `AT_EXECFN` (31) | address of the path the program was started under |
+
+There is no vDSO (`AT_SYSINFO_EHDR`): a program that looks for one makes
+real system calls instead.
+
+A program that sets up thread-local storage does so itself, from its
+`PT_TLS` program header, and tells the kernel where with
+`arch_prctl(ARCH_SET_FS)`. That is what a statically linked C library
+does first.
 
 ## How the kernel implements it
 

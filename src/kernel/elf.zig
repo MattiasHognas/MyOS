@@ -17,6 +17,10 @@ pub const Loaded = struct {
     entry: u64,
     /// Pages allocated for its segments.
     pages: u64,
+    /// Address of its program headers in memory (0 if they are not
+    /// loaded), and how many there are.
+    phdr: u64,
+    phnum: u64,
 };
 
 /// Load the ELF executable `image` into the address space `root` and return
@@ -63,5 +67,5 @@ pub fn load(root: u64, image: []const u8, limits: elf_image.Limits) Error!Loaded
             };
         }
     }
-    return .{ .entry = img.entry, .pages = img.pages };
+    return .{ .entry = img.entry, .pages = img.pages, .phdr = img.phdr_vaddr, .phnum = img.phnum };
 }

@@ -19,12 +19,11 @@ const regs = @import("fpu_regs.zig");
 /// The 512-byte FXSAVE image taken at entry.
 export var fx_area: [512]u8 align(64) = undefined;
 
-/// Program entry point. On entry RSP is 8 below a 16-byte boundary, as
-/// after a call, so the `call` below would misalign it: hence the `sub`.
-export fn _start() callconv(.naked) noreturn {
+/// Program entry point. On entry RSP is on a 16-byte boundary, which is
+/// what a `call` expects to find.
+pub export fn _start() callconv(.naked) noreturn {
     asm volatile (
         \\ fxsave64 fx_area(%%rip)
-        \\ sub $8, %%rsp
         \\ call fpuCleanMain
         \\ ud2
     );

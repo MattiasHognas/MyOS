@@ -91,6 +91,11 @@ pub const PerCpu = extern struct {
     /// CR3 loads on this CPU. A statistic, read by tests.
     root_loads: u64 = 0,
 
+    /// The FS and GS base loaded for user code on this CPU: the last
+    /// thread's that ran in ring 3 here (`setUserBases`).
+    user_fs_base: u64 = 0,
+    user_gs_base: u64 = 0,
+
     /// Set by a CPU that wants this one to do the request in flight, and
     /// cleared by this one when it has (`ipi.zig`).
     ipi_pending: bool = false,
@@ -187,4 +192,25 @@ pub inline fn currentThread() ?*anyopaque {
     return asm volatile ("mov %%gs:24, %[ret]"
         : [ret] "=r" (-> ?*anyopaque),
     );
+}
+
+/// MSR holding the FS base. The kernel does not use FS, so it always holds
+/// the running program's.
+pub const MSR_FS_BASE = 0xC0000100;
+
+/// Make `fs` and `gs` the FS and GS base that user code runs with on this
+/// CPU. While the CPU is in the kernel the user's GS base is the inactive
+/// one (`KERNEL_GS_BASE`), which the `swapgs` on the way out makes active.
+/// Writing these registers is slow, so nothing is written that is already
+/// there. Interrupts must be off.
+pub fn setUserBases(fs: u64, gs: u64) void {
+    const c = current();
+    if (c.user_fs_base != fs) {
+        cpu.wrmsr(MSR_FS_BASE, fs);
+        c.user_fs_base = fs;
+    }
+    if (c.user_gs_base != gs) {
+        cpu.wrmsr(MSR_KERNEL_GS_BASE, gs);
+        c.user_gs_base = gs;
+    }
 }

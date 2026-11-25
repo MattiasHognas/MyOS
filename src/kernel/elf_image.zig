@@ -15,7 +15,8 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_PHDRS = 64;
 
 const EHDR_SIZE = 64;
-const PHDR_SIZE = 56;
+/// Size of one program header.
+pub const PHDR_SIZE = 56;
 const PT_LOAD = 1;
 const PT_INTERP = 3;
 const PF_X = 1;
@@ -94,6 +95,10 @@ pub const Image = struct {
     bytes: []const u8,
     phoff: usize,
     phnum: usize,
+    /// Address the program header table has once the segments are loaded,
+    /// or 0 if no segment contains it. A C library finds its thread-local
+    /// data through it (`AT_PHDR`).
+    phdr_vaddr: u64 = 0,
 
     /// Iterate over the segments to load, in file order.
     pub fn segments(self: *const Image) Iterator {
@@ -230,5 +235,17 @@ pub fn parse(image: []const u8, limits: Limits) Error!Image {
     }
     if (total == 0) return error.BadHeader; // nothing to load
     if (!entry_ok) return error.BadEntry;
-    return .{ .entry = entry, .pages = total / PAGE_SIZE, .bytes = image, .phoff = phoff, .phnum = phnum };
+
+    // Where the program headers end up in memory: inside the segment that
+    // covers their place in the file, if one does.
+    var phdr_vaddr: u64 = 0;
+    const table_end = phoff + phnum * PHDR_SIZE;
+    for (0..phnum) |i| {
+        const seg = loadSegment(image, phoff, i) orelse continue;
+        if (phoff >= seg.file_off and table_end <= seg.file_off + seg.filesz) {
+            phdr_vaddr = seg.vaddr + (phoff - seg.file_off);
+            break;
+        }
+    }
+    return .{ .entry = entry, .pages = total / PAGE_SIZE, .bytes = image, .phoff = phoff, .phnum = phnum, .phdr_vaddr = phdr_vaddr };
 }

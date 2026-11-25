@@ -90,6 +90,89 @@ pub fn run(path: [*:0]const u8) u64 {
     return syscall(Sys.myos_run, @intFromPtr(path), 0, 0);
 }
 
+// --- Startup ---------------------------------------------------------------
+//
+// A program starts the way a Linux program does: the stack pointer is on a
+// 16-byte boundary and points at `argc`, followed by the argument pointers,
+// NULL, the environment pointers, NULL, and the auxiliary vector
+// (`docs/syscalls.md`). `_start` below notes where that is and calls the
+// program's `pub fn main() noreturn`. For that to be linked in, the program
+// names this file at compile time: `comptime { _ = lib; }`. A program that
+// must control its very first instructions defines `pub export fn _start`
+// itself instead.
+
+const root = @import("root");
+
+/// True if the program brings its own `_start` (which must be `pub`).
+const own_start = @hasDecl(root, "_start");
+
+comptime {
+    if (!own_start) {
+        @export(&start, .{ .name = "_start" });
+        @export(&startMain, .{ .name = "myosStart" });
+    }
+}
+
+fn start() callconv(.naked) noreturn {
+    asm volatile (
+        \\ mov %%rsp, %%rdi
+        \\ call myosStart
+        \\ ud2
+    );
+}
+
+/// The initial stack pointer, for `argv`, `environ` and `auxValue`.
+var initial_stack: [*]const usize = undefined;
+
+fn startMain(sp: [*]const usize) callconv(.c) noreturn {
+    initial_stack = sp;
+    root.main();
+}
+
+/// Tell the runtime where the initial stack is. Only for a program with
+/// its own `_start`, which passes the stack pointer it was entered with.
+pub fn setInitialStack(sp: [*]const usize) void {
+    initial_stack = sp;
+}
+
+/// The program's arguments; the first is the name it was started under.
+pub fn argv() []const [*:0]const u8 {
+    const argc = initial_stack[0];
+    const first: [*]const [*:0]const u8 = @ptrCast(initial_stack + 1);
+    return first[0..argc];
+}
+
+/// The program's environment: strings of the form `NAME=value`.
+pub fn environ() []const [*:0]const u8 {
+    const first: [*]const ?[*:0]const u8 = @ptrCast(initial_stack + 1 + initial_stack[0] + 1);
+    var n: usize = 0;
+    while (first[n] != null) n += 1;
+    return @ptrCast(first[0..n]);
+}
+
+/// The environment as the NULL-terminated array the program was started
+/// with, to hand on to a program it starts.
+pub fn environPointers() [*]const ?[*:0]const u8 {
+    return @ptrCast(initial_stack + 1 + initial_stack[0] + 1);
+}
+
+/// The value the kernel gave for key `key` (`abi.AT`) in the auxiliary
+/// vector, or null if it gave none.
+pub fn auxValue(key: usize) ?usize {
+    var at = initial_stack + 1 + initial_stack[0] + 1 + environ().len + 1;
+    while (at[0] != abi.AT.NULL) : (at += 2) {
+        if (at[0] == key) return at[1];
+    }
+    return null;
+}
+
+/// Start the program at `path` with the arguments `arg_list` and the
+/// environment `env_list` (each a NULL-terminated array of strings, or null)
+/// and wait for it to exit. Returns as `run` does.
+pub fn runArgs(path: [*:0]const u8, arg_list: ?[*]const ?[*:0]const u8, env_list: ?[*]const ?[*:0]const u8) u64 {
+    return syscall(Sys.myos_run, @intFromPtr(path), @intFromPtr(arg_list), @intFromPtr(env_list));
+}
+
 /// Format `args` with `fmt` and write the result to the console. Output
 /// longer than 256 bytes is replaced by `<print overflow>`.
 pub fn print(comptime fmt: []const u8, args: anytype) void {

@@ -6,7 +6,7 @@
 
 /// Program entry point. Naked, so no compiler-generated code touches a
 /// register before they are all OR-ed together.
-export fn _start() callconv(.naked) noreturn {
+pub export fn _start() callconv(.naked) noreturn {
     asm volatile (
         \\ or %%rax, %%rdi
         \\ or %%rbx, %%rdi
