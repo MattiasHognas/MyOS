@@ -488,6 +488,9 @@ const ElfSpec = struct {
     second_vaddr: ?u64 = null,
     second_type: u32 = 1, // PT_LOAD
     second_flags: u32 = 6, // R + W
+    /// A `PT_INTERP` header as the second one instead (set `phnum` to 2
+    /// as well), naming this path.
+    interp: ?[]const u8 = null,
     /// Length of the returned image.
     len: usize = 0x1010,
 };
@@ -526,6 +529,17 @@ fn buildElf(spec: ElfSpec) []const u8 {
         std.mem.writeInt(u64, ph2[40..48], 0x1000, .little);
     }
     @memset(b[0x1000..0x1010], 0xAA);
+    if (spec.interp) |path| {
+        const ph2 = b[120..176];
+        std.mem.writeInt(u32, ph2[0..4], 3, .little); // PT_INTERP
+        std.mem.writeInt(u32, ph2[4..8], 4, .little);
+        std.mem.writeInt(u64, ph2[8..16], 0x1010, .little);
+        std.mem.writeInt(u64, ph2[16..24], spec.vaddr + 0x10, .little);
+        std.mem.writeInt(u64, ph2[32..40], path.len + 1, .little);
+        std.mem.writeInt(u64, ph2[40..48], path.len + 1, .little);
+        @memcpy(b[0x1010..][0..path.len], path);
+        return b[0 .. 0x1010 + path.len + 1];
+    }
     return b[0..spec.len];
 }
 
@@ -653,7 +667,8 @@ fn elfRejectMalformed() TestError!void {
         .{ .class = 1 }, // 32-bit
         .{ .data = 2 }, // big endian
         .{ .machine = 3 }, // i386
-        .{ .typ = 3 }, // ET_DYN, not ET_EXEC
+        .{ .typ = 1 }, // ET_REL: an object file
+        .{ .typ = 4 }, // ET_CORE
         .{ .version = 2 }, // unknown ELF version
         .{ .ehsize = 52 }, // wrong ELF header size
         .{ .phentsize = 64 }, // wrong program header size
@@ -679,7 +694,7 @@ fn elfRejectMalformed() TestError!void {
         .{ .entry = 0xFFFF_FFFF_8000_0000 }, // entry point in the kernel
         .{ .phnum = 2, .second_vaddr = 0x40_1000 }, // second segment on a page of the first
         .{ .phnum = 2, .second_vaddr = 0x50_0000, .second_flags = 7 }, // second segment writable and executable
-        .{ .phnum = 2, .second_vaddr = 0x50_0000, .second_type = 3 }, // PT_INTERP: dynamically linked
+        .{ .phnum = 2, .second_vaddr = 0x50_0000, .second_type = 3 }, // PT_INTERP that names no path
         .{ .memsz = 1 << 40 }, // a terabyte of .bss
         .{ .memsz = helpers.image_limits.max_bytes + 1 }, // one byte over the memory limit
     };
@@ -696,6 +711,11 @@ fn elfSpawnRollback() TestError!void {
     try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .second_vaddr = 0x40_1000 })));
     try check(helpers.spawnFailsCleanly(buildElf(.{ .machine = 3 })));
     try check(helpers.spawnFailsCleanly("not an ELF"));
+    // A program whose interpreter is missing, is no program, or is linked
+    // for the addresses the program itself is at.
+    try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .interp = "/lib/ld-does-not-exist.so.1" })));
+    try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .interp = "/etc/motd" })));
+    try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .interp = "/fixtures/musl-hello-static", .vaddr = 0x100_0000, .entry = 0x100_0000 })));
 
     // An image within the limit that needs more pages than are free is
     // refused before anything is allocated (skipped on a machine with more
@@ -922,6 +942,50 @@ fn muslHello() TestError!void {
     try check(code == 3);
     // With no arguments given it gets its path as the only one.
     try check(helpers.runProgram("/fixtures/musl-hello-static") == 1);
+    try check(helpers.footprint().eql(memory));
+}
+
+/// Position-independent programs built for Linux run (a C program and a
+/// Rust program, each a static PIE that relocates itself), at an address
+/// that is different every time unless the layout is fixed.
+fn positionIndependent() TestError!void {
+    const memory = helpers.footprint();
+    const c = helpers.runProgramArgs("/fixtures/musl-hello-static-pie", &.{ "musl-hello-pie", "one", "two words" }, &.{"GREETING=hi pie"}) orelse return error.Failed;
+    if (c != 3) report("musl static-pie exit status", c);
+    try check(c == 3);
+    const r = helpers.runProgramArgs("/fixtures/rust-hello-static-pie", &.{ "rust-hello-pie", "from", "MyOS" }, &.{"GREETING=hi rust pie"}) orelse return error.Failed;
+    if (r != 3) report("rust static-pie exit status", r);
+    try check(r == 3);
+
+    // Where it is put: the same place with the layout fixed, another one
+    // each time otherwise, always on a page boundary within the range.
+    const path = "/fixtures/musl-hello-static-pie";
+    const fixed = helpers.entryOf(path, false) orelse return error.Failed;
+    try check(helpers.entryOf(path, false) == fixed);
+    try check(fixed >= helpers.PIE_BASE and fixed - helpers.PIE_BASE < 0x10_0000);
+    var seen: [4]u64 = undefined;
+    for (&seen, 0..) |*s, i| {
+        s.* = helpers.entryOf(path, true) orelse return error.Failed;
+        try check(s.* >= fixed and (s.* - fixed) % 4096 == 0);
+        try check((s.* - fixed) / 4096 < helpers.PIE_RANDOM_PAGES);
+        for (seen[0..i]) |other| try check(other != s.*);
+    }
+    try check(helpers.footprint().eql(memory));
+}
+
+/// A program that names an interpreter is not run itself: the
+/// interpreter is loaded beside it and started. Here the "interpreter"
+/// is a C program that prints its arguments and exits with their number,
+/// first as a position-independent one, then as one for fixed addresses;
+/// the program that names it is never run, but its headers are mapped, as
+/// a real program's are: a C library reads them (`AT_PHDR`).
+fn elfInterpreter() TestError!void {
+    _ = helpers.runImage(buildElf(.{ .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static-pie" })); // warm up
+    const memory = helpers.footprint();
+    try check(helpers.runImage(buildElf(.{ .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static-pie" })) == 1);
+    try check(helpers.runImage(buildElf(.{ .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static" })) == 1);
+    // And a position-independent program with an interpreter.
+    try check(helpers.runImage(buildElf(.{ .typ = 3, .vaddr = 0, .entry = 0, .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static-pie" })) == 1);
     try check(helpers.footprint().eql(memory));
 }
 
@@ -1655,6 +1719,8 @@ fn runCases() noreturn {
         .{ .name = "a multi-threaded musl program built for Linux runs (pthreads: mutex, condvar, barrier, TLS, join)", .func = muslThreads },
         .{ .name = "a static Rust program built for Linux runs (std: arguments, environment, allocation, println)", .func = rustHello },
         .{ .name = "a Go program built for Linux runs (runtime threads, goroutines, channel, GC)", .func = goHello },
+        .{ .name = "position-independent programs built for Linux run, at a random address", .func = positionIndependent },
+        .{ .name = "a program's ELF interpreter is loaded and started in its place", .func = elfInterpreter },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },

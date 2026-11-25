@@ -179,6 +179,13 @@ pub fn spawnFailsCleanly(image: []const u8) bool {
     return false;
 }
 
+/// Start the program in `image` and wait for it. Returns its exit status,
+/// or null if it could not be started.
+pub fn runImage(image: []const u8) ?u64 {
+    const p = process.spawn("image", image, .{ .randomize = randomize_layout }) catch return null;
+    return waitUntilGone(p);
+}
+
 /// Run the program at `path` as a child process of the current
 /// Thread and wait for it. Returns its exit code (255 if it was killed by a
 /// Fault), or null if it could not be started.
@@ -200,6 +207,18 @@ pub fn runProgramArgs(path: []const u8, argv: []const []const u8, envp: []const 
     const p = process.spawnPath(path, .{ .argv = argv, .envp = envp, .randomize = randomize_layout }) catch return null;
     return waitUntilGone(p);
 }
+
+/// Start the program at `path`, note where its first instruction is, and
+/// wait for it. Null if it could not be started.
+pub fn entryOf(path: []const u8, randomize: bool) ?u64 {
+    const p = process.spawnPath(path, .{ .randomize = randomize }) catch return null;
+    const entry = p.entry;
+    _ = waitUntilGone(p);
+    return entry;
+}
+
+pub const PIE_BASE = process.PIE_BASE;
+pub const PIE_RANDOM_PAGES = process.PIE_RANDOM_PAGES;
 
 /// `runProgramArgs` with `limits` on the new process.
 pub fn runProgramLimitedArgs(path: []const u8, argv: []const []const u8, limits: Limits) ?u64 {

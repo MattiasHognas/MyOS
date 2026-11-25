@@ -79,7 +79,7 @@ for the time.
 | C, static, musl | Runs (`tests/fixtures/bin/musl-hello-static`) |
 | Rust with std, static, musl, fixed address | Runs (`tests/fixtures/bin/rust-hello-static`) |
 | C with pthreads, static, musl | Runs, its threads on several CPUs (`tests/fixtures/bin/musl-threads-static`) |
-| The same as position-independent executables | Needs `ET_DYN` loading (4.1) |
+| C and Rust as static position-independent executables | Run, at a random address (`musl-hello-static-pie`, `rust-hello-static-pie`) |
 | Go, static | Runs: the runtime's threads, goroutines on every CPU, a channel, a garbage collection (`tests/fixtures/bin/go-hello-static`). No signal has to be delivered for that; the runtime sends itself some (to preempt goroutines that do not yield) and carries on when they do not arrive |
 | .NET Native AOT, static, musl, fixed address | Runs: the runtime, eight managed threads that allocate, a garbage collection that stops them (`tests/fixtures/bin/dotnet-hello-static`). No signal has to be delivered: the collector stops threads through `membarrier` and the checks compiled into managed code |
 | .NET as its tools build it (`dotnet publish -r linux-x64 --self-contained`) | The goal ([roadmap 9](todo.md)). Dynamically linked against glibc: needs `ET_DYN` and `PT_INTERP` loading, file-backed `mmap`, glibc in the image, and for the JIT runtime signals |

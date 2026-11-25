@@ -1,8 +1,11 @@
 //! Validation of untrusted ELF64 executables.
 //!
 //! `parse` checks a whole image before anything is mapped and returns the
-//! segments to load. An image that passes cannot ask for memory outside the
-//! range the caller allows, for two segments in one page, for a writable and
+//! segments to load. Two kinds are accepted: executables linked for fixed
+//! addresses (`ET_EXEC`) and position-independent ones (`ET_DYN`: PIE
+//! programs, the dynamic loader), whose addresses count from wherever the
+//! loader puts them (`Image.fitsAt`). An image that passes cannot ask for
+//! memory outside the range the caller allows, for two segments in one page, for a writable and
 //! executable page, or for more memory than the caller's limit. This module
 //! has no kernel dependencies, so it is tested and fuzzed on the host;
 //! `elf.zig` does the mapping.
@@ -29,7 +32,8 @@ pub const Error = error{
     BadMagic,
     /// Not a 64-bit little-endian x86-64 file.
     NotX86_64,
-    /// Not a statically linked executable (`ET_EXEC`).
+    /// Neither an executable (`ET_EXEC`) nor a position-independent one
+    /// (`ET_DYN`).
     NotExecutable,
     /// Wrong version or header sizes, or a program header table that is
     /// empty, too long or outside the file.
@@ -45,10 +49,18 @@ pub const Error = error{
     BadEntry,
     /// A segment is both writable and executable.
     WritableExecutable,
-    /// A valid file that needs something the loader does not do: an ELF
-    /// interpreter (dynamic linking).
+    /// A `PT_INTERP` header that does not name a path: outside the file,
+    /// empty, too long, not ending in a NUL or with one in the middle, or
+    /// a second such header.
+    BadInterpreter,
+    /// A valid file that needs something the loader does not do.
     Unsupported,
 };
+
+/// Longest interpreter path, without its NUL.
+pub const MAX_INTERP = 255;
+const ET_EXEC = 2;
+const ET_DYN = 3;
 
 /// What an image is allowed to ask for.
 pub const Limits = struct {
@@ -99,6 +111,26 @@ pub const Image = struct {
     /// or 0 if no segment contains it. A C library finds its thread-local
     /// data through it (`AT_PHDR`).
     phdr_vaddr: u64 = 0,
+    /// Position independent (`ET_DYN`): every address above and in the
+    /// segments counts from a base the loader chooses and adds.
+    dynamic: bool = false,
+    /// The first page of the lowest segment and the end of the highest,
+    /// as addresses in the file's terms.
+    lowest: u64 = 0,
+    highest: u64 = 0,
+    /// Path of the program that is to load this one (`PT_INTERP`: the
+    /// dynamic loader), without its NUL; inside `bytes`.
+    interp: ?[]const u8 = null,
+
+    /// Whether the image, moved up by `bias`, lies inside the addresses
+    /// `limits` allows. Always true for bias 0 of an image that is not
+    /// position independent: `parse` checked.
+    pub fn fitsAt(self: *const Image, bias: u64, limits: Limits) bool {
+        if (bias % PAGE_SIZE != 0) return false;
+        const low = add(self.lowest, bias) orelse return false;
+        const high = add(self.highest, bias) orelse return false;
+        return low >= limits.min_addr and high <= limits.max_addr;
+    }
 
     /// Iterate over the segments to load, in file order.
     pub fn segments(self: *const Image) Iterator {
@@ -168,27 +200,36 @@ fn loadSegment(image: []const u8, phoff: usize, index: usize) ?Segment {
 /// load. Nothing in the file is trusted, and all arithmetic on its values is
 /// overflow checked.
 ///
-/// Accepted: a 64-bit little-endian x86-64 `ET_EXEC` file, version 1, with
-/// standard header sizes and 1 to `MAX_PHDRS` program headers inside the
-/// file. Every non-empty `PT_LOAD` segment must
+/// Accepted: a 64-bit little-endian x86-64 `ET_EXEC` or `ET_DYN` file,
+/// version 1, with standard header sizes and 1 to `MAX_PHDRS` program
+/// headers inside the file. Every non-empty `PT_LOAD` segment must
 /// - have its data inside the file and `filesz <= memsz`;
 /// - have an alignment that is zero or a power of two, with the address and
 ///   the file offset equal modulo that alignment and modulo the page size
 ///   (the address itself need not be page aligned);
-/// - lie inside `[limits.min_addr, limits.max_addr)`;
+/// - lie inside `[limits.min_addr, limits.max_addr)`; in a position-
+///   independent file, where addresses start near zero, the segments
+///   together must be no longer than that range (the loader then picks a
+///   base with `Image.fitsAt`);
 /// - have at least one permission, and not be writable and executable at
 ///   once;
 /// - share no page with another segment.
 ///
 /// The pages of all segments together may not exceed `limits.max_bytes`, and
 /// the entry point must be inside an executable segment. `PT_LOAD` segments
-/// with `memsz` 0 and other segment types are ignored, except `PT_INTERP`,
-/// which is rejected.
+/// with `memsz` 0 and other segment types are ignored, except `PT_INTERP`:
+/// the path it names is returned (`Image.interp`), and it must be one.
 pub fn parse(image: []const u8, limits: Limits) Error!Image {
     if (image.len < EHDR_SIZE or r32(image, 0) != 0x464C_457F) return error.BadMagic; // "\x7fELF"
     if (image[4] != 2 or image[5] != 1 or r16(image, 18) != 0x3E) return error.NotX86_64; // 64-bit, little endian, x86-64
     if (image[6] != 1 or r32(image, 20) != 1 or r16(image, 52) != EHDR_SIZE) return error.BadHeader; // both versions, e_ehsize
-    if (r16(image, 16) != 2) return error.NotExecutable; // ET_EXEC
+    const dynamic = switch (r16(image, 16)) {
+        ET_EXEC => false,
+        ET_DYN => true,
+        else => return error.NotExecutable,
+    };
+    if (limits.max_addr < limits.min_addr) return error.BadSegment;
+    const span = limits.max_addr - limits.min_addr;
 
     const phentsize = r16(image, 54);
     const phnum: usize = r16(image, 56);
@@ -199,11 +240,25 @@ pub fn parse(image: []const u8, limits: Limits) Error!Image {
     const entry = r64(image, 24);
     var entry_ok = false;
     var total: u64 = 0;
+    var lowest: u64 = std.math.maxInt(u64);
+    var highest: u64 = 0;
+    var interp: ?[]const u8 = null;
     for (0..phnum) |i| {
         const ph = phdr(image, phoff, i);
         switch (r32(ph, 0)) {
             PT_LOAD => {},
-            PT_INTERP => return error.Unsupported,
+            PT_INTERP => {
+                if (interp != null) return error.BadInterpreter;
+                const off = r64(ph, 8);
+                const size = r64(ph, 32);
+                if (size < 2 or size > MAX_INTERP + 1) return error.BadInterpreter;
+                if (off > image.len or image.len - off < size) return error.BadInterpreter;
+                const path = image[@intCast(off)..][0..@intCast(size - 1)];
+                if (image[@intCast(off + size - 1)] != 0) return error.BadInterpreter;
+                if (std.mem.indexOfScalar(u8, path, 0) != null) return error.BadInterpreter;
+                interp = path;
+                continue;
+            },
             else => continue,
         }
         if (r64(ph, 32) > r64(ph, 40)) return error.BadSegment; // filesz > memsz
@@ -214,7 +269,11 @@ pub fn parse(image: []const u8, limits: Limits) Error!Image {
         const file_end = add(seg.file_off, seg.filesz) orelse return error.BadSegment;
         const mem_end = add(seg.vaddr, seg.memsz) orelse return error.BadSegment;
         if (file_end > image.len) return error.BadSegment;
-        if (seg.vaddr < limits.min_addr or mem_end > limits.max_addr) return error.BadSegment;
+        if (dynamic) {
+            if (mem_end > span) return error.BadSegment;
+        } else if (seg.vaddr < limits.min_addr or mem_end > limits.max_addr) return error.BadSegment;
+        lowest = @min(lowest, seg.start());
+        highest = @max(highest, seg.end());
 
         if (alignment & (alignment -% 1) != 0) return error.BadSegment; // zero or a power of two
         if (alignment > 1 and (seg.vaddr ^ seg.file_off) & (alignment - 1) != 0) return error.BadSegment;
@@ -247,5 +306,16 @@ pub fn parse(image: []const u8, limits: Limits) Error!Image {
             break;
         }
     }
-    return .{ .entry = entry, .pages = total / PAGE_SIZE, .bytes = image, .phoff = phoff, .phnum = phnum, .phdr_vaddr = phdr_vaddr };
+    return .{
+        .entry = entry,
+        .pages = total / PAGE_SIZE,
+        .bytes = image,
+        .phoff = phoff,
+        .phnum = phnum,
+        .phdr_vaddr = phdr_vaddr,
+        .dynamic = dynamic,
+        .lowest = lowest,
+        .highest = highest,
+        .interp = interp,
+    };
 }

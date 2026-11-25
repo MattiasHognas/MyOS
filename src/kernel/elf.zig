@@ -1,8 +1,12 @@
-//! Loader for static x86-64 ELF executables.
+//! Loader for x86-64 ELF executables.
 //!
-//! `elf_image.parse` validates the whole image first; `load` then copies each
-//! `PT_LOAD` segment into freshly allocated pages of a user address space.
-//! Nothing is allocated for an image that fails validation.
+//! `elf_image.parse` validates the whole image first; `loadAt` then copies
+//! each `PT_LOAD` segment into freshly allocated pages of a user address
+//! space, moved up by a base the caller chose if the image is position
+//! independent. Nothing is allocated for an image that fails validation.
+//! Relocating a position-independent image is its own business (a static
+//! PIE does it in its startup code, the dynamic loader for itself and
+//! then for the program).
 
 const vmm = @import("../arch/x86_64/vmm.zig");
 const elf_image = @import("elf_image.zig");
@@ -17,6 +21,9 @@ pub const Error = elf_image.Error || error{OutOfMemory};
 pub const Loaded = struct {
     /// Entry point of the program.
     entry: u64,
+    /// What was added to the image's addresses (0 unless it is position
+    /// independent).
+    bias: u64 = 0,
     /// Pages allocated for its segments.
     pages: u64,
     /// Address of its program headers in memory (0 if they are not
@@ -48,12 +55,26 @@ pub const Loaded = struct {
 /// the segment's permissions.
 pub fn load(root: u64, image: []const u8, limits: elf_image.Limits, regions: ?*vm_regions.Regions) Error!Loaded {
     const img = try elf_image.parse(image, limits);
+    // A position-independent image goes to the lowest address allowed,
+    // or stays where it is if that is higher.
+    const bias = if (img.dynamic and img.lowest < limits.min_addr) limits.min_addr - img.lowest else 0;
+    if (!img.fitsAt(bias, limits)) return error.BadSegment;
+    return loadAt(root, &img, bias, regions);
+}
+
+/// `load` for an image that is parsed already, with `bias` added to all
+/// its addresses: 0 for an image linked for fixed addresses, otherwise a
+/// base for which `img.fitsAt` holds.
+pub fn loadAt(root: u64, img: *const elf_image.Image, bias: u64, regions: ?*vm_regions.Regions) Error!Loaded {
+    const image = img.bytes;
     var image_end: u64 = 0;
 
     if (img.pages + img.pages / 256 + 128 > pmm.free_pages) return error.OutOfMemory;
 
     var it = img.segments();
-    while (it.next()) |seg| {
+    while (it.next()) |unmoved| {
+        var seg = unmoved;
+        seg.vaddr += bias;
         var pte: u64 = vmm.USER;
         if (seg.writable) pte |= vmm.WRITABLE;
         if (!seg.executable) pte |= vmm.NX;
@@ -84,5 +105,12 @@ pub fn load(root: u64, image: []const u8, limits: elf_image.Limits, regions: ?*v
             };
         }
     }
-    return .{ .entry = img.entry, .pages = img.pages, .phdr = img.phdr_vaddr, .phnum = img.phnum, .end = image_end };
+    return .{
+        .entry = img.entry + bias,
+        .bias = bias,
+        .pages = img.pages,
+        .phdr = if (img.phdr_vaddr != 0) img.phdr_vaddr + bias else 0,
+        .phnum = img.phnum,
+        .end = image_end,
+    };
 }

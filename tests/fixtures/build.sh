@@ -12,6 +12,10 @@
 #                       musl and clang: `zig cc -target x86_64-linux-musl`)
 #   musl-threads-static C with pthreads: mutex, condition variable, barrier,
 #                       thread-local storage, join, a timed wait
+#   musl-hello-static-pie, rust-hello-static-pie
+#                       the C and the Rust program as static PIEs: loaded
+#                       at a random address, relocated by their own startup
+#                       code
 #   go-hello-static     Go (no cgo): goroutines, a channel, the garbage
 #                       collector
 #   rust-hello-static   Rust with its standard library, statically linked
@@ -34,6 +38,13 @@ zig cc -target x86_64-linux-musl -static -no-pie -O2 -s -pthread \
 
 rustc -O --target x86_64-unknown-linux-musl -C relocation-model=static \
     -C strip=symbols -o bin/rust-hello-static src/hello.rs
+
+# The same two as static position-independent executables, which is what
+# both toolchains build unless told otherwise (for Zig's clang: -pie).
+zig cc -target x86_64-linux-musl -static -fPIE -pie -O2 -s \
+    -o bin/musl-hello-static-pie src/hello.c
+rustc -O --target x86_64-unknown-linux-musl -C strip=symbols \
+    -o bin/rust-hello-static-pie src/hello.rs
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' \
     -o bin/go-hello-static src/hello.go

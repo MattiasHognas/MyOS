@@ -130,7 +130,6 @@ test "elf image: header fields" {
     try expectError(error.BadHeader, check(.{ .version = 2 }));
     try expectError(error.BadHeader, check(.{ .ehsize = 52 }));
     try expectError(error.NotExecutable, check(.{ .typ = 1 })); // ET_REL
-    try expectError(error.NotExecutable, check(.{ .typ = 3 })); // ET_DYN
     try expectError(error.NotExecutable, check(.{ .typ = 4 })); // ET_CORE
 }
 
@@ -273,8 +272,76 @@ test "elf image: entry point" {
     try expectError(error.BadEntry, check(.{ .entry = 0x40_0000, .phdrs = &.{.{ .offset = 0x1123, .vaddr = 0x40_0123 }} }));
 }
 
-test "elf image: dynamically linked executables are refused" {
-    try expectError(error.Unsupported, check(.{ .phdrs = &.{ .{}, .{ .typ = 3, .flags = 4, .offset = 0x1000, .vaddr = 0x40_0000, .filesz = 16, .memsz = 16 } } }));
+/// A `PT_INTERP` header for `size` bytes of the file at 0x1800.
+fn interpHeader(size: u64) Ph {
+    return .{ .typ = 3, .flags = 4, .offset = 0x1800, .vaddr = 0x40_0800, .filesz = size, .memsz = size };
+}
+
+/// The image of `spec` with `path` at 0x1800, where `interpHeader` points.
+fn withInterp(spec: Spec, path: []const u8) []const u8 {
+    const image = build(spec);
+    @memcpy(image_buf[0x1800..][0..path.len], path);
+    return image;
+}
+
+test "elf image: the interpreter a program names" {
+    const path = "/lib64/ld-linux-x86-64.so.2";
+    const img = try parse(withInterp(.{ .phdrs = &.{ .{}, interpHeader(path.len + 1) } }, path), limits);
+    try std.testing.expectEqualStrings(path, img.interp.?);
+    try expectEqual(1, loads(&img).len); // the header itself loads nothing
+    try expectEqual(null, (try check(.{})).interp);
+
+    // The longest path, and one more.
+    const long = "/" ++ &@as([elf_image.MAX_INTERP - 1]u8, @splat('a'));
+    try std.testing.expectEqualStrings(long, (try parse(withInterp(.{ .phdrs = &.{ .{}, interpHeader(long.len + 1) } }, long), limits)).interp.?);
+    try expectError(error.BadInterpreter, parse(withInterp(.{ .phdrs = &.{ .{}, interpHeader(long.len + 2) } }, long ++ "a"), limits));
+    // Not a string: no NUL at its end, one in the middle, empty.
+    try expectError(error.BadInterpreter, parse(withInterp(.{ .phdrs = &.{ .{}, interpHeader(path.len) } }, path), limits));
+    try expectError(error.BadInterpreter, parse(withInterp(.{ .phdrs = &.{ .{}, interpHeader(path.len + 1) } }, "/lib\x00/ld.so.1234567890123456789"), limits));
+    try expectError(error.BadInterpreter, check(.{ .phdrs = &.{ .{}, interpHeader(1) } }));
+    try expectError(error.BadInterpreter, check(.{ .phdrs = &.{ .{}, interpHeader(0) } }));
+    // Outside the file, with and without overflow.
+    try expectError(error.BadInterpreter, check(.{ .phdrs = &.{ .{}, .{ .typ = 3, .offset = 0x1FF0, .filesz = 0x20 } } }));
+    try expectError(error.BadInterpreter, check(.{ .phdrs = &.{ .{}, .{ .typ = 3, .offset = 0x2001, .filesz = 4 } } }));
+    try expectError(error.BadInterpreter, check(.{ .phdrs = &.{ .{}, .{ .typ = 3, .offset = ~@as(u64, 0) - 2, .filesz = 8 } } }));
+    // Two of them.
+    try expectError(error.BadInterpreter, parse(withInterp(.{ .phdrs = &.{ .{}, interpHeader(path.len + 1), interpHeader(path.len + 1) } }, path), limits));
+}
+
+test "elf image: position-independent executables" {
+    // Addresses count from zero; the loader adds a base.
+    const pie: Spec = .{ .typ = 3, .entry = 0x1000, .phdrs = &.{ .{ .vaddr = 0x1000 }, data(0x3000) } };
+    const img = try check(pie);
+    try expect(img.dynamic);
+    try expectEqual(0x1000, img.entry);
+    try expectEqual(0x1000, img.lowest);
+    try expectEqual(0x5000, img.highest);
+    try expectEqual(0x1000, loads(&img)[0].vaddr);
+    try expect(!(try check(.{})).dynamic);
+
+    // Where it may go: page-aligned bases that keep it inside the limits.
+    try expect(img.fitsAt(0x5555_5555_4000, limits));
+    try expect(!img.fitsAt(0x5555_5555_4800, limits)); // not a page
+    try expect(!img.fitsAt(0, limits)); // below the lowest address allowed
+    try expect(img.fitsAt(limits.min_addr - 0x1000, limits));
+    try expect(img.fitsAt(limits.max_addr - 0x5000, limits));
+    try expect(!img.fitsAt(limits.max_addr - 0x4000, limits));
+    try expect(!img.fitsAt(~@as(u64, 0xFFF), limits)); // the sum overflows
+    // One linked for fixed addresses fits where it is and nowhere else.
+    const fixed = try check(.{});
+    try expect(fixed.fitsAt(0, limits) and !fixed.fitsAt(limits.max_addr, limits));
+
+    // The same rules as for any image, in its own terms.
+    try expectError(error.BadEntry, check(.{ .typ = 3, .entry = 0x40_0000, .phdrs = &.{.{ .vaddr = 0x1000 }} }));
+    try expectError(error.Overlap, check(.{ .typ = 3, .entry = 0x1000, .phdrs = &.{ .{ .vaddr = 0x1000 }, data(0x2000) } }));
+    try expectError(error.WritableExecutable, check(.{ .typ = 3, .entry = 0x1000, .phdrs = &.{.{ .vaddr = 0x1000, .flags = 7 }} }));
+    // Longer than the addresses there are: no base could fit it.
+    const span = limits.max_addr - limits.min_addr;
+    try expectError(error.BadSegment, check(.{ .typ = 3, .entry = 0x1000, .phdrs = &.{ .{ .vaddr = 0x1000 }, data(span) } }));
+    try expectError(error.BadSegment, check(.{ .typ = 3, .entry = 0x1000, .phdrs = &.{ .{ .vaddr = 0x1000 }, data(~@as(u64, 0xFFF)) } }));
+    _ = try check(.{ .typ = 3, .entry = 0x1000, .phdrs = &.{ .{ .vaddr = 0x1000 }, data(span - 0x2000) } });
+    // A segment at address zero is fine here.
+    _ = try check(.{ .typ = 3, .entry = 0, .phdrs = &.{.{ .vaddr = 0 }} });
 }
 
 /// Check everything `parse` promises about an image it accepted.
@@ -286,7 +353,10 @@ fn expectSound(img: *const elf_image.Image, image: []const u8) !void {
     for (segs, 0..) |*s, i| {
         try expect(s.memsz > 0 and s.filesz <= s.memsz);
         try expect(s.file_off <= image.len and s.filesz <= image.len - s.file_off);
-        try expect(s.start() >= limits.min_addr and s.end() <= limits.max_addr);
+        if (img.dynamic) {
+            try expect(s.end() <= limits.max_addr - limits.min_addr);
+            try expect(s.start() >= img.lowest and s.end() <= img.highest);
+        } else try expect(s.start() >= limits.min_addr and s.end() <= limits.max_addr);
         try expect(s.start() <= s.vaddr and s.vaddr + s.memsz <= s.end());
         try expect(!(s.writable and s.executable));
         for (segs[0..i]) |*o| try expect(s.end() <= o.start() or o.end() <= s.start());
@@ -296,6 +366,11 @@ fn expectSound(img: *const elf_image.Image, image: []const u8) !void {
     try expect(total <= limits.max_bytes);
     try expectEqual(total / elf_image.PAGE_SIZE, img.pages);
     try expect(entry_ok);
+    if (img.interp) |path| {
+        try expect(path.len >= 1 and path.len <= elf_image.MAX_INTERP);
+        try expect(@intFromPtr(path.ptr) >= @intFromPtr(image.ptr) and @intFromPtr(path.ptr) + path.len < @intFromPtr(image.ptr) + image.len);
+        try expect(std.mem.indexOfScalar(u8, path, 0) == null and path.ptr[path.len] == 0);
+    }
 }
 
 test "elf image: fuzz with mutated and random images" {

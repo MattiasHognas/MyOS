@@ -120,6 +120,12 @@ pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
 /// Lowest address a program may be loaded at. The first 64 KiB stay unmapped
 /// (as on Linux), so a null pointer faults even with a small offset added.
 pub const IMAGE_MIN: u64 = 0x1_0000;
+/// Where a position-independent program is loaded: at a random page up to
+/// `PIE_RANDOM_PAGES` (1 TiB, Linux's 28 bits) above this, which is where
+/// Linux starts too. Its `brk` heap follows it; `mmap` works down from
+/// the stack, far above.
+pub const PIE_BASE: u64 = 0x5555_5555_4000;
+pub const PIE_RANDOM_PAGES: u64 = 1 << 28;
 /// Most memory the segments of one program may take under the default limits.
 pub const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Size of a process's descriptor table, and so the most `Limits.max_files` can allow.
@@ -601,6 +607,83 @@ pub fn teardown(p: *Process) void {
     release(p);
 }
 
+/// Put on the new stack what the program finds there: arguments,
+/// environment and the auxiliary vector, laid out as on Linux
+/// (`startup_stack.zig`), ending at `data_top`. `interp_base` is where
+/// the interpreter was loaded, 0 without one. Returns the stack pointer
+/// the program starts with. Not inlined, for the reason given at
+/// `loadInterpreter`.
+noinline fn writeStartupData(
+    name: []const u8,
+    options: SpawnOptions,
+    loaded: *const elf.Loaded,
+    interp_base: u64,
+    stack_pages: *const [STACK_PAGES]u64,
+    stack_top: u64,
+    data_top: u64,
+) !u64 {
+    var random_bytes: [16]u8 = undefined;
+    random.bytes(&random_bytes);
+    const start_args: startup_stack.Args = .{
+        .argv = if (options.argv.len != 0) options.argv else &.{name},
+        .envp = options.envp,
+        .execfn = name,
+        .random = random_bytes,
+        .phdr = loaded.phdr,
+        .phent = elf_image.PHDR_SIZE,
+        .phnum = loaded.phnum,
+        .entry = loaded.entry,
+        .base = interp_base,
+        .hwcap = cpu.cpuid(1, 0).edx,
+        .clktck = timer.HZ,
+    };
+    const start_size = startup_stack.size(start_args) catch return error.ArgumentsTooLong;
+    if (start_size > abi.ARG_MAX) return error.ArgumentsTooLong;
+    const start_block = try heap.allocator.alloc(u8, start_size);
+    defer heap.allocator.free(start_block);
+    const entry_rsp = startup_stack.build(start_block, data_top, start_args) catch unreachable; // it has the size asked for
+    copyToStack(stack_pages, stack_top, entry_rsp, start_block);
+    return entry_rsp;
+}
+
+/// Load the program `image` into the empty address space `root`. A
+/// position-independent one goes where Linux puts one: two thirds up the
+/// address space, at a random page from there if `randomize`. Also
+/// returns the path of the interpreter it names, if any (inside `image`).
+/// Not inlined, for the reason given at `loadInterpreter`.
+noinline fn loadProgram(root: u64, image: []const u8, limits: elf_image.Limits, randomize: bool, regions: *vm_regions.Regions) !struct { loaded: elf.Loaded, interp: ?[]const u8 } {
+    const img = try elf_image.parse(image, limits);
+    const bias = if (img.dynamic) blk: {
+        const base = PIE_BASE + (if (randomize) random.below(PIE_RANDOM_PAGES) * pmm.PAGE_SIZE else 0);
+        if (base < img.lowest or !img.fitsAt(base - img.lowest, limits)) return error.BadSegment;
+        break :blk base - img.lowest;
+    } else 0;
+    return .{ .loaded = try elf.loadAt(root, &img, bias, regions), .interp = img.interp };
+}
+
+/// Load the program at `path` into the address space `root` as the
+/// interpreter of the program that is there already (its dynamic loader).
+/// A position-independent one goes where `mmap` would put it: the highest
+/// free place below `mmap_top`. Fails with `error.FileNotFound`,
+/// `error.Unsupported` if it names an interpreter of its own (one level,
+/// as on Linux), or as `elf.loadAt` does.
+///
+/// A function of its own, never inlined, to keep the image and its
+/// headers off the stack frame of `spawn`.
+noinline fn loadInterpreter(root: u64, path: []const u8, limits: elf_image.Limits, regions: *vm_regions.Regions, mmap_top: u64) !elf.Loaded {
+    const node = vfs.lookup(path) orelse return error.FileNotFound;
+    const image = try heap.allocator.alloc(u8, node.size);
+    defer heap.allocator.free(image);
+    if (vfs.read(&node, 0, image) != node.size) return error.ReadFailed;
+    const img = try elf_image.parse(image, limits);
+    if (img.interp != null) return error.Unsupported;
+    const bias = if (img.dynamic) blk: {
+        const at = regions.findFree(img.highest - img.lowest, IMAGE_MIN, mmap_top) orelse return error.OutOfMemory;
+        break :blk at - img.lowest;
+    } else 0;
+    return elf.loadAt(root, &img, bias, regions);
+}
+
 /// Create a process named `name` that runs the ELF executable `image`.
 ///
 /// Creates a new address space, loads `image` into it (`image` is copied and
@@ -623,7 +706,9 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     // the stack. They become the process's once it exists.
     var regions: vm_regions.Regions = .{};
     errdefer regions.deinit(heap.allocator);
-    const loaded = try elf.load(root, image, imageLimits(limits), &regions);
+    const image_limits_now = imageLimits(limits);
+    const program = try loadProgram(root, image, image_limits_now, options.randomize, &regions);
+    const loaded = &program.loaded;
 
     // Where the stack goes, and how far below its top the program's
     // startup data ends (a multiple of 16 bytes), so that nothing on the
@@ -645,31 +730,26 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         stack_pages[i] = phys;
     }
 
-    // What the program finds on its stack: arguments, environment and the
-    // auxiliary vector, laid out as on Linux (`startup_stack.zig`).
-    var random_bytes: [16]u8 = undefined;
-    random.bytes(&random_bytes);
-    const start_args: startup_stack.Args = .{
-        .argv = if (options.argv.len != 0) options.argv else &.{name},
-        .envp = options.envp,
-        .execfn = name,
-        .random = random_bytes,
-        .phdr = loaded.phdr,
-        .phent = elf_image.PHDR_SIZE,
-        .phnum = loaded.phnum,
-        .entry = loaded.entry,
-        .hwcap = cpu.cpuid(1, 0).edx,
-        .clktck = timer.HZ,
-    };
-    const start_size = startup_stack.size(start_args) catch return error.ArgumentsTooLong;
-    if (start_size > abi.ARG_MAX) return error.ArgumentsTooLong;
-    const start_block = try heap.allocator.alloc(u8, start_size);
-    defer heap.allocator.free(start_block);
-    const entry_rsp = startup_stack.build(start_block, data_top, start_args) catch unreachable; // it has the size asked for
-    copyToStack(&stack_pages, stack_top, entry_rsp, start_block);
+    // A program that names an interpreter (the dynamic loader) is not
+    // started itself: the interpreter is loaded beside it and started,
+    // and finds the program through the auxiliary vector.
+    const mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE;
+    var interp_limits = image_limits_now;
+    interp_limits.max_bytes -|= loaded.pages * pmm.PAGE_SIZE;
+    var first_entry = loaded.entry;
+    var interp_base: u64 = 0;
+    var interp_pages: u64 = 0;
+    if (program.interp) |path| {
+        const interp = try loadInterpreter(root, path, interp_limits, &regions, mmap_top);
+        first_entry = interp.entry;
+        interp_base = interp.bias;
+        interp_pages = interp.pages;
+    }
+
+    const entry_rsp = try writeStartupData(name, options, loaded, interp_base, &stack_pages, stack_top, data_top);
 
     // Everything the process takes, now that its page tables exist.
-    const pages = loaded.pages + STACK_PAGES + vmm.userTablePages(root) + kstack.STACK_PAGES;
+    const pages = loaded.pages + interp_pages + STACK_PAGES + vmm.userTablePages(root) + kstack.STACK_PAGES;
     if (pages > limits.max_pages) return error.TooLarge;
 
     const p = try heap.allocator.create(Process);
@@ -682,7 +762,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     console.* = .{ .kind = .console, .refs = 3 };
     p.* = .{
         .root = root,
-        .entry = loaded.entry,
+        .entry = first_entry,
         .stack_top = stack_top,
         .entry_rsp = entry_rsp,
         .name = name_copy,
@@ -694,7 +774,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
             .regions = regions,
             .brk_start = loaded.end,
             .brk_end = loaded.end,
-            .mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE,
+            .mmap_top = mmap_top,
         },
     };
     for (p.files[0..3]) |*slot| slot.* = console;

@@ -36,6 +36,9 @@ pub const Args = struct {
     phent: u64,
     phnum: u64,
     entry: u64,
+    /// Where the program's interpreter (the dynamic loader) was put; 0
+    /// without one (`AT_BASE`).
+    base: u64 = 0,
     /// CPUID.1:EDX.
     hwcap: u64,
     /// Timer ticks per second.
@@ -122,7 +125,7 @@ pub fn build(mem: []u8, top: u64, a: Args) Error!u64 {
         .{ AT.PHDR, a.phdr },
         .{ AT.PHENT, a.phent },
         .{ AT.PHNUM, a.phnum },
-        .{ AT.BASE, 0 },
+        .{ AT.BASE, a.base },
         .{ AT.FLAGS, 0 },
         .{ AT.ENTRY, a.entry },
         .{ AT.UID, 0 },

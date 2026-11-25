@@ -122,7 +122,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages (a JIT later needs pages that go from writable to executable with `mprotect`, never both at once; see 9.3).
   - A segment that is both writable and executable is refused (`error.WritableExecutable`), and so is one with no permissions at all.
   - x86-64 pages are always readable, so write-only and execute-only segments are readable too.
-- [x] Refuse dynamically linked executables (`PT_INTERP`) with `error.Unsupported` instead of starting them without their interpreter (until 9.3).
+- [x] Refuse dynamically linked executables (`PT_INTERP`) with `error.Unsupported` instead of starting them without their interpreter (until 9.3). Since 9.3 the interpreter is loaded.
 - [x] Roll back every allocated page and table on loading failure.
 - [x] Add malformed and truncated ELF tests.
 - [x] Split ELF header/segment validation from page mapping so it runs in host tests, and fuzz it there.
@@ -252,7 +252,7 @@ From the code review before 2.2. None of these fix a known hole; they shrink wha
 - [x] Randomize the kernel's load address and the user stack (KASLR/ASLR).
   - The kernel is a position-independent executable, and `kaslr: yes` in `limine.conf` has the bootloader load it at a random address in the top 2 GiB. Backtraces take the offset into account and print it. `MYOS_KASLR=no scripts/build.sh` turns it off for debuggers.
   - Each process's stack ends at a random page in a 16 GiB range, and its initial stack pointer is at a random 16-byte step within the last half page.
-  - Moved to 4.1: the program's own load address, which needs position-independent programs.
+  - Done in 4.1: a position-independent program's own load address is random.
   - Not randomized: the kernel's direct map of physical memory, its heap, its stacks and the device window, which are at fixed addresses (`randomise_hhdm_base: no`, because a random direct map could land on the fixed regions). See 13.
 - [x] Poison freed heap memory and freed pages in debug builds to catch use-after-free (`-Dpoison`, on in Debug builds and the test kernel).
   - A freed heap block is filled with 0xDD and checked when it is handed out again: a write after free is a panic naming the address, the byte and its offset (the `use_after_free` scenario).
@@ -388,8 +388,8 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 - [x] Pass arguments and environment to spawned programs (`process.SpawnOptions`, and `myos_run(path, argv, envp)` from user space; at most 8 KiB and 256 strings together, `E2BIG` beyond).
 - [x] Update the Zig user startup code to read arguments/environment: programs are entered as Linux programs are (`rsp` at `argc`, on a 16-byte boundary), `app/lib.zig` has the `_start` that calls `main`, and `lib.argv`, `lib.environ` and `lib.auxValue`.
 - [x] Parse command lines with arguments and basic quoting (`app/cmdline.zig`, tested on the host; the shell passes the arguments and its own environment).
-- [ ] Load position-independent executables (`ET_DYN`) at a chosen load bias.
-- [ ] Choose that load bias at random for each process (moved from 2.9, which randomized the stack and the kernel), with `process.SpawnOptions.randomize` turning it off as it does for the stack. Fixed-address executables (`ET_EXEC`) cannot be moved. Test that two runs of a PIE get different bases.
+- [x] Load position-independent executables (`ET_DYN`) at a chosen load bias: `elf_image.parse` accepts them and says what they span, `process.spawn` picks the base (`PIE_BASE`, where Linux starts too, plus a random page within 1 TiB unless the layout is fixed) and `elf.loadAt` adds it. Relocating is the program's own business.
+- [x] Choose that load bias at random for each process (moved from 2.9, which randomized the stack and the kernel), with `process.SpawnOptions.randomize` turning it off as it does for the stack. Fixed-address executables (`ET_EXEC`) cannot be moved. Test that two runs of a PIE get different bases. Tested: four runs, four bases, one base with the layout fixed.
 - [ ] Give each thread its own FS base: `arch_prctl(ARCH_SET_FS)`, saved and restored on context switch; enable FSGSBASE when the CPU has it.
   - Done: `arch_prctl` with all four codes, FS and GS base per thread, loaded when the thread gets a CPU, and refused outside user space. Open: FSGSBASE stays off (programs fall back to `arch_prctl`), until `isr_paranoid` is changed as the next point says.
   - Before FSGSBASE is enabled, change `isr_paranoid` (`src/arch/x86_64/idt.zig`): it takes a GS base with the top bit set to be the kernel's, and with `wrgsbase` a program can load such a value, so an NMI or debug exception would run on the user's GS base. Save the GS base on entry, load this CPU's own unconditionally, and restore the saved one on exit, as Linux does. Test from ring 3: set a kernel-looking GS base, single-step into a syscall, and expect the kernel to survive.
@@ -408,9 +408,9 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 
 ### 4.3 Fixtures
 - [x] Keep prebuilt fixture binaries (with the commands that built them) and run them as QEMU tests, checking their output: `tests/fixtures/` (`build.sh` has the commands), packaged as `/fixtures/` in the test image and `/bin/` in the normal one.
-- [ ] Run a static and a static-PIE musl hello-world built on Linux, with arguments and environment.
-  - The static one runs, on one and on four CPUs: it prints its arguments and environment through musl's `printf` and exits with its argument count. The static-PIE one waits for `ET_DYN` loading.
-- [ ] Test malformed `ET_DYN` images and an unknown syscall number from ring 3.
+- [x] Run a static and a static-PIE musl hello-world built on Linux, with arguments and environment.
+  - Both run, on one and on four CPUs: they print their arguments and environment through musl's `printf` and exit with their argument count. So does the Rust program as a static PIE, which is what `rustc` builds for musl unless told otherwise.
+- [x] Test malformed `ET_DYN` images and an unknown syscall number from ring 3: host tests for the parser (span longer than the address space, bases that do not fit, overflow, the usual rules in the image's own terms; the fuzz test covers both kinds), `/test/syscalls` for unknown numbers.
 
 **Milestone 4 done when:** An unmodified static musl hello-world built on Linux prints its arguments on MyOS, as a CI test on several CPUs.
 
@@ -594,7 +594,7 @@ These are dynamically linked against glibc, so MyOS loads the dynamic loader, ma
 
 ### 9.3 Dynamic linking and the JIT runtime
 Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
-- [ ] Load position-independent executables (`ET_DYN`, 4.1) and the ELF interpreter named by `PT_INTERP`, with `AT_BASE`, `AT_PHDR` and `AT_ENTRY` in the auxiliary vector, so dynamically linked programs run with the unmodified loader and shared libraries from the filesystem.
+- [x] Load position-independent executables (`ET_DYN`, 4.1) and the ELF interpreter named by `PT_INTERP`, with `AT_BASE`, `AT_PHDR` and `AT_ENTRY` in the auxiliary vector, so dynamically linked programs run with the unmodified loader and shared libraries from the filesystem. The interpreter goes where `mmap` would put it, the highest free place below the stack; one that names an interpreter itself is refused, as on Linux. Tested with a C program standing in for the loader; malformed `PT_INTERP` headers on the host, missing and unusable interpreters in the kernel tests.
 - [ ] File-backed `mmap` (5), private and copy-on-write, with the permissions of each segment.
 - [ ] The calls a loader finds libraries with: `openat`, `fstat`, `pread64`, `readlink`, `access`, `getdents64`, `getcwd`.
 - [ ] Ship glibc's loader and libraries (`ld-linux-x86-64.so.2`, `libc.so.6`, `libm`, `libstdc++`, `libgcc_s`) in the image.

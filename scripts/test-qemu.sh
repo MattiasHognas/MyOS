@@ -222,6 +222,9 @@ run_scenario() {
             expect_line '^argv\[2\]=MyOS$'
             expect_line '^sum of squares below 100000: 333328333350000$'
             expect_line '^GREETING=hi rust$'
+            # The same C and Rust programs as position-independent executables.
+            expect_line '^env GREETING=hi pie$'
+            expect_line '^GREETING=hi rust pie$'
             # A program past its memory limit is told so, and killed like any fault.
             expect_line '^\*\*\* thread [0-9]+ \(/test/vm\): no memory for the page it touched'
             expect_line '^\*\*\* thread [0-9]+ \(/test/vm\): Page fault in user mode \(vector 14, error 0x[0-9a-f]+\), killed$'
