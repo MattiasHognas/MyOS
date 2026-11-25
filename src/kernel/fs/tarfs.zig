@@ -44,6 +44,15 @@ fn isDirectory(_: *anyopaque, path: []const u8) bool {
     return false;
 }
 
+/// `vfs.Fs.next` implementation: the cookie is the offset of the next
+/// archive header to look at.
+fn nextEntry(_: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?vfs.DirEntry {
+    var offset: usize = @intCast(cookie.*);
+    defer cookie.* = offset;
+    const entry = tar.nextInDirectory(archive, tar.normalize(dir), &offset, name_buf) orelse return null;
+    return .{ .name = entry.name, .kind = if (entry.directory) .directory else .file };
+}
+
 /// `vfs.Ops.read` implementation: copy up to `buf.len` bytes starting at
 /// `offset` into `buf`. Returns the number of bytes copied, or 0 if `offset`
 /// is at or beyond the end of the file.
@@ -65,5 +74,5 @@ pub fn init(image: []const u8) vfs.Fs {
     while (tar.next(archive, &off)) |e| {
         if (tar.isFile(e)) log.debug("/{s}{s}{s} ({d} bytes)", .{ e.prefix, if (e.prefix.len != 0) "/" else "", e.name, e.data.len });
     }
-    return .{ .ctx = undefined, .lookup = lookup, .is_dir = isDirectory };
+    return .{ .ctx = undefined, .lookup = lookup, .is_dir = isDirectory, .next = nextEntry };
 }

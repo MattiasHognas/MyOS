@@ -58,8 +58,8 @@ pub fn main() noreturn {
     // open: kernel pointer, path too long, empty path, missing file, write access.
     expect(lib.syscall(Sys.open, KERNEL_PTR, 0, 0) == err(.FAULT)); // 9
     expect(lib.syscall(Sys.open, longPath(300), 0, 0) == err(.NAMETOOLONG)); // 10
-    expect(lib.syscall(Sys.open, longPath(256), 0, 0) == err(.NAMETOOLONG)); // 11: 256 bytes + NUL
-    expect(lib.syscall(Sys.open, longPath(255), 0, 0) == err(.NOENT)); // 12: the longest path that fits
+    expect(lib.syscall(Sys.open, longPath(257), 0, 0) == err(.NAMETOOLONG)); // 11: a name of 256 bytes
+    expect(lib.syscall(Sys.open, longPath(256), 0, 0) == err(.NOENT)); // 12: the longest name there can be
     expect(lib.open("") == err(.NOENT)); // 13
     expect(lib.open("/does/not/exist") == err(.NOENT)); // 14
     expect(lib.syscall(Sys.open, @intFromPtr(path), lib.abi.O.WRONLY, 0) == err(.ROFS)); // 15

@@ -35,6 +35,85 @@ pub const Entry = struct {
     }
 };
 
+/// The entry's whole name in `buf` (its two parts with a slash between
+/// them), or null if it does not fit.
+pub fn fullName(e: Entry, buf: []u8) ?[]const u8 {
+    if (e.prefix.len == 0) {
+        if (e.name.len > buf.len) return null;
+        @memcpy(buf[0..e.name.len], e.name);
+        return buf[0..e.name.len];
+    }
+    const len = e.prefix.len + 1 + e.name.len;
+    if (len > buf.len) return null;
+    @memcpy(buf[0..e.prefix.len], e.prefix);
+    buf[e.prefix.len] = '/';
+    @memcpy(buf[e.prefix.len + 1 ..][0..e.name.len], e.name);
+    return buf[0..len];
+}
+
+/// What a name contributes to a listing of the directory `dir`
+/// (normalized; empty for the root): the name of the entry of `dir` it is
+/// or is below, and whether it is that entry itself (`exact`) or
+/// something inside it, which makes the entry a directory. Null if the
+/// name is not below `dir`.
+pub fn childOf(full: []const u8, dir: []const u8) ?struct { name: []const u8, exact: bool } {
+    var rest = full;
+    if (dir.len != 0) {
+        if (full.len <= dir.len + 1 or !std.mem.startsWith(u8, full, dir) or full[dir.len] != '/') return null;
+        rest = full[dir.len + 1 ..];
+    }
+    if (rest.len == 0) return null;
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return .{ .name = rest, .exact = true };
+    return .{ .name = rest[0..slash], .exact = false };
+}
+
+/// Longest whole name `fullName` can give: both parts and the slash.
+pub const MAX_NAME = 155 + 1 + 100;
+
+/// The next entry of the directory `dir` (normalized; empty for the root)
+/// in `archive`, starting at the header at `offset.*`, which is moved past
+/// the member that gave it. Each name is given once, where it first
+/// appears: as a file, as a directory with an entry of its own, or as a
+/// directory that exists only because something is inside it.
+pub fn nextInDirectory(archive: []const u8, dir: []const u8, offset: *usize, name_buf: []u8) ?struct { name: []const u8, directory: bool } {
+    var full_buf: [MAX_NAME]u8 = undefined;
+    var earlier_buf: [MAX_NAME]u8 = undefined;
+    while (true) {
+        const at = offset.*;
+        const e = next(archive, offset) orelse return null;
+        const full = fullName(e, &full_buf) orelse continue;
+        const child = childOf(full, dir) orelse continue;
+        // Seen before? Then an earlier member had the same name here.
+        var seen = false;
+        var scan: usize = 0;
+        while (scan < at) {
+            const other = next(archive, &scan) orelse break;
+            const other_full = fullName(other, &earlier_buf) orelse continue;
+            const other_child = childOf(other_full, dir) orelse continue;
+            if (std.mem.eql(u8, other_child.name, child.name)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen or child.name.len > name_buf.len) continue;
+        // A directory, unless it is a file itself. (A name that is a file
+        // here and has something inside it there is a broken archive; the
+        // first word on it stands.)
+        var directory = !child.exact or !isFile(e);
+        if (!directory) {
+            // ... or a later member lies inside it.
+            var ahead = offset.*;
+            while (next(archive, &ahead)) |later| {
+                const later_full = fullName(later, &earlier_buf) orelse continue;
+                const later_child = childOf(later_full, dir) orelse continue;
+                if (!later_child.exact and std.mem.eql(u8, later_child.name, child.name)) directory = true;
+            }
+        }
+        @memcpy(name_buf[0..child.name.len], child.name);
+        return .{ .name = name_buf[0..child.name.len], .directory = directory };
+    }
+}
+
 /// Parse an octal number from a tar header field, stopping at the first
 /// non-octal character (NUL or space).
 fn octal(field: []const u8) u64 {

@@ -448,19 +448,20 @@ Designed once, demand-paged from the start, instead of an eager `mmap` first and
 Every syscall added here takes Linux's number, signature and struct layout (`stat`, `timespec`, `iovec`, `dirent64`, `pollfd`, ...) from the start.
 
 ### 6.1 VFS and directories
-- [ ] Distinguish regular files from directories in VFS nodes.
-- [ ] Add directory lookup and `readdir` operations (`getdents64`).
+- [x] Distinguish regular files from directories in VFS nodes. Done by path, not by node: a filesystem says whether a path is a directory (`Fs.is_dir`) and lists it (`Fs.next`); a `Node` stays a file. The image's filesystem has no directory records to hand out, and nothing needed one.
+- [x] Add directory lookup and `readdir` operations (`getdents64`). `vfs.next` with a cookie the filesystem defines; `getdents64` on a directory descriptor, with "." and ".." and the entries of `/proc` and `/dev`.
 - [x] Add `stat`-like metadata queries (`fstat`/`newfstatat`). Done with 9.3: `fstat`, `newfstatat`, `stat`, `lstat`, for files, directories, pipes, the console and the entries of `/proc` and `/dev`.
-- [ ] Normalize paths and handle `.` and `..`.
-- [ ] Raise the longest path from 255 bytes to Linux's 4095 (`PATH_MAX` 4096). Paths are copied to a buffer on the 16 KiB kernel stack today (2.5), which is why the limit is low; the buffer has to move to the heap first. Relative paths and a current directory belong here too.
-- [ ] Add mount-point traversal so multiple filesystems can coexist.
+- [x] Normalize paths and handle `.` and `..`. `vfs.normalize`, before anything is looked up; every path call goes through it (`Path.from` in `syscall.zig`).
+- [x] Raise the longest path from 255 bytes to Linux's 4095 (`PATH_MAX` 4096). Paths are copied to a buffer on the 16 KiB kernel stack today (2.5), which is why the limit is low; the buffer has to move to the heap first. Relative paths and a current directory belong here too. Paths are copied to heap memory now (two buffers of 4096 bytes for each path call: what the program gave, and what it comes to).
+- [x] Add mount-point traversal so multiple filesystems can coexist. `vfs.mount`: a path goes to the filesystem mounted at its longest matching prefix; mount points and the way to them show up in listings. Tested on the host with three filesystems; the kernel mounts only the root until the next item.
 - [ ] Add create/write/truncate/unlink/mkdir operations to the VFS interface.
 - [ ] Add a small in-memory filesystem (ramfs) mounted at `/tmp`, so redirection (6.3) has somewhere to write and the write API is proven before FAT32 (11.5).
-- [ ] Define consistent VFS error codes that map onto the syscall error codes (2.5).
+- [x] Define consistent VFS error codes that map onto the syscall error codes (2.5). `vfs.Error`, each with its Linux number in `syscall.vfsError`.
 - [ ] Test directory lookup, `readdir`, `stat`, `.`/`..` normalization, mount traversal and error codes (host tests with fake filesystems, plus initrd tests in QEMU).
+  - Done: host tests with fake filesystems for normalization, mounts, shadowing and listings (`tests/host/vfs_test.zig`); from ring 3 listings of the root, `/etc`, `/dev` and `/proc/self`, small buffers, rewinding, relative paths from a descriptor and from the working directory, a child inheriting it, long paths (`/test/files`). Open: nothing is mounted in the kernel besides the root, so mount traversal is tested on the host only until `/tmp` exists.
 - [ ] Test ramfs create, write, read-back, truncate, unlink and out-of-memory on the host and from ring 3.
-- [ ] Run the tarfs parser in host tests and fuzz it with malformed archives.
-  - Done: the archive format is `fs/tar.zig`, with host tests for walking headers, truncated archives and names stored in two parts (`tests/host/tar_test.zig`). Open: fuzzing it with malformed archives.
+- [x] Run the tarfs parser in host tests and fuzz it with malformed archives.
+  - The archive format is `fs/tar.zig`, with host tests for walking headers, truncated archives, names stored in two parts and listings, and a fuzz test: three thousand damaged archives, walked and listed, must end and stay inside the archive.
 
 ### 6.2 Descriptors and I/O
 - [x] Reserve FDs 0/1/2 for stdin/stdout/stderr: a process starts with the three open on the console, as one open file with three descriptors (`open_file.zig`). They are closed, duplicated and replaced like any other.

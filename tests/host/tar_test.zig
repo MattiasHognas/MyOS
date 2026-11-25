@@ -107,3 +107,135 @@ test "tar: names are normalized" {
     try testing.expectEqualStrings("", tar.normalize("/"));
     try testing.expectEqualStrings("", tar.normalize("./"));
 }
+
+/// Every name `nextInDirectory` gives for `dir`, with a slash after the
+/// directories, joined with spaces.
+fn listing(archive: []const u8, dir: []const u8, out: []u8) []const u8 {
+    var off: usize = 0;
+    var len: usize = 0;
+    var name_buf: [256]u8 = undefined;
+    while (tar.nextInDirectory(archive, dir, &off, &name_buf)) |e| {
+        if (len != 0) {
+            out[len] = ' ';
+            len += 1;
+        }
+        @memcpy(out[len..][0..e.name.len], e.name);
+        len += e.name.len;
+        if (e.directory) {
+            out[len] = '/';
+            len += 1;
+        }
+    }
+    return out[0..len];
+}
+
+test "tar: what a directory holds, each name once" {
+    // As `tar` writes a tree: directories have entries of their own, the
+    // root's is "./".
+    const archive = build(&.{
+        .{ .name = "./", .typ = '5' },
+        .{ .name = "./etc/", .typ = '5' },
+        .{ .name = "./etc/motd", .data = "hi" },
+        .{ .name = "./bin/", .typ = '5' },
+        .{ .name = "./bin/sh" },
+        .{ .name = "./bin/hello" },
+        .{ .name = "./lib/x86_64/libc.so", .prefix = "" }, // "lib" and "x86_64" have no entries
+        .{ .name = "libm.so", .prefix = "lib/x86_64" }, // a name in two parts
+        .{ .name = "./empty/", .typ = '5' },
+        .{ .name = "./top" },
+    });
+    var out: [256]u8 = undefined;
+    try testing.expectEqualStrings("etc/ bin/ lib/ empty/ top", listing(archive, "", &out));
+    try testing.expectEqualStrings("motd", listing(archive, "etc", &out));
+    try testing.expectEqualStrings("sh hello", listing(archive, "bin", &out));
+    try testing.expectEqualStrings("x86_64/", listing(archive, "lib", &out));
+    try testing.expectEqualStrings("libc.so libm.so", listing(archive, "lib/x86_64", &out));
+    try testing.expectEqualStrings("", listing(archive, "empty", &out));
+    try testing.expectEqualStrings("", listing(archive, "nothing", &out));
+    try testing.expectEqualStrings("", listing(archive, "etc/motd", &out)); // a file holds nothing
+    try testing.expectEqualStrings("", listing(archive, "et", &out)); // a prefix of a name is not the name
+}
+
+test "tar: a listing goes on where it stopped" {
+    const archive = build(&.{ .{ .name = "a" }, .{ .name = "b/c" }, .{ .name = "b/d" }, .{ .name = "e" } });
+    var off: usize = 0;
+    var name_buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("a", tar.nextInDirectory(archive, "", &off, &name_buf).?.name);
+    const resume_at = off; // what a directory descriptor keeps between two calls
+    try testing.expectEqualStrings("b", tar.nextInDirectory(archive, "", &off, &name_buf).?.name);
+    try testing.expectEqualStrings("e", tar.nextInDirectory(archive, "", &off, &name_buf).?.name);
+    try expectEqual(null, tar.nextInDirectory(archive, "", &off, &name_buf));
+    try expectEqual(null, tar.nextInDirectory(archive, "", &off, &name_buf)); // and stays at the end
+    off = resume_at;
+    try testing.expectEqualStrings("b", tar.nextInDirectory(archive, "", &off, &name_buf).?.name);
+    // A name longer than the caller's buffer is left out, not cut.
+    var tiny: [1]u8 = undefined;
+    const long = build(&.{ .{ .name = "long-name" }, .{ .name = "x" } });
+    off = 0;
+    try testing.expectEqualStrings("x", tar.nextInDirectory(long, "", &off, &tiny).?.name);
+}
+
+test "tar: the entry of a directory a name belongs to" {
+    try testing.expectEqualStrings("bin", tar.childOf("bin/hello", "").?.name);
+    try expect(!tar.childOf("bin/hello", "").?.exact and tar.childOf("bin", "").?.exact);
+    try testing.expectEqualStrings("hello", tar.childOf("bin/hello", "bin").?.name);
+    try expect(tar.childOf("bin/hello", "bin").?.exact);
+    try testing.expectEqualStrings("x", tar.childOf("a/b/x/y/z", "a/b").?.name);
+    try expectEqual(null, tar.childOf("bin", "bin")); // not below itself
+    try expectEqual(null, tar.childOf("binary/x", "bin"));
+    try expectEqual(null, tar.childOf("etc/motd", "bin"));
+    try expectEqual(null, tar.childOf("", ""));
+}
+
+test "tar: fuzz with damaged archives" {
+    // Whatever is in the headers, walking and listing must end and must
+    // stay inside the archive (the bounds checks of a test build would
+    // stop it otherwise).
+    var prng: std.Random.DefaultPrng = .init(0x7461722d66757a7a);
+    const random = prng.random();
+    var name_buf: [64]u8 = undefined;
+    var copy: [16 * 512]u8 = undefined;
+    for (0..3000) |round| {
+        const good = build(&.{
+            .{ .name = "./etc/", .typ = '5' },
+            .{ .name = "./etc/motd", .data = "Welcome\n" },
+            .{ .name = "hello", .prefix = "bin" },
+            .{ .name = "./lib/a/b/c", .data = &@as([700]u8, @splat('z')) },
+        });
+        @memcpy(copy[0..good.len], good);
+        var image = copy[0..good.len];
+        // Damage: some bytes anywhere, or in a header field that matters.
+        for (0..random.uintLessThan(usize, 12) + 1) |_| {
+            const header = random.uintLessThan(usize, image.len / 512) * 512;
+            const at = switch (random.uintLessThan(u8, 4)) {
+                0 => random.uintLessThan(usize, image.len),
+                1 => header + 124 + random.uintLessThan(usize, 12), // the size
+                2 => header + random.uintLessThan(usize, 100), // the name
+                else => header + 345 + random.uintLessThan(usize, 155), // the prefix
+            };
+            if (at < image.len) image[at] = random.int(u8);
+        }
+        if (round % 3 == 0) image = image[0..random.uintLessThan(usize, image.len + 1)]; // cut short
+
+        var off: usize = 0;
+        var members: usize = 0;
+        while (tar.next(image, &off)) |e| {
+            members += 1;
+            try expect(off <= image.len + 512 and members <= image.len / 512);
+            // The contents are inside the archive.
+            try expect(@intFromPtr(e.data.ptr) >= @intFromPtr(image.ptr) and @intFromPtr(e.data.ptr) + e.data.len <= @intFromPtr(image.ptr) + image.len);
+            _ = e.named("etc/motd");
+            _ = e.below("lib/a");
+        }
+        for ([_][]const u8{ "", "etc", "lib/a", "bin" }) |dir| {
+            var at: usize = 0;
+            var entries: usize = 0;
+            while (tar.nextInDirectory(image, dir, &at, &name_buf)) |entry| {
+                entries += 1;
+                try expect(entry.name.len != 0 and entry.name.len <= name_buf.len);
+                try expect(std.mem.indexOfScalar(u8, entry.name, '/') == null);
+                try expect(entries <= image.len / 512);
+            }
+        }
+    }
+}

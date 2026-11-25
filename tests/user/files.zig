@@ -37,6 +37,44 @@ fn openFlags(path: [*:0]const u8, flags: u64) u64 {
 }
 
 var text: [8192]u8 = undefined;
+var long_path: [4200]u8 = undefined;
+var list_buf: [2048]u8 = undefined;
+var dents: [1024]u8 align(8) = undefined;
+
+/// The names `getdents64` gives for the directory `fd` from where it
+/// stands, joined with spaces.
+fn listing(fd: u64) []const u8 {
+    var len: usize = 0;
+    while (true) {
+        const n = lib.syscall(Sys.getdents64, fd, @intFromPtr(&dents), dents.len);
+        if (lib.isError(n)) lib.exit(190);
+        if (n == 0) break;
+        var at: usize = 0;
+        while (at < n) {
+            const reclen = std.mem.readInt(u16, dents[at + 16 ..][0..2], .little);
+            if (reclen < 20 or reclen % 8 != 0 or at + reclen > n) lib.exit(191);
+            const name = std.mem.sliceTo(dents[at + 19 .. at + reclen], 0);
+            if (std.mem.readInt(u64, dents[at..][0..8], .little) == 0) lib.exit(192); // an inode number is never 0
+            if (len != 0) {
+                list_buf[len] = ' ';
+                len += 1;
+            }
+            @memcpy(list_buf[len..][0..name.len], name);
+            len += name.len;
+            at += reclen;
+        }
+    }
+    return list_buf[0..len];
+}
+
+/// Whether the listing `names` has the name `name`.
+fn has(names: []const u8, name: []const u8) bool {
+    var it = std.mem.splitScalar(u8, names, ' ');
+    while (it.next()) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
 
 /// Read the whole file at `path` into `text`.
 fn slurp(path: [*:0]const u8) []const u8 {
@@ -61,8 +99,9 @@ pub fn main() noreturn {
     expect(kind("/etc/motd") == S.IFREG and kind("/et") == 0 and kind("/etc/mot") == 0 and kind("/etc/motd/x") == 0, 2);
     expect(lib.syscall(Sys.access, @intFromPtr("/etc"), abi.ACCESS.R_OK | abi.ACCESS.X_OK, 0) == 0, 3);
     expect(lib.syscall(Sys.readlink, @intFromPtr("/etc"), bufp, buf.len) == lib.err(.INVAL), 4); // no link
-    // One cannot be opened yet; a file is not one.
-    expect(lib.open("/etc") == lib.err(.ACCES), 5);
+    // One is opened for reading only; a file is not one.
+    const etc = lib.open("/etc");
+    expect(!lib.isError(etc), 5);
     expect(openFlags("/etc", abi.O.WRONLY) == lib.err(.ISDIR), 6);
     expect(openFlags("/etc/motd", abi.O.DIRECTORY) == lib.err(.NOTDIR), 7);
     expect(openFlags("/sys/devices/system/node", abi.O.DIRECTORY) == lib.err(.NOENT), 8);
@@ -71,6 +110,102 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.lstat, @intFromPtr("/etc/motd"), @intFromPtr(&st), 0) == 0 and st.size == 17, 9);
     expect(lib.syscall(Sys.stat, @intFromPtr("/nothing"), @intFromPtr(&st), 0) == lib.err(.NOENT), 10);
     expect(lib.syscall(Sys.stat, @intFromPtr("/etc/motd"), 8, 0) == lib.err(.FAULT), 11);
+
+    // --- A directory descriptor: listed, and a place for paths to start.
+    expect(lib.syscall(Sys.fstat, etc, @intFromPtr(&st), 0) == 0 and st.mode & S.IFMT == S.IFDIR, 110);
+    expect(lib.read(etc, &buf) == lib.err(.ISDIR) and lib.syscall(Sys.write, etc, bufp, 1) == lib.err(.BADF), 111);
+    expect(lib.syscall(Sys.fcntl, etc, 3, 0) == abi.O.RDONLY | abi.O.DIRECTORY, 112);
+    expect(std.mem.eql(u8, listing(etc), ". .. motd"), 113);
+    expect(std.mem.eql(u8, listing(etc), ""), 114); // at the end it stays at the end
+    expect(lib.syscall(Sys.lseek, etc, 0, abi.SEEK.SET) == 0 and std.mem.eql(u8, listing(etc), ". .. motd"), 115); // from the start again
+    expect(lib.syscall(Sys.lseek, etc, 5, abi.SEEK.SET) == lib.err(.INVAL) and lib.syscall(Sys.lseek, etc, 0, abi.SEEK.END) == lib.err(.INVAL), 116);
+    // A buffer for one entry at a time gives them one at a time; one too
+    // small for the next entry is an error, not a short answer.
+    _ = lib.syscall(Sys.lseek, etc, 0, abi.SEEK.SET);
+    var small: [24]u8 align(8) = undefined;
+    expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 24) == 24 and small[19] == '.' and small[20] == 0, 117);
+    expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 24) == 24 and small[20] == '.', 118);
+    expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 20) == lib.err(.INVAL), 119); // "motd" needs 24
+    expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 24) == 24 and std.mem.eql(u8, small[19..23], "motd") and small[18] == abi.DT.REG, 120);
+    expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 24) == 0, 121);
+    expect(lib.syscall(Sys.getdents64, etc, 8, 4096) == lib.err(.INVAL) or lib.syscall(Sys.getdents64, etc, 8, 4096) == 0, 122);
+    expect(lib.syscall(Sys.getdents64, 99, bufp, 64) == lib.err(.BADF), 123);
+    const motd_for_dents = lib.open("/etc/motd");
+    expect(lib.syscall(Sys.getdents64, motd_for_dents, bufp, 64) == lib.err(.NOTDIR), 124);
+    // The root holds what the image holds, and /proc and /dev besides.
+    const root_dir = lib.open("/");
+    const root_list = listing(root_dir);
+    expect(std.mem.startsWith(u8, root_list, ". .. proc dev "), 125);
+    expect(has(root_list, "etc") and has(root_list, "bin") and has(root_list, "test") and !has(root_list, "motd"), 126);
+    expect(std.mem.count(u8, root_list, "etc") == 1 and std.mem.count(u8, root_list, "dev") == 1, 127); // each once
+    _ = lib.close(root_dir);
+    const dev_dir = lib.open("/dev");
+    expect(std.mem.eql(u8, listing(dev_dir), ". .. null urandom random"), 128);
+    _ = lib.close(dev_dir);
+    const self_dir = lib.open("/proc/self/");
+    expect(std.mem.eql(u8, listing(self_dir), ". .. exe maps stat"), 129);
+    _ = lib.close(self_dir);
+    // What is in the directory, by a path that starts at its descriptor.
+    const rel = lib.syscall(Sys.openat, etc, @intFromPtr("motd"), 0);
+    expect(!lib.isError(rel) and lib.read(rel, buf[0..7]) == 7 and std.mem.eql(u8, buf[0..7], "Welcome"), 130);
+    _ = lib.close(rel);
+    expect(lib.syscall6(Sys.newfstatat, etc, @intFromPtr("./motd"), @intFromPtr(&st), 0, 0, 0) == 0 and st.size == 17, 131);
+    expect(lib.syscall6(Sys.newfstatat, etc, @intFromPtr("../bin/hello"), @intFromPtr(&st), 0, 0, 0) == 0, 132);
+    expect(lib.syscall6(Sys.newfstatat, etc, @intFromPtr("../../../etc/motd"), @intFromPtr(&st), 0, 0, 0) == 0, 133); // ".." stops at the root
+    expect(lib.syscall(Sys.openat, etc, @intFromPtr("nothing"), 0) == lib.err(.NOENT), 134);
+    expect(lib.syscall(Sys.openat, motd_for_dents, @intFromPtr("x"), 0) == lib.err(.NOTDIR), 135); // a file is no place to start
+    expect(lib.syscall(Sys.openat, 99, @intFromPtr("x"), 0) == lib.err(.BADF), 136);
+    const absolute = lib.syscall(Sys.openat, 99, @intFromPtr("/etc/motd"), 0);
+    expect(!lib.isError(absolute) and lib.close(absolute) == 0, 137); // absolute: the descriptor does not matter
+    _ = lib.close(motd_for_dents);
+    // A slash at the end asks for a directory.
+    expect(lib.open("/etc/motd/") == lib.err(.NOTDIR), 138);
+    expect(lib.syscall(Sys.stat, @intFromPtr("/etc/motd/"), @intFromPtr(&st), 0) == lib.err(.NOTDIR), 139);
+    expect(lib.syscall(Sys.stat, @intFromPtr("/etc//./"), @intFromPtr(&st), 0) == 0 and st.mode & S.IFMT == S.IFDIR, 140);
+
+    // --- The working directory: where relative paths start.
+    expect(lib.syscall(Sys.getcwd, bufp, buf.len, 0) == 2 and buf[0] == '/' and buf[1] == 0, 150);
+    const from_root = lib.open("etc/motd"); // relative to "/"
+    expect(!lib.isError(from_root) and lib.close(from_root) == 0, 151);
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/etc"), 0, 0) == 0, 152);
+    expect(lib.syscall(Sys.getcwd, bufp, buf.len, 0) == 5 and std.mem.eql(u8, buf[0..5], "/etc\x00"), 153);
+    expect(lib.syscall(Sys.getcwd, bufp, 4, 0) == lib.err(.RANGE) and lib.syscall(Sys.getcwd, 8, 64, 0) == lib.err(.FAULT), 154);
+    const in_etc = lib.open("motd");
+    expect(!lib.isError(in_etc) and lib.read(in_etc, buf[0..7]) == 7 and std.mem.eql(u8, buf[0..7], "Welcome"), 155);
+    _ = lib.close(in_etc);
+    expect(kind("motd") == S.IFREG and kind("./motd") == S.IFREG and kind("../etc/motd") == S.IFREG and kind(".") == S.IFDIR, 156);
+    expect(lib.syscall(Sys.chdir, @intFromPtr(".."), 0, 0) == 0 and kind("motd") == 0 and kind("etc/motd") == S.IFREG, 157);
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/etc/motd"), 0, 0) == lib.err(.NOTDIR), 158);
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/nothing"), 0, 0) == lib.err(.NOENT) and lib.syscall(Sys.chdir, 8, 0, 0) == lib.err(.FAULT), 159);
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/proc/self"), 0, 0) == 0 and lib.syscall(Sys.readlink, @intFromPtr("exe"), bufp, buf.len) == "/test/files".len, 160);
+    // By descriptor.
+    expect(lib.syscall(Sys.fchdir, etc, 0, 0) == 0 and kind("motd") == S.IFREG, 161);
+    expect(lib.syscall(Sys.fchdir, 1, 0, 0) == lib.err(.NOTDIR) and lib.syscall(Sys.fchdir, 99, 0, 0) == lib.err(.BADF), 162);
+    // A program started from here starts here: by a relative path, and
+    // it finds a file by a relative path in turn.
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/test"), 0, 0) == 0, 163);
+    expect(lib.run("entry_regs") == 0, 164);
+    expect(lib.run("./entry_regs") == 0 and lib.run("../test/entry_regs") == 0, 165);
+    expect(lib.run("nothing") == lib.err(.NOENT), 166);
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/"), 0, 0) == 0, 167);
+    _ = lib.close(etc);
+
+    // --- Long paths: up to 4095 bytes, each part up to 255.
+    @memset(&long_path, 'a');
+    var at: usize = 0;
+    while (at <= 4000) : (at += 200) long_path[at] = '/'; // parts of 199 bytes, and a last one of 94
+    long_path[4095] = 0; // 4095 bytes: the longest there is
+    expect(lib.syscall(Sys.stat, @intFromPtr(&long_path), @intFromPtr(&st), 0) == lib.err(.NOENT), 171);
+    long_path[4095] = 'a';
+    long_path[4096] = 0; // one more
+    expect(lib.syscall(Sys.stat, @intFromPtr(&long_path), @intFromPtr(&st), 0) == lib.err(.NAMETOOLONG), 172);
+    @memset(long_path[0..300], 'b');
+    long_path[0] = '/';
+    long_path[256] = 0; // one part of 255
+    expect(lib.syscall(Sys.stat, @intFromPtr(&long_path), @intFromPtr(&st), 0) == lib.err(.NOENT), 173);
+    long_path[256] = 'b';
+    long_path[257] = 0; // and of 256
+    expect(lib.syscall(Sys.stat, @intFromPtr(&long_path), @intFromPtr(&st), 0) == lib.err(.NAMETOOLONG), 174);
 
     // --- /proc/self/exe: how a program finds its own file.
     const pid = lib.syscall(Sys.getpid, 0, 0, 0);

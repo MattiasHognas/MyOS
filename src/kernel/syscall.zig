@@ -44,17 +44,76 @@ fn sysGetChar() u64 {
     return keyboard.read() orelse err(.INTR); // the process is ending: the result goes nowhere
 }
 
-/// Copy the NUL-terminated path at the user address `ptr` into `buf` and
-/// return it without the NUL. Errors are syscall results: `EFAULT` if it
-/// cannot be read, `ENAMETOOLONG` if it does not end within `PATH_MAX`
-/// bytes, `ENOENT` if it is empty.
-fn userPath(buf: *[abi.PATH_MAX]u8, ptr: u64) union(enum) { path: []const u8, fail: u64 } {
-    const len = uaccess.copyStringFromUser(buf, ptr) catch |e| return .{ .fail = switch (e) {
-        error.Fault => err(.FAULT),
-        error.TooLong => err(.NAMETOOLONG),
-    } };
-    if (len == 0) return .{ .fail = err(.NOENT) };
-    return .{ .path = buf[0..len] };
+/// `AT_FDCWD` as a system call argument.
+const CWD: u64 = @bitCast(@as(i64, abi.AT_FDCWD));
+
+/// A path a program gave, made absolute and plain (`vfs.normalize`):
+/// relative to the process's working directory, or to the directory a
+/// descriptor is open on, unless it starts with a slash. It lives in heap
+/// memory, two buffers of `PATH_MAX` bytes being too much for a kernel
+/// stack: `deinit` when done.
+const Path = struct {
+    storage: []u8,
+    text: []const u8,
+    /// The program ended it with a slash: it has to name a directory.
+    directory_wanted: bool,
+
+    fn deinit(self: *Path) void {
+        heap.allocator.free(self.storage);
+    }
+
+    /// The path at the user address `ptr`, relative to `dirfd` (`CWD` for
+    /// the working directory). Errors are system call results: `EFAULT`
+    /// if it cannot be read, `ENAMETOOLONG` if it or what it comes to does
+    /// not fit `PATH_MAX` bytes or has a part of more than 255, `ENOENT`
+    /// if it is empty, `EBADF` and `ENOTDIR` for a `dirfd` that is not an
+    /// open directory (only looked at for a relative path), `ENOMEM`.
+    fn from(dirfd: u64, ptr: u64) union(enum) { path: Path, fail: u64 } {
+        const p = thread.current().process orelse return .{ .fail = err(.NOSYS) };
+        const storage = heap.allocator.alloc(u8, 2 * abi.PATH_MAX) catch return .{ .fail = err(.NOMEM) };
+        const raw_buf = storage[0..abi.PATH_MAX];
+        // One byte less than the buffer: a path is at most `PATH_MAX - 1`
+        // bytes, so that it fits a buffer of `PATH_MAX` with its NUL.
+        const out = storage[abi.PATH_MAX..][0 .. abi.PATH_MAX - 1];
+        const fail: u64 = blk: {
+            const len = uaccess.copyStringFromUser(raw_buf, ptr) catch |e| break :blk switch (e) {
+                error.Fault => err(.FAULT),
+                error.TooLong => err(.NAMETOOLONG),
+            };
+            const raw = raw_buf[0..len];
+            if (len == 0) break :blk err(.NOENT);
+            const directory_wanted = raw[len - 1] == '/';
+            // The base is looked at only while it cannot change: the
+            // working directory under its lock, a directory's path while
+            // this call holds the open file.
+            const result = if (raw[0] == '/')
+                vfs.normalize(out, "/", raw)
+            else if (dirfd == CWD) with_cwd: {
+                const held = p.files_lock.acquire();
+                defer p.files_lock.release(held);
+                break :with_cwd vfs.normalize(out, p.cwd, raw);
+            } else with_dir: {
+                const of = getFile(dirfd) orelse break :blk err(.BADF);
+                defer putFile(of);
+                if (of.kind != .directory) break :blk err(.NOTDIR);
+                break :with_dir vfs.normalize(out, of.path, raw);
+            };
+            const text = result catch |e| break :blk vfsError(e);
+            return .{ .path = .{ .storage = storage, .text = text, .directory_wanted = directory_wanted } };
+        };
+        heap.allocator.free(storage);
+        return .{ .fail = fail };
+    }
+};
+
+/// The Linux error number for what the filesystem layer said.
+fn vfsError(e: vfs.Error) u64 {
+    return switch (e) {
+        error.NotFound => err(.NOENT),
+        error.NotDirectory => err(.NOTDIR),
+        error.IsDirectory => err(.ISDIR),
+        error.NameTooLong => err(.NAMETOOLONG),
+    };
 }
 
 /// The strings of an argument or environment list copied from user
@@ -119,17 +178,18 @@ fn copyStringList(ptr: u64, bytes_left: *usize, count_left: *usize) union(enum) 
 /// `myos_run`: spawn the program at the user path `ptr` as a child process,
 /// with the arguments `argv` and the environment `envp` (user arrays as for
 /// `execve`; null for none), and block until it exits. Returns the child's
-/// exit status (0-255), or an error: those of `userPath`, `ENOENT` (no such
+/// exit status (0-255), or an error: those of `Path.from`, `ENOENT` (no such
 /// file), `ENOEXEC` (not a loadable program), `E2BIG` (arguments and
 /// environment too long), `EFAULT`, `ENOMEM` (no memory, or the program is
 /// larger than the caller's memory limit) or `EAGAIN` (the caller, or a
 /// process above it, has as many descendants as it may).
 fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
-    var path_buf: [abi.PATH_MAX]u8 = undefined;
-    const path = switch (userPath(&path_buf, ptr)) {
+    var given = switch (Path.from(CWD, ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
+    defer given.deinit();
+    const path = given.text;
     var bytes_left: usize = abi.ARG_MAX;
     var count_left: usize = abi.ARG_COUNT_MAX;
     const args = switch (copyStringList(argv, &bytes_left, &count_left)) {
@@ -142,7 +202,15 @@ fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
         .fail => |e| return e,
     };
     defer env.deinit();
-    const child = proc.spawnPath(path, .{ .parent = thread.current().process, .argv = args.items(), .envp = env.items() }) catch |e| return switch (e) {
+    // The child starts in the directory this process is in now.
+    const me = thread.current().process.?;
+    const cwd = blk: {
+        const held = me.files_lock.acquire();
+        defer me.files_lock.release(held);
+        break :blk heap.allocator.dupe(u8, me.cwd);
+    } catch return err(.NOMEM);
+    defer heap.allocator.free(cwd);
+    const child = proc.spawnPath(path, .{ .parent = me, .argv = args.items(), .envp = env.items(), .cwd = cwd }) catch |e| return switch (e) {
         error.FileNotFound => err(.NOENT),
         error.OutOfMemory, error.TooLarge => err(.NOMEM),
         error.TooManyProcesses => err(.AGAIN),
@@ -259,7 +327,7 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
                 const len = @min(count, abi.MAX_RW_COUNT);
                 return if (user_range.valid(ptr, len)) len else err(.FAULT);
             },
-            .file, .pipe_read => return err(.BADF), // files are read-only
+            .file, .pipe_read, .directory => return err(.BADF), // files are read-only
         }
     }
     const len = @min(count, abi.MAX_RW_COUNT);
@@ -286,7 +354,7 @@ fn sysWritev(fd: u64, iov: u64, count: u64) u64 {
     {
         const of = getFile(fd) orelse return err(.BADF);
         defer putFile(of);
-        if (of.kind == .file or of.kind == .pipe_read) return err(.BADF);
+        if (of.kind == .file or of.kind == .pipe_read or of.kind == .directory) return err(.BADF);
     }
     if (count > abi.IOV_MAX) return err(.INVAL);
     var total: u64 = 0;
@@ -389,32 +457,38 @@ fn isOpen(fd: u64) bool {
     return true;
 }
 
-/// `open`: look up the user path `ptr` and store an `OpenFile` for it in the
-/// lowest free descriptor from 3 up. `flags` must ask for read-only access
-/// (`EROFS` otherwise: every filesystem is read-only); other flag bits and
-/// the mode are ignored. Returns the descriptor, or an error: those of
-/// `userPath`, `ENOENT`, `EMFILE` (the process has as many descriptors as
-/// its limit allows) or `ENOMEM`.
-fn sysOpen(ptr: u64, flags: u64) u64 {
-    var path_buf: [abi.PATH_MAX]u8 = undefined;
-    const path = switch (userPath(&path_buf, ptr)) {
+/// `open` and `openat`: open the file or directory at a path and return
+/// the lowest free descriptor for it. Files are read-only: `EROFS` for
+/// another access mode or `O_CREAT` of what does not exist; the devices
+/// in `/dev` may be opened for writing. A directory can be opened for
+/// reading only (`EISDIR`), to be listed (`getdents64`) or to open what
+/// is in it. `ENOTDIR` for `O_DIRECTORY` or a path ending in a slash that
+/// names something else. `ENOENT`, `EMFILE`, `ENOMEM`, and what `Path.from`
+/// says.
+fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
+    var given = switch (Path.from(dirfd, ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
+    defer given.deinit();
+    const path = given.text;
     const p = thread.current().process orelse return err(.BADF);
     const what = named(path);
+    const directory_wanted = given.directory_wanted or flags & abi.O.DIRECTORY != 0;
     var opened: OpenFile = .{};
     switch (what) {
         .none => return if (flags & abi.O.CREAT != 0) err(.ROFS) else err(.NOENT),
-        // Directories cannot be opened yet: there is nothing to do with
-        // one (no `getdents64`, no paths relative to it).
-        .directory => return if (flags & abi.O.ACCMODE != abi.O.RDONLY) err(.ISDIR) else err(.ACCES),
+        .directory => {
+            if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ISDIR);
+            opened.kind = .directory;
+            opened.path = heap.allocator.dupe(u8, path) catch return err(.NOMEM);
+        },
         .device => |kind| {
-            if (flags & abi.O.DIRECTORY != 0) return err(.NOTDIR);
+            if (directory_wanted) return err(.NOTDIR);
             opened.kind = kind; // may be opened for writing: what is written is thrown away
         },
         .file, .exe_link, .generated => {
-            if (flags & abi.O.DIRECTORY != 0) return err(.NOTDIR);
+            if (directory_wanted) return err(.NOTDIR);
             if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ROFS);
             if (what == .generated) {
                 const text = procfs.generate(what.generated, p) catch return err(.NOMEM);
@@ -427,7 +501,7 @@ fn sysOpen(ptr: u64, flags: u64) u64 {
 
     // Allocated before the table is locked, and freed again if it is full.
     const of = heap.allocator.create(OpenFile) catch {
-        if (opened.generated) |text| heap.allocator.free(text);
+        open_file.freeContents(&opened);
         return err(.NOMEM);
     };
     of.* = opened;
@@ -506,19 +580,6 @@ fn sysDup2(old: u64, new: u64, same_is_error: bool) u64 {
     return new;
 }
 
-/// `openat`: `open` for a path that is absolute, or relative to the
-/// current directory (`AT_FDCWD`), which is the root: there are no other
-/// directories to be relative to yet (`EBADF` for one).
-fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
-    const dir: i32 = @truncate(@as(i64, @bitCast(dirfd)));
-    if (dir != abi.AT_FDCWD) {
-        // An absolute path ignores the directory, as on Linux.
-        const first = fromUser(u8, ptr) orelse return err(.FAULT);
-        if (first != '/') return err(.BADF);
-    }
-    return sysOpen(ptr, flags);
-}
-
 /// Read up to `len` bytes of the open file `of` from `offset` into the
 /// user buffer at `ptr`. Returns the number of bytes read, short if a
 /// later part of the buffer cannot be written, or `EFAULT` if none could.
@@ -555,6 +616,7 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
         .pipe_read => return pipeRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
         .null_device => return 0,
         .random_device => return sysGetRandom(ptr, count),
+        .directory => return err(.ISDIR),
         // Nothing to read from the console yet.
         .console, .pipe_write => return err(.BADF),
     }
@@ -590,8 +652,16 @@ fn sysPread(fd: u64, ptr: u64, count: u64, offset: u64) u64 {
 fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
     const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
-    if (of.kind != .file) return err(.SPIPE);
     const p = thread.current().process.?;
+    if (of.kind == .directory) {
+        // A listing can be started again, and that is all.
+        if (whence != abi.SEEK.SET or offset != 0) return err(.INVAL);
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        of.offset = 0;
+        return 0;
+    }
+    if (of.kind != .file) return err(.SPIPE);
     const held = p.files_lock.acquire();
     defer p.files_lock.release(held);
     const base: i64 = switch (whence) {
@@ -713,19 +783,6 @@ fn fileStat(node: vfs.Node) abi.Stat {
     return st;
 }
 
-/// The path at `ptr`, which must be absolute unless `dirfd` is
-/// `AT_FDCWD`: there are no directories to be relative to (`ENOTDIR`),
-/// and the working directory is always "/".
-fn pathAt(buf: *[abi.PATH_MAX]u8, dirfd: u64, ptr: u64) union(enum) { path: []const u8, fail: u64 } {
-    const path = switch (userPath(buf, ptr)) {
-        .path => |p| p,
-        .fail => |e| return .{ .fail = e },
-    };
-    const dir: i32 = @truncate(@as(i64, @bitCast(dirfd)));
-    if (path[0] != '/' and dir != abi.AT_FDCWD) return .{ .fail = if (isOpen(dirfd)) err(.NOTDIR) else err(.BADF) };
-    return .{ .path = path };
-}
-
 /// `newfstatat`: `stat` of the file at a path, or of the descriptor
 /// itself with an empty path and `AT_EMPTY_PATH`. `ENOENT`, `EINVAL`
 /// for unknown flags, `EFAULT`.
@@ -735,12 +792,15 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
         const first = fromUser(u8, path_ptr) orelse return err(.FAULT);
         if (first == 0) return sysFstat(dirfd, stat_ptr);
     }
-    var path_buf: [abi.PATH_MAX]u8 = undefined;
-    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+    var given = switch (Path.from(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
-    const st = switch (named(path)) {
+    defer given.deinit();
+    const path = given.text;
+    const what = named(path);
+    if (given.directory_wanted and what != .directory and what != .none) return err(.NOTDIR);
+    const st = switch (what) {
         .none => return err(.NOENT),
         .directory => directoryStat(),
         .file => |node| fileStat(node),
@@ -765,11 +825,12 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
 /// with a read-only filesystem; then `EROFS`. With `must_exist` false
 /// (the call would make the file) a missing file is `EROFS` too.
 fn sysReadOnlyPath(dirfd: u64, path_ptr: u64, must_exist: bool) u64 {
-    var path_buf: [abi.PATH_MAX]u8 = undefined;
-    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+    var given = switch (Path.from(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
+    defer given.deinit();
+    const path = given.text;
     if (must_exist and named(path) == .none) return err(.NOENT);
     return err(.ROFS);
 }
@@ -778,11 +839,12 @@ fn sysReadOnlyPath(dirfd: u64, path_ptr: u64, must_exist: bool) u64 {
 /// never written (`EROFS`). `ENOENT`, `EINVAL` for an unknown mode.
 fn sysAccess(dirfd: u64, path_ptr: u64, mode: u64) u64 {
     if (mode & ~@as(u64, abi.ACCESS.R_OK | abi.ACCESS.W_OK | abi.ACCESS.X_OK) != 0) return err(.INVAL);
-    var path_buf: [abi.PATH_MAX]u8 = undefined;
-    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+    var given = switch (Path.from(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
+    defer given.deinit();
+    const path = given.text;
     if (named(path) == .none) return err(.NOENT);
     return if (mode & abi.ACCESS.W_OK != 0) err(.ROFS) else 0;
 }
@@ -792,11 +854,12 @@ fn sysAccess(dirfd: u64, path_ptr: u64, mode: u64) u64 {
 /// `/proc/self/exe`, by which a program finds its own file. `EINVAL` for
 /// what exists and is no link, or a size of zero; `ENOENT`; `EFAULT`.
 fn sysReadlink(dirfd: u64, path_ptr: u64, buf: u64, size: u64) u64 {
-    var path_buf: [abi.PATH_MAX]u8 = undefined;
-    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+    var given = switch (Path.from(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
+    defer given.deinit();
+    const path = given.text;
     switch (named(path)) {
         .none => return err(.NOENT),
         .file, .directory, .generated, .device => return err(.INVAL),
@@ -815,9 +878,161 @@ fn sysReadlink(dirfd: u64, path_ptr: u64, buf: u64, size: u64) u64 {
 /// with the NUL, as the system call does; `ERANGE` if the buffer is
 /// shorter, `EFAULT`.
 fn sysGetcwd(buf: u64, size: u64) u64 {
-    const cwd = [2]u8{ '/', 0 };
-    if (size < cwd.len) return err(.RANGE);
-    return if (toUser(buf, cwd)) cwd.len else err(.FAULT);
+    const p = thread.current().process orelse return err(.NOSYS);
+    // A copy, so that the program's memory is not touched under the lock.
+    const copy = heap.allocator.alloc(u8, abi.PATH_MAX) catch return err(.NOMEM);
+    defer heap.allocator.free(copy);
+    const len = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        @memcpy(copy[0..p.cwd.len], p.cwd); // normalized paths are shorter than PATH_MAX
+        break :blk p.cwd.len;
+    };
+    copy[len] = 0;
+    if (size < len + 1) return err(.RANGE);
+    uaccess.copyToUser(buf, copy[0 .. len + 1]) catch return err(.FAULT);
+    return len + 1;
+}
+
+/// `chdir` and `fchdir`: make the directory at a path, or the one a
+/// descriptor is open on, the process's working directory, which relative
+/// paths start from. `ENOENT`, `ENOTDIR`; `EBADF` for a descriptor that is
+/// not open; `ENOMEM`.
+fn sysChdir(path_ptr: u64) u64 {
+    var given = switch (Path.from(CWD, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    return switch (named(given.text)) {
+        .none => err(.NOENT),
+        .directory => setCwd(given.text),
+        else => err(.NOTDIR),
+    };
+}
+
+fn sysFchdir(fd: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind != .directory) return err(.NOTDIR);
+    return setCwd(of.path);
+}
+
+fn setCwd(path: []const u8) u64 {
+    const p = thread.current().process.?;
+    const new = heap.allocator.dupe(u8, path) catch return err(.NOMEM);
+    const old = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        const before = p.cwd;
+        p.cwd = new;
+        break :blk before;
+    };
+    heap.allocator.free(old);
+    return 0;
+}
+
+/// `getdents64`: the next entries of the directory `fd` is open on, as
+/// many as fit in `count` bytes at `buf`, in Linux's `struct
+/// linux_dirent64`. Returns the bytes stored, 0 at the end. "." and ".."
+/// come first. `EBADF`, `ENOTDIR`, `EFAULT`, `EINVAL` if not even one
+/// entry fits.
+///
+/// Two threads reading one directory descriptor at once each get entries;
+/// which gets which is not defined, as with a file.
+fn sysGetdents64(fd: u64, buf: u64, count: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind != .directory) return err(.NOTDIR);
+    const p = thread.current().process.?;
+    const len = @min(count, abi.MAX_RW_COUNT);
+    if (!user_range.valid(buf, len)) return err(.FAULT);
+
+    var position = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        break :blk of.offset;
+    };
+    var done: u64 = 0;
+    var name_buf: [vfs.NAME_MAX]u8 = undefined;
+    var record: [abi.DIRENT_HEADER + vfs.NAME_MAX + 8]u8 align(8) = undefined;
+    while (true) {
+        const before = position;
+        const entry = nextEntry(of.path, &position, &name_buf) orelse break;
+        const size = std.mem.alignForward(usize, abi.DIRENT_HEADER + entry.name.len + 1, 8);
+        if (size > len - done) {
+            position = before; // it comes with the next call
+            if (done == 0) return err(.INVAL);
+            break;
+        }
+        @memset(record[0..size], 0);
+        // An inode number, which is never 0: a hash of the name (FNV-1a;
+        // the standard library's hashes take kilobytes of stack unoptimized).
+        var ino: u64 = 0xcbf29ce484222325;
+        for (entry.name) |c| ino = (ino ^ c) *% 0x100000001b3;
+        std.mem.writeInt(u64, record[0..8], ino | 1, .little);
+        std.mem.writeInt(u64, record[8..16], position, .little);
+        std.mem.writeInt(u16, record[16..18], @intCast(size), .little);
+        record[18] = entry.type;
+        @memcpy(record[abi.DIRENT_HEADER..][0..entry.name.len], entry.name);
+        uaccess.copyToUser(buf + done, record[0..size]) catch return err(.FAULT);
+        done += size;
+    }
+    const held = p.files_lock.acquire();
+    defer p.files_lock.release(held);
+    of.offset = position;
+    return done;
+}
+
+/// One entry of a listing, for `getdents64`.
+const ListEntry = struct { name: []const u8, type: u8 };
+
+/// Positions of a listing before what the filesystem layer gives: "."
+/// and "..", then what this file adds to a directory (`extraEntries`).
+/// The filesystem layer's own positions follow, moved up by `LIST_BASE`.
+const LIST_BASE = 16;
+
+/// The entries of `/proc`, `/dev` and `/` that no filesystem holds.
+fn extraEntries(dir: []const u8) []const ListEntry {
+    const DIR = abi.DT.DIR;
+    const REG = abi.DT.REG;
+    if (std.mem.eql(u8, dir, "/")) return &.{ .{ .name = "proc", .type = DIR }, .{ .name = "dev", .type = DIR } };
+    if (std.mem.eql(u8, dir, "/dev")) return &.{
+        .{ .name = "null", .type = abi.DT.CHR },
+        .{ .name = "urandom", .type = abi.DT.CHR },
+        .{ .name = "random", .type = abi.DT.CHR },
+    };
+    if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG } };
+    if (named(dir) == .directory and std.mem.startsWith(u8, dir, "/proc/")) return &.{
+        .{ .name = "exe", .type = abi.DT.LNK },
+        .{ .name = "maps", .type = REG },
+        .{ .name = "stat", .type = REG },
+    };
+    return &.{};
+}
+
+/// The entry of the directory `dir` at `position`, which is moved past it;
+/// null at the end. Position 0 is the start.
+fn nextEntry(dir: []const u8, position: *u64, name_buf: []u8) ?ListEntry {
+    const extra = extraEntries(dir);
+    if (position.* < LIST_BASE) {
+        const index: usize = @intCast(position.*);
+        position.* += 1;
+        if (index == 0) return .{ .name = ".", .type = abi.DT.DIR };
+        if (index == 1) return .{ .name = "..", .type = abi.DT.DIR };
+        if (index - 2 < extra.len) return extra[index - 2];
+        position.* = LIST_BASE;
+    }
+    var cookie = position.* - LIST_BASE;
+    defer position.* = cookie + LIST_BASE;
+    while (vfs.next(dir, &cookie, name_buf)) |entry| {
+        // Not twice, if the filesystem has a directory of that name too.
+        var listed = false;
+        for (extra) |e| listed = listed or std.mem.eql(u8, e.name, entry.name);
+        if (listed) continue;
+        return .{ .name = entry.name, .type = if (entry.kind == .directory) abi.DT.DIR else abi.DT.REG };
+    }
+    return null;
 }
 
 /// `set_robust_list`: a thread's list of locks to mark as abandoned if it
@@ -845,6 +1060,7 @@ fn sysFstat(fd: u64, ptr: u64) u64 {
             st.blksize = kpipe.SIZE;
         },
         .null_device, .random_device => st = deviceStat(),
+        .directory => st = directoryStat(),
         .file => st = fileStat(of.node),
     }
     return if (toUser(ptr, st)) 0 else err(.FAULT);
@@ -865,6 +1081,7 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
             const access: u64 = switch (of.kind) {
                 .console, .null_device, .random_device => abi.O.RDWR,
                 .file, .pipe_read => abi.O.RDONLY,
+                .directory => abi.O.RDONLY | abi.O.DIRECTORY,
                 .pipe_write => abi.O.WRONLY,
             };
             return access | if (nonblocking(of)) @as(u64, abi.O.NONBLOCK) else 0;
@@ -1024,6 +1241,7 @@ fn pollState(of: *OpenFile, events: i16) i16 {
         // The console can be written to and has nothing to read yet.
         .console => return events & abi.POLL.OUT,
         .null_device, .random_device => return events & (abi.POLL.IN | abi.POLL.OUT),
+        .directory => return events & abi.POLL.IN,
         // A file can always be read.
         .file => return events & abi.POLL.IN,
         .pipe_read => {
@@ -1391,11 +1609,12 @@ fn sysSysinfo(ptr: u64) u64 {
 /// `ENOENT` for a path that does not exist, which is how a program finds
 /// that there are no control groups here.
 fn sysStatfs(path_ptr: u64, ptr: u64) u64 {
-    var path_buf: [abi.PATH_MAX]u8 = undefined;
-    const path = switch (userPath(&path_buf, path_ptr)) {
+    var given = switch (Path.from(CWD, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
+    defer given.deinit();
+    const path = given.text;
     if (named(path) == .none) return err(.NOENT);
     const st: abi.StatFs = .{ .type = abi.TMPFS_MAGIC };
     return if (toUser(ptr, st)) 0 else err(.FAULT);
@@ -1471,7 +1690,7 @@ fn dispatchCall(f: *arch.Frame) void {
     f.rax = switch (f.rax) {
         Sys.read => sysRead(f.rdi, f.rsi, f.rdx),
         Sys.write => sysWrite(f.rdi, f.rsi, f.rdx),
-        Sys.open => sysOpen(f.rdi, f.rsi),
+        Sys.open => sysOpenAt(CWD, f.rdi, f.rsi),
         Sys.close => sysClose(f.rdi),
         Sys.sched_yield => blk: {
             thread.yield();
@@ -1483,9 +1702,9 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.openat => sysOpenAt(f.rdi, f.rsi, f.rdx),
         Sys.fcntl => sysFcntl(f.rdi, f.rsi, f.rdx),
         Sys.newfstatat => sysNewfstatat(f.rdi, f.rsi, f.rdx, f.r10),
-        Sys.stat => sysNewfstatat(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi, 0),
-        Sys.lstat => sysNewfstatat(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi, abi.AT_SYMLINK_NOFOLLOW),
-        Sys.unlink => sysReadOnlyPath(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, true),
+        Sys.stat => sysNewfstatat(CWD, f.rdi, f.rsi, 0),
+        Sys.lstat => sysNewfstatat(CWD, f.rdi, f.rsi, abi.AT_SYMLINK_NOFOLLOW),
+        Sys.unlink => sysReadOnlyPath(CWD, f.rdi, true),
         Sys.unlinkat => sysReadOnlyPath(f.rdi, f.rsi, true),
         Sys.mknodat => sysReadOnlyPath(f.rdi, f.rsi, false),
         Sys.fchmod => if (isOpen(f.rdi)) err(.ROFS) else err(.BADF),
@@ -1498,11 +1717,14 @@ fn dispatchCall(f: *arch.Frame) void {
         // compiled code twice (writable here, executable there) maps it
         // once instead.
         Sys.memfd_create => err(.NOSYS),
-        Sys.access => sysAccess(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi),
+        Sys.access => sysAccess(CWD, f.rdi, f.rsi),
         Sys.faccessat, Sys.faccessat2 => sysAccess(f.rdi, f.rsi, f.rdx),
-        Sys.readlink => sysReadlink(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi, f.rdx),
+        Sys.readlink => sysReadlink(CWD, f.rdi, f.rsi, f.rdx),
         Sys.readlinkat => sysReadlink(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getcwd => sysGetcwd(f.rdi, f.rsi),
+        Sys.chdir => sysChdir(f.rdi),
+        Sys.fchdir => sysFchdir(f.rdi),
+        Sys.getdents64 => sysGetdents64(f.rdi, f.rsi, f.rdx),
         Sys.set_robust_list => sysSetRobustList(f.rdi, f.rsi),
         // Restartable sequences are not offered; a C library asks once
         // and does without.

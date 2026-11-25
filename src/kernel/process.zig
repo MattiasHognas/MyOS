@@ -186,6 +186,10 @@ pub const Process = struct {
     /// File descriptor table, indexed by fd. A process starts with 0, 1
     /// and 2 open on the console. Several descriptors can refer to one
     /// open file (`dup`), which is counted (`OpenFile.refs`).
+    /// The working directory: what relative paths start from. Absolute and
+    /// normalized, in memory of its own that is replaced when it changes,
+    /// under `files_lock`.
+    cwd: []u8 = &.{},
     /// The table is replaced by a longer one when it has to grow, so its
     /// address and length are read under `files_lock` too.
     files: []?*open_file.OpenFile = &.{},
@@ -250,6 +254,8 @@ pub const SpawnOptions = struct {
     argv: []const []const u8 = &.{},
     /// Its environment: strings of the form `NAME=value`.
     envp: []const []const u8 = &.{},
+    /// The working directory it starts in: absolute and normalized.
+    cwd: []const u8 = "/",
 };
 
 /// Count a new process against every ancestor from `parent` up. Fails,
@@ -591,6 +597,8 @@ fn closeFiles(p: *Process) void {
     }
     heap.allocator.free(p.files);
     p.files = &.{};
+    heap.allocator.free(p.cwd);
+    p.cwd = &.{};
 }
 
 /// Make the descriptor table of `p` at least `slots` long (at most
@@ -808,6 +816,8 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     console.* = .{ .kind = .console, .refs = 3 };
     const files = try heap.allocator.alloc(?*open_file.OpenFile, FILES_INITIAL);
     errdefer heap.allocator.free(files);
+    const cwd = try heap.allocator.dupe(u8, options.cwd);
+    errdefer heap.allocator.free(cwd);
     @memset(files, null);
     @memset(files[0..3], console);
     p.* = .{
@@ -829,6 +839,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         },
     };
     p.files = files;
+    p.cwd = cwd;
     // (On an error below, the list is freed through `regions`, which
     // still refers to it; the structure goes separately.)
 

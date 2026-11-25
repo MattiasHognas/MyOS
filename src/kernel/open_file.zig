@@ -21,6 +21,9 @@ pub const OpenFile = struct {
     /// open file. Such a file cannot be mapped, since a mapping would
     /// outlive it.
     generated: ?[]u8 = null,
+    /// For a directory: its path, absolute and normalized, in memory of
+    /// the open file's own. `offset` is then the place in its listing.
+    path: []u8 = &.{},
     /// The pipe, for the two pipe kinds.
     pipe: *pipe.Pipe = undefined,
     /// `O_NONBLOCK`: reads and writes that would wait fail with `EAGAIN`.
@@ -43,6 +46,9 @@ pub const Kind = enum {
     /// The reading and the writing end of a pipe (`pipe.zig`).
     pipe_read,
     pipe_write,
+    /// A directory: listed with `getdents64`, and what paths relative to
+    /// its descriptor start from.
+    directory,
     /// `/dev/null`: reads find the end, writes are thrown away.
     null_device,
     /// `/dev/urandom` and `/dev/random`: reads give random bytes, writes
@@ -71,8 +77,16 @@ pub fn destroy(of: *OpenFile) void {
     switch (of.kind) {
         .pipe_read => pipe.closeEnd(of.pipe, .read),
         .pipe_write => pipe.closeEnd(of.pipe, .write),
-        .file, .console, .null_device, .random_device => {},
+        .file, .console, .null_device, .random_device, .directory => {},
     }
-    if (of.generated) |text| heap.allocator.free(text);
+    freeContents(of);
     heap.allocator.destroy(of);
+}
+
+/// Free the memory an open file owns besides itself.
+pub fn freeContents(of: *OpenFile) void {
+    if (of.generated) |text| heap.allocator.free(text);
+    if (of.path.len != 0) heap.allocator.free(of.path);
+    of.generated = null;
+    of.path = &.{};
 }

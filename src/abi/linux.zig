@@ -92,7 +92,12 @@ pub const Sys = struct {
     /// `memfd_create(name, flags)`: files that exist only in memory are
     /// not offered yet (`ENOSYS`).
     pub const memfd_create = 319;
-    /// `getcwd(buf, size) -> length with the NUL`: always "/".
+    /// `chdir(path)` and `fchdir(fd)`: the working directory.
+    pub const chdir = 80;
+    pub const fchdir = 81;
+    /// `getdents64(fd, buf, count) -> bytes`: the next entries of a directory.
+    pub const getdents64 = 217;
+    /// `getcwd(buf, size) -> length with the NUL`.
     pub const getcwd = 79;
     /// `readlink(path, buf, size)`: there are no symbolic links (`EINVAL`).
     pub const readlink = 89;
@@ -271,9 +276,19 @@ pub fn errno(ret: u64) u16 {
 /// to this (Linux's `MAX_RW_COUNT`: 2 GiB minus one page).
 pub const MAX_RW_COUNT: u64 = 0x7FFF_F000;
 
-/// Longest path, including the terminating NUL. Linux's `PATH_MAX` is 4096;
-/// MyOS's is smaller because paths are copied to the 16 KiB kernel stack.
-pub const PATH_MAX = 256;
+/// Longest path, including the terminating NUL: Linux's `PATH_MAX`.
+pub const PATH_MAX = 4096;
+
+/// `getdents64`: bytes of a `struct linux_dirent64` before the name
+/// (inode number, offset of the next entry, record length, type), and the
+/// types.
+pub const DIRENT_HEADER = 19;
+pub const DT = struct {
+    pub const CHR = 2;
+    pub const DIR = 4;
+    pub const REG = 8;
+    pub const LNK = 10;
+};
 
 /// `open` flags (Linux's values). Only read-only opens are supported.
 pub const O = struct {
