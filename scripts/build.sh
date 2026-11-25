@@ -46,7 +46,7 @@ cp zig-out/bin/sh.elf "$initrd/bin/sh"
 cp zig-out/bin/hello.elf "$initrd/bin/hello"
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
 # Programs built for Linux by other toolchains (tests/fixtures), to run by hand.
-cp tests/fixtures/bin/* "$initrd/bin/"
+find tests/fixtures/bin -maxdepth 1 -type f -exec cp {} "$initrd/bin/" \;
 # The C library dynamically linked Linux programs expect on the system:
 # the loader and shared libraries of scripts/fetch-sysroot.sh, if they have
 # been fetched. Not in a release image: passing them on has licence terms
@@ -65,7 +65,24 @@ if [[ "$mode" == --package-test ]]; then
     done
     # Programs built for Linux by other toolchains (tests/fixtures): /fixtures/<name>
     mkdir -p "$initrd/fixtures"
-    cp tests/fixtures/bin/* "$initrd/fixtures/"
+    cp -r tests/fixtures/bin/* "$initrd/fixtures/"
+    # The .NET program published as a folder is complete with the runtime's
+    # native libraries, which every such folder has the same copy of
+    # (scripts/fetch-dotnet-runtime.sh). Without them it is left out, and
+    # the kernel test for it says so.
+    if [[ -f dotnet-runtime/.complete ]]; then
+        cp dotnet-runtime/* "$initrd/fixtures/dotnet-hello-app/"
+    else
+        rm -rf "$initrd/fixtures/dotnet-hello-app"
+        echo "note: no dotnet-runtime/ (scripts/fetch-dotnet-runtime.sh): the self-contained .NET program is left out" >&2
+    fi
+fi
+# Anything else the image is to hold: the tree under MYOS_INITRD_EXTRA is
+# copied over the root, so <dir>/app/hello becomes /app/hello. This is how
+# a program built elsewhere (a `dotnet publish` folder, say) gets into an
+# image until there is a disk to copy it to.
+if [[ -n "${MYOS_INITRD_EXTRA:-}" ]]; then
+    cp -rL "$MYOS_INITRD_EXTRA"/. "$initrd/"
 fi
 tar --format=ustar -cf "$iso_root/boot/initrd.tar" -C "$initrd" .
 

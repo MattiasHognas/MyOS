@@ -24,6 +24,7 @@ const percpu = @import("../arch/x86_64/percpu.zig");
 const kfutex = @import("futex.zig");
 const kpipe = @import("pipe.zig");
 const open_file = @import("open_file.zig");
+const procfs = @import("procfs.zig");
 const OpenFile = open_file.OpenFile;
 const pmm = @import("pmm.zig");
 const futex = kfutex; // its clock helpers read better by this name
@@ -253,6 +254,11 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
         switch (of.kind) {
             .console => {},
             .pipe_write => return pipeWrite(of, ptr, @min(count, abi.MAX_RW_COUNT)),
+            .null_device, .random_device => {
+                // Thrown away unread; only an address outside user space is refused.
+                const len = @min(count, abi.MAX_RW_COUNT);
+                return if (user_range.valid(ptr, len)) len else err(.FAULT);
+            },
             .file, .pipe_read => return err(.BADF), // files are read-only
         }
     }
@@ -280,7 +286,7 @@ fn sysWritev(fd: u64, iov: u64, count: u64) u64 {
     {
         const of = getFile(fd) orelse return err(.BADF);
         defer putFile(of);
-        if (of.kind != .console and of.kind != .pipe_write) return err(.BADF);
+        if (of.kind == .file or of.kind == .pipe_read) return err(.BADF);
     }
     if (count > abi.IOV_MAX) return err(.INVAL);
     var total: u64 = 0;
@@ -356,9 +362,9 @@ fn sysSetTidAddress(ptr: u64) u64 {
 /// reference keeps the file there while another thread closes the descriptor.
 fn getFile(fd: u64) ?*OpenFile {
     const p = thread.current().process orelse return null;
-    if (fd >= p.files.len) return null;
     const held = p.files_lock.acquire();
     defer p.files_lock.release(held);
+    if (fd >= p.files.len) return null;
     const of = p.files[nospec.index(fd, p.files.len)] orelse return null;
     of.refs += 1;
     return of;
@@ -395,16 +401,38 @@ fn sysOpen(ptr: u64, flags: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    const node = vfs.lookup(path) orelse
-        return if (flags & abi.O.CREAT != 0) err(.ROFS) else err(.NOENT);
-    if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ROFS);
     const p = thread.current().process orelse return err(.BADF);
+    const what = named(path);
+    var opened: OpenFile = .{};
+    switch (what) {
+        .none => return if (flags & abi.O.CREAT != 0) err(.ROFS) else err(.NOENT),
+        // Directories cannot be opened yet: there is nothing to do with
+        // one (no `getdents64`, no paths relative to it).
+        .directory => return if (flags & abi.O.ACCMODE != abi.O.RDONLY) err(.ISDIR) else err(.ACCES),
+        .device => |kind| {
+            if (flags & abi.O.DIRECTORY != 0) return err(.NOTDIR);
+            opened.kind = kind; // may be opened for writing: what is written is thrown away
+        },
+        .file, .exe_link, .generated => {
+            if (flags & abi.O.DIRECTORY != 0) return err(.NOTDIR);
+            if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ROFS);
+            if (what == .generated) {
+                const text = procfs.generate(what.generated, p) catch return err(.NOMEM);
+                opened.generated = text;
+                opened.node = open_file.memoryNode(text);
+            } else opened.node = fileAt(path) orelse return err(.NOENT);
+        },
+    }
+    opened.nonblock = flags & abi.O.NONBLOCK != 0;
 
     // Allocated before the table is locked, and freed again if it is full.
-    const of = heap.allocator.create(OpenFile) catch return err(.NOMEM);
-    of.* = .{ .node = node };
+    const of = heap.allocator.create(OpenFile) catch {
+        if (opened.generated) |text| heap.allocator.free(text);
+        return err(.NOMEM);
+    };
+    of.* = opened;
     return installFile(p, of, 0) orelse {
-        heap.allocator.destroy(of);
+        open_file.destroy(of);
         return err(.MFILE);
     };
 }
@@ -413,16 +441,24 @@ fn sysOpen(ptr: u64, flags: u64) u64 {
 /// and within the process's limit, and return it; null if there is none.
 /// The reference the caller holds becomes the descriptor's.
 fn installFile(p: *proc.Process, of: *OpenFile, from: usize) ?usize {
-    const max_files = @min(p.files.len, p.limits.max_files);
-    const held = p.files_lock.acquire();
-    defer p.files_lock.release(held);
-    var fd = from;
-    while (fd < max_files) : (fd += 1) {
-        if (p.files[fd] != null) continue;
-        p.files[fd] = of;
-        return fd;
+    const limit = @min(proc.MAX_FILES, p.limits.max_files);
+    while (true) {
+        const len = blk: {
+            const held = p.files_lock.acquire();
+            defer p.files_lock.release(held);
+            var fd = from;
+            while (fd < @min(p.files.len, limit)) : (fd += 1) {
+                if (p.files[fd] != null) continue;
+                p.files[fd] = of;
+                return fd;
+            }
+            break :blk p.files.len;
+        };
+        // None free in the table as it is: a longer one, if the limit
+        // allows, and again (another thread may take what was added).
+        const need = @max(len, from) + 1;
+        if (need > limit or !proc.growFiles(p, need)) return null;
     }
-    return null;
 }
 
 /// `dup` and `fcntl(F_DUPFD)`: a second descriptor for what `fd` refers
@@ -430,7 +466,7 @@ fn installFile(p: *proc.Process, of: *OpenFile, from: usize) ?usize {
 /// and its offset. `EBADF`, `EINVAL` (no such descriptor number), `EMFILE`.
 fn sysDup(fd: u64, from: u64) u64 {
     const p = thread.current().process orelse return err(.BADF);
-    if (from >= p.files.len) return err(.INVAL);
+    if (from >= @min(proc.MAX_FILES, p.limits.max_files)) return err(.INVAL);
     const of = getFile(fd) orelse return err(.BADF);
     // The reference from `getFile` becomes the new descriptor's.
     return installFile(p, of, @intCast(from)) orelse {
@@ -445,13 +481,18 @@ fn sysDup(fd: u64, from: u64) u64 {
 fn sysDup2(old: u64, new: u64, same_is_error: bool) u64 {
     const p = thread.current().process orelse return err(.BADF);
     const of = getFile(old) orelse return err(.BADF);
-    if (new >= @min(p.files.len, p.limits.max_files)) {
+    if (new >= @min(proc.MAX_FILES, p.limits.max_files)) {
         putFile(of);
         return err(.BADF);
     }
     if (old == new) {
         putFile(of);
         return if (same_is_error) err(.INVAL) else new;
+    }
+    // The table only ever grows, so once it is long enough it stays so.
+    if (!proc.growFiles(p, @intCast(new + 1))) {
+        putFile(of);
+        return err(.NOMEM);
     }
     const replaced = blk: {
         const held = p.files_lock.acquire();
@@ -512,6 +553,8 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
     switch (of.kind) {
         .file => {},
         .pipe_read => return pipeRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
+        .null_device => return 0,
+        .random_device => return sysGetRandom(ptr, count),
         // Nothing to read from the console yet.
         .console, .pipe_write => return err(.BADF),
     }
@@ -565,6 +608,96 @@ fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
 
 /// `fstat`: what kind of thing `fd` is and, for a file, how large. The
 /// standard streams are character devices.
+/// What a path names.
+const Named = union(enum) {
+    /// Nothing.
+    none,
+    file: vfs.Node,
+    directory,
+    /// A symbolic link to the program the calling process runs
+    /// (`/proc/self/exe`): the only links there are.
+    exe_link,
+    /// A text file made when it is opened (`procfs.zig`).
+    generated: procfs.File,
+    /// `/dev/null`, `/dev/urandom`, `/dev/random`.
+    device: open_file.Kind,
+};
+
+/// What `path` (absolute) names, without following a link at its end. The
+/// filesystem's files and directories, and the few entries of `/proc` a
+/// program finds itself by: `/proc`, `/proc/self` and `/proc/<its pid>`
+/// are directories, and `exe` in the last two is a link to its program.
+fn named(path: []const u8) Named {
+    if (procEntry(path)) |entry| return entry;
+    if (std.mem.eql(u8, path, "/dev/null")) return .{ .device = .null_device };
+    if (std.mem.eql(u8, path, "/dev/urandom") or std.mem.eql(u8, path, "/dev/random")) return .{ .device = .random_device };
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, path, "/"), "/dev")) return .directory;
+    if (vfs.lookup(path)) |node| return .{ .file = node };
+    return if (vfs.isDirectory(path)) .directory else .none;
+}
+
+fn procEntry(path: []const u8) ?Named {
+    const p = thread.current().process orelse return null;
+    var rest = std.mem.trimEnd(u8, path, "/");
+    if (!std.mem.startsWith(u8, rest, "/proc")) return null;
+    rest = rest["/proc".len..];
+    if (rest.len == 0) return .directory;
+    if (rest[0] != '/') return null; // "/process", say
+    rest = rest[1..];
+    // "/proc/<name>", or "/proc/<self or the caller's ID>[/<name>]".
+    const slash = std.mem.indexOfScalar(u8, rest, '/');
+    const first = rest[0 .. slash orelse rest.len];
+    var id_buf: [20]u8 = undefined;
+    const own_id = std.fmt.bufPrint(&id_buf, "{d}", .{p.pid}) catch unreachable;
+    if (!std.mem.eql(u8, first, "self") and !std.mem.eql(u8, first, own_id)) {
+        if (slash == null) if (procfs.find(first, false)) |file| return .{ .generated = file };
+        return .none;
+    }
+    const name = rest[(slash orelse return .directory) + 1 ..];
+    if (std.mem.eql(u8, name, "exe")) return .exe_link;
+    return if (procfs.find(name, true)) |file| .{ .generated = file } else .none;
+}
+
+/// The file `path` names, following the link if it is one. Null if it
+/// names nothing or a directory.
+fn fileAt(path: []const u8) ?vfs.Node {
+    return switch (named(path)) {
+        .file => |node| node,
+        .exe_link => vfs.lookup(thread.current().process.?.name),
+        .none, .directory, .generated, .device => null,
+    };
+}
+
+/// What `stat` says about a directory.
+fn directoryStat() abi.Stat {
+    var st: abi.Stat = .{};
+    st.mode = abi.S.IFDIR | 0o555;
+    st.nlink = 2;
+    st.dev = 1;
+    st.ino = 2;
+    return st;
+}
+
+/// What `stat` says about a text file of `/proc`: a file of no length,
+/// as on Linux, since its text does not exist until it is opened.
+fn generatedStat() abi.Stat {
+    var st: abi.Stat = .{};
+    st.mode = abi.S.IFREG | 0o444;
+    st.dev = 2;
+    st.ino = 4;
+    return st;
+}
+
+/// What `stat` says about `/dev/null` and the random devices.
+fn deviceStat() abi.Stat {
+    var st: abi.Stat = .{};
+    st.mode = abi.S.IFCHR | 0o666;
+    st.rdev = 0x0103; // 1, 3: /dev/null's number; programs only look at the type
+    st.dev = 3;
+    st.ino = 5;
+    return st;
+}
+
 /// What `stat` says about a file of the filesystem.
 fn fileStat(node: vfs.Node) abi.Stat {
     var st: abi.Stat = .{};
@@ -607,8 +740,38 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    const node = vfs.lookup(path) orelse return err(.NOENT);
-    return if (toUser(stat_ptr, fileStat(node))) 0 else err(.FAULT);
+    const st = switch (named(path)) {
+        .none => return err(.NOENT),
+        .directory => directoryStat(),
+        .file => |node| fileStat(node),
+        .generated => generatedStat(),
+        .device => deviceStat(),
+        .exe_link => blk: {
+            if (flags & abi.AT_SYMLINK_NOFOLLOW != 0) {
+                var link: abi.Stat = .{};
+                link.mode = abi.S.IFLNK | 0o777;
+                link.dev = 1;
+                link.ino = 3;
+                break :blk link;
+            }
+            break :blk fileStat(fileAt(path) orelse return err(.NOENT));
+        },
+    };
+    return if (toUser(stat_ptr, st)) 0 else err(.FAULT);
+}
+
+/// A call that would change the filesystem, at a path: `ENOENT` and the
+/// other errors of a path that cannot be found come first, as on Linux
+/// with a read-only filesystem; then `EROFS`. With `must_exist` false
+/// (the call would make the file) a missing file is `EROFS` too.
+fn sysReadOnlyPath(dirfd: u64, path_ptr: u64, must_exist: bool) u64 {
+    var path_buf: [abi.PATH_MAX]u8 = undefined;
+    const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    if (must_exist and named(path) == .none) return err(.NOENT);
+    return err(.ROFS);
 }
 
 /// `access`, `faccessat` and `faccessat2`: files can be read and run,
@@ -620,19 +783,32 @@ fn sysAccess(dirfd: u64, path_ptr: u64, mode: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    if (vfs.lookup(path) == null) return err(.NOENT);
+    if (named(path) == .none) return err(.NOENT);
     return if (mode & abi.ACCESS.W_OK != 0) err(.ROFS) else 0;
 }
 
-/// `readlink` and `readlinkat`: there are no symbolic links, so a file
-/// that exists is not one (`EINVAL`) and anything else is `ENOENT`.
-fn sysReadlink(dirfd: u64, path_ptr: u64) u64 {
+/// `readlink` and `readlinkat`: what a symbolic link points to, without
+/// a NUL, cut to `size` bytes; returns the bytes stored. The one link is
+/// `/proc/self/exe`, by which a program finds its own file. `EINVAL` for
+/// what exists and is no link, or a size of zero; `ENOENT`; `EFAULT`.
+fn sysReadlink(dirfd: u64, path_ptr: u64, buf: u64, size: u64) u64 {
     var path_buf: [abi.PATH_MAX]u8 = undefined;
     const path = switch (pathAt(&path_buf, dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
-    return if (vfs.lookup(path) == null) err(.NOENT) else err(.INVAL);
+    switch (named(path)) {
+        .none => return err(.NOENT),
+        .file, .directory, .generated, .device => return err(.INVAL),
+        .exe_link => {},
+    }
+    if (size == 0) return err(.INVAL);
+    // The name can change under another thread's feet only by the process
+    // ending, and then this thread ends too.
+    const target = thread.current().process.?.name;
+    const n = @min(target.len, size);
+    uaccess.copyToUser(buf, target[0..n]) catch return err(.FAULT);
+    return n;
 }
 
 /// `getcwd`: the working directory is always "/". Returns the length
@@ -668,6 +844,7 @@ fn sysFstat(fd: u64, ptr: u64) u64 {
             st.mode = abi.S.IFIFO | 0o600;
             st.blksize = kpipe.SIZE;
         },
+        .null_device, .random_device => st = deviceStat(),
         .file => st = fileStat(of.node),
     }
     return if (toUser(ptr, st)) 0 else err(.FAULT);
@@ -686,7 +863,7 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
         1, 2 => return 0, // F_GETFD, F_SETFD
         3 => { // F_GETFL
             const access: u64 = switch (of.kind) {
-                .console => abi.O.RDWR,
+                .console, .null_device, .random_device => abi.O.RDWR,
                 .file, .pipe_read => abi.O.RDONLY,
                 .pipe_write => abi.O.WRONLY,
             };
@@ -706,10 +883,10 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
 /// when its last descriptor does. Returns 0, or `EBADF` if `fd` is not open.
 fn sysClose(fd: u64) u64 {
     const p = thread.current().process orelse return err(.BADF);
-    if (fd >= p.files.len) return err(.BADF);
     const of = blk: {
         const held = p.files_lock.acquire();
         defer p.files_lock.release(held);
+        if (fd >= p.files.len) return err(.BADF);
         const slot = &p.files[nospec.index(fd, p.files.len)];
         const of = slot.* orelse return err(.BADF);
         slot.* = null;
@@ -846,6 +1023,7 @@ fn pollState(of: *OpenFile, events: i16) i16 {
     switch (of.kind) {
         // The console can be written to and has nothing to read yet.
         .console => return events & abi.POLL.OUT,
+        .null_device, .random_device => return events & (abi.POLL.IN | abi.POLL.OUT),
         // A file can always be read.
         .file => return events & abi.POLL.IN,
         .pipe_read => {
@@ -1048,6 +1226,61 @@ fn sysClone3(f: *const arch.Frame) u64 {
     return tid;
 }
 
+/// The thread a scheduling call is about: `tid` 0 is the caller, anything
+/// else must be a thread of the calling process (`ESRCH`; other
+/// processes' threads are nobody's business yet).
+fn schedTarget(tid: u64) ?u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    if (tid != 0 and !proc.hasThread(p, tid)) return err(.SRCH);
+    return null;
+}
+
+/// `sched_setaffinity`: which CPUs a thread may run on. The scheduler has
+/// one queue for all CPUs and does not keep threads off any, so a mask is
+/// accepted if it leaves the thread a CPU that is up, and changes
+/// nothing. `EINVAL` for a mask with none, `EFAULT`, `ESRCH`.
+fn sysSchedSetAffinity(tid: u64, size: u64, ptr: u64) u64 {
+    if (schedTarget(tid)) |e| return e;
+    var mask: u64 = 0;
+    const take = @min(size, @sizeOf(u64));
+    uaccess.copyFromUser(std.mem.asBytes(&mask)[0..take], ptr) catch return err(.FAULT);
+    const n = percpu.count();
+    const up: u64 = if (n >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
+    return if (mask & up == 0) err(.INVAL) else 0;
+}
+
+/// `sched_getscheduler`, `sched_getparam`, `sched_setscheduler`,
+/// `sched_setparam`: every thread has the policy `SCHED_OTHER` and the
+/// priority 0, and may be given just that. `EINVAL` for another policy or
+/// priority, `ESRCH`, `EFAULT`.
+fn sysSchedPolicy(comptime call: enum { get_policy, get_param, set_policy, set_param }, f: *const arch.Frame) u64 {
+    if (schedTarget(f.rdi)) |e| return e;
+    switch (call) {
+        .get_policy => return abi.SCHED.OTHER,
+        .get_param => return if (toUser(f.rsi, @as(i32, 0))) 0 else err(.FAULT),
+        .set_policy, .set_param => {
+            const param_ptr = if (call == .set_policy) f.rdx else f.rsi;
+            const priority = fromUser(i32, param_ptr) orelse return err(.FAULT);
+            if (call == .set_policy and f.rsi != abi.SCHED.OTHER) return err(.INVAL);
+            return if (priority == 0) 0 else err(.INVAL);
+        },
+    }
+}
+
+/// `sched_get_priority_max` and `_min`: 0 for the one policy there is;
+/// the real-time policies, which Linux knows and this kernel does not,
+/// are `EINVAL` like any unknown one.
+fn sysSchedPriorityRange(policy: u64) u64 {
+    return if (policy == abi.SCHED.OTHER) 0 else err(.INVAL);
+}
+
+/// `getsid`: every process is a session of its own, since there is no
+/// terminal to share. `ESRCH` for another process.
+fn sysGetsid(pid: u64) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    return if (pid == 0 or pid == p.pid) p.pid else err(.SRCH);
+}
+
 /// `sched_getaffinity`: the CPUs the thread may run on, which is all that
 /// are up. Runtimes count the bits to learn how many CPUs there are.
 /// Returns the bytes written (8); `EINVAL` if the buffer is smaller.
@@ -1163,7 +1396,7 @@ fn sysStatfs(path_ptr: u64, ptr: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    if (vfs.lookup(path) == null and !std.mem.eql(u8, path, "/")) return err(.NOENT);
+    if (named(path) == .none) return err(.NOENT);
     const st: abi.StatFs = .{ .type = abi.TMPFS_MAGIC };
     return if (toUser(ptr, st)) 0 else err(.FAULT);
 }
@@ -1202,7 +1435,7 @@ fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, 
             if (f.r10 & abi.MAP.ANONYMOUS != 0) break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, null);
             const of = getFile(f.r8) orelse break :blk err(.BADF);
             defer putFile(of); // the mapping keeps the file, not the descriptor
-            if (of.kind != .file) break :blk err(.NODEV);
+            if (of.kind != .file or of.generated != null) break :blk err(.NODEV);
             break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, .{ .node = of.node, .offset = f.r9 });
         },
         .mprotect => user_memory.mprotect(p, f.rdi, f.rsi, f.rdx),
@@ -1250,10 +1483,25 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.openat => sysOpenAt(f.rdi, f.rsi, f.rdx),
         Sys.fcntl => sysFcntl(f.rdi, f.rsi, f.rdx),
         Sys.newfstatat => sysNewfstatat(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.stat => sysNewfstatat(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi, 0),
+        Sys.lstat => sysNewfstatat(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi, abi.AT_SYMLINK_NOFOLLOW),
+        Sys.unlink => sysReadOnlyPath(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, true),
+        Sys.unlinkat => sysReadOnlyPath(f.rdi, f.rsi, true),
+        Sys.mknodat => sysReadOnlyPath(f.rdi, f.rsi, false),
+        Sys.fchmod => if (isOpen(f.rdi)) err(.ROFS) else err(.BADF),
+        // No descriptor can be open for writing a file, which is what
+        // Linux says `EINVAL` for.
+        Sys.ftruncate => if (isOpen(f.rdi)) err(.INVAL) else err(.BADF),
+        // No networking yet (12): every address family is unsupported.
+        Sys.socket => err(.AFNOSUPPORT),
+        // Not offered yet; a runtime that wants one for mapping its
+        // compiled code twice (writable here, executable there) maps it
+        // once instead.
+        Sys.memfd_create => err(.NOSYS),
         Sys.access => sysAccess(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi),
         Sys.faccessat, Sys.faccessat2 => sysAccess(f.rdi, f.rsi, f.rdx),
-        Sys.readlink => sysReadlink(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi),
-        Sys.readlinkat => sysReadlink(f.rdi, f.rsi),
+        Sys.readlink => sysReadlink(@bitCast(@as(i64, abi.AT_FDCWD)), f.rdi, f.rsi, f.rdx),
+        Sys.readlinkat => sysReadlink(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getcwd => sysGetcwd(f.rdi, f.rsi),
         Sys.set_robust_list => sysSetRobustList(f.rdi, f.rsi),
         // Restartable sequences are not offered; a C library asks once
@@ -1271,6 +1519,13 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.getpid => if (thread.current().process) |p| p.pid else err(.NOSYS),
         Sys.clone => sysClone(f),
         Sys.clone3 => sysClone3(f),
+        Sys.sched_setaffinity => sysSchedSetAffinity(f.rdi, f.rsi, f.rdx),
+        Sys.sched_getscheduler => sysSchedPolicy(.get_policy, f),
+        Sys.sched_getparam => sysSchedPolicy(.get_param, f),
+        Sys.sched_setscheduler => sysSchedPolicy(.set_policy, f),
+        Sys.sched_setparam => sysSchedPolicy(.set_param, f),
+        Sys.sched_get_priority_max, Sys.sched_get_priority_min => sysSchedPriorityRange(f.rdi),
+        Sys.getsid => sysGetsid(f.rdi),
         Sys.time => sysTime(f.rdi),
         Sys.futex => sysFutex(f),
         Sys.sched_getaffinity => sysSchedGetAffinity(f.rsi, f.rdx),

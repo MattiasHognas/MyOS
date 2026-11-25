@@ -478,6 +478,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
 - [ ] Add `epoll` and `eventfd` on top of `poll`.
 - [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents (the list from 4.2 says which).
+  - Done: `/dev/null`, `/dev/urandom`, `/dev/random`, `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/meminfo` (`procfs.zig`: text made when the file is opened). Open: `/proc/cpuinfo`, `/proc/stat`, `/proc/self/mountinfo` and `cgroup`, `/sys/devices/system/cpu/*`, which the .NET runtime looks for and does without.
 - [ ] Test EOF, partial I/O, invalid descriptors, and cleanup.
 - [ ] Test terminal line editing and `poll` (ready, blocking, and timeout cases) with input injected over serial.
 
@@ -599,12 +600,14 @@ Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
 - [x] File-backed `mmap` (5), private, with the permissions of each segment: a page is read from the file when it is first touched and is the program's own from then on (`user_memory.zig`, regions of kind `file`). Read-only shared mappings are the same thing; writable shared ones are refused, files being read-only.
   - Open: pages of a file that nobody has written are copied per process instead of shared. Sharing them (a page cache, copy-on-write) saves the memory of one C library per process; it is in 13.
 - [x] The calls a loader finds libraries with: `openat`, `fstat`, `newfstatat`, `pread64`, `readlink`, `access`/`faccessat`, `getcwd`; and `set_robust_list`, with `rseq` refused on purpose.
-  - Open: `getdents64` and directories as such (the filesystem only knows files; a loader does not list directories).
+  - Directories exist for `stat` and `access` since the JIT runtime needed them (it resolves its own path one part at a time). Open: opening and listing them (`getdents64`).
 - [x] Ship glibc's loader and libraries (`ld-linux-x86-64.so.2`, `libc.so.6`, `libm`, `libstdc++`, `libgcc_s`) in the image: `scripts/fetch-sysroot.sh` takes them from Debian 13, pinned by checksum, and `scripts/build.sh` packs them. Not in release images until the licence side of passing them on is decided.
 - [x] Run a dynamically linked hello-world built for Linux against glibc; test malformed `PT_INTERP` headers. (`tests/fixtures/bin/glibc-hello-dynamic`, on one and four CPUs, two at once, memory back afterwards.)
-- [ ] Run the JIT-based runtime: a self-contained `dotnet publish -r linux-x64` hello-world. It needs the above, signal delivery (8), and memory that changes from writable to executable (see the permission item in 2.4); the rest comes from tracing it.
+- [x] Run the JIT-based runtime: a self-contained `dotnet publish -r linux-x64` hello-world (`tests/fixtures/bin/dotnet-hello-app`, completed with the runtime's native libraries by `scripts/fetch-dotnet-runtime.sh`). The host program finds itself through `/proc/self/exe`, loads the runtime from its folder, and the runtime compiles and runs the program, with eight managed threads and a garbage collection, on one and four CPUs, two at once, its memory back afterwards. The untrimmed 80 MB folder runs too (tried by hand with `MYOS_INITRD_EXTRA`); the fixture is the trimmed one.
+  - What it needed beyond the ahead-of-time build: directories that exist, `/proc/self/exe`, `/proc/self/maps` (glibc finds the main stack there; without it the runtime reports that it is out of memory), `stat`, more than 16 descriptors, the scheduling-policy calls and `sched_setaffinity`, `getsid`. No signal was delivered.
+  - Open, each tolerated by the runtime today: `memfd_create` with shared mappings (it wants its code mapped twice, writable in one place and executable in another; without that it uses memory that is both), sockets for its diagnostics, FIFOs in `/tmp`, `/proc/self/mountinfo` and cgroup files, `/sys/devices/system/cpu`.
 - [ ] The same published as a single file.
-- [ ] A script that puts a published folder into the image, until there is a writable disk (11) or a network (12).
+- [x] A way to put a published folder into the image, until there is a writable disk (11) or a network (12): `MYOS_INITRD_EXTRA=<dir> scripts/build.sh` copies the tree under `<dir>` over the image's root.
 - Not supported: framework-dependent builds (`dotnet app.dll` with a runtime installed on the system).
 
 **Milestone 9 done when:** The unmodified output of `dotnet publish -r linux-x64 --self-contained` runs on MyOS as it does on Linux, uses several cores, cannot crash or corrupt the kernel, and its measured performance is recorded against Linux on the same hardware.

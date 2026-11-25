@@ -174,12 +174,17 @@ fn processLimits() TestError!void {
     // Too little even for the stacks: refused before anything is allocated.
     try check(tooLarge(helpers.spawnError("/bin/hello", .{ .max_pages = 8 })));
 
-    // Open files: 13 by default, fewer with a lower limit, none at 3.
-    try check(helpers.runProgram("/test/open_count") == 13);
+    // Open files: as many as the limit says less the three that are open
+    // already, none at 3; by default more than a hundred, with a table
+    // that grows as they are opened, up to 1024 and not one more.
+    try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 16 }) == 13);
+    try check(helpers.runProgram("/test/open_count") == 201);
+    try check(helpers.runProgramArgs("/test/open_count", &.{ "open_count", "all" }, &.{}) == 0);
     try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 5 }) == 2);
     try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 3 }) == 0);
     try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 0 }) == 0);
-    try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 1000 }) == 13); // the table is the cap
+    try check(helpers.runProgramLimited("/test/open_count", .{ .max_files = 100_000 }) == 201); // no more than the default for it
+    try check(helpers.runProgramLimitedArgs("/test/open_count", &.{ "open_count", "all" }, .{ .max_files = 100_000 }) == 0);
 
     // Descendants: the chain stops exactly at the limit, with EAGAIN (100
     // plus the depth reached; see tests/user/recurse.zig).
@@ -301,6 +306,19 @@ fn randomNumbers() TestError!void {
 /// Freed heap blocks and pages are poisoned; pages for users are zeroed.
 fn poisonAndZero() TestError!void {
     try expectChecks("poison and zero", helpers.poisonAndZero());
+}
+
+/// The kernel holds exactly the memory it held at `before`: free pages,
+/// heap bytes in use, kernel stacks. Says what differs if not.
+fn expectFootprint(before: helpers.Footprint) TestError!void {
+    const now = helpers.footprint();
+    if (now.eql(before)) return;
+    root.print("  memory not as before: pages {d} -> {d}, heap bytes {d} -> {d}, kernel stacks {d} -> {d}\n", .{
+        before.pages,      now.pages,
+        before.heap_bytes, now.heap_bytes,
+        before.stacks,     now.stacks,
+    });
+    return error.Failed;
 }
 
 /// A new process finds only zeroes in memory it has not written, even
@@ -736,7 +754,8 @@ fn elfSpawnRollback() TestError!void {
 
 /// Syscall buffer and descriptor validation, checked from ring 3.
 fn userSyscalls() TestError!void {
-    const code = helpers.runProgram("/test/syscalls") orelse return error.Failed;
+    // (With 16 descriptors: it fills the table to see what happens then.)
+    const code = helpers.runProgramLimited("/test/syscalls", .{ .max_files = 16 }) orelse return error.Failed;
     if (code != 0) {
         var buf: [64]u8 = undefined;
         serial.puts(std.fmt.bufPrint(&buf, "  /test/syscalls failed check {d}\n", .{code}) catch "");
@@ -755,7 +774,7 @@ fn userPointers() TestError!void {
         serial.puts(std.fmt.bufPrint(&buf, "  /test/user_pointers failed check {d}\n", .{code}) catch "");
     }
     try check(code == 0);
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// `copyFromUser`/`copyToUser` against mapped, unmapped, partly mapped and
@@ -851,7 +870,7 @@ fn syscallReturnStates() TestError!void {
     // one with privileged flags included) used sysretq.
     try check(via_iret == 16 and helpers.iretReturns() - iret_before == via_iret);
     try expectProgram("/bin/hello"); // the kernel is fine
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// The kernel's GS base never reaches ring 3, and is back after every entry.
@@ -897,7 +916,7 @@ fn linuxStartup() TestError!void {
     // Arguments that do not fit are refused, and nothing is started.
     const memory = helpers.footprint();
     try check(helpers.argumentsTooLong());
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// Memory on demand: `mmap`, `munmap`, `mprotect`, `madvise`, `brk`, a
@@ -923,7 +942,7 @@ fn userMemory() TestError!void {
     if (oom != 255) report("/test/vm oom exit status", oom);
     try check(oom == 255);
     try check(helpers.runProgram("/bin/hello") == 0); // the kernel is fine
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
     try check(pmm.consistent());
 }
 
@@ -942,7 +961,7 @@ fn muslHello() TestError!void {
     try check(code == 3);
     // With no arguments given it gets its path as the only one.
     try check(helpers.runProgram("/fixtures/musl-hello-static") == 1);
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// Position-independent programs built for Linux run (a C program and a
@@ -970,7 +989,7 @@ fn positionIndependent() TestError!void {
         try check((s.* - fixed) / 4096 < helpers.PIE_RANDOM_PAGES);
         for (seen[0..i]) |other| try check(other != s.*);
     }
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// A program that names an interpreter is not run itself: the
@@ -986,7 +1005,7 @@ fn elfInterpreter() TestError!void {
     try check(helpers.runImage(buildElf(.{ .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static" })) == 1);
     // And a position-independent program with an interpreter.
     try check(helpers.runImage(buildElf(.{ .typ = 3, .vaddr = 0, .entry = 0, .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static-pie" })) == 1);
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// A dynamically linked C program runs: the kernel loads the dynamic
@@ -1008,7 +1027,7 @@ fn dynamicHello() TestError!void {
     if (code != 3) report("dynamically linked hello exit status", code);
     try check(code == 3);
     try check(helpers.runPairExpect(path, 1)); // two at once
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// A .NET program published the ordinary way for Linux, ahead of time
@@ -1029,7 +1048,33 @@ fn dotnetAot() TestError!void {
     if (code != 2) report("dotnet aot exit status", code);
     try check(code == 2);
     try check(helpers.runPairExpect(path, 0)); // two runtimes at once
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
+}
+
+/// A .NET program as `dotnet publish -r linux-x64 --self-contained`
+/// leaves it: a folder with a small host program, the runtime with its
+/// JIT compiler as shared libraries, and the program as an assembly.
+///
+/// The host finds its own file through `/proc/self/exe` and the folder it
+/// is in, loads `libhostfxr.so`, `libhostpolicy.so` and `libcoreclr.so`
+/// from it; the runtime maps the assemblies, compiles the program's code
+/// with `libclrjit.so` into memory it then runs, and collects garbage
+/// with eight managed threads running.
+fn dotnetSelfContained() TestError!void {
+    const path = "/fixtures/dotnet-hello-app/hello";
+    if (!helpers.fileExists("/fixtures/dotnet-hello-app/libcoreclr.so") or !helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
+        root.print("  skipped: the image has no .NET runtime (scripts/fetch-dotnet-runtime.sh) or no C library (scripts/fetch-sysroot.sh)\n", .{});
+        return;
+    }
+    _ = helpers.runProgramArgs(path, &.{path}, &.{}); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    helpers.traceUnknownSyscalls(true);
+    defer helpers.traceUnknownSyscalls(false);
+    const code = helpers.runProgramArgs(path, &.{ path, "self", "contained" }, &.{"GREETING=hi dotnet jit"}) orelse return error.Failed;
+    if (code != 2) report("dotnet self-contained exit status", code);
+    try check(code == 2);
+    try check(helpers.runPairExpect(path, 0)); // two runtimes at once
+    try expectFootprint(memory); // code heaps, mapped assemblies, threads: all gone
 }
 
 /// Threads and futexes through the raw calls: a lock made of a futex,
@@ -1049,23 +1094,38 @@ fn threadsAndFutexes() TestError!void {
         if (status != mode[1]) report("/test/threads " ++ mode[0] ++ " exit status", status);
         try check(status == mode[1]);
     }
-    try check(helpers.footprint().eql(memory)); // every thread, stack and futex waiter is gone
+    try expectFootprint(memory); // every thread, stack and futex waiter is gone
 }
 
 /// Descriptors that are more than files: the standard streams, `dup`,
 /// pipes with their waiting and their ends; and a process that ends with
 /// a thread asleep in a pipe takes the thread and the pipe with it.
 fn descriptorsAndPipes() TestError!void {
-    _ = helpers.runProgram("/test/pipes"); // warm up: the heap may grow
+    // (With 16 descriptors: it fills the table to see what happens then.)
+    _ = helpers.runProgramLimited("/test/pipes", .{ .max_files = 16 }); // warm up: the heap may grow
     const memory = helpers.footprint();
-    const code = helpers.runProgram("/test/pipes") orelse return error.Failed;
+    const code = helpers.runProgramLimited("/test/pipes", .{ .max_files = 16 }) orelse return error.Failed;
     if (code != 0) report("/test/pipes failed check", code);
     try check(code == 0);
-    try check(helpers.runPair("/test/pipes"));
+    try check(helpers.runPairLimited("/test/pipes", .{ .max_files = 16 }));
     const status = helpers.runProgramArgs("/test/pipes", &.{ "pipes", "blocked" }, &.{}) orelse return error.Failed;
     if (status != 9) report("/test/pipes blocked exit status", status);
     try check(status == 9);
-    try check(helpers.footprint().eql(memory)); // open files and pipes are all gone
+    try expectFootprint(memory); // open files and pipes are all gone
+}
+
+/// What a program finds besides plain files: directories, `/proc` about
+/// itself, `/dev/null` and the random device, a descriptor table that
+/// grows, a filesystem that says it is read-only; and the scheduling
+/// calls a runtime makes.
+fn filesAndProc() TestError!void {
+    _ = helpers.runProgram("/test/files"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/files") orelse return error.Failed;
+    if (code != 0) report("/test/files failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/files"));
+    try expectFootprint(memory); // generated files and grown tables are freed
 }
 
 /// A multi-threaded C program built for Linux against musl runs: eight
@@ -1079,7 +1139,7 @@ fn muslThreads() TestError!void {
     if (code != 0) report("musl threads exit status", code);
     try check(code == 0);
     try check(helpers.runPair("/fixtures/musl-threads-static")); // two processes of eight threads
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// A Rust program built for Linux against musl runs with its standard
@@ -1096,7 +1156,7 @@ fn rustHello() TestError!void {
     if (code != 3) report("rust hello exit status", code);
     try check(code == 3);
     try check(helpers.runPairExpect("/fixtures/rust-hello-static", 1)); // two at once
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// A Go program built for Linux runs: its runtime's threads, its heap
@@ -1111,7 +1171,7 @@ fn goHello() TestError!void {
     if (code != 3) report("go hello exit status", code);
     try check(code == 3);
     try check(helpers.runPairExpect("/fixtures/go-hello-static", 1)); // two runtimes at once
-    try check(helpers.footprint().eql(memory)); // its threads, its reservations, all gone
+    try expectFootprint(memory); // its threads, its reservations, all gone
 }
 
 /// A .NET program compiled ahead of time for Linux (Native AOT, linked
@@ -1127,7 +1187,7 @@ fn dotnetHello() TestError!void {
     if (code != 2) report("dotnet hello exit status", code);
     try check(code == 2); // .NET's `args` leaves the program's name out
     try check(helpers.runPairExpect("/fixtures/dotnet-hello-static", 0)); // two runtimes at once
-    try check(helpers.footprint().eql(memory)); // its threads, its heap, its pipe: all gone
+    try expectFootprint(memory); // its threads, its heap, its pipe: all gone
 }
 
 /// Programs run, are preempted, crash and are torn down on every CPU at once.
@@ -1184,7 +1244,7 @@ fn extendedStateSwitching() TestError!void {
     if (helpers.probes.user_ticks < 10) report("timer interrupts in ring 3:", helpers.probes.user_ticks);
     try check(helpers.probes.user_ticks >= 10 and helpers.probes.violation == 0);
     helpers.removeProbes();
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// A new process gets clean x87, SSE and AVX registers, not the previous
@@ -1200,7 +1260,7 @@ fn syscallFuzz() TestError!void {
     try expectProgram("/test/fuzz"); // also the warm-up: the heap may grow
     const memory = helpers.footprint();
     try expectProgram("/test/fuzz");
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
     try expectProgram("/bin/hello");
 }
 
@@ -1237,7 +1297,7 @@ fn userFaults() TestError!void {
     try check(helpers.runProgram("/test/single_step") == 255);
     try check(helpers.iretReturns() == iret_before + 1);
     try check(helpers.runProgram("/bin/hello") == 0);
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// Double faults, NMIs and debug exceptions have their own stacks, and the CPU switches to them.
@@ -1280,7 +1340,7 @@ fn processLifecycle() TestError!void {
     const memory = helpers.footprint();
     try check(helpers.runProgram("/bin/hello") == 0);
     try check(helpers.runProgram("/test/kernel_read") == 255);
-    try check(helpers.footprint().eql(memory));
+    try expectFootprint(memory);
 }
 
 /// Kernel threads take turns in FIFO order and are reaped after exiting.
@@ -1766,7 +1826,9 @@ fn runCases() noreturn {
         .{ .name = "a program's ELF interpreter is loaded and started in its place", .func = elfInterpreter },
         .{ .name = "a dynamically linked C program runs with its loader and C library from files", .func = dynamicHello },
         .{ .name = "a .NET program published ahead of time for linux-x64 (glibc, dynamic) runs", .func = dotnetAot },
+        .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
+        .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
         .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },

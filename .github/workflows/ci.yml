@@ -111,6 +111,18 @@ jobs:
       - name: Fetch sysroot
         run: scripts/fetch-sysroot.sh
 
+      # The native libraries of the .NET runtime, which complete the
+      # self-contained .NET test program (a pinned package from nuget.org,
+      # checked by checksum).
+      - name: Cache .NET runtime
+        uses: actions/cache@v6
+        with:
+          path: dotnet-runtime
+          key: dotnet-runtime-${{ hashFiles('scripts/fetch-dotnet-runtime.sh') }}
+
+      - name: Fetch .NET runtime
+        run: scripts/fetch-dotnet-runtime.sh
+
       - name: Build kernel and apps
         run: zig build -Doptimize=${{ matrix.optimize }}
 

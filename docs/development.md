@@ -52,6 +52,23 @@ The console font is not in the repository. Put it in place once:
 ```bash
 scripts/fetch-font.sh
 scripts/fetch-sysroot.sh   # optional: the C library for dynamically linked programs
+scripts/fetch-dotnet-runtime.sh   # optional: completes the self-contained .NET test program
+```
+
+`scripts/fetch-dotnet-runtime.sh` downloads Microsoft's .NET runtime
+package for linux-x64 (pinned by version and checksum) and unpacks its
+native libraries to `dotnet-runtime/`. Every self-contained .NET program
+carries the same copy of them; the test program's folder in
+`tests/fixtures/bin/dotnet-hello-app` is checked in without, and the test
+image gets them from there. Without it the kernel test for that program
+reports that it was skipped.
+
+To run a program of your own, published elsewhere, put its folder under
+a directory and name that directory when building the image:
+
+```bash
+dotnet publish -c Release -r linux-x64 --self-contained -o extra/app
+MYOS_INITRD_EXTRA=extra scripts/build.sh    # the program is /app/<name>
 ```
 
 `scripts/fetch-sysroot.sh` downloads Debian 13's glibc, libgcc and

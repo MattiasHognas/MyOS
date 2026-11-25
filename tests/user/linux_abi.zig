@@ -194,7 +194,7 @@ pub fn main() noreturn {
     fds[0] = .{ .fd = -1, .events = abi.POLL.IN, .revents = 7 }; // a negative descriptor is skipped
     expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 3, 0) == 2, 91);
     expect(fds[0].revents == 0 and fds[1].revents == abi.POLL.OUT and fds[2].revents == abi.POLL.NVAL, 92);
-    expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 1000, 0) == lib.err(.INVAL), 93);
+    expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 2000, 0) == lib.err(.INVAL), 93); // more than there can be descriptors
     expect(lib.syscall(Sys.poll, 8, 1, 0) == lib.err(.FAULT), 94);
     expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 1, 20) == 0, 95); // waits out the 20 ms, nothing comes
 
@@ -268,7 +268,8 @@ pub fn main() noreturn {
 
     var link: [16]u8 = undefined;
     expect(lib.syscall(Sys.readlink, @intFromPtr("/etc/motd"), @intFromPtr(&link), link.len) == lib.err(.INVAL), 151); // not a link
-    expect(lib.syscall(Sys.readlink, @intFromPtr("/proc/self/exe"), @intFromPtr(&link), link.len) == lib.err(.NOENT), 152);
+    expect(lib.syscall(Sys.readlink, @intFromPtr("/etc/nothing"), @intFromPtr(&link), link.len) == lib.err(.NOENT), 152);
+    expect(lib.syscall(Sys.readlink, @intFromPtr("/etc"), @intFromPtr(&link), link.len) == lib.err(.INVAL), 160); // a directory is no link either
     expect(lib.syscall6(Sys.readlinkat, cwd, @intFromPtr("/etc/motd"), @intFromPtr(&link), link.len, 0, 0) == lib.err(.INVAL), 153);
 
     expect(lib.syscall(Sys.getcwd, @intFromPtr(&link), link.len, 0) == 2 and link[0] == '/' and link[1] == 0, 154);

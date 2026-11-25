@@ -10,6 +10,7 @@ booted by Limine. Currently on x86-64, will add arm later.
 zig build test          # host tests + QEMU integration tests
 scripts/fetch-font.sh   # once: console font
 scripts/fetch-sysroot.sh # once, optional: glibc, for dynamically linked programs
+scripts/fetch-dotnet-runtime.sh # once, optional: for the self-contained .NET test
 scripts/build.sh        # build kernel, apps and os.iso
 scripts/run-qemu.sh     # boot it in QEMU
 ```

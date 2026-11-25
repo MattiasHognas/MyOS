@@ -48,6 +48,10 @@ pub const Sys = struct {
     /// `dup(fd) -> new fd`, and `dup2(old, new)`.
     pub const dup = 32;
     pub const dup2 = 33;
+    /// `stat(path, statbuf)` and `lstat`, which does not follow a link at
+    /// the end of the path.
+    pub const stat = 4;
+    pub const lstat = 6;
     /// `access(path, mode) -> 0`: whether the file is there and may be
     /// used that way.
     pub const access = 21;
@@ -68,14 +72,45 @@ pub const Sys = struct {
     pub const uname = 63;
     /// `fcntl(fd, command, arg)`.
     pub const fcntl = 72;
+    /// `sched_setaffinity(pid, size, mask) -> 0`: accepted if the mask
+    /// has a CPU that is up; threads run on any CPU all the same.
+    pub const sched_setaffinity = 203;
     /// `time(tloc) -> seconds`.
     pub const time = 201;
+    /// `socket(domain, type, protocol)`: there is no networking yet
+    /// (`EAFNOSUPPORT`).
+    pub const socket = 41;
+    /// `ftruncate(fd, length)`: files cannot be written (`EINVAL`, as
+    /// for a descriptor not open for writing).
+    pub const ftruncate = 77;
+    /// `unlink(path)`, `mknodat(dirfd, path, mode, dev)`, `fchmod(fd,
+    /// mode)`: the filesystem is read-only (`EROFS`).
+    pub const unlink = 87;
+    pub const fchmod = 91;
+    pub const mknodat = 259;
+    pub const unlinkat = 263;
+    /// `memfd_create(name, flags)`: files that exist only in memory are
+    /// not offered yet (`ENOSYS`).
+    pub const memfd_create = 319;
     /// `getcwd(buf, size) -> length with the NUL`: always "/".
     pub const getcwd = 79;
     /// `readlink(path, buf, size)`: there are no symbolic links (`EINVAL`).
     pub const readlink = 89;
     /// `gettimeofday(tv, tz) -> 0`.
     pub const gettimeofday = 96;
+    /// `getsid(pid) -> session ID`: every process is its own session.
+    pub const getsid = 124;
+    /// The scheduling policy calls. There is one policy, `SCHED_OTHER`,
+    /// with priority 0: `sched_setparam(pid, param)`,
+    /// `sched_getparam(pid, param)`, `sched_setscheduler(pid, policy,
+    /// param)`, `sched_getscheduler(pid) -> policy`,
+    /// `sched_get_priority_max(policy)` and `_min`.
+    pub const sched_setparam = 142;
+    pub const sched_getparam = 143;
+    pub const sched_setscheduler = 144;
+    pub const sched_getscheduler = 145;
+    pub const sched_get_priority_max = 146;
+    pub const sched_get_priority_min = 147;
     /// `sysinfo(info) -> 0`: memory and uptime.
     pub const sysinfo = 99;
     /// `mremap(old, old_size, new_size, flags, new) -> address`: grow or
@@ -187,8 +222,12 @@ pub const E = enum(u16) {
     NODEV = 19,
     /// Not a directory.
     NOTDIR = 20,
+    /// Is a directory.
+    ISDIR = 21,
     /// The result does not fit the buffer.
     RANGE = 34,
+    /// Address family not supported.
+    AFNOSUPPORT = 97,
     /// Invalid argument.
     INVAL = 22,
     /// Not a terminal: the descriptor has no such `ioctl`.
@@ -247,6 +286,7 @@ pub const O = struct {
     pub const TRUNC = 0o1000;
     pub const APPEND = 0o2000;
     pub const NONBLOCK = 0o4000;
+    pub const DIRECTORY = 0o200000;
     pub const CLOEXEC = 0o2000000;
 };
 
@@ -456,6 +496,8 @@ pub const S = struct {
     pub const IFCHR = 0o020000;
     pub const IFIFO = 0o010000;
     pub const IFREG = 0o100000;
+    pub const IFDIR = 0o040000;
+    pub const IFLNK = 0o120000;
 };
 
 pub const SEEK = struct {
@@ -555,4 +597,12 @@ pub const CloneArgs = extern struct {
     stack: u64,
     stack_size: u64,
     tls: u64,
+};
+
+/// Scheduling policies. Only `OTHER` exists; `BATCH` and `IDLE` are the
+/// same thing to this scheduler and are refused rather than ignored.
+pub const SCHED = struct {
+    pub const OTHER = 0;
+    pub const FIFO = 1;
+    pub const RR = 2;
 };

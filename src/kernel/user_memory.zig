@@ -303,6 +303,52 @@ pub fn mremap(p: *Process, addr: u64, old_length: u64, new_length: u64, flags: u
     return addr;
 }
 
+/// The mappings of `p` as `/proc/self/maps` lists them, one a line, lowest
+/// first: `start-end perms offset dev inode name`, with the name given
+/// for the stack and the heap. In memory the caller frees with
+/// `heap.allocator`.
+pub fn describe(p: *Process) error{OutOfMemory}![]u8 {
+    const LINE = 96; // more than the longest line
+    // The text is written with the lock held and the memory for it cannot
+    // be got then: room for the regions there are now and some more, and
+    // again from the start if they have become more than that meanwhile.
+    var room: usize = 0;
+    while (true) {
+        {
+            const held = p.mem.lock.acquire();
+            defer p.mem.lock.release(held);
+            room = @max(room, (p.mem.regions.items().len + 16) * LINE);
+        }
+        const buf = try heap.allocator.alloc(u8, room);
+        var len: usize = 0;
+        const fits = blk: {
+            const held = p.mem.lock.acquire();
+            defer p.mem.lock.release(held);
+            for (p.mem.regions.items()) |r| {
+                if (buf.len - len < LINE) break :blk false;
+                const line = std.fmt.bufPrint(buf[len..], "{x:0>8}-{x:0>8} {c}{c}{c}p {x:0>8} 00:00 0 {s}\n", .{
+                    r.start,
+                    r.end,
+                    @as(u8, if (r.prot.read) 'r' else '-'),
+                    @as(u8, if (r.prot.write) 'w' else '-'),
+                    @as(u8, if (r.prot.exec) 'x' else '-'),
+                    if (r.kind == .file) r.backing.offset else 0,
+                    switch (r.kind) {
+                        .stack => "                         [stack]",
+                        .heap => "                         [heap]",
+                        .image, .anon, .file => "",
+                    },
+                }) catch break :blk false;
+                len += line.len;
+            }
+            break :blk true;
+        };
+        defer heap.allocator.free(buf);
+        if (fits) return heap.allocator.dupe(u8, buf[0..len]); // exactly as long as the text
+        room *= 2;
+    }
+}
+
 /// `munmap`.
 pub fn munmap(p: *Process, addr: u64, length: u64) u64 {
     if (length == 0 or addr % PAGE != 0 or length > MAP_MAX) return abi.err(.INVAL);

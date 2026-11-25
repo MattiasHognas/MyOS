@@ -128,8 +128,12 @@ pub const PIE_BASE: u64 = 0x5555_5555_4000;
 pub const PIE_RANDOM_PAGES: u64 = 1 << 28;
 /// Most memory the segments of one program may take under the default limits.
 pub const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
-/// Size of a process's descriptor table, and so the most `Limits.max_files` can allow.
-pub const MAX_FILES = 16;
+/// Most descriptors a process can have, and so the most
+/// `Limits.max_files` can allow: Linux's default limit. The table starts
+/// with `FILES_INITIAL` slots and is doubled when a descriptor beyond it is
+/// needed (`growFiles`).
+pub const MAX_FILES = 1024;
+pub const FILES_INITIAL = 32;
 
 /// What one process may use. Inherited by the processes it starts.
 pub const Limits = struct {
@@ -182,7 +186,9 @@ pub const Process = struct {
     /// File descriptor table, indexed by fd. A process starts with 0, 1
     /// and 2 open on the console. Several descriptors can refer to one
     /// open file (`dup`), which is counted (`OpenFile.refs`).
-    files: [MAX_FILES]?*open_file.OpenFile = @splat(null),
+    /// The table is replaced by a longer one when it has to grow, so its
+    /// address and length are read under `files_lock` too.
+    files: []?*open_file.OpenFile = &.{},
     /// What this process may use.
     limits: Limits = .{},
     /// Pages of physical memory the process takes (see `Limits.max_pages`).
@@ -205,6 +211,8 @@ pub const Process = struct {
     /// are. Under the process-tree lock.
     thread_list: ?*thread.Thread = null,
     thread_count: u32 = 0,
+    /// When it was started, in timer ticks since boot.
+    start_ticks: u64 = 0,
     /// Set, once, when the process is ending: its threads are to end too.
     killed: std.atomic.Value(bool) = .init(false),
     /// Where the thread that ends the process waits for the others to go.
@@ -549,6 +557,17 @@ pub fn release(p: *Process) void {
     heap.allocator.destroy(p);
 }
 
+/// Whether `tid` is a thread of `p` that has not exited.
+pub fn hasThread(p: *Process, tid: u64) bool {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        if (one.id == tid) return true;
+    }
+    return false;
+}
+
 /// Number of `Process` structures that exist: processes that run, and
 /// exited ones somebody still holds a reference to.
 pub fn liveCount() usize {
@@ -560,15 +579,42 @@ pub fn liveCount() usize {
 // Guarded by the tree lock.
 var live: usize = 0;
 
-/// Close every open file of `p`.
+/// Close every open file of `p` and free its descriptor table. Nothing
+/// else uses them: the caller is the process's last thread.
 fn closeFiles(p: *Process) void {
-    for (&p.files) |*slot| {
+    for (p.files) |*slot| {
         if (slot.*) |of| {
             of.refs -= 1;
             if (of.refs == 0) open_file.destroy(of);
         }
         slot.* = null;
     }
+    heap.allocator.free(p.files);
+    p.files = &.{};
+}
+
+/// Make the descriptor table of `p` at least `slots` long (at most
+/// `MAX_FILES`), keeping what is in it. False if there is no memory for it.
+/// The new table is allocated without the lock and put in place with it;
+/// if another thread has made the table long enough meanwhile, that one
+/// stays.
+pub fn growFiles(p: *Process, slots: usize) bool {
+    std.debug.assert(slots <= MAX_FILES);
+    var want: usize = FILES_INITIAL;
+    while (want < slots) want *= 2;
+    const new = heap.allocator.alloc(?*open_file.OpenFile, want) catch return false;
+    const old = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        if (p.files.len >= want) break :blk new; // not needed after all
+        @memcpy(new[0..p.files.len], p.files);
+        @memset(new[p.files.len..], null);
+        const before = p.files;
+        p.files = new;
+        break :blk before;
+    };
+    heap.allocator.free(old);
+    return true;
 }
 
 /// Load the executable at `path` from the VFS and start it as a new process.
@@ -760,8 +806,13 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     const console = try heap.allocator.create(open_file.OpenFile);
     errdefer heap.allocator.destroy(console);
     console.* = .{ .kind = .console, .refs = 3 };
+    const files = try heap.allocator.alloc(?*open_file.OpenFile, FILES_INITIAL);
+    errdefer heap.allocator.free(files);
+    @memset(files, null);
+    @memset(files[0..3], console);
     p.* = .{
         .root = root,
+        .start_ticks = timer.now(),
         .entry = first_entry,
         .stack_top = stack_top,
         .entry_rsp = entry_rsp,
@@ -777,7 +828,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
             .mmap_top = mmap_top,
         },
     };
-    for (p.files[0..3]) |*slot| slot.* = console;
+    p.files = files;
     // (On an error below, the list is freed through `regions`, which
     // still refers to it; the structure goes separately.)
 

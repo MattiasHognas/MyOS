@@ -84,7 +84,7 @@ for the time.
 | .NET Native AOT, static, musl, fixed address | Runs: the runtime, eight managed threads that allocate, a garbage collection that stops them (`tests/fixtures/bin/dotnet-hello-static`). No signal has to be delivered: the collector stops threads through `membarrier` and the checks compiled into managed code |
 | C, dynamically linked against glibc | Runs (`tests/fixtures/bin/glibc-hello-dynamic`): the kernel loads `ld-linux-x86-64.so.2`, which maps `libc.so.6` from its file. Loader and library are Debian 13's, unchanged (`scripts/fetch-sysroot.sh`). Beyond a static program it calls `newfstatat`, `access`, `mmap` of a file, `set_robust_list` and `rseq` (which it does without) |
 | .NET ahead of time as its tools build it (`dotnet publish -r linux-x64 -p:PublishAot=true`) | Runs (`tests/fixtures/bin/dotnet-hello-aot`): dynamically linked against glibc, position independent. glibc makes its threads with `clone3` |
-| .NET as its tools build it (`dotnet publish -r linux-x64 --self-contained`) | The goal ([roadmap 9](todo.md)). Dynamically linked against glibc, which runs; the runtime itself is next, and for the JIT signals |
+| .NET as its tools build it (`dotnet publish -r linux-x64 --self-contained`) | Runs (`tests/fixtures/bin/dotnet-hello-app`): the host program, `libhostfxr`, `libhostpolicy`, `libcoreclr` and the JIT compiler `libclrjit` from the program's folder, eight managed threads, a garbage collection. Trimmed in the fixture; the untrimmed 80 MB folder runs the same. No signal has to be delivered for this program |
 
 ## What this means for the order of work
 

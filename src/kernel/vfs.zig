@@ -4,6 +4,8 @@
 //! and each node carries the operations used to read it. This module has no
 //! kernel dependencies, so it is also tested natively on the host.
 
+const std = @import("std");
+
 /// The filesystem mounted at "/" by `mountRoot`, if any.
 var root_fs: ?Fs = null;
 
@@ -30,6 +32,9 @@ pub const Fs = struct {
     ctx: *anyopaque,
     /// Return the node for `path`, or null if it doesn't exist.
     lookup: *const fn (ctx: *anyopaque, path: []const u8) ?Node,
+    /// Whether `path` is a directory. A filesystem without the function
+    /// has none but its root.
+    is_dir: ?*const fn (ctx: *anyopaque, path: []const u8) bool = null,
 };
 
 /// Mount `fs` as the root filesystem, replacing any previous one. The kernel calls this once during boot.
@@ -46,6 +51,15 @@ pub fn lookup(path: []const u8) ?Node {
 
 /// Read up to `buf.len` bytes from `node` starting at `offset`. Returns the
 /// number of bytes read, or 0 if `offset` is at or beyond the end of the file.
+/// Whether `path` is a directory: the root, or what the mounted
+/// filesystem says is one.
+pub fn isDirectory(path: []const u8) bool {
+    const fs = root_fs orelse return false;
+    if (std.mem.trim(u8, path, "/").len == 0) return path.len != 0;
+    const is_dir = fs.is_dir orelse return false;
+    return is_dir(fs.ctx, path);
+}
+
 pub fn read(node: *const Node, offset: u64, buf: []u8) usize {
     return node.ops.read(node, offset, buf);
 }

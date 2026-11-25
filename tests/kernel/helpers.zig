@@ -269,9 +269,12 @@ pub fn traceAllSyscalls(on: bool) void {
 pub fn waitUntilGone(p: *process.Process) u64 {
     process.retain(p); // to look at it after `wait` has given up one reference
     const code = process.wait(p);
-    // The thread holds one reference until it is freed; then ours is the last.
-    var tries: usize = 0;
-    while (@atomicLoad(u32, &p.refs, .monotonic) != 1 and tries < 100_000) : (tries += 1) thread.yield();
+    // Each of its threads holds one reference until it is freed; then ours
+    // is the last. Bounded by time, not by tries: under a hypervisor the
+    // CPU that has to let go of a stack can be off the host's CPU for
+    // many milliseconds, longer than any number of yields here takes.
+    const deadline = timer.now() + 10 * timer.HZ;
+    while (@atomicLoad(u32, &p.refs, .monotonic) != 1 and timer.now() < deadline) thread.yield();
     process.release(p);
     return code;
 }
@@ -942,12 +945,13 @@ pub fn enterUserPageSpace() bool {
 
 // State shared by `runPair` and its two runner threads.
 var pair_path: []const u8 = "";
+var pair_limits: Limits = .{};
 var pair_codes: [2]?u64 = .{ null, null };
 var pair_done: usize = 0;
 
 /// Runner thread `index`: run the program and report its exit status.
 fn pairRunner(index: usize) void {
-    const code = runProgram(pair_path);
+    const code = runProgramLimited(pair_path, pair_limits);
     _ = cpu.saveAndDisableInterrupts(); // restored when the thread exits
     pair_codes[index] = code;
     signalDone(&pair_done, &done_queue);
@@ -968,6 +972,13 @@ pub fn runPair(path: []const u8) bool {
     return runPairExpect(path, 0);
 }
 
+/// `runPair` with `limits` on both processes.
+pub fn runPairLimited(path: []const u8, limits: Limits) bool {
+    pair_limits = limits;
+    defer pair_limits = .{};
+    return runPairExpect(path, 0);
+}
+
 /// `runPair` for a program that exits with status `want`.
 pub fn runPairExpect(path: []const u8, want: u64) bool {
     const flags = cpu.saveAndDisableInterrupts();
@@ -978,7 +989,9 @@ pub fn runPairExpect(path: []const u8, want: u64) bool {
     _ = thread.spawn(pairRunnerA, null) catch return false;
     _ = thread.spawn(pairRunnerB, null) catch return false;
     waitForDone(&pair_done, 2, &done_queue);
-    return pair_codes[0] == want and pair_codes[1] == want;
+    if (pair_codes[0] == want and pair_codes[1] == want) return true;
+    kernel_root.print("  two at once: exit statuses {any} and {any}, expected {d}\n", .{ pair_codes[0], pair_codes[1], want });
+    return false;
 }
 
 const RFLAGS_IF: u64 = 1 << 9;
@@ -2645,7 +2658,7 @@ fn programRunner() void {
         .{ .path = "/test/fpu", .want = 0 }, // every x87/SSE/AVX register, across switches
         .{ .path = "/bin/hello", .want = 0 },
         .{ .path = "/test/preempt", .want = 0 }, // long syscalls, registers checked after each
-        .{ .path = "/test/open_count", .want = 13 },
+        .{ .path = "/test/open_count", .want = 201 },
         .{ .path = "/test/div_zero", .want = process.EXIT_KILLED }, // a fault kills it, wherever it runs
         .{ .path = "/test/syscall_abi", .want = 0 },
         .{ .path = "/test/zero_pages", .want = 0 }, // nothing of another process in fresh memory
@@ -3023,7 +3036,7 @@ pub fn processWaiting() u32 {
     const threads_alive = thread.spawnedCount() - thread.reapedCount();
 
     // Exited long before the wait. It opens 13 files and leaves them open.
-    const early = process.spawnPath("/test/open_count", .{}) catch return 1;
+    const early = process.spawnPath("/test/open_count", .{ .limits = .{ .max_files = 16 } }) catch return 1;
     if (process.liveCount() != live + 1) return 2;
     if (!untilTornDown(early)) return 3;
     if (early.exit_code != 13) return 4;
@@ -3130,7 +3143,7 @@ pub fn lifecycleStress(rounds: usize) u32 {
         // Two at a time, collected in reverse order: the first has usually
         // exited long before it is waited for.
         const a = process.spawnPath("/test/entry_regs", .{}) catch return 2;
-        const b = process.spawnPath("/test/open_count", .{}) catch return 3;
+        const b = process.spawnPath("/test/open_count", .{ .limits = .{ .max_files = 16 } }) catch return 3;
         if (process.wait(b) != 13) return 4;
         if (process.wait(a) != 0) return 5;
         // Never waited for.

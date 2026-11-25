@@ -102,7 +102,7 @@ pub fn build(b: *std.Build) void {
         "preempt",    "gs_base",     "fpu",        "fpu_clean",      "fuzz",
         "bad_return", "single_step", "recurse",    "open_count",     "run_many",
         "getchar",    "zero_pages",  "linux_abi",  "vm",             "threads",
-        "pipes",
+        "pipes",      "files",
     }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, user_target, optimize);
         exe.root_module.addImport("lib", user_lib);
@@ -277,6 +277,7 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "startup_stack", "src/kernel/startup_stack.zig" },
         .{ "cmdline", "app/cmdline.zig" },
         .{ "vm_regions", "src/kernel/vm_regions.zig" },
+        .{ "tar", "src/kernel/fs/tar.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),

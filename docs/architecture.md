@@ -145,7 +145,7 @@ registers, so they are saved and restored only when the CPU moves from one
 user thread to another. Read: `src/arch/x86_64/fpu.zig`.
 
 **Files.** A small virtual filesystem layer with one filesystem behind it:
-the read-only initrd. Read: `src/kernel/vfs.zig`, `src/kernel/fs/tarfs.zig`; for what a descriptor can refer to besides a file (the console, a pipe): `src/kernel/open_file.zig`, `src/kernel/pipe.zig`.
+the read-only initrd. Read: `src/kernel/vfs.zig`, `src/kernel/fs/tarfs.zig`; for what a descriptor can refer to besides a file (the console, a pipe, a device): `src/kernel/open_file.zig`, `src/kernel/pipe.zig`; for the text files of `/proc`: `src/kernel/procfs.zig`; for the archive format of the initrd: `src/kernel/fs/tar.zig`.
 
 **Devices.** Serial port, framebuffer console, PS/2 keyboard, HPET, local
 and I/O APIC, PCI, and NVMe (reads, polled). Read: `src/drivers/`,

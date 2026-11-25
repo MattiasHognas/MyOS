@@ -31,6 +31,10 @@
 #                       it shows what the runtime's core asks of the kernel
 #                       before the kernel can load shared libraries. Linked
 #                       with Zig (zig-link) for want of an installed musl
+#   dotnet-hello-app/   .NET as `dotnet publish -r linux-x64
+#                       --self-contained` builds it: a folder with the
+#                       JIT runtime, less the runtime's native libraries
+#                       (scripts/fetch-dotnet-runtime.sh has those)
 #   dotnet-hello-aot    .NET as `dotnet publish -r linux-x64
 #                       -p:PublishAot=true` builds it: dynamically linked
 #                       against glibc, position independent
@@ -82,4 +86,29 @@ ZIG_LINK_TARGET=x86_64-linux-gnu.2.36 dotnet publish "$work/hello.csproj" -c Rel
     -o "$work/out" >/dev/null
 cp "$work/out/hello" bin/dotnet-hello-aot
 
-ls -l bin
+# And as `dotnet publish -r linux-x64 --self-contained` leaves it: a folder
+# with a host program, the runtime and its JIT compiler as shared
+# libraries, and the program as an assembly. Trimmed (-p:PublishTrimmed),
+# which leaves out the parts of the class library the program does not
+# use: 23 MB instead of 80. Of those, 20 MB are the runtime's native
+# libraries, which publishing copies unchanged from Microsoft's runtime
+# package; they are not checked in but fetched from that package
+# (scripts/fetch-dotnet-runtime.sh) and compared here. If the SDK on this
+# machine publishes another runtime version than that script pins, the
+# comparison fails: change the version and the checksum there.
+rm -rf "$work/out" "$work/bin" "$work/obj"
+dotnet publish "$work/hello.csproj" -c Release -r linux-x64 --self-contained \
+    -p:PublishTrimmed=true -o "$work/out" >/dev/null
+../../scripts/fetch-dotnet-runtime.sh >/dev/null
+rm -rf bin/dotnet-hello-app
+mkdir bin/dotnet-hello-app
+for f in "$work/out"/*; do
+    name="$(basename "$f")"
+    if [[ -f "../../dotnet-runtime/$name" ]]; then
+        cmp "$f" "../../dotnet-runtime/$name" # the same file: not kept twice
+    elif [[ "$name" != *.pdb && "$name" != *.dbg ]]; then
+        cp "$f" bin/dotnet-hello-app/
+    fi
+done
+
+ls -l bin bin/dotnet-hello-app

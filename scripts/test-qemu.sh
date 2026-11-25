@@ -232,6 +232,10 @@ run_scenario() {
                 expect_line '^hello from dotnet: 2 args$'
                 expect_line '^GREETING=hi dotnet aot$'
             fi
+            # .NET published as a self-contained folder: the JIT runtime.
+            if [[ -f zig-out/test/initrd/fixtures/dotnet-hello-app/libcoreclr.so && -f zig-out/test/initrd/lib64/ld-linux-x86-64.so.2 ]]; then
+                expect_line '^GREETING=hi dotnet jit$'
+            fi
             # The same C and Rust programs as position-independent executables.
             expect_line '^env GREETING=hi pie$'
             expect_line '^GREETING=hi rust pie$'

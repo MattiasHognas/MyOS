@@ -72,11 +72,13 @@ Linux calls, with Linux's numbers:
 
 | Number | Call | Notes |
 | --- | --- | --- |
-| 0 | `read(fd, buf, count)` | Files and pipes. A pipe gives what it holds, waiting only while it is empty and has a writer; 0 at its end. The console is not readable yet (`EBADF`); use `myos_getchar`. |
-| 1 | `write(fd, buf, count)` | The console (serial port and screen), which descriptors 0, 1 and 2 start out as, and pipes. A pipe takes all of it, waiting for room; `EPIPE` when no reader is left (no `SIGPIPE` yet). Files are read-only (`EBADF`). |
-| 2 | `open(path, flags, mode)` | Read-only: the access mode in `flags` must be `O_RDONLY`. Other flags and `mode` are ignored, except that `O_CREAT` on a missing file gives `EROFS`. |
+| 0 | `read(fd, buf, count)` | Files and pipes. A pipe gives what it holds, waiting only while it is empty and has a writer; 0 at its end. `/dev/null` is at its end at once, the random devices give random bytes. The console is not readable yet (`EBADF`); use `myos_getchar`. |
+| 1 | `write(fd, buf, count)` | The console (serial port and screen), which descriptors 0, 1 and 2 start out as, pipes, and `/dev/null` and the random devices, which throw it away. A pipe takes all of it, waiting for room; `EPIPE` when no reader is left (no `SIGPIPE` yet). Files are read-only (`EBADF`). |
+| 2 | `open(path, flags, mode)` | Files read-only: the access mode in `flags` must be `O_RDONLY` (`EROFS` otherwise). `/dev/null`, `/dev/urandom` and `/dev/random` may be opened for writing. The text files of `/proc` (see below) are made when they are opened. A directory cannot be opened yet (`EACCES`; `EISDIR` for writing); `O_DIRECTORY` on a file is `ENOTDIR`. `O_NONBLOCK` is kept; other flags are ignored. |
 | 3 | `close(fd)` | Any open descriptor, the standard ones too. What it referred to goes with its last descriptor. |
+| 4 | `stat(path, statbuf)` | `newfstatat` for a path. |
 | 5 | `fstat(fd, statbuf)` | The console is a character device, a pipe a FIFO, an open file a regular file with its size. Two descriptors or paths are the same file if device and inode number are equal. |
+| 6 | `lstat(path, statbuf)` | `stat` without following a link at the end. |
 | 7 | `poll(fds, nfds, timeout)` | The console is writable, a file readable, a pipe when it has bytes or room; `POLLHUP` and `POLLERR` for a pipe whose other end is closed, `POLLNVAL` for a descriptor that is not open. Waits by looking again every tick. |
 | 8 | `lseek(fd, offset, whence)` | Open files; `ESPIPE` for the console and pipes. |
 | 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory, and files: a private mapping gets each page from the file when it is first touched and keeps its changes to itself; a shared one may only be read (files cannot be written: `EACCES`). A page wholly past the end of the file kills the program that touches it. `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`; `MAP_DENYWRITE` is ignored. `ENODEV` for a descriptor that is not a file. |
@@ -97,17 +99,28 @@ Linux calls, with Linux's numbers:
 | 33 | `dup2(old, new)` | Closes what `new` was. |
 | 35 | `nanosleep(req, rem)` | Resolution is one timer tick (10 ms), rounded up. `rem` is never written: nothing interrupts a sleep yet. |
 | 39 | `getpid()` | The ID of the process's first thread. |
+| 41 | `socket(domain, type, protocol)` | No networking yet: `EAFNOSUPPORT`. |
 | 56 | `clone(flags, stack, ptid, ctid, tls)` | New threads only: `flags` must include `CLONE_VM`, `CLONE_SIGHAND` and `CLONE_THREAD` (`EINVAL` otherwise; there is no `fork` yet). `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. |
 | 60 | `exit(status)` | Ends the calling thread. The last thread's status is the process's: the parent sees `status & 0xff`. |
 | 62 | `kill(pid, sig)` | The calling process only. Signals are not delivered yet: signal 0 checks; a signal with no handler whose default is to end the process ends it with status 128 + the signal (that is `abort`); anything else is dropped. `tkill` (200) and `tgkill` (234) likewise. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
+| 77 | `ftruncate(fd, length)` | No descriptor is open for writing a file: `EINVAL`. |
 | 79 | `getcwd(buf, size)` | Always `/`: there are no directories to change to. |
-| 89 | `readlink(path, buf, size)` | There are no symbolic links: `EINVAL` for a file, `ENOENT` otherwise. |
+| 87 | `unlink(path)` | The filesystem is read-only: `EROFS`, or `ENOENT` if there is nothing to remove. |
+| 89 | `readlink(path, buf, size)` | The one symbolic link is `/proc/self/exe` (also `/proc/<own pid>/exe`): the path of the program the process runs, cut to `size`. `EINVAL` for anything else that exists, `ENOENT` otherwise. |
+| 91 | `fchmod(fd, mode)` | `EROFS`. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
+| 124 | `getsid(pid)` | Every process is its own session. |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, recorded. |
 | 137 | `statfs(path, buf)` | One filesystem, in memory and read-only, reported as `tmpfs`. `ENOENT` for a path that does not exist. |
+| 142 | `sched_setparam(pid, param)` | One policy, `SCHED_OTHER`, with priority 0: that may be set, anything else is `EINVAL`. `pid` is 0 or a thread of the calling process. |
+| 143 | `sched_getparam(pid, param)` | Priority 0. |
+| 144 | `sched_setscheduler(pid, policy, param)` | As `sched_setparam`. |
+| 145 | `sched_getscheduler(pid)` | `SCHED_OTHER`. |
+| 146 | `sched_get_priority_max(policy)` | 0 for `SCHED_OTHER`; `EINVAL` for the real-time policies, which do not exist here. |
+| 147 | `sched_get_priority_min(policy)` | The same. |
 | 149 | `mlock(addr, length)` | Memory is never paged out: checks the range and succeeds. |
 | 150 | `munlock(addr, length)` | The same. |
 | 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
@@ -115,6 +128,7 @@ Linux calls, with Linux's numbers:
 | 186 | `gettid()` | |
 | 201 | `time(tloc)` | Seconds of the real-time clock. |
 | 202 | `futex(addr, op, val, timeout, addr2, val3)` | `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, with or without `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`. Only within one process. Timeouts have the timer's resolution and never end early. |
+| 203 | `sched_setaffinity(pid, size, mask)` | Accepted if the mask has a CPU that is up, and changes nothing: threads run on any CPU. |
 | 204 | `sched_getaffinity(pid, size, mask)` | Every CPU that is up; 8 bytes. |
 | 218 | `set_tid_address(ptr)` | Returns the thread ID. When the thread exits, zero is written to `ptr` and one futex waiter on it is woken. |
 | 228 | `clock_gettime(clock, ts)` | Monotonic clocks count from boot. The real-time clock is time since boot counted from 2026-01-01: there is no clock chip driver yet. CPU-time clocks return time since boot. |
@@ -122,7 +136,9 @@ Linux calls, with Linux's numbers:
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
 | 239 | `get_mempolicy(mode, nodemask, maxnode, addr, flags)` | One memory node, the default policy: mode 0 and an empty mask. No flags. |
 | 257 | `openat(dirfd, path, flags, mode)` | `AT_FDCWD` or an absolute path. |
-| 262 | `newfstatat(dirfd, path, statbuf, flags)` | `stat` by path; of the descriptor itself with an empty path and `AT_EMPTY_PATH`. Paths are absolute, or relative to `AT_FDCWD` (`ENOTDIR` for another descriptor). Only files exist: a directory is `ENOENT`. |
+| 259 | `mknodat(dirfd, path, mode, dev)` | `EROFS`. |
+| 262 | `newfstatat(dirfd, path, statbuf, flags)` | `stat` by path; of the descriptor itself with an empty path and `AT_EMPTY_PATH`. Paths are absolute, or relative to `AT_FDCWD` (`ENOTDIR` for another descriptor). Files, directories (whatever a file is in), the `/proc` and `/dev` entries; `AT_SYMLINK_NOFOLLOW` shows `/proc/self/exe` as the link it is. |
+| 263 | `unlinkat(dirfd, path, flags)` | As `unlink`. |
 | 267 | `readlinkat(dirfd, path, buf, size)` | As `readlink`. |
 | 269 | `faccessat(dirfd, path, mode)` | As `access`. |
 | 273 | `set_robust_list(head, size)` | Accepted and not used: a thread that dies takes its process with it. |
@@ -130,6 +146,7 @@ Linux calls, with Linux's numbers:
 | 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
 | 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
 | 318 | `getrandom(buf, len, flags)` | Never blocks. |
+| 319 | `memfd_create(name, flags)` | Not offered yet: `ENOSYS`, on purpose. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
 | 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
 | 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules: new threads only. Fields past the first version of the structure must be zero. |
@@ -153,10 +170,21 @@ Every other number returns `ENOSYS`.
 - **Threads** share their process's address space, descriptors and signal
   handlers, and each has its own registers, FS and GS base and signal
   mask. `getpid` is the same in all of them, `gettid` different.
-- **Descriptors.** A process has 16. It starts with 0, 1 and 2 open on the
+- **Descriptors.** A process may have 1024, Linux's default; its table
+  starts with 32 slots and doubles as higher ones are used. It starts
+  with 0, 1 and 2 open on the
   console; they can be closed, duplicated and replaced like any other.
   `open`, `dup` and `pipe2` return the lowest free one. Descriptors are
   not inherited by programs started with `myos_run`.
+- **Directories** are not stored: a path is a directory if a file is
+  somewhere below it. They can be asked about (`stat`, `access`) and not
+  yet opened or listed.
+- **`/proc` and `/dev`.** A process finds a few things about itself and
+  the machine as files, in Linux's format: `/proc/self/exe` (a link to
+  its program), `/proc/self/maps` (its mappings; a C library finds the
+  main thread's stack there), `/proc/self/stat`, `/proc/meminfo`;
+  `self` may be its own process ID, and no other process is visible.
+  `/dev/null`, `/dev/urandom` and `/dev/random` are devices.
 - **Counts** above `0x7ffff000` are shortened to that, as on Linux.
 - **Limits.** Every process has limits, inherited from the process that
   started it: 256 MiB of memory (its program, stack, page tables and kernel
