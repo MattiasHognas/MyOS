@@ -421,17 +421,20 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 
 Designed once, demand-paged from the start, instead of an eager `mmap` first and demand paging later.
 
-- [ ] Before designing the next item, read the two opposite answers to it in `docs/research.md` and write down which way MyOS goes and why: page tables as the only record, with metadata per page (CortenMM), or a region structure built for concurrency (the interval skiplist). Many threads of one process fault and change mappings at once under a garbage collector, so the choice decides how 7 and 9.2 scale.
-- [ ] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults.
-- [ ] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
+- [x] Before designing the next item, read the two opposite answers to it in `docs/research.md` and write down which way MyOS goes and why: page tables as the only record, with metadata per page (CortenMM), or a region structure built for concurrency (the interval skiplist). Many threads of one process fault and change mappings at once under a garbage collector, so the choice decides how 7 and 9.2 scale.
+  - Decided: a list of regions per process next to the page tables, under one lock per address space (`vm_regions.zig`, `user_memory.zig`). The regions say what a fault means without reading page tables, and reserving a gigabyte costs one entry. One lock is right while a process has one thread; it is the thing to revisit when many threads of one process fault at once (7), and the two designs in the research notes are the candidates then.
+- [x] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults. Tested on the host against a page-by-page model.
+- [x] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
 - [ ] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
-- [ ] Implement `mprotect`, `munmap` of partial ranges, `madvise(MADV_DONTNEED)` and `brk`, with resource reclamation.
-- [ ] Charge every page a process gets after it has started against its memory limit (`process.Limits.max_pages`, 2.6): pages given on demand to `mmap`, `brk` and stack growth, and the page tables they need; give the charge back on `munmap`. Today the limit is only checked when the program is loaded, because nothing else can allocate. A request over the limit fails with `ENOMEM`; a page fault over it follows the out-of-memory policy below. Test that the charge always equals what left the allocator, as the 2.6 test does at start.
-- [ ] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes).
-- [ ] Shoot down TLB entries on the other CPUs on `munmap` and `mprotect` (3.4).
-- [ ] Define the out-of-memory policy: when a page fault cannot be given a page, the process is killed and the kernel carries on; tie it to the per-process limits of 2.6.
+  - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations. Open: private file-backed mappings.
+- [x] Implement `mprotect`, `munmap` of partial ranges, `madvise(MADV_DONTNEED)` and `brk`, with resource reclamation.
+- [x] Charge every page a process gets after it has started against its memory limit (`process.Limits.max_pages`, 2.6): pages given on demand to `mmap`, `brk` and stack growth, and the page tables they need; give the charge back on `munmap`. Today the limit is only checked when the program is loaded, because nothing else can allocate. A request over the limit fails with `ENOMEM`; a page fault over it follows the out-of-memory policy below. Test that the charge always equals what left the allocator, as the 2.6 test does at start.
+- [x] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes). The stack's region is 8 MiB, Linux's default limit; below it 1 MiB is kept free of mappings.
+- [x] Shoot down TLB entries on the other CPUs on `munmap` and `mprotect` (3.4).
+- [x] Define the out-of-memory policy: when a page fault cannot be given a page, the process is killed and the kernel carries on; tie it to the per-process limits of 2.6.
 - [ ] Add a small userspace allocator for the Zig programs on top of `mmap`.
 - [ ] Test reserve-then-commit of a multi-gigabyte range, permission changes, partial unmaps, faults on `PROT_NONE` pages, stack growth up to its limit, the out-of-memory kill, and page faults on several CPUs at once in one address space (once threads exist, 7).
+  - Done (`/test/vm`, alone and two at once): reserve 4 GiB and commit 1 MiB of it, permission changes that keep the data, partial unmaps, the kills for touching `PROT_NONE`, read-only and unmapped pages and for a stack past its limit, the kill at the memory limit, and system calls reading into memory nothing has touched. Open: faults on several CPUs in one address space, which needs threads.
 
 **Milestone 5 done when:** A program can reserve a multi-gigabyte range and commit it piece by piece, and a program that exhausts memory is the only casualty.
 

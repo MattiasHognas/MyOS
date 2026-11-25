@@ -77,7 +77,8 @@ The initrd is a tar archive built by `scripts/build.sh`: `/bin/sh`,
 | --- | --- | --- |
 | `0x0` to 64 KiB | Never mapped | A null pointer faults, also with a small offset |
 | 64 KiB upwards | The program | Wherever its ELF file says, below the stack's range |
-| Below `0x7FFF_FFFF_0000` | The user stack | Its top is random within 16 GiB; 8 MiB are reserved for it, 16 KiB mapped |
+| Below the stack | `mmap` | Placed top down from 1 MiB below the stack's region; memory comes when it is touched |
+| Below `0x7FFF_FFFF_0000` | The user stack | Its top is random within 16 GiB; it may grow to 8 MiB, and its pages come as it is used |
 | Last page below `0x8000_0000_0000` | Never mapped | See `vmm.USER_MAP_END` |
 | `0xFFFF_8000_0000_0000` | Direct map of all physical memory | 2 MiB pages; never executable; the kernel image's read-only pages are read-only here too |
 | `0xFFFF_9000_0000_0000` | Kernel heap | Up to 1 GiB, grows on demand |

@@ -880,6 +880,33 @@ fn linuxStartup() TestError!void {
     try check(helpers.footprint().eql(memory));
 }
 
+/// Memory on demand: `mmap`, `munmap`, `mprotect`, `madvise`, `brk`, a
+/// multi-gigabyte reservation committed piece by piece, a stack that
+/// grows; faults that kill only the program; and nothing left behind.
+fn userMemory() TestError!void {
+    _ = helpers.runProgram("/test/vm"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/vm") orelse return error.Failed;
+    if (code != 0) report("/test/vm failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/vm")); // two address spaces at once
+    try check(helpers.runProgramArgs("/test/vm", &.{ "vm", "deep" }, &.{}) == 0);
+    // What a program is killed for.
+    inline for (.{ "none", "readonly", "unmapped", "stack" }) |mode| {
+        const status = helpers.runProgramArgs("/test/vm", &.{ "vm", mode }, &.{}) orelse return error.Failed;
+        if (status != 255) report("/test/vm " ++ mode ++ " exit status", status);
+        try check(status == 255);
+    }
+    // A process that uses up its memory limit is the only casualty: it
+    // asks for 1 GiB and may have 16 MiB.
+    const oom = helpers.runProgramLimitedArgs("/test/vm", &.{ "vm", "oom" }, .{ .max_pages = 4096 }) orelse return error.Failed;
+    if (oom != 255) report("/test/vm oom exit status", oom);
+    try check(oom == 255);
+    try check(helpers.runProgram("/bin/hello") == 0); // the kernel is fine
+    try check(helpers.footprint().eql(memory));
+    try check(pmm.consistent());
+}
+
 /// A C program built for Linux and linked against musl, with nothing of
 /// MyOS in it, runs: it finds its arguments and environment, prints them
 /// through its own `printf`, and exits with its number of arguments. The
@@ -1524,6 +1551,7 @@ fn runCases() noreturn {
         .{ .name = "CPUs (all online, own per-CPU state, tables and stacks, same setup, timer interrupts)", .func = cpus, .alone = true },
         .{ .name = "speculation barrier after the conditional swapgs at kernel entry", .func = swapgsFences },
         .{ .name = "Linux startup: initial stack, FS and GS base, writev, ioctl, set_tid_address, exit_group", .func = linuxStartup },
+        .{ .name = "memory on demand: mmap, munmap, mprotect, madvise, brk, stack growth, faults, the limit", .func = userMemory },
         .{ .name = "a static musl program built for Linux runs (arguments, environment, printf)", .func = muslHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },

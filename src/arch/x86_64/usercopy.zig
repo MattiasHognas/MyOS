@@ -138,6 +138,12 @@ pub fn fixup(rip: u64, fault_addr: u64) ?u64 {
     return @intFromPtr(&user_copy_fault);
 }
 
+/// True if `rip` is the copy instruction of `user_copy`: a fault there is
+/// on the memory a system call was given.
+pub fn inCopy(rip: u64) bool {
+    return rip >= @intFromPtr(&user_copy_start) and rip < @intFromPtr(&user_copy_end);
+}
+
 /// True once SMAP is on.
 pub fn smapEnabled() bool {
     return smap_enabled != 0;

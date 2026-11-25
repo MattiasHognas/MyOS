@@ -68,6 +68,30 @@ pub fn close(fd: u64) u64 {
     return syscall(Sys.close, fd, 0, 0);
 }
 
+/// Map `len` bytes of zeroed memory with the permissions `prot`
+/// (`abi.PROT`), at `addr` if given and free, or with `abi.MAP.FIXED` in
+/// `flags` exactly there. Private and anonymous are added to `flags`.
+/// Returns the address, or an error. The memory is not there until it is
+/// touched, so a large mapping costs nothing until it is used.
+pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64) u64 {
+    return syscall6(Sys.mmap, addr, len, prot, flags | abi.MAP.PRIVATE | abi.MAP.ANONYMOUS, ~@as(u64, 0), 0);
+}
+
+/// Unmap `len` bytes at `addr`. Returns 0, or an error.
+pub fn munmap(addr: u64, len: u64) u64 {
+    return syscall(Sys.munmap, addr, len, 0);
+}
+
+/// Change the permissions of `len` bytes at `addr`. Returns 0, or an error.
+pub fn mprotect(addr: u64, len: u64, prot: u64) u64 {
+    return syscall(Sys.mprotect, addr, len, prot);
+}
+
+/// Move the end of the heap to `addr` (0: just ask) and return where it is.
+pub fn brk(addr: u64) u64 {
+    return syscall(Sys.brk, addr, 0, 0);
+}
+
 /// Give the CPU to another ready thread.
 pub fn yield() void {
     _ = syscall(Sys.sched_yield, 0, 0, 0);

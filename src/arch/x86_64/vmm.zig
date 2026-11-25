@@ -314,6 +314,118 @@ pub fn unmapRange(root: u64, virt: u64, phys: []?u64) void {
     for (0..phys.len) |i| pruneTables(root, virt + i * pmm.PAGE_SIZE);
 }
 
+/// `map` for a page a running program is given, which also says how many
+/// page tables had to be added for it (0 to 3): they are memory the
+/// process takes, like the page.
+pub fn mapCounting(root: u64, virt: u64, phys: u64, flags: u64, tables_added: *usize) MapError!void {
+    const before = userTablePagesOnPath(root, virt);
+    try map(root, virt, phys, flags, false);
+    tables_added.* = userTablePagesOnPath(root, virt) - before;
+}
+
+/// Number of page tables below the PML4 on the way to `virt` that exist.
+fn userTablePagesOnPath(root: u64, virt: u64) usize {
+    var t = table(root);
+    var n: usize = 0;
+    var level: u6 = 3;
+    while (level > 0) : (level -= 1) {
+        const e = t[index(virt, level)];
+        if (e & PRESENT == 0 or e & HUGE != 0) break;
+        n += 1;
+        t = table(e & ADDR_MASK);
+    }
+    return n;
+}
+
+/// Bytes one entry of the table at `level` covers (0 = PT ... 3 = PML4).
+fn span(level: u6) u64 {
+    return @as(u64, 1) << (12 + 9 * level);
+}
+
+/// What `walkUserRange` does to each mapped page.
+const RangeAction = union(enum) {
+    /// Remove the mapping and free the page.
+    unmap,
+    /// Replace the permission bits of the entry (`USER`, `WRITABLE`, `NX`).
+    protect: u64,
+};
+
+/// Apply `action` to every mapped 4 KiB page of `[start, end)` under the
+/// table at `phys` of `level`, whose first entry maps `base`. Tables that
+/// have nothing in the range are skipped whole, so a range of gigabytes
+/// with little in it costs little. Returns the number of pages and page
+/// tables freed, or for `protect` the number of pages changed. When unmapping, a table that ends up empty is freed too
+/// (its entry in the parent is cleared by the caller, who is told through
+/// `emptied`).
+fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: RangeAction, emptied: *bool) usize {
+    const t = table(phys);
+    var freed: usize = 0;
+    const step = span(level);
+    const first: usize = if (start > base) @intCast((start - base) / step) else 0;
+    var i = first;
+    while (i < 512) : (i += 1) {
+        const entry_base = base + i * step;
+        if (entry_base >= end) break;
+        const e = t[i];
+        if (e & PRESENT == 0 or e & HUGE != 0) continue;
+        if (level == 0) {
+            switch (action) {
+                .unmap => {
+                    t[i] = 0;
+                    pmm.free(e & ADDR_MASK);
+                    freed += 1;
+                },
+                .protect => |bits| {
+                    t[i] = (e & ~(USER | WRITABLE | NX)) | bits;
+                    freed += 1; // counted, though nothing is freed: see the callers
+                },
+            }
+        } else {
+            var child_empty = false;
+            freed += walkUserRange(e & ADDR_MASK, level - 1, entry_base, start, end, action, &child_empty);
+            if (child_empty) {
+                t[i] = 0;
+                pmm.free(e & ADDR_MASK);
+                freed += 1;
+            }
+        }
+    }
+    emptied.* = action == .unmap and level < 3 and isEmpty(t);
+    return freed;
+}
+
+/// Remove every mapping in the user range `[start, end)` of the address
+/// space `root`, free the pages, and free the page tables that are left
+/// empty. Returns how many pages and page tables were freed. The pages are
+/// flushed from every CPU that has `root` loaded before any of them is
+/// reused: the order `unmap` keeps, for a whole range. Unlike `unmap`, the
+/// pages are freed here: they are the address space's own.
+pub fn unmapUserRange(root: u64, start: u64, end: u64) usize {
+    assert.check(.vmm, start <= end and end <= USER_END and start % pmm.PAGE_SIZE == 0 and end % pmm.PAGE_SIZE == 0, "unmapping the user range 0x{x}-0x{x}", .{ start, end });
+    if (start == end) return 0;
+    // Two passes, so that nothing is freed before it is flushed: clear the
+    // entries of the range first (remembering nothing: the pages are found
+    // again through the tables, which are only freed afterwards)...
+    var unused = false;
+    const mapped = walkUserRange(root, 3, 0, start, end, .{ .protect = 0 }, &unused); // no user access from here on
+    if (mapped == 0) return 0; // nothing was ever touched there: nothing to flush or free
+    flushEverywhere(root, start, (end - start) / pmm.PAGE_SIZE);
+    // ...then free the pages and the tables.
+    return walkUserRange(root, 3, 0, start, end, .unmap, &unused);
+}
+
+/// Give every mapped page of the user range `[start, end)` the permission
+/// bits `flags` (`USER`, `WRITABLE`, `NX`; without `USER` the program
+/// cannot touch the page at all), and flush them from every CPU that has
+/// `root` loaded.
+pub fn protectUserRange(root: u64, start: u64, end: u64, flags: u64) void {
+    assert.check(.vmm, start <= end and end <= USER_END and start % pmm.PAGE_SIZE == 0 and end % pmm.PAGE_SIZE == 0, "protecting the user range 0x{x}-0x{x}", .{ start, end });
+    if (start == end) return;
+    var unused = false;
+    const changed = walkUserRange(root, 3, 0, start, end, .{ .protect = flags & (USER | WRITABLE | NX) }, &unused);
+    if (changed != 0) flushEverywhere(root, start, (end - start) / pmm.PAGE_SIZE);
+}
+
 /// Return the leaf page-table entry (PT entry, or PD entry of a 2 MiB page)
 /// that maps `virt` in the address space whose PML4 is `root`, or null if
 /// `virt` is not mapped. Only reads the page tables, so it is safe to call

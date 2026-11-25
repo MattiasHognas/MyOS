@@ -141,7 +141,7 @@ pub fn addressSpaceRoundtrip() bool {
 pub fn elfProbe(image: []const u8, addr: u64, out: []u8) ?ElfProbe {
     const root = vmm.createAddressSpace() catch return null;
     defer vmm.destroyAddressSpace(root);
-    const entry = (elf.load(root, image, process.image_limits) catch return null).entry;
+    const entry = (elf.load(root, image, process.image_limits, null) catch return null).entry;
     const pte = vmm.leafEntry(root, addr) orelse 0;
     if (vmm.translate(root, addr)) |phys| {
         const n = @min(out.len, pmm.PAGE_SIZE - (addr % pmm.PAGE_SIZE));
@@ -155,7 +155,7 @@ pub fn elfProbe(image: []const u8, addr: u64, out: []u8) ?ElfProbe {
 pub fn elfLoadError(image: []const u8) ?elf.Error {
     const root = vmm.createAddressSpace() catch return error.OutOfMemory;
     defer vmm.destroyAddressSpace(root);
-    _ = elf.load(root, image, process.image_limits) catch |e| return e;
+    _ = elf.load(root, image, process.image_limits, null) catch |e| return e;
     return null;
 }
 
@@ -198,6 +198,12 @@ pub fn runProgramLimited(path: []const u8, limits: Limits) ?u64 {
 /// not be started.
 pub fn runProgramArgs(path: []const u8, argv: []const []const u8, envp: []const []const u8) ?u64 {
     const p = process.spawnPath(path, .{ .argv = argv, .envp = envp, .randomize = randomize_layout }) catch return null;
+    return waitUntilGone(p);
+}
+
+/// `runProgramArgs` with `limits` on the new process.
+pub fn runProgramLimitedArgs(path: []const u8, argv: []const []const u8, limits: Limits) ?u64 {
+    const p = process.spawnPath(path, .{ .argv = argv, .limits = limits, .randomize = randomize_layout }) catch return null;
     return waitUntilGone(p);
 }
 

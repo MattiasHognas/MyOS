@@ -76,9 +76,14 @@ Linux calls, with Linux's numbers:
 | 1 | `write(fd, buf, count)` | Descriptors 1 and 2 only, both the console (serial port and screen). Files cannot be written (`EBADF`). |
 | 2 | `open(path, flags, mode)` | Read-only: the access mode in `flags` must be `O_RDONLY`. Other flags and `mode` are ignored, except that `O_CREAT` on a missing file gives `EROFS`. |
 | 3 | `close(fd)` | Closing 0, 1 or 2 succeeds and does nothing. |
+| 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory only (`MAP_ANONYMOUS` with `MAP_PRIVATE` or `MAP_SHARED`; a file is `ENODEV`). `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, and an address hint that is used if it is free; otherwise placed top down. `MAP_NORESERVE` and `MAP_STACK` are accepted. The memory is given page by page as it is touched. |
+| 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
+| 11 | `munmap(addr, length)` | Any part of any mappings; unmapping what is not mapped succeeds. |
+| 12 | `brk(addr)` | Returns the new end of the heap, or the old one if it cannot move. |
 | 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for the standard streams and open files (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
 | 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. Descriptors 1 and 2 only. |
 | 24 | `sched_yield()` | |
+| 28 | `madvise(addr, length, advice)` | `MADV_DONTNEED` and `MADV_FREE` give the pages back at once: they read as zeroes afterwards. Other advice is accepted and ignored. |
 | 60 | `exit(status)` | The parent sees `status & 0xff`. Ends the process (which has one thread). |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
@@ -112,8 +117,15 @@ Every other number returns `ENOSYS`.
 - **Arguments and environment** of a new program may take 8 KiB on its
   stack together, the auxiliary vector included, and be 256 strings (on
   Linux: a quarter of the stack limit, 2 MiB by default).
-- **Running out of memory** fails the call that needed it with `ENOMEM`.
-  Nothing is killed to make room.
+- **Memory is given on first touch.** `mmap` and `brk` reserve address
+  space; a page exists once it is read or written. A reservation of any
+  size succeeds and costs nothing (there is no overcommit limit), and a
+  process pays, against its limit, for the pages it has touched and the
+  page tables for them.
+- **Running out of memory** fails the system call that needed it with
+  `ENOMEM`. A program that touches a page it cannot be given (it is at
+  its limit, or the machine has none left) is killed, like any fault it
+  cannot continue from; nothing else is killed to make room.
 - **A process the kernel kills** (a fault in ring 3) ends with status 255.
   There are no signals yet (milestone 8).
 
@@ -123,8 +135,9 @@ A program is entered at its ELF entry point in ring 3 the way Linux enters
 one, with:
 
 - all general-purpose registers zero, RFLAGS `0x202` (interrupts on);
-- a 16 KiB stack whose top is at a random page in a 16 GiB range below
-  `0x7fffffff0000`, different for every process;
+- a stack whose top is at a random page in a 16 GiB range below
+  `0x7fffffff0000`, different for every process. It may grow to 8 MiB,
+  and gets its pages as it is used;
 - `rsp` on a 16-byte boundary, pointing at the initial stack described
   below, which ends a random distance below the top of the stack;
 - FS and GS base zero, until the program sets them with `arch_prctl`;

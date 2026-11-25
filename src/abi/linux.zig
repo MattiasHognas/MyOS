@@ -16,12 +16,23 @@ pub const Sys = struct {
     pub const open = 2;
     /// `close(fd) -> 0`.
     pub const close = 3;
+    /// `mmap(addr, length, prot, flags, fd, offset) -> address`: anonymous
+    /// memory, given page by page as it is touched.
+    pub const mmap = 9;
+    /// `mprotect(addr, length, prot) -> 0`.
+    pub const mprotect = 10;
+    /// `munmap(addr, length) -> 0`.
+    pub const munmap = 11;
+    /// `brk(addr) -> end of the heap`: move it, or with 0 just ask.
+    pub const brk = 12;
     /// `ioctl(fd, request, arg)`: no device has requests yet, so `ENOTTY`.
     pub const ioctl = 16;
     /// `writev(fd, iov, iovcnt) -> bytes written`: `write` from several buffers.
     pub const writev = 20;
     /// `sched_yield() -> 0`: give the CPU to another ready thread.
     pub const sched_yield = 24;
+    /// `madvise(addr, length, advice) -> 0`.
+    pub const madvise = 28;
     /// `exit(status)`: terminate the calling process. Does not return.
     pub const exit = 60;
     /// `arch_prctl(code, addr)`: get or set the thread's FS or GS base (`ARCH`).
@@ -65,6 +76,10 @@ pub const E = enum(u16) {
     NOMEM = 12,
     /// Bad address: a pointer argument is outside user space or not mapped.
     FAULT = 14,
+    /// Already exists.
+    EXIST = 17,
+    /// No such device: the object cannot be mapped.
+    NODEV = 19,
     /// Invalid argument.
     INVAL = 22,
     /// Not a terminal: the descriptor has no such `ioctl`.
@@ -179,3 +194,28 @@ pub const AT = struct {
 pub const ARG_MAX = 8192;
 /// Most arguments and environment strings together.
 pub const ARG_COUNT_MAX = 256;
+
+/// `mmap` and `mprotect` permissions.
+pub const PROT = struct {
+    pub const NONE = 0;
+    pub const READ = 1;
+    pub const WRITE = 2;
+    pub const EXEC = 4;
+};
+
+/// `mmap` flags.
+pub const MAP = struct {
+    pub const SHARED = 0x01;
+    pub const PRIVATE = 0x02;
+    pub const FIXED = 0x10;
+    pub const ANONYMOUS = 0x20;
+    pub const NORESERVE = 0x4000;
+    pub const STACK = 0x20000;
+    pub const FIXED_NOREPLACE = 0x100000;
+};
+
+/// `madvise` advice.
+pub const MADV = struct {
+    pub const DONTNEED = 4;
+    pub const FREE = 8;
+};

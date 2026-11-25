@@ -204,6 +204,9 @@ run_scenario() {
             expect_line '^env GREETING=hi$'
             expect_line '^env EMPTY=$'
             expect_line '^linux_abi: writev works$'
+            # A program past its memory limit is told so, and killed like any fault.
+            expect_line '^\*\*\* thread [0-9]+ \(/test/vm\): no memory for the page it touched'
+            expect_line '^\*\*\* thread [0-9]+ \(/test/vm\): Page fault in user mode \(vector 14, error 0x[0-9a-f]+\), killed$'
             ;;
         panic)
             expect_status 3

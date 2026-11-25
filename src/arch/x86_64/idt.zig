@@ -41,6 +41,7 @@ const apic = @import("../../arch/x86_64/apic.zig");
 const backtrace = @import("../../kernel/debug/backtrace.zig");
 const kstack = @import("../../kernel/kstack.zig");
 const process = @import("../../kernel/process.zig");
+const user_memory = @import("../../kernel/user_memory.zig");
 const thread = @import("../../kernel/thread.zig");
 const gdt = @import("gdt.zig");
 const ipi = @import("ipi.zig");
@@ -310,8 +311,24 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
         VECTOR_NMI, VECTOR_DOUBLE_FAULT, VECTOR_MACHINE_CHECK => true,
         else => false,
     };
+    // A page fault on a user address may be the first touch of memory the
+    // program has every right to: then it gets the page and carries on.
+    // That goes for a fault from ring 3, and for one inside a user copy
+    // in a system call (reading into a buffer nothing was written to yet).
+    var out_of_memory = false;
+    if (f.vector == VECTOR_PAGE_FAULT and (from_user or usercopy.inCopy(f.rip))) {
+        if (thread.current().process) |p| {
+            const access: user_memory.Access = .{
+                .write = f.error_code & 2 != 0,
+                .exec = f.error_code & 16 != 0,
+                .present = f.error_code & 1 != 0,
+            };
+            if (user_memory.handleFault(p, readCr2(), access)) |_| return else |e| out_of_memory = e == error.OutOfMemory;
+        }
+    }
     if (from_user and !kernel_fatal) { // kill the process, keep the kernel
         const p = thread.current().process.?;
+        if (out_of_memory) root.print("\n*** thread {d} ({s}): no memory for the page it touched (its limit, or the machine's)\n", .{ thread.id(), p.name });
         root.print("\n*** thread {d} ({s}): {s} in user mode (vector {d}, error 0x{x}), killed\n", .{ thread.id(), p.name, name, f.vector, f.error_code });
         root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.rsp, f.rflags });
         if (f.vector == VECTOR_PAGE_FAULT) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});

@@ -77,6 +77,8 @@ const thread = @import("thread.zig");
 const vfs = @import("vfs.zig");
 const random = @import("random.zig");
 const startup_stack = @import("startup_stack.zig");
+const user_memory = @import("user_memory.zig");
+const vm_regions = @import("vm_regions.zig");
 const timer = @import("timer.zig");
 const abi = @import("abi");
 
@@ -171,6 +173,9 @@ pub const Process = struct {
     parent: ?*Process = null,
     /// Processes alive below this one (see `Limits.max_descendants`).
     descendants: u32 = 0,
+    /// Its regions of memory, `brk` heap and the lock for them and its
+    /// page tables (`user_memory.zig`).
+    mem: user_memory.UserMemory = .{},
     /// This process's children that have not exited, and its link in its
     /// parent's list.
     first_child: ?*Process = null,
@@ -358,6 +363,7 @@ fn freeAddressSpace(p: *Process) void {
     vmm.unloadRoot(p.root);
     vmm.destroyAddressSpace(p.root);
     p.root = 0;
+    user_memory.deinit(p);
 }
 
 /// Called by the scheduler when the thread of `p` has been reaped: nothing
@@ -386,7 +392,11 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     const root = try vmm.createAddressSpace();
     errdefer vmm.destroyAddressSpace(root);
 
-    const loaded = try elf.load(root, image, imageLimits(limits));
+    // The regions of the new address space: the program's segments, then
+    // the stack. They become the process's once it exists.
+    var regions: vm_regions.Regions = .{};
+    errdefer regions.deinit(heap.allocator);
+    const loaded = try elf.load(root, image, imageLimits(limits), &regions);
 
     // Where the stack goes, and how far below its top the program's
     // startup data ends (a multiple of 16 bytes), so that nothing on the
@@ -394,6 +404,10 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     const stack_top = if (options.randomize) STACK_TOP_MAX - random.below(STACK_RANDOM_PAGES) * pmm.PAGE_SIZE else STACK_TOP_MAX;
     const data_top = stack_top - (if (options.randomize) random.below(STACK_RANDOM_OFFSET / 16) * 16 else 0);
 
+    // The stack may grow to `STACK_RESERVE`: all of that is its region,
+    // and the pages come as they are touched (`user_memory.zig`). The
+    // top ones are given now, for the startup data.
+    regions.add(heap.allocator, stack_top - STACK_RESERVE, STACK_RESERVE, vm_regions.Prot.rw, .stack) catch return error.OutOfMemory;
     var stack_pages: [STACK_PAGES]u64 = undefined; // physical; [0] is the highest page
     for (0..STACK_PAGES) |i| {
         const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
@@ -445,7 +459,15 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         .pages = pages,
         .parent = options.parent,
         .refs = 2, // the thread's and the caller's
+        .mem = .{
+            .regions = regions,
+            .brk_start = loaded.end,
+            .brk_end = loaded.end,
+            .mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE,
+        },
     };
+    // (On an error below, the list is freed through `regions`, which
+    // still refers to it; the structure goes separately.)
 
     // Everything that can fail for lack of memory happens before the
     // tree lock, which is held for the few lines that put the process in

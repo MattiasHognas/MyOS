@@ -6,7 +6,9 @@
 
 const vmm = @import("../arch/x86_64/vmm.zig");
 const elf_image = @import("elf_image.zig");
+const heap = @import("heap.zig");
 const pmm = @import("pmm.zig");
+const vm_regions = @import("vm_regions.zig");
 
 /// Ways `load` can fail.
 pub const Error = elf_image.Error || error{OutOfMemory};
@@ -21,6 +23,9 @@ pub const Loaded = struct {
     /// loaded), and how many there are.
     phdr: u64,
     phnum: u64,
+    /// First address past its highest segment, page aligned: where its
+    /// `brk` heap starts.
+    end: u64,
 };
 
 /// Load the ELF executable `image` into the address space `root` and return
@@ -38,8 +43,12 @@ pub const Loaded = struct {
 /// image needs more pages than are free (with some left over for page
 /// tables). If memory still runs out part-way (another thread took it), the
 /// address space is left partly filled; the caller destroys it.
-pub fn load(root: u64, image: []const u8, limits: elf_image.Limits) Error!Loaded {
+///
+/// Each segment is also recorded in `regions`, if given, as a region with
+/// the segment's permissions.
+pub fn load(root: u64, image: []const u8, limits: elf_image.Limits, regions: ?*vm_regions.Regions) Error!Loaded {
     const img = try elf_image.parse(image, limits);
+    var image_end: u64 = 0;
 
     if (img.pages + img.pages / 256 + 128 > pmm.free_pages) return error.OutOfMemory;
 
@@ -48,6 +57,14 @@ pub fn load(root: u64, image: []const u8, limits: elf_image.Limits) Error!Loaded
         var pte: u64 = vmm.USER;
         if (seg.writable) pte |= vmm.WRITABLE;
         if (!seg.executable) pte |= vmm.NX;
+
+        image_end = @max(image_end, seg.end());
+        if (regions) |r| {
+            r.add(heap.allocator, seg.start(), seg.end() - seg.start(), .{ .read = true, .write = seg.writable, .exec = seg.executable }, .image) catch |e| return switch (e) {
+                error.OutOfMemory, error.TooManyRegions => error.OutOfMemory,
+                else => error.Overlap, // `parse` has ruled the others out
+            };
+        }
 
         const data_end = seg.vaddr + seg.filesz;
         var va = seg.start();
@@ -67,5 +84,5 @@ pub fn load(root: u64, image: []const u8, limits: elf_image.Limits) Error!Loaded
             };
         }
     }
-    return .{ .entry = img.entry, .pages = img.pages, .phdr = img.phdr_vaddr, .phnum = img.phnum };
+    return .{ .entry = img.entry, .pages = img.pages, .phdr = img.phdr_vaddr, .phnum = img.phnum, .end = image_end };
 }

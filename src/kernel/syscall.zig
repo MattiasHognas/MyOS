@@ -20,6 +20,7 @@ const heap = @import("heap.zig");
 const proc = @import("process.zig");
 const thread = @import("thread.zig");
 const uaccess = @import("uaccess.zig");
+const user_memory = @import("user_memory.zig");
 const user_range = @import("user_range.zig");
 const vfs = @import("vfs.zig");
 
@@ -315,6 +316,19 @@ fn sysClose(fd: u64) u64 {
     return 0;
 }
 
+/// The memory calls (`user_memory.zig`), for the calling thread's process.
+fn memory(comptime call: enum { mmap, mprotect, munmap, brk, madvise }, f: *const arch.Frame) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    return switch (call) {
+        // The offset (`f.r9`) only means something for a file.
+        .mmap => user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        .mprotect => user_memory.mprotect(p, f.rdi, f.rsi, f.rdx),
+        .munmap => user_memory.munmap(p, f.rdi, f.rsi),
+        .brk => user_memory.brk(p, f.rdi),
+        .madvise => user_memory.madvise(p, f.rdi, f.rsi, f.rdx),
+    };
+}
+
 /// Syscall handler, called by the arch layer's entry code: call the implementation
 /// selected by `f.rax` with the arguments from the frame and store its
 /// result in `f.rax`. Unknown numbers return `ENOSYS`.
@@ -328,6 +342,11 @@ pub fn dispatch(f: *arch.Frame) void {
             thread.yield();
             break :blk 0;
         },
+        Sys.mmap => memory(.mmap, f),
+        Sys.mprotect => memory(.mprotect, f),
+        Sys.munmap => memory(.munmap, f),
+        Sys.brk => memory(.brk, f),
+        Sys.madvise => memory(.madvise, f),
         Sys.ioctl => sysIoctl(f.rdi),
         Sys.writev => sysWritev(f.rdi, f.rsi, f.rdx),
         Sys.arch_prctl => sysArchPrctl(f.rdi, f.rsi),
