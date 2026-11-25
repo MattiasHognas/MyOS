@@ -333,11 +333,9 @@ pub fn spawnPath(path: []const u8, options: SpawnOptions) !*Process {
 /// runs in `p` any more. Its address space may still be loaded, if only
 /// kernel threads ran since, so it is switched away from first. Frees the
 /// address space and gives up the thread's reference. Interrupts are off
-/// and no lock is held.
-///
-/// With several CPUs the address space may also be loaded on another one
-/// that only ran kernel threads since; that CPU has to be asked to switch
-/// away first (3.4).
+/// and no lock is held. The address space may also be loaded on other
+/// CPUs that only ran kernel threads since: `unloadRoot` has them all
+/// switch away first.
 pub fn teardown(p: *Process) void {
     assert.check(.process, p.exit_code != null, "tearing down process '{s}', which has not exited", .{p.name});
     assert.check(.process, p.root != 0, "process '{s}' torn down twice", .{p.name});

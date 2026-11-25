@@ -43,6 +43,7 @@ const kstack = @import("../../kernel/kstack.zig");
 const process = @import("../../kernel/process.zig");
 const thread = @import("../../kernel/thread.zig");
 const gdt = @import("gdt.zig");
+const ipi = @import("ipi.zig");
 const usercopy = @import("usercopy.zig");
 
 var idt = std.mem.zeroes([256]Entry);
@@ -297,6 +298,7 @@ fn readCr2() u64 {
 ///   backtrace, then halt, except breakpoints (`int3`), which resume.
 export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
+    if (f.vector == VECTOR_NMI) ipi.haltIfStopped(); // another CPU is reporting a crash
     if (f.vector >= 32) {
         apic.eoi(); // BEFORE the handler: it may switch threads
         if (handlers[f.vector]) |h| h(f) else root.print("unhandled vector {d}\n", .{f.vector});

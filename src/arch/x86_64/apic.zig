@@ -64,6 +64,31 @@ pub fn eoi() void {
     lapicReg(0xB0).* = 0;
 }
 
+/// True once the local APIC is mapped and enabled on the boot CPU.
+pub fn ready() bool {
+    return lapic != 0;
+}
+
+/// Send interrupt `vector` to the CPU whose local APIC ID is `apic_id`.
+/// Interrupts must be off: the command takes two register writes.
+pub fn sendIpi(apic_id: u32, vector: u8) void {
+    sendCommand(apic_id, vector); // fixed delivery, edge, physical destination
+}
+
+/// Send a non-maskable interrupt to the CPU whose local APIC ID is
+/// `apic_id`: it arrives even while that CPU has interrupts off.
+pub fn sendNmi(apic_id: u32) void {
+    sendCommand(apic_id, 0x400); // delivery mode NMI; the vector is ignored
+}
+
+/// Write the interrupt command register and wait until the local APIC has
+/// sent the interrupt.
+fn sendCommand(apic_id: u32, low: u32) void {
+    lapicReg(0x310).* = apic_id << 24;
+    lapicReg(0x300).* = low;
+    while (lapicReg(0x300).* & (1 << 12) != 0) {} // delivery status: pending
+}
+
 /// Return the local APIC ID of the calling CPU.
 pub fn id() u8 {
     return @truncate(lapicReg(0x20).* >> 24);

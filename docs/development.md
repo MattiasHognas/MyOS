@@ -148,7 +148,7 @@ the terminal.
 | --- | --- |
 | `src/main.zig` | Kernel entry (`kmain`), boot order, `print`/`log`/panic handling |
 | `src/abi/linux.zig` | The user/kernel ABI (Linux's syscall numbers, error values and flags), imported by the kernel and by user programs (see [syscalls](syscalls.md)) |
-| `src/arch/x86_64/` | GDT/TSS with the double-fault, NMI, debug and machine-check emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry and the `sysretq`/`iretq` choice (`syscall`, `sysret`), per-CPU data behind the GS base (`percpu`), starting the other CPUs (`smp`), x87/SSE/AVX state (`fpu`), fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), speculation guards (`nospec`), the Meltdown check (`meltdown`), port I/O |
+| `src/arch/x86_64/` | GDT/TSS with the double-fault, NMI, debug and machine-check emergency stacks, IDT and interrupt entry, APIC, paging (`vmm`), context switch, syscall entry and the `sysretq`/`iretq` choice (`syscall`, `sysret`), per-CPU data behind the GS base (`percpu`), starting the other CPUs (`smp`), requests between CPUs (`ipi`), x87/SSE/AVX state (`fpu`), fault-tolerant user copies and UMIP/SMEP/SMAP (`usercopy`), speculation guards (`nospec`), the Meltdown check (`meltdown`), port I/O |
 | `src/boot/limine.zig` | Limine boot protocol requests and responses |
 | `src/drivers/` | Serial, PS/2 keyboard, HPET, PCI, NVMe |
 | `src/firmware/acpi.zig` | ACPI table discovery and MADT parsing |

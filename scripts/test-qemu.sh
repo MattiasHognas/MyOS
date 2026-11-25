@@ -11,7 +11,12 @@
 #          kernel saves x87/SSE state with FXSAVE
 #   tests_smp  the same suite on a machine with four CPUs: all must come
 #          up, each with its own state, set up like the boot CPU
+#   tests_kvm  the four-CPU run on the host's own CPU, with KVM: real
+#          hardware and real parallelism instead of the emulator. Skipped
+#          where KVM cannot be used, or where the kernel refuses the host CPU
 #   panic  fail a subsystem assertion; must print a symbolized backtrace
+#   panic_smp  panic on a machine with four CPUs that are all printing;
+#          the report must come out whole, with nothing after it
 #   fault  page-fault in kernel mode; must print CR2 and a symbolized backtrace
 #   smap   read user memory from the kernel outside a user copy; must page-fault
 #   smep   execute user memory from the kernel; must page-fault
@@ -47,12 +52,16 @@ iso="$out/os.iso"
 timeout_s="${MYOS_QEMU_TIMEOUT:-45}"
 
 # Boot one scenario on the CPU model $2 (default: max, every feature QEMU
-# emulates) with $3 CPUs (default: 1); leaves the QEMU exit status in $status and the CR-stripped log
+# emulates; "host" runs on the host's CPU with KVM) with $3 CPUs (default:
+# 1). $4 is the scenario name the kernel is told (default: $1). Leaves the QEMU exit status in $status and the CR-stripped log
 # path in $log.
 boot() {
     local scenario="$1"
     local cpu="${2:-max}"
     local cpus="${3:-1}"
+    local told="${4:-$scenario}"
+    local accel=()
+    [[ "$cpu" == host ]] && accel=(-enable-kvm)
     local dir="$out/$scenario"
     mkdir -p "$dir"
     local raw="$dir/serial.log"
@@ -67,14 +76,14 @@ boot() {
 
     set +e
     timeout --foreground "${timeout_s}s" qemu-system-x86_64 \
-        -machine q35 -cpu "$cpu" -smp "$cpus" -m 256M \
+        -machine q35 "${accel[@]}" -cpu "$cpu" -smp "$cpus" -m 256M \
         -cdrom "$iso" -boot d \
         -display none -monitor none -serial stdio \
         -no-reboot \
         -drive file="$disk",if=none,id=nvm,format=raw \
         -device nvme,serial=myos-test,drive=nvm \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        -fw_cfg name=opt/myos/scenario,string="$scenario" \
+        -fw_cfg name=opt/myos/scenario,string="$told" \
         >"$raw" 2>&1
     status=$?
     set -e
@@ -110,26 +119,49 @@ expect_status() {
 # A symbolized backtrace line: "  #N 0x<16 hex digits> <name>+0x<offset>".
 frame_re='^  #[0-9]+ 0x[0-9a-f]{16} [^?].*\+0x[0-9a-f]+$'
 
+skipped=()
+
+# Leave the current scenario out, saying why.
+skip() {
+    echo "SKIP [$scenario]: $*"
+    skipped+=("$scenario")
+    rm -rf "${out:?}/$scenario"
+}
+
 run_scenario() {
     scenario="$1"
     echo "=== QEMU scenario: $scenario"
+    if [[ "$scenario" == tests_kvm && ! -w /dev/kvm ]]; then
+        skip "/dev/kvm cannot be used here"
+        return
+    fi
     case "$scenario" in
+        tests_kvm) boot "$scenario" host 4 tests_smp ;;
         # Without XSAVE there is no AVX either (and nothing that builds on it).
         tests_fxsave) boot "$scenario" max,xsave=off ;;
-        tests_smp) boot "$scenario" max 4 ;;
+        tests_smp | panic_smp) boot "$scenario" max 4 ;;
         *) boot "$scenario" ;;
     esac
     local before=${#failures[@]}
 
+    # The kernel does not run on a CPU that is affected by Meltdown. That
+    # is its decision about the host, not a failure of the kernel.
+    if [[ "$scenario" == tests_kvm ]] && grep -q 'affected by Meltdown, and MyOS has no page-table isolation' "$log"; then
+        skip "the kernel refuses this host's CPU (Meltdown)"
+        return
+    fi
+
     case "$scenario" in
-        tests | tests_fxsave | tests_smp)
+        tests | tests_fxsave | tests_smp | tests_kvm)
             expect_status 1
             if [[ "$scenario" == tests_fxsave ]]; then
                 expect_line 'extended state: FXSAVE, 512 bytes \(no XSAVE; AVX off\)$'
+            elif [[ "$scenario" == tests_kvm ]]; then
+                expect_line 'extended state: (XSAVE|FXSAVE), [0-9]+ bytes' # whatever the host has
             else
                 expect_line 'extended state: XSAVE, 832 bytes, AVX on$'
             fi
-            if [[ "$scenario" == tests_smp ]]; then
+            if [[ "$scenario" == tests_smp || "$scenario" == tests_kvm ]]; then
                 expect_line 'info\(smp\): 4 of 4 CPUs online$'
             else
                 expect_line 'info\(smp\): 1 of 1 CPUs online$'
@@ -168,6 +200,15 @@ run_scenario() {
             expect_line "$frame_re"
             expect_line ' [^ ]*scenarioPanicInner\+0x'
             expect_line ' [^ ]*scenarioPanic\+0x'
+            ;;
+        panic_smp)
+            expect_status 3
+            expect_line '^chatter from thread [0-9]+$' # the other CPUs were busy printing
+            expect_line '^PANIC: scenario: assertion failed: deliberate test panic$'
+            expect_line '^backtrace:$'
+            expect_line ' [^ ]*scenarioPanicSmp\+0x'
+            # Everything from the panic on is the report: the others were stopped first.
+            if sed -n '/^PANIC: /,$p' "$log" | grep -q 'chatter'; then fail "another CPU printed after the panic began"; fi
             ;;
         fault)
             expect_status 3
@@ -266,14 +307,14 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests tests_fxsave tests_smp panic fault smap smep double_fault stack_overflow use_after_free relro text_alias lock_order sleep_with_lock)
+((${#scenarios[@]})) || scenarios=(tests tests_fxsave tests_smp tests_kvm panic panic_smp fault smap smep double_fault stack_overflow use_after_free relro text_alias lock_order sleep_with_lock)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 # KASLR: the kernel reports where it was loaded in every boot. Seeing the
 # same address in all of several boots means it is not being randomized.
 if ((${#scenarios[@]} >= 4)); then
     scenario="kaslr"
-    slides=$(for s in "${scenarios[@]}"; do grep -a -m1 '^MYOS_KERNEL_SLIDE ' "$out/$s/serial-clean.log" || true; done | sort -u | wc -l)
+    slides=$(for s in "${scenarios[@]}"; do grep -a -m1 '^MYOS_KERNEL_SLIDE ' "$out/$s/serial-clean.log" 2>/dev/null || true; done | sort -u | wc -l)
     if ((slides < 2)); then
         fail "the kernel was loaded at the same address in all ${#scenarios[@]} boots"
     else
@@ -291,4 +332,5 @@ if ((${#failures[@]})); then
     printf '  %s\n' "${failures[@]}" >&2
     exit 1
 fi
+((${#skipped[@]})) && echo "Skipped: ${skipped[*]}"
 echo "QEMU integration tests passed (${scenarios[*]})"

@@ -88,11 +88,9 @@ fn setSlotFree(slot: usize, is_free: bool) void {
 
 /// Unmap and free the first `count` pages of the stack starting at `low`.
 fn unmapPages(low: usize, count: usize) void {
-    for (0..count) |i| {
-        const phys = vmm.unmap(vmm.kernel_root, low + i * pmm.PAGE_SIZE) orelse
-            @panic("kstack: stack page not mapped");
-        pmm.free(phys);
-    }
+    var pages: [STACK_PAGES]?u64 = undefined;
+    vmm.unmapRange(vmm.kernel_root, low, pages[0..count]); // one flush on every CPU for all of them
+    for (pages[0..count]) |phys| pmm.free(phys orelse @panic("kstack: stack page not mapped"));
 }
 
 /// Allocate a kernel stack: reserve a slot and map fresh pages (writable,

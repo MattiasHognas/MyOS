@@ -68,9 +68,18 @@ pub const PerCpu = extern struct {
     // The scheduler's (`thread.zig`).
     /// Timer ticks left of the running thread's time slice.
     slice_left: u32 = 0,
-    /// Whether this CPU takes threads from the ready queue. A CPU that has
-    /// been started but only handles its interrupts does not (until 3.4).
+    /// Whether this CPU takes threads from the ready queue. While it does
+    /// not, it runs only the thread it started in (`idle_thread`), which
+    /// halts between interrupts: the CPU is parked. Changed under the
+    /// scheduler lock, by any CPU.
     runs_threads: bool = false,
+    /// The CPU has halted because no thread was ready, and no other CPU
+    /// has sent it a wake-up since. Guarded by the scheduler lock.
+    idle: bool = false,
+    /// A thread (a `*thread.Thread`) that only this CPU runs, to halt in
+    /// when it is parked or the thread it ran last has exited. Null on the
+    /// boot CPU until the other CPUs are started.
+    idle_thread: ?*anyopaque = null,
     /// Times this CPU halted because no thread was ready.
     halts: u64 = 0,
     /// Timer interrupts this CPU has taken.
@@ -81,6 +90,10 @@ pub const PerCpu = extern struct {
     loaded_root: u64 = 0,
     /// CR3 loads on this CPU. A statistic, read by tests.
     root_loads: u64 = 0,
+
+    /// Set by a CPU that wants this one to do the request in flight, and
+    /// cleared by this one when it has (`ipi.zig`).
+    ipi_pending: bool = false,
 
     /// What this CPU's control registers held when it came up.
     setup: Setup = .{},

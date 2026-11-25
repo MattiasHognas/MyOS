@@ -39,9 +39,12 @@ fn fill(s: *regs.State, rng: *u64) void {
     const exponent: u16 = @intCast(1 + next(rng) % 0x7FFE);
     std.mem.writeInt(u64, s.st0[0..8], mantissa, .little);
     std.mem.writeInt(u16, s.st0[8..10], exponent, .little);
-    // All exceptions masked; rounding and precision control vary.
+    // All exceptions masked; rounding and precision control vary. Bit 6
+    // is reserved and always reads as 1 on a real CPU (QEMU's emulation
+    // keeps what was written), so it is set here: the value must come back
+    // unchanged on both.
     const r = next(rng);
-    s.fcw = 0x003F | @as(u16, @intCast(r & 3)) << 10 | @as(u16, @intCast(r >> 2 & 3)) << 8;
+    s.fcw = 0x007F | @as(u16, @intCast(r & 3)) << 10 | @as(u16, @intCast(r >> 2 & 3)) << 8;
     s.mxcsr = 0x1F80 | @as(u32, @intCast(r >> 4 & 3)) << 13;
 }
 

@@ -4,16 +4,10 @@ How kernel code stays correct when it can be interrupted, preempted and, from
 milestone 3 on, run on several CPUs at once. This is the model the SMP work
 follows ([roadmap 3.1](todo.md#31-synchronization)).
 
-**Status: the locks are in the code, every CPU is started, and one runs
-threads.** Everything under "Locks and what they protect", "Lock order",
-"Sleeping and waking", "Per-CPU state" and "Checks in the code" is
-implemented and tested, as far as it can be while threads run on one CPU:
-every critical section that relied on "interrupts off means nothing else
-runs" takes a lock that other CPUs take too, and what belongs to a CPU is in
-its own structure. The other CPUs are up and take interrupts, but do not
-run threads until one CPU can interrupt another (3.4), which the TLB rules,
-tearing down an address space and waking an idle CPU need; those parts are
-marked "not yet" below. The blocking protocols have been model-checked (see
+**Status: implemented.** Every CPU of the machine is started and runs
+threads. Everything below is in the code and tested, on one CPU and on
+several, under QEMU's emulation and on real CPUs with KVM. The blocking
+protocols have also been model-checked (see
 [the end](#what-has-been-checked)).
 
 ## The model in one page
@@ -114,8 +108,11 @@ What follows from the order:
   released.
 - **The console lock is innermost**, so anything may print. A CPU that
   reports a panic or a kernel fault does not wait for it
-  (`root.seizeConsole`): it may be the one holding it. Not yet: stopping
-  the other CPUs first, so that nothing else is printed in between (3.4).
+  (`root.seizeConsole`): it may be the one holding it. It halts the other
+  CPUs first, with a non-maskable interrupt, so that nothing else runs or
+  prints while it reports.
+- **A request to the other CPUs is outside the order** (`ipi.zig`): it may
+  be sent while holding any lock. See [below](#requests-between-cpus).
 
 ## Sleeping and waking
 
@@ -164,9 +161,21 @@ is on its stack (`on_cpu`, changed under the scheduler lock). Waking a
 blocked thread that has one just marks it running, and it carries on where
 it is; putting it in the ready queue would let a second CPU run on the same
 stack. Because the lock covers every switch, "blocked, with a CPU on its
-stack, and the lock free" can only mean "idling". Not yet: the waking CPU
-has to interrupt the halted one, which until then notices at its next timer
-tick (3.4).
+stack, and the lock free" can only mean "idling". The waking CPU sends the
+halted one an interrupt, so it does not wait for its next timer tick.
+
+**A CPU with nothing to run says so, and is woken.** It marks itself idle
+under the scheduler lock before it halts. Whoever puts a thread in the ready
+queue sends one idle CPU an interrupt; an interrupt that arrives between
+"release the lock" and the halt ends the halt at once, so the thread is
+never left waiting behind a sleeping CPU.
+
+**Two reasons to leave a thread that is not going to run.** A CPU cannot
+halt on the stack of a thread that has exited (the thread would never be
+freed), and a parked CPU (`thread.setParked`, used by tests) may not go on
+running a thread at all. For those two cases each CPU has a thread of its
+own to halt in: the context it started in, or one made for it. It is never
+in the ready queue and never takes a turn from a ready thread.
 
 **A timer callback and the thread that armed the timer can run at once.**
 On one CPU a callback runs to completion inside the timer interrupt before
@@ -217,10 +226,8 @@ Another CPU may read from a `PerCpu` what never changes once the CPU is up
 (its number, its tables) and the counts, as statistics.
 
 Each CPU starts in a context of its own, which becomes a thread
-(`thread.adoptCpu`). There is still no idle thread: a CPU with nothing to
-run halts inside `block` of whichever thread it ran last. Not yet: the CPUs
-other than the boot CPU do not run threads; their starting context stays
-their thread, and halts between interrupts.
+(`thread.adoptCpu`) and retires once the CPU is up. From then on the CPU
+takes threads from the one ready queue, like every other.
 
 **Time is kept by one CPU.** Every CPU has a timer interrupt, for its own
 time slices; only the boot CPU's advances the tick count and runs the timer
@@ -229,23 +236,43 @@ it may be anywhere.
 
 ## Address spaces and the TLB
 
-Not yet in the code: these are the rules for 3.4. Today `unmap` and the
-teardown of an address space are correct for one CPU only.
-
 - **User mappings.** Removing a mapping or making it stricter must reach
   every CPU that has that address space loaded. That includes a CPU running
   a kernel thread: a kernel thread keeps whichever address space was loaded
-  (`thread.zig`). So each address space records the CPUs it is loaded on,
-  and the record changes where CR3 is loaded.
+  (`thread.zig`). Every CPU is asked, and the ones that have it loaded
+  flush. (Recording the CPUs an address space is loaded on, so that only
+  those are asked, is an optimization for when user mappings are removed
+  often: milestone 5.)
 - **Kernel mappings** are global and the same everywhere, so removing one (a
-  freed kernel stack) must reach every CPU.
-- **Order.** Clear the page-table entries, flush on every CPU concerned, and
-  only then free the page tables and the pages. `vmm.unmap` frees tables and
-  returns the page before it flushes today, which is correct on one CPU only
-  ([roadmap 3.4](todo.md#34-smp-scheduling-and-memory)).
-- **Tearing down an address space.** It must be loaded on no CPU.
-  `vmm.unloadRoot` does that for this CPU today; with several, teardown asks
-  the others to switch away first.
+  freed kernel stack) reaches every CPU.
+- **Order.** `vmm.unmap` clears the page-table entry, has every CPU
+  concerned flush the address, and only then frees page tables that became
+  empty and hands the page to its caller. Until the flush another CPU can
+  still reach the page through its TLB, or walk the tables.
+- **Tearing down an address space.** It must be loaded on no CPU:
+  `vmm.unloadRoot` has every CPU that still has it switch to the kernel's
+  own page tables, before anything is freed. Nothing can load it again,
+  because its threads are gone.
+
+## Requests between CPUs
+
+One CPU asks the others to do something, and waits until all have, in two
+cases: flushing addresses from their TLBs, and letting go of an address
+space (`ipi.zig`). The request arrives as an interrupt.
+
+A CPU with interrupts off does not take it. If that CPU is in turn waiting
+for the sender (spinning on a spinlock the sender holds, or waiting to send
+a request of its own), the two would wait for each other for good. So the
+work is not tied to the interrupt: **every loop that waits with interrupts
+off looks for a pending request and does it on the spot.** There are three
+such loops: waiting for a spinlock, waiting to send a request, and waiting
+for the answers to one. This is why a request can be sent while holding any
+lock, and why the work a request asks for must be safe anywhere in the
+kernel: it touches only the CPU's own TLB and CR3.
+
+Stopping the other CPUs for a crash report is separate and uses a
+non-maskable interrupt: it must get through to a CPU that is stuck with
+interrupts off, which may be the very thing being reported.
 
 ## What interrupt handlers may do
 
@@ -305,9 +332,10 @@ with and are the first to split when measurements say so.
 
 ## Decisions left to later items
 
-- **One ready queue or one per CPU** ([3.4](todo.md#34-smp-scheduling-and-memory)).
-  The global scheduler lock above is the starting point because it makes the
-  switch-out rule simple. Per-CPU queues replace the lock with one per
+- **One ready queue or one per CPU.** There is one, under the global
+  scheduler lock: it makes the switch-out rule simple, and a thread that
+  becomes ready is taken by whichever CPU is free, with no balancing to do.
+  It is the first thing to split when many CPUs switch threads often. Per-CPU queues replace the lock with one per
   queue; the per-thread `on_cpu` flag they need is already there.
 - **A timer queue per CPU.** One CPU counts ticks and runs the one queue,
   which is enough until timers are armed often from every CPU (futex
@@ -338,7 +366,7 @@ lock order is not modelled but enforced as the kernel runs (see
 [checks](#checks-in-the-code)). The per-CPU rules and the TLB rules are
 neither; they follow from reading the code.
 
-What one CPU cannot show is two CPUs inside these protocols at the same
-moment. The tests that need that are listed in
-[roadmap 3.4](todo.md#34-smp-scheduling-and-memory) and run once the other
-CPUs run threads.
+The code itself is run on several CPUs at once by three in-kernel tests
+(programs, a kernel stress test and a TLB test, see
+[testing](testing.md)), under emulation and, where the host allows it, on
+real CPUs with KVM.

@@ -341,26 +341,36 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [x] Print and test online CPU counts (`N of M CPUs online`; QEMU scenario `tests_smp` with four CPUs, next to the one-CPU runs, in CI).
 
 ### 3.4 SMP scheduling and memory
-- [ ] Let the started CPUs run threads (`PerCpu.runs_threads`, `thread.retire` for the context each one starts in), once the two items below that need a cross-CPU interrupt are done: taking an address space away from a CPU before it is freed, and TLB shootdowns.
-- [ ] Protect shared scheduler state.
-- [ ] Choose per-CPU queues or a documented global-queue scheduling model.
-- [ ] Support cross-CPU wakeups and inter-processor interrupts.
-  - A CPU that halted with nothing to run must be interrupted when another CPU makes a thread ready or wakes the thread it idles in (`thread.wake`, `idleOnce`); until then it notices at its next timer tick.
-  - A CPU that reports a panic or a kernel fault stops the others first, so the report comes out whole (`root.seizeConsole`).
-- [ ] Add CPU affinity/load balancing if needed.
-- [ ] Synchronize PMM, heap, page tables, and drivers.
-- [ ] Implement cross-CPU TLB shootdowns.
-  - `vmm.unmap` frees page tables that became empty, and hands the page back to its caller, before it flushes. With several CPUs the order must be: clear the entries, flush on every CPU that has the address space loaded, and only then free tables and pages. Otherwise another CPU can walk a freed table.
+- [x] Let the started CPUs run threads: each takes threads from the ready queue as soon as it is up, and the context it started in retires.
+  - A CPU can be parked (`thread.setParked`): it gives up its thread and halts in a thread of its own until it is unparked. The tests use it to have the machine to themselves.
+- [x] Protect shared scheduler state (the scheduler lock from 3.1; what belongs to a CPU is in its `PerCpu`).
+- [x] Choose per-CPU queues or a documented global-queue scheduling model: one ready queue under the scheduler lock (`docs/locking.md`). A ready thread is taken by whichever CPU is free. Per-CPU queues are for when measurements show the lock is contended.
+- [x] Support cross-CPU wakeups and inter-processor interrupts (`arch/x86_64/ipi.zig`).
+  - A CPU that halted with nothing to run is interrupted when another CPU makes a thread ready or wakes the thread it idles in.
+  - Requests that every other CPU must carry out before the sender goes on (TLB flushes, letting go of an address space). They cannot deadlock against a CPU that has interrupts off: every loop that waits with interrupts off looks for a pending request and does it.
+  - A CPU that reports a panic or a kernel fault halts the others first, with a non-maskable interrupt, so the report comes out whole (QEMU scenario `panic_smp`).
+- [ ] Add CPU affinity/load balancing if needed. Not needed with one queue; comes back with per-CPU queues.
+- [x] Synchronize PMM, heap, page tables, and drivers: each has its lock (3.1), and all are used from every CPU at once by the stress test below.
+  - Still for one user at a time: the NVMe driver, which polls and has no lock. It is used by its test only; it gets one with the block layer (11).
+- [x] Implement cross-CPU TLB shootdowns.
+  - `vmm.unmap` clears the entries, has every CPU concerned flush, and only then frees page tables and hands back the page. A kernel stack is unmapped with one flush for all its pages (`vmm.unmapRange`).
+  - An address space is taken away from every CPU that has it loaded before it is freed (`vmm.unloadRoot`).
+  - A CPU whose thread has exited no longer sits on that thread's stack until something else is ready: it moves to a thread of its own, so the thread, its stack and its process are freed at once.
 - [ ] Decide the page allocator for several CPUs: per-CPU caches of free pages in front of the bitmap, or a lock-free design on bitmaps such as LLFree (`docs/research.md`), which also hands out 2 MiB frames cheaply (9.2).
 - [ ] Give the kernel heap size classes with a per-CPU cache of free objects, replacing the first-fit list under one lock (`docs/research.md`: magazines, snmalloc).
-- [ ] Preempt on wake-up, or otherwise bound how long a woken thread waits: today it goes to the tail of the queue and waits for the running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
-- [ ] Stress-test simultaneous allocations, processes, interrupts, and I/O.
-  - From 3.1, the cases one CPU cannot produce: a timer that fires on another CPU exactly as the waiter is woken (`WakeTimer.finish` then has to wait for the callback); a wake-up from another CPU between a waiter's check and its sleep; a thread woken while its CPU is still switching away from it; real contention on the scheduler, process-tree and console locks.
-  - The in-kernel tests that hand results between threads now do it under a lock. What is left are tests that turn interrupts off to keep other threads from running at all (to make an order of events certain, or to measure something undisturbed); with several CPUs running threads they need another way to be alone, such as staying on one CPU.
-- [ ] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run.
-  - Started in 3.3 with `tests_smp`: the whole suite on four CPUs, of which one runs threads. The crash scenarios still run on one.
+- [ ] Preempt on wake-up, or otherwise bound how long a woken thread waits: with every CPU busy it goes to the tail of the queue and waits for a running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
+- [x] Stress-test simultaneous allocations, processes, interrupts, and I/O. Three tests run with every CPU taking threads:
+  - programs: eight threads each run seven programs (extended state, long syscalls, a crash, fresh memory), so processes start, are preempted, move between CPUs, die and are torn down everywhere at once, and memory is back afterwards;
+  - the kernel: eight threads use the page allocator, the heap, kernel stacks, a spinlock, a mutex and a wait queue with timeouts that run out as the wake-up comes (the timer fires on the boot CPU, the waker runs anywhere);
+  - the TLB: threads on every CPU read a kernel page until it is in their TLBs, then it is unmapped and replaced, and nobody may see the old page.
+  - Not covered: I/O, of which there is none to do in parallel yet.
+- [x] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run: `tests_smp` runs the whole suite on four CPUs, and `panic_smp` a crash.
+  - Most tests still have the machine to themselves: the other CPUs are parked while they run, because they check exact orders and counts that hold only if nothing else runs. The three stress tests above run on all CPUs. To do: go through the others and let those that can share the machine do so.
 - [ ] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
-  - A first run by hand (2026-11-25, `-enable-kvm -cpu host`): all four CPUs come up and the CPU test passes, but four tests fail, with one CPU as with four, and already at the commit before the other CPUs were started: "kernel state at syscalls and timer interrupts, preemption mid-syscall" (not every time), "x87/SSE/AVX registers survive process switches", "new process starts with clean x87/SSE/AVX state" and "kernel thread keeps the loaded address space" (check 3). Find out for each whether the test assumes the emulator's CPU and timing or the kernel is wrong on a real CPU, before this run goes into CI.
+  - `scripts/test-qemu.sh` has it as scenario `tests_kvm` (four CPUs, the host's own CPU), skipped where `/dev/kvm` cannot be used or the kernel refuses the host CPU. It passes on the development machine (AMD Zen 5), also run a hundred times over.
+  - The four tests that failed under KVM at first were the tests' fault: one wrote a reserved bit of the x87 control word as 0, which a real CPU reads back as 1 (three tests used that program); one needed timer interrupts to land inside syscalls and gave up after a fixed number of runs, which a fast CPU finishes between two ticks.
+  - Open: CI does not run it. The hosted runners would need `/dev/kvm` opened up, and their CPUs differ from run to run.
+- [ ] Measure what the emergency stacks really use, now that every CPU has four, and size them by that (16 KiB each today; Linux uses 4 KiB).
 
 **Milestone 3 done when:** Multiple cores safely execute user threads and syscalls concurrently, and CI runs the test suite on several CPUs.
 

@@ -32,8 +32,8 @@
 //! - `map` either succeeds or changes nothing. When memory runs out while
 //!   it builds page tables, the tables it had already added are removed
 //!   again and it returns `error.OutOfMemory`.
-//! - `unmap` flushes the page from this CPU's TLB and gives page tables that
-//!   became empty back to the PMM.
+//! - `unmap` flushes the page from the TLB of every CPU that may have it,
+//!   and gives page tables that became empty back to the PMM afterwards.
 //! - Running out of memory is an error to the caller, never a panic, once
 //!   boot is over.
 
@@ -43,6 +43,7 @@ const assert = @import("../../kernel/debug/assert.zig");
 const panicFmt = @import("../../kernel/debug/panic.zig").panicFmt;
 const pmm = @import("../../kernel/pmm.zig");
 const percpu = @import("percpu.zig");
+const ipi = @import("ipi.zig");
 const SpinLock = @import("../../kernel/sync/spinlock.zig").SpinLock;
 
 /// Page table entry flag: the mapping is valid.
@@ -197,34 +198,37 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) MapError!voi
     leaf.* = (phys & ADDR_MASK) | (flags & ~GLOBAL) | global | PRESENT | (if (huge) HUGE else 0);
 }
 
-/// Remove the 4 KiB mapping of `virt` from the address space whose PML4 is
-/// `root` and flush it from this CPU's TLB. Returns the physical address the
-/// page was mapped to (the caller decides whether to free it), or null if
-/// `virt` was not mapped by a 4 KiB page.
-///
-/// Page tables left without any entry are freed, up to but not including
-/// the tables the kernel half of every address space shares (the ones the
-/// PML4 points at for kernel addresses). `invlpg` also drops the CPU's
-/// cached pointers to those tables.
-///
-/// With several CPUs the other ones need a TLB shootdown too.
-pub fn unmap(root: u64, virt: u64) ?u64 {
-    // tables[level] is the table of that level on the way to `virt`.
+/// Clear the 4 KiB mapping of `virt` in the address space `root` and
+/// return the physical address it had, or null if there was none. Nothing
+/// is flushed and no table is freed: the first step of an unmap.
+fn clearLeaf(root: u64, virt: u64) ?u64 {
+    var t = table(root);
+    var level: u6 = 3;
+    while (level > 0) : (level -= 1) {
+        const e = t[index(virt, level)];
+        if (e & PRESENT == 0 or e & HUGE != 0) return null;
+        t = table(e & ADDR_MASK);
+    }
+    const leaf = &t[index(virt, 0)];
+    const e = leaf.*;
+    if (e & PRESENT == 0) return null;
+    leaf.* = 0;
+    return e & ADDR_MASK;
+}
+
+/// Free the page tables on the way to `virt` that have become empty: the
+/// PT, then the PD, then (for user addresses only) the PDPT, but never the
+/// tables the kernel half of every address space shares. The last step of
+/// an unmap: no CPU may still have these tables cached.
+fn pruneTables(root: u64, virt: u64) void {
     var tables: [4]*[512]u64 = undefined;
     tables[3] = table(root);
     var level: u6 = 3;
     while (level > 0) : (level -= 1) {
         const e = tables[level][index(virt, level)];
-        if (e & PRESENT == 0 or e & HUGE != 0) return null;
+        if (e & PRESENT == 0 or e & HUGE != 0) return; // freed already, with a neighbour
         tables[level - 1] = table(e & ADDR_MASK);
     }
-    const leaf = &tables[0][index(virt, 0)];
-    const e = leaf.*;
-    if (e & PRESENT == 0) return null;
-    leaf.* = 0;
-
-    // Free tables that are empty now: the PT, then the PD, then (for user
-    // addresses only) the PDPT.
     const top: u6 = if (virt < USER_END) 3 else 2;
     level = 0;
     while (level < top and isEmpty(tables[level])) : (level += 1) {
@@ -232,12 +236,65 @@ pub fn unmap(root: u64, virt: u64) ?u64 {
         pmm.free(parent.* & ADDR_MASK);
         parent.* = 0;
     }
+}
 
-    asm volatile ("invlpg (%[v])"
-        :
-        : [v] "r" (virt),
-        : .{ .memory = true });
-    return e & ADDR_MASK;
+/// Flush `pages` pages from `start` out of this CPU's TLB, together with
+/// its cached pointers to the page tables on the way to them. For many
+/// pages everything is flushed instead, global entries included.
+pub fn flushLocal(start: u64, pages: u64) void {
+    if (pages > 32) {
+        const cr4 = cpu.readCr4();
+        cpu.writeCr4(cr4 & ~CR4_PGE);
+        cpu.writeCr4(cr4);
+        return;
+    }
+    for (0..pages) |i| {
+        asm volatile ("invlpg (%[v])"
+            :
+            : [v] "r" (start + i * pmm.PAGE_SIZE),
+            : .{ .memory = true });
+    }
+}
+
+/// Flush `pages` pages from `start` in the address space `root` out of
+/// the TLB of every CPU that may hold them: all of them for kernel
+/// addresses, the ones that have `root` loaded for user addresses. Returns
+/// when every CPU has done it.
+fn flushEverywhere(root: u64, start: u64, pages: u64) void {
+    if (start >= KERNEL_BASE) {
+        flushLocal(start, pages);
+        ipi.broadcast(.{ .flush_kernel = .{ .start = start, .pages = pages } });
+    } else {
+        if (loadedRoot() == root) flushLocal(start, pages);
+        ipi.broadcast(.{ .flush_user = .{ .root = root, .start = start, .pages = pages } });
+    }
+}
+
+/// Remove the 4 KiB mapping of `virt` from the address space whose PML4 is
+/// `root`. Returns the physical address the page was mapped to (the caller
+/// decides whether to free it), or null if `virt` was not mapped by a
+/// 4 KiB page.
+///
+/// The order is what makes this safe with several CPUs: the entry is
+/// cleared; then the address is flushed from the TLB of every CPU that may
+/// have it, which also drops their cached pointers to the page tables; and
+/// only then are page tables that became empty given back, and the page
+/// handed to the caller. Until the flush another CPU can still use the
+/// page through its TLB, or walk the tables.
+pub fn unmap(root: u64, virt: u64) ?u64 {
+    const phys = clearLeaf(root, virt) orelse return null;
+    flushEverywhere(root, virt, 1);
+    pruneTables(root, virt);
+    return phys;
+}
+
+/// Remove the 4 KiB mappings of the `phys.len` pages from `virt` on, with
+/// one flush for all of them. `phys[i]` is set to what page `i` was mapped
+/// to, or null if it was not mapped. Otherwise as `unmap`.
+pub fn unmapRange(root: u64, virt: u64, phys: []?u64) void {
+    for (phys, 0..) |*p, i| p.* = clearLeaf(root, virt + i * pmm.PAGE_SIZE);
+    flushEverywhere(root, virt, phys.len);
+    for (0..phys.len) |i| pruneTables(root, virt + i * pmm.PAGE_SIZE);
 }
 
 /// Return the leaf page-table entry (PT entry, or PD entry of a 2 MiB page)
@@ -301,12 +358,18 @@ pub fn rootLoads() usize {
     return percpu.current().root_loads;
 }
 
-/// Make sure the address space `root` is not the one loaded on this CPU, by
-/// switching to the kernel's own page tables if it is. Must be called before
-/// `root` is destroyed: a kernel thread may still be running on the address
-/// space of the last process that ran (`thread.zig`). Interrupts must be off.
+/// Make sure the address space `root` is loaded on no CPU, by switching
+/// every CPU that has it to the kernel's own page tables. Must be called
+/// before `root` is destroyed: a CPU that ran one of its threads keeps it
+/// loaded for as long as it runs only kernel threads afterwards
+/// (`thread.zig`). Nothing may load `root` again: its threads are gone.
 pub fn unloadRoot(root: u64) void {
-    if (percpu.current().loaded_root == root) loadRoot(kernel_root);
+    {
+        const flags = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(flags);
+        if (percpu.current().loaded_root == root) loadRoot(kernel_root);
+    }
+    ipi.broadcast(.{ .unload_root = root });
 }
 
 /// Count the page tables under the table at `phys`, itself included.

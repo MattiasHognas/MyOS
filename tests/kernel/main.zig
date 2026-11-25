@@ -790,8 +790,12 @@ fn syscallRegisters() TestError!void {
 fn kernelEntryInvariants() TestError!void {
     helpers.installProbes(.noncanonical_rip);
     defer helpers.removeProbes();
-    var runs: usize = 0;
-    while (runs < 30) : (runs += 1) {
+    // Until the timer has hit both places often enough. How many runs that
+    // takes depends on how fast the machine is: under QEMU's emulation a
+    // run spans several ticks, on a real CPU (KVM) it is over in a
+    // fraction of one, so the bound is time, not a number of runs.
+    const give_up = helpers.nanos() + 10 * std.time.ns_per_s;
+    while (helpers.nanos() < give_up) {
         try check(helpers.runPair("/test/preempt"));
         if (helpers.probes.syscall_ticks >= 3 and helpers.probes.user_ticks >= 3) break;
     }
@@ -852,6 +856,7 @@ fn debugTrapEntry() TestError!void {
 
 /// True in the `tests_fxsave` scenario, where QEMU hides XSAVE from the kernel.
 var expect_fxsave = false;
+var all_parallel = false;
 /// CPUs the scenario's machine has.
 var expect_cpus: usize = 1;
 
@@ -860,6 +865,30 @@ fn cpus() TestError!void {
     const irq = helpers.enableInterrupts();
     defer helpers.restoreInterrupts(irq);
     try expectChecks("CPU", helpers.cpuChecks(expect_cpus));
+}
+
+/// Programs run, are preempted, crash and are torn down on every CPU at once.
+fn parallelPrograms() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    var first: usize = 0;
+    const failed = helpers.parallelPrograms(&first);
+    if (first != 0) report("parallel programs: wrong exit status from program number", first);
+    try expectChecks("parallel programs", failed);
+}
+
+/// Allocators, locks, wait queues and timers used from every CPU at once.
+fn kernelStress() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("kernel stress", helpers.kernelStress());
+}
+
+/// A kernel mapping that is removed is gone from every CPU's TLB.
+fn tlbShootdown() TestError!void {
+    const irq = helpers.enableInterrupts();
+    defer helpers.restoreInterrupts(irq);
+    try expectChecks("TLB shootdown", helpers.tlbShootdown());
 }
 
 /// The CPU cannot run on past the conditional `swapgs` on a wrong guess.
@@ -1259,6 +1288,16 @@ noinline fn scenarioStackOverflow() void {
     @panic("stack_overflow scenario: the overflow was not caught");
 }
 
+/// Integration-test scenario "panic_smp": panic while every CPU is busy
+/// printing. The CPU that panics must halt the others first, so its report
+/// comes out whole and nothing is printed after it.
+noinline fn scenarioPanicSmp() void {
+    const irq = helpers.enableInterrupts();
+    _ = helpers.startChatter() orelse @panic("panic_smp scenario: out of memory");
+    helpers.restoreInterrupts(irq);
+    scenarioPanicInner(true);
+}
+
 /// Integration-test scenario "lock_order": take two spinlocks in the wrong
 /// order. The kernel must panic on the spot, naming both, on one CPU as on
 /// several: a wrong order that is only noticed when it deadlocks is noticed
@@ -1296,13 +1335,32 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "use_after_free")) scenarioUseAfterFree();
     if (std.mem.eql(u8, scenario, "relro")) scenarioRelro();
     if (std.mem.eql(u8, scenario, "text_alias")) scenarioTextAlias();
+    if (std.mem.eql(u8, scenario, "panic_smp")) scenarioPanicSmp();
     if (std.mem.eql(u8, scenario, "lock_order")) scenarioLockOrder();
     if (std.mem.eql(u8, scenario, "sleep_with_lock")) scenarioSleepWithLock();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
-    const smp_run = std.mem.eql(u8, scenario, "tests_smp");
+    all_parallel = std.mem.eql(u8, scenario, "tests_all_parallel"); // an experiment: nothing is parked
+    const smp_run = std.mem.eql(u8, scenario, "tests_smp") or all_parallel;
     expect_cpus = if (smp_run) 4 else 1; // as `scripts/test-qemu.sh` starts QEMU
     if (!std.mem.eql(u8, scenario, "tests") and !expect_fxsave and !smp_run) panicFmt("unknown test scenario '{s}'", .{scenario});
     runCases();
+}
+
+/// Run one test case and return whether it passed. A case that can share
+/// the machine (`parallel`) runs with every CPU taking threads; the other
+/// CPUs are parked again before the next case. A function of its own, not
+/// part of the loop in `runCases`: unrolled over every case, its locals
+/// would make that function's stack frame larger than a page.
+noinline fn runCase(func: *const fn () TestError!void, parallel: bool) bool {
+    const share = parallel or all_parallel;
+    if (share) _ = helpers.setOthersParked(false);
+    const ok = if (func()) |_| true else |_| false;
+    if (share) {
+        const irq = helpers.enableInterrupts();
+        defer helpers.restoreInterrupts(irq);
+        if (!helpers.setOthersParked(true)) @panic("tests: the other CPUs did not park");
+    }
+    return ok;
 }
 
 /// Run every test case, log the results and exit QEMU with 0 if all passed, 1 otherwise.
@@ -1408,6 +1466,9 @@ fn runCases() noreturn {
         .{ .name = "wait queues (several waiters, order, timeouts)", .func = waitQueues },
         .{ .name = "CPUs (all online, own per-CPU state, tables and stacks, same setup, timer interrupts)", .func = cpus },
         .{ .name = "speculation barrier after the conditional swapgs at kernel entry", .func = swapgsFences },
+        .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown, .parallel = true },
+        .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress, .parallel = true },
+        .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms, .parallel = true },
         .{ .name = "locking model (locks held per CPU, idle wake-up in place, wake timers, unstarted threads)", .func = lockingModel },
         .{ .name = "kernel timers (order, expiry, cancel, sleep)", .func = timers },
         .{ .name = "mutex exclusion and hand-off under preemption", .func = mutexes },
@@ -1437,11 +1498,19 @@ fn runCases() noreturn {
         },
     };
 
+    // A test has the machine to itself unless it says it can share it
+    // (`.parallel = true`): most of them check exact counts and orders that
+    // hold only if nothing else runs. The other CPUs are parked meanwhile.
+    const irq = helpers.enableInterrupts();
+    if (!helpers.setOthersParked(true)) @panic("tests: the other CPUs did not park");
+    helpers.restoreInterrupts(irq);
+
     inline for (cases) |case| {
-        if (case.func()) |_| {
+        const parallel = @hasField(@TypeOf(case), "parallel") and case.parallel;
+        if (runCase(case.func, parallel)) {
             passed += 1;
             serial.puts("[PASS] " ++ case.name ++ "\n");
-        } else |_| {
+        } else {
             failed += 1;
             serial.puts("[FAIL] " ++ case.name ++ "\n");
         }

@@ -18,15 +18,13 @@
 //! exactly the protections that are checked once at boot, so the kernel
 //! refuses to go on.
 //!
-//! **A started CPU does not run threads yet.** It handles its interrupts
-//! and halts in between (`PerCpu.runs_threads` is false). For it to take
-//! threads from the ready queue, the kernel must first be able to reach
-//! across to another CPU: to take an address space away from one that still
-//! has it loaded, and to flush its TLB (roadmap 3.4).
+//! Once it is up, a CPU takes threads from the ready queue like the boot
+//! CPU (`thread.zig`); the context it started in retires and is where it
+//! idles first.
 //!
 //! Time is kept by the boot CPU alone: its timer interrupt advances the
 //! tick count and runs the timers. The other CPUs' timer interrupts only
-//! drive their own scheduling, which today is a count (`PerCpu.ticks`).
+//! drive their own time slices.
 
 const std = @import("std");
 
@@ -105,6 +103,7 @@ pub fn init(response: ?*limine.MpResponse) void {
     const boot = percpu.current();
     boot.apic_id = apic.id();
     boot.setup = readSetup();
+    thread.createIdle(boot) catch @panic("smp: no memory for the boot CPU's idle thread");
 
     if (response) |r| {
         detected = r.cpu_count;
@@ -192,9 +191,11 @@ fn apMain() callconv(.c) noreturn {
     }
 
     apic.timerStart(timer.HZ);
+    c.runs_threads = true;
     percpu.register(c); // online: the boot CPU goes on to the next one
     log.debug("CPU {d} (APIC ID {d}) is up", .{ c.id, c.apic_id });
 
-    // Not running threads yet (see the top of the file): handle interrupts.
-    while (true) asm volatile ("sti; hlt");
+    // This context has nothing left to do: the CPU takes threads from the
+    // ready queue from here on, and idles in this thread until there is one.
+    thread.retire();
 }

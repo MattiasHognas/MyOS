@@ -23,6 +23,7 @@ pub const arch = struct {
         pub const fpu = @import("arch/x86_64/fpu.zig");
         pub const gdt = @import("arch/x86_64/gdt.zig");
         pub const idt = @import("arch/x86_64/idt.zig");
+        pub const ipi = @import("arch/x86_64/ipi.zig");
         pub const meltdown = @import("arch/x86_64/meltdown.zig");
         pub const nospec = @import("arch/x86_64/nospec.zig");
         pub const percpu = @import("arch/x86_64/percpu.zig");
@@ -203,9 +204,11 @@ var console_seized = false;
 /// whichever lock the fault happened under, and its report matters more
 /// than a tidy log. Interrupts must be off.
 ///
-/// With several CPUs the others keep running and may print in between,
-/// until this CPU can stop them with an interrupt (3.4).
+/// The other CPUs are halted first, so nothing else runs or prints while
+/// this one reports. If another CPU got there first, this one is among
+/// those it halts: it stops here and reports nothing.
 pub fn seizeConsole() void {
+    if (!arch.x86_64.ipi.stopOthers()) arch.x86_64.ipi.haltIfStopped();
     console_seized = true;
     kernel.sync.spinlock.stopChecking();
 }
@@ -336,6 +339,7 @@ fn kmainOnStack() callconv(.c) noreturn {
     syscall.init();
 
     // The other CPUs, now that the boot CPU is set up the way each of them must be.
+    arch.x86_64.ipi.init();
     const mp: *volatile @TypeOf(mp_request) = &mp_request;
     arch.x86_64.smp.init(mp.response);
 

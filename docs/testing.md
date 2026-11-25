@@ -6,7 +6,7 @@ change or add a subsystem.
 | Layer | Command | Where | What it is for |
 | --- | --- | --- | --- |
 | Host unit tests | `zig build test-host` | `tests/host/` | Hardware-independent kernel code (VFS, ELF image validation with a fixed-seed mutation fuzzer, ELF symbol lookup, log formatting, user address-range checks, the ABI's numbers against Linux's, the `sysretq`/`iretq` decision, extended-state feature selection, the physical allocator's page bookkeeping against a model and at every position in a 64-bit word, the timer queue against a model, the spinlock under real multi-threaded contention, the lock order and the record of locks held, the random generator's core, the Meltdown rule; two coverage-guided fuzz tests, see [fuzzing](#fuzzing)), compiled natively with fakes. Fast; covered by `zig build coverage`. |
-| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes for user and global kernel mappings, which kernel mappings are global, what in the kernel is writable), memory exhaustion and failed allocations, heap, kernel stacks, process limits, spinlocks, wait queues, mutexes, timers and sleeping, the CPUs (all of them up; per-CPU state, GDT, TSS, emergency and kernel stacks of their own; control registers and `syscall` MSRs the same on each; timer interrupts on each), the speculation barrier after the conditional `swapgs`, the locking model (the locks a CPU holds through waits, switches and interrupts; a thread woken while its CPU idles on its stack; timers that wake a thread), the random-number generator, poisoning and zeroing of memory, speculation guards (also that the user-copy routines cannot be made to touch kernel memory), address randomization, the process lifecycle (late waits, orphans, a stress run), ELF loading, scheduler and processes (round robin, no idling while a thread is ready, the address space a kernel thread runs on), syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
+| In-kernel tests | `zig build test-qemu` (scenarios `tests`, `tests_fxsave`) | `tests/kernel/main.zig`, `tests/user/` | Code that needs the real kernel: PMM, VMM (mapping conflicts, unmapping, TLB flushes for user and global kernel mappings, which kernel mappings are global, what in the kernel is writable), memory exhaustion and failed allocations, heap, kernel stacks, process limits, spinlocks, wait queues, mutexes, timers and sleeping, several CPUs at once (programs; allocators, locks and wait queues; TLB shootdown), the CPUs (all of them up; per-CPU state, GDT, TSS, emergency and kernel stacks of their own; control registers and `syscall` MSRs the same on each; timer interrupts on each), the speculation barrier after the conditional `swapgs`, the locking model (the locks a CPU holds through waits, switches and interrupts; a thread woken while its CPU idles on its stack; timers that wake a thread), the random-number generator, poisoning and zeroing of memory, speculation guards (also that the user-copy routines cannot be made to touch kernel memory), address randomization, the process lifecycle (late waits, orphans, a stress run), ELF loading, scheduler and processes (round robin, no idling while a thread is ready, the address space a kernel thread runs on), syscalls from ring 3 (errors, register preservation, return states, a fuzzer), kernel entry and exit (GS base, stacks, address spaces, preemption), x87/SSE/AVX state, user-memory copies, tarfs, NVMe reads, symbolization, fw_cfg. |
 | QEMU scenarios | `zig build test-qemu` | `scripts/test-qemu.sh` | Whole-system behaviour checked from the serial log, including runs that are meant to crash. |
 
 `zig build test` runs the host tests, the [stack frame check](#stack-frame-check) and all QEMU scenarios. Add
@@ -24,7 +24,9 @@ scenario. The scenario name reaches the kernel through QEMU's fw_cfg device
 | --- | --- | --- |
 | `tests` | Runs the in-kernel test suite | Exit code 0, `MYOS_TEST_PASS`, `failed=0`, no `[FAIL]` lines, the peak kernel stack usage (`MYOS_STACK_PEAK`) under the warning level, the diagnostics of the user faults the suite provokes (program name, vector, error code, RIP/RSP, CR2), the reports of syscall returns to invalid states, and the fuzzer finishing |
 | `tests_fxsave` | Runs the same suite on a CPU without XSAVE and AVX (`-cpu max,xsave=off`), so extended state is saved with FXSAVE | As `tests`, and the boot log names FXSAVE (`tests` requires XSAVE with AVX) |
-| `tests_smp` | Runs the same suite on a machine with four CPUs (`-smp 4`). The CPU test then checks all four; the others run on the boot CPU while the rest take interrupts | As `tests`, and the boot log says `4 of 4 CPUs online` (`tests` and `tests_fxsave` require `1 of 1`) |
+| `tests_smp` | Runs the same suite on a machine with four CPUs (`-smp 4`). The three "on every CPU at once" tests run with all four taking threads; for the others the three other CPUs are parked (see [below](#tests-and-several-cpus)) | As `tests`, and the boot log says `4 of 4 CPUs online` (`tests` and `tests_fxsave` require `1 of 1`) |
+| `tests_kvm` | The same as `tests_smp`, on the host's own CPU with KVM (`-enable-kvm -cpu host`): real hardware and real parallelism instead of the emulator | As `tests_smp`, with whatever extended state the host has. Skipped, with a notice, if `/dev/kvm` cannot be used or the kernel refuses the host's CPU (Meltdown) |
+| `panic_smp` | Panics on a machine with four CPUs while a thread on each prints without end | Exit code 1, the panic message and a backtrace through `scenarioPanicSmp`, and no other output after the panic began (the panicking CPU halts the others first) |
 | `panic` | Fails a subsystem assertion two calls deep | Exit code 1, the panic message, a symbolized backtrace through `scenarioPanicInner` and `scenarioPanic` |
 | `fault` | Writes to an unmapped kernel address | Exit code 1, `Page fault`, the right CR2, backtrace frame `#0` in `scenarioFault` |
 | `smap` | Reads a mapped user page from kernel code outside a user copy | Exit code 1, `Page fault` with error 0x1 and CR2 = the user page, frame `#0` in `scenarioSmap` (SMAP is enforced) |
@@ -50,6 +52,33 @@ serial log; CI uploads the logs as the `serial-logs-<mode>` artifact.
 
 In the test kernel, `root.halt()` and the panic handler exit QEMU with status
 1 (host status 3) instead of hanging, so crashes end the run immediately.
+
+### Tests and several CPUs
+
+Most in-kernel tests check exact orders and counts ("this thread was never
+switched away from", "memory is back the moment the thread is gone") that
+hold only if nothing else runs. So the test runner parks the other CPUs
+(`thread.setParked`): they give up their threads and halt until unparked.
+A test case that can share the machine says so with `.parallel = true` in
+the case list of `tests/kernel/main.zig`; the runner unparks the other
+CPUs for it. Such a test may be anywhere when it runs, and so may its
+threads: everything they share must be atomic or under a lock, and what
+it measures must not depend on timing. Three do so today:
+
+- programs on every CPU at once (extended state, long syscalls, a crash,
+  fresh memory), ending with memory as it was;
+- the kernel's shared parts from every CPU at once: page allocator, heap,
+  kernel stacks, a spinlock, a mutex, a wait queue with timeouts;
+- a kernel page read on every CPU, then unmapped and replaced: no CPU may
+  see the old page.
+
+On one CPU they run too, and check the same things without the parallelism.
+
+Tests that pass under the emulator can fail on a real CPU, and the other
+way round: the emulator runs one instruction at a time per CPU and lets
+some things stand that hardware does not (a reserved bit written as 0
+reads back as 0). Run `scripts/test-qemu.sh tests_kvm` when you change
+anything that several CPUs share.
 
 ### Adding a scenario
 

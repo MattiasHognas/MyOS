@@ -20,7 +20,8 @@
 //! - **blocked**: called `block` and waits for `wake`; in no scheduler queue
 //!   (it may be on a `WaitQueue`, which is how others find it).
 //! - **dead**: called `exit`; on the zombie list once its CPU has left its
-//!   stack, until the next thread that runs frees it. Never runs again.
+//!   stack, until the next thread that runs on any CPU frees it. Never runs
+//!   again.
 //!
 //! A thread is in at most one scheduler queue, and `Thread.link` says which.
 //! Every insertion checks it, so a thread can never be queued twice, and
@@ -38,13 +39,13 @@
 //!
 //! ## Idling
 //!
-//! There is no idle thread. When a thread blocks or exits and nothing is
-//! ready, the CPU halts right there, in `block` or `exit` on that thread's
-//! stack, until an interrupt makes a thread ready. So a ready thread never
-//! waits behind an idle one. A blocked thread whose CPU idles on its stack
-//! is still "on a CPU" (`Thread.on_cpu`): waking it lets it carry on where
-//! it is and does not put it in the ready queue, where another CPU could
-//! pick it up and run on the same stack.
+//! There is no idle thread that takes turns with the others. When a thread
+//! blocks and nothing is ready, its CPU halts right there, in `block` on
+//! that thread's stack, until an interrupt makes a thread ready. So a ready
+//! thread never waits behind an idle one. A blocked thread whose CPU idles
+//! on its stack is still "on a CPU" (`Thread.on_cpu`): waking it lets it
+//! carry on where it is and does not put it in the ready queue, where
+//! another CPU could pick it up and run on the same stack.
 //!
 //! ## Address spaces
 //!
@@ -74,11 +75,29 @@
 //!
 //! ## Several CPUs
 //!
-//! Each CPU starts in a context of its own, which `adoptCpu` makes a
-//! thread. Only CPUs with `PerCpu.runs_threads` take threads from the ready
-//! queue: the boot CPU today. The others are started and handle their
-//! interrupts, and join once an address space can be taken away from a CPU
-//! that still has it loaded (3.4).
+//! There is one ready queue, and every CPU takes threads from it: a thread
+//! runs on whichever CPU picks it up, and may be on a different one after
+//! every switch. Each CPU starts in a context of its own, which `adoptCpu`
+//! makes a thread; once the CPU is up that thread retires, like the boot
+//! thread.
+//!
+//! Each CPU has a thread of its own to fall back to (`PerCpu.idle_thread`:
+//! the one it started in, or one made for it), for the two cases where it
+//! cannot halt in the thread it ran last: that thread has exited, and
+//! would not be freed for as long as the CPU sat on its stack; or the CPU
+//! is parked. It is not an idle thread that takes turns: it is never in
+//! the ready queue, and a CPU whose thread merely blocks still halts right
+//! there.
+//!
+//! A CPU that halts with nothing to run says so (`PerCpu.idle`). Whoever
+//! makes a thread ready sends one idle CPU an interrupt, and whoever wakes
+//! a thread in place sends it to that thread's CPU, so neither waits for
+//! the next timer tick.
+//!
+//! A CPU can be **parked** (`setParked`): it gives up the thread it runs,
+//! goes back to the thread it started in and halts there, taking only
+//! interrupts, until it is unparked. The tests use it to have the machine
+//! to themselves; it is also the first half of taking a CPU offline.
 
 const std = @import("std");
 const root = @import("root");
@@ -87,6 +106,7 @@ const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
+const ipi = @import("../arch/x86_64/ipi.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const vmm = @import("../arch/x86_64/vmm.zig");
 const assert = @import("debug/assert.zig");
@@ -215,6 +235,8 @@ pub const Thread = struct {
     /// to until the CPU that switches away from it has left the stack. A
     /// blocked thread with this set is idling in `block`.
     on_cpu: bool = false,
+    /// The CPU that runs the thread, or ran it last. Null until it has run.
+    cpu: ?*percpu.PerCpu = null,
     /// Heap block holding the saved x87/SSE/AVX state while the thread is
     /// not running (`fpu.zig`). Null for kernel threads, which have none.
     fpu_alloc: ?[]u8 = null,
@@ -261,18 +283,37 @@ pub fn block() void {
 }
 
 /// Sleep until the next interrupt. Called with the scheduler lock held and
-/// the ready queue empty; the lock is released for the sleep and held again
+/// the ready queue empty (or this CPU parked); the lock is released for the sleep and held again
 /// on return. The `sti` takes effect after the following instruction, so no
 /// interrupt of this CPU can arrive between enabling them and halting.
 ///
-/// Another CPU can make a thread ready in that gap. It has to send this one
-/// an interrupt for that (3.4); until it does, the timer ends the halt.
+/// Another CPU can make a thread ready in that gap. It finds this CPU
+/// marked idle and sends it an interrupt, which is taken the moment the
+/// halt begins.
 fn idleOnce() void {
-    assert.check(.thread, ready_head == null, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
-    percpu.current().halts += 1;
+    const c = percpu.current();
+    assert.check(.thread, ready_head == null or !c.runs_threads, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
+    c.halts += 1;
+    c.idle = true;
     lock.drop();
     asm volatile ("sti; hlt; cli");
     lock.take();
+    c.idle = false;
+}
+
+/// A thread has just been put in the ready queue: if a CPU is halted with
+/// nothing to run, end its halt so it picks the thread up. One thread, one
+/// CPU: the CPU is marked as no longer idle, so the next thread wakes
+/// another. The scheduler lock must be held.
+fn kickIdleCpu() void {
+    const me = percpu.current();
+    for (0..percpu.count()) |i| {
+        const c = percpu.get(i);
+        if (c == me or !c.idle or !c.runs_threads) continue;
+        c.idle = false;
+        ipi.wake(c);
+        return;
+    }
 }
 
 /// Wake thread `t`: if it is blocked, make it runnable; otherwise leave a
@@ -290,11 +331,15 @@ pub fn wake(t: *Thread) void {
     if (t.state != .blocked) return;
     if (t.on_cpu) {
         // It is blocked but a CPU is still on its stack, idling in `block`
-        // because nothing else was ready: it just carries on there.
+        // because nothing else was ready: it just carries on there. If that
+        // is another CPU, it is halted and has to be told.
         t.state = .running;
+        const c = t.cpu.?;
+        if (c != percpu.current()) ipi.wake(c);
     } else {
         t.state = .ready;
         enqueue(t);
+        kickIdleCpu();
     }
 }
 
@@ -341,6 +386,7 @@ pub fn start(t: *Thread) void {
     t.id = next_id;
     next_id += 1;
     enqueue(t);
+    kickIdleCpu();
 }
 
 /// Create a thread that runs `entry` and put it in the ready queue: `create`
@@ -365,6 +411,29 @@ pub fn init() void {
     const c = percpu.current();
     c.thread = &boot_thread;
     c.slice_left = SLICE_TICKS;
+    boot_thread.cpu = c;
+}
+
+/// Give CPU `c` a thread to idle in, for a CPU whose first thread goes on
+/// to do other things: the boot CPU, whose boot thread runs the rest of
+/// boot and may end up on any CPU. (The other CPUs idle in the thread they
+/// started in.) The thread only ever runs on `c`, when `c` has nothing
+/// else and must leave the thread it ran: see `switchToNext`. Returns
+/// `error.OutOfMemory` if there is no memory for it.
+pub fn createIdle(c: *percpu.PerCpu) !void {
+    const t = try create(idleBody, null);
+    t.state = .blocked;
+    {
+        const held = lock.acquire();
+        defer lock.release(held);
+        t.id = next_id;
+        next_id += 1;
+        c.idle_thread = t;
+    }
+}
+
+fn idleBody() void {
+    retire();
 }
 
 /// Create the thread that CPU `c` starts in: the context it runs on `stack`
@@ -374,7 +443,7 @@ pub fn init() void {
 /// from. Returns `error.OutOfMemory` if there is no memory for it.
 pub fn adoptCpu(c: *percpu.PerCpu, stack: []u8) !*Thread {
     const t = try heap.allocator.create(Thread);
-    t.* = .{ .id = 0, .stack = stack, .state = .running, .on_cpu = true };
+    t.* = .{ .id = 0, .stack = stack, .state = .running, .on_cpu = true, .cpu = c };
     {
         const held = lock.acquire();
         defer lock.release(held);
@@ -382,6 +451,7 @@ pub fn adoptCpu(c: *percpu.PerCpu, stack: []u8) !*Thread {
         next_id += 1;
     }
     c.thread = t;
+    c.idle_thread = t;
     c.slice_left = SLICE_TICKS;
     const top = @intFromPtr(stack.ptr) + stack.len;
     c.kernel_rsp = top;
@@ -418,19 +488,31 @@ pub fn yield() void {
 fn switchToNext() bool {
     spinlock.assertHeld(1, "switching threads");
     const c = percpu.current();
-    assert.check(.thread, c.runs_threads, "CPU {d} switches threads, but does not run them yet", .{c.id});
-    const next = dequeue() orelse return false;
     const prev = current();
-    assert.check(.thread, next != prev and !next.on_cpu, "thread {d} is in the ready queue while on a CPU", .{next.id});
+    const next: *Thread = (if (c.runs_threads) dequeue() else null) orelse blk: {
+        // Nothing to take from the queue. The CPU halts where it is,
+        // unless it has a thread of its own to do that in (`idle_thread`,
+        // which sits blocked in `retire` and is in no queue) and a reason
+        // to leave this one: the CPU is parked, so it may not
+        // go on running `prev`; or `prev` has exited, and would not be
+        // freed for as long as the CPU idled on its stack.
+        const idle: *Thread = @ptrCast(@alignCast(c.idle_thread orelse return false));
+        if (prev == idle) return false;
+        if (c.runs_threads and prev.state != .dead) return false;
+        break :blk idle;
+    };
+    assert.check(.thread, next != prev and !next.on_cpu, "thread {d} is to be run while on a CPU", .{next.id});
 
     // Safe before the switch only because the lock is held across it:
     // nobody can take `prev` from the queue while this CPU is on its stack.
     if (prev.state == .running) {
         prev.state = .ready;
         enqueue(prev);
+        kickIdleCpu(); // it need not wait for this CPU to come back to it
     }
     next.state = .running;
     next.on_cpu = true;
+    next.cpu = c;
     c.thread = next;
     c.slice_left = SLICE_TICKS;
     switches += 1;
@@ -487,7 +569,11 @@ pub fn retire() noreturn {
 pub fn tick() void {
     const c = percpu.current();
     c.ticks += 1;
-    if (!c.runs_threads) return;
+    if (!c.runs_threads) {
+        // Parked while it was running a thread: give the thread back.
+        if (c.thread != c.idle_thread) yield();
+        return;
+    }
     if (c.slice_left > 0) c.slice_left -= 1;
     if (c.slice_left == 0) yield();
 }
@@ -508,6 +594,30 @@ pub fn exit() noreturn {
     while (true) {
         if (!switchToNext()) idleOnce();
     }
+}
+
+/// Park or unpark CPU number `n` (not one whose first thread still runs): see "Several CPUs" at
+/// the top of the file. Returns at once; a CPU that is told to park gives
+/// up its thread at its next timer tick, or sooner if the thread blocks,
+/// and `isParked` says when it has.
+pub fn setParked(n: usize, parked: bool) void {
+    const c = percpu.get(n);
+    assert.check(.thread, c.idle_thread != null, "CPU {d} cannot be parked", .{n});
+    const held = lock.acquire();
+    defer lock.release(held);
+    c.runs_threads = !parked;
+    if (!parked and c != percpu.current()) {
+        c.idle = false;
+        ipi.wake(c); // it is halted: have it look at the ready queue
+    }
+}
+
+/// True if CPU number `n` is parked and has given up the thread it ran.
+pub fn isParked(n: usize) bool {
+    const c = percpu.get(n);
+    const held = lock.acquire();
+    defer lock.release(held);
+    return !c.runs_threads and c.thread == c.idle_thread;
 }
 
 /// Threads freed since boot. With `spawnedCount`, tests use it to see that
@@ -532,11 +642,12 @@ pub fn switchCount() usize {
     return switches;
 }
 
-/// Times the CPU was halted because no thread was ready, since boot.
+/// Times the CPU this is called on was halted because no thread was
+/// ready, since boot.
 pub fn haltCount() usize {
-    var n: usize = 0;
-    for (0..percpu.count()) |i| n += @atomicLoad(u64, &percpu.get(i).halts, .monotonic);
-    return n;
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    return percpu.current().halts;
 }
 
 /// Record how much of its kernel stack the current thread has used so far

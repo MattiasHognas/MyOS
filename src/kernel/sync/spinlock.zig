@@ -27,7 +27,10 @@
 //! releasing its condition's lock while the thread sleeps, the scheduler
 //! keeping its lock across a context switch.
 
+const std = @import("std");
+
 const cpu = @import("../../arch/x86_64/cpu.zig");
+const ipi = @import("../../arch/x86_64/ipi.zig");
 const percpu = @import("../../arch/x86_64/percpu.zig");
 const assert = @import("../debug/assert.zig");
 const panicFmt = @import("../debug/panic.zig").panicFmt;
@@ -101,7 +104,19 @@ pub const SpinLock = struct {
     pub fn take(self: *SpinLock) void {
         assert.check(.spinlock, cpu.readFlags() & (1 << 9) == 0, "taking a {t} lock with interrupts on", .{self.rank});
         self.noteTaken();
-        if (!self.raw.lockBounded(STUCK_SPINS)) @panic("spinlock: stuck (taken twice, or its holder never released it)");
+        var spins: usize = 0;
+        while (!self.raw.tryLock()) {
+            // Only read the flag while waiting, so the cache line is not
+            // bounced between CPUs. The holder may be waiting for this CPU
+            // to answer a request, which it cannot take as an interrupt
+            // now: look for one (`ipi.zig`).
+            while (self.raw.isLocked()) {
+                ipi.poll();
+                spins += 1;
+                if (spins == STUCK_SPINS) @panic("spinlock: stuck (taken twice, or its holder never released it)");
+                std.atomic.spinLoopHint();
+            }
+        }
     }
 
     /// Release the lock and leave interrupts off. The other half of `take`,

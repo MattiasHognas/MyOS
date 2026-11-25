@@ -26,10 +26,9 @@ The main objects:
   kernel's and the same in every address space; the lower half is the
   process's own.
 
-Every CPU of the machine is started and has its own state, but threads run
-on the boot CPU only today; the others handle their interrupts and wait.
-Milestone 3 changes that; the rules it follows are in [concurrency and
-locking](locking.md).
+Every CPU of the machine is started and runs threads: there is one queue
+of ready threads, and a thread runs on whichever CPU picks it up. The rules
+that keep this correct are in [concurrency and locking](locking.md).
 
 ## How a program runs
 
@@ -122,9 +121,10 @@ mapping, and either succeeds or changes nothing. Read:
 objects; stacks in their own region with guard pages, so an overflow faults
 instead of corrupting memory. Read: `src/kernel/heap.zig`, `kstack.zig`.
 
-**Threads and scheduling.** A round-robin queue with a 50 ms time slice;
-kernel code can be preempted. There is no idle thread: with nothing to run,
-the CPU halts inside the thread that ran last. A kernel thread runs on
+**Threads and scheduling.** One round-robin queue for all CPUs, with a
+50 ms time slice; kernel code can be preempted. There is no idle thread
+that takes turns: with nothing to run, a CPU halts inside the thread that
+ran last, and is woken by an interrupt when a thread becomes ready. A kernel thread runs on
 whichever address space is loaded. Read: `src/kernel/thread.zig`,
 `src/arch/x86_64/context.zig`.
 

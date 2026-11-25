@@ -202,6 +202,11 @@ pub fn spawnError(path: []const u8, limits: Limits) ?anyerror {
     return null;
 }
 
+/// Nanoseconds since boot, by the HPET.
+pub fn nanos() u64 {
+    return hpet.nanos();
+}
+
 /// Bytes currently allocated from the kernel heap.
 pub fn heapInUse() usize {
     return heap.stats().bytes_in_use;
@@ -2314,6 +2319,25 @@ fn overlap(a: []const u8, b: []const u8) bool {
     return a_low < b_low + b.len and b_low < a_low + a.len;
 }
 
+/// Park every CPU but this one (the boot CPU), or let them run threads
+/// again. Parking returns when each of them has given up the thread it ran
+/// and halted; false if one does not within a few seconds. Must be called
+/// with interrupts on.
+pub fn setOthersParked(parked: bool) bool {
+    const n = percpu.count();
+    for (1..n) |i| thread.setParked(i, parked);
+    if (!parked) return true;
+    for (0..500) |_| {
+        var all = true;
+        for (1..n) |i| {
+            if (!thread.isParked(i)) all = false;
+        }
+        if (all) return true;
+        timer.sleepTicks(1);
+    }
+    return false;
+}
+
 /// Check the speculation barriers at kernel entry: where the two paths of
 /// the conditional `swapgs` meet, in the common and in the emergency entry
 /// path, the next instruction is `lfence`, and a `swapgs` comes right
@@ -2343,8 +2367,8 @@ pub fn swapgsFences() u32 {
 /// MSRs every CPU must have are the same on all of them and each one's GS
 /// base points at its own structure; every CPU takes timer interrupts,
 /// with no lock left held; only the boot CPU runs threads, and time
-/// advances once per tick however many CPUs there are. Must be called with
-/// interrupts on. Returns 0, or the number of the first failing check.
+/// advances once per tick however many CPUs there are. The other CPUs must
+/// be parked (`setOthersParked`). Must be called with interrupts on. Returns 0, or the number of the first failing check.
 pub fn cpuChecks(want: usize) u32 {
     if (!interruptsOn()) return 1;
     const n = percpu.count();
@@ -2370,7 +2394,10 @@ pub fn cpuChecks(want: usize) u32 {
         const tables = c.tables orelse return base + 2;
         const t: *thread.Thread = @ptrCast(@alignCast(c.thread orelse return base + 3));
         const stack = t.stack orelse return base + 4;
-        if (!t.on_cpu or t.state != .running or t.link != .none) return base + 5;
+        // This thread runs; the other CPUs are parked, each halted in the thread it started in.
+        if (!t.on_cpu or t.link != .none or t.cpu != c) return base + 5;
+        if (i == 0 and t.state != .running) return base + 5;
+        if (i != 0 and (c.thread != c.idle_thread or !thread.isParked(i))) return base + 5;
         // Its kernel stack is where `syscall` and interrupts from ring 3 would land.
         const top = @intFromPtr(stack.ptr) + stack.len;
         if (i != 0 and (c.kernel_rsp != top or tables.tss.rsp0 != top)) return base + 6;
@@ -2387,7 +2414,7 @@ pub fn cpuChecks(want: usize) u32 {
         if (!smp.sameSetup(c.setup, mine)) return base + 11;
         if (c.setup.gs_base != @intFromPtr(c) or c.setup.kernel_gs_base != 0) return base + 12;
         if (c.loaded_root != vmm.kernel_root and i != 0) return base + 13;
-        if (c.runs_threads != (i == 0)) return base + 14;
+        if (c.runs_threads != (i == 0)) return base + 14; // parked for this test
 
         // Nothing is shared with another CPU.
         for (0..i) |j| {
@@ -2420,10 +2447,410 @@ pub fn cpuChecks(want: usize) u32 {
         const c = percpu.get(i);
         const took = @atomicLoad(u64, &c.ticks, .monotonic) - ticks_before[i];
         if (took < 8 or took > 15) return @intCast(20 + i);
-        if (i != 0 and c.locks.len != 0) return @intCast(30 + i); // idle between interrupts: nothing held
-        if (i != 0 and c.halts != 0) return @intCast(40 + i); // it has not been in the scheduler
+        if (i != 0 and c.halts == 0) return @intCast(40 + i); // it idles through the scheduler
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Several CPUs at once (roadmap 3.4). These tests run with every CPU taking
+// threads, so everything they share is atomic or under a lock.
+
+const ipi = kernel_root.arch.x86_64.ipi;
+const Atomic = std.atomic.Value;
+
+/// Which CPUs the threads of a test were seen running on, as a bit mask.
+var seen_cpus: Atomic(u64) = .init(0);
+
+/// Note the CPU the calling thread is on right now.
+fn noteCpu() void {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    _ = seen_cpus.fetchOr(@as(u64, 1) << @intCast(percpu.current().id), .monotonic);
+}
+
+/// Number of CPUs that run threads.
+fn schedulingCpus() usize {
+    var n: usize = 0;
+    for (0..percpu.count()) |i| {
+        if (i == 0 or !thread.isParked(i)) n += 1;
+    }
+    return n;
+}
+
+/// Sleep until memory is back to `before` (threads that have exited are
+/// freed by whichever CPU switches threads next). False if it never is.
+fn untilFootprint(before: Footprint) bool {
+    for (0..200) |_| {
+        if (footprint().eql(before)) return true;
+        timer.sleepTicks(1);
+    }
+    return false;
+}
+
+/// Sleep until memory use has stopped changing (exited threads have been
+/// freed) and return it.
+fn settledFootprint() Footprint {
+    var last = footprint();
+    var same: usize = 0;
+    for (0..300) |_| {
+        timer.sleepTicks(2);
+        const now = footprint();
+        same = if (now.eql(last)) same + 1 else 0;
+        last = now;
+        if (same == 5) break;
+    }
+    return last;
+}
+
+var par_done: usize = 0;
+var par_failures: Atomic(usize) = .init(0);
+var par_first_failure: Atomic(usize) = .init(0);
+
+/// Run a mix of programs one after the other and compare their exit statuses.
+fn programRunner() void {
+    const programs = [_]struct { path: []const u8, want: u64 }{
+        .{ .path = "/test/fpu", .want = 0 }, // every x87/SSE/AVX register, across switches
+        .{ .path = "/bin/hello", .want = 0 },
+        .{ .path = "/test/preempt", .want = 0 }, // long syscalls, registers checked after each
+        .{ .path = "/test/open_count", .want = 13 },
+        .{ .path = "/test/div_zero", .want = process.EXIT_KILLED }, // a fault kills it, wherever it runs
+        .{ .path = "/test/syscall_abi", .want = 0 },
+        .{ .path = "/test/zero_pages", .want = 0 }, // nothing of another process in fresh memory
+    };
+    for (programs, 1..) |program, n| {
+        noteCpu();
+        const code = runProgram(program.path);
+        if (code != program.want) {
+            _ = par_failures.fetchAdd(1, .monotonic);
+            _ = par_first_failure.cmpxchgStrong(0, n, .monotonic, .monotonic);
+        }
+    }
+    signalDone(&par_done, &done_queue);
+}
+
+/// Run programs on every CPU at once: eight kernel threads each start and
+/// wait for seven programs, so processes are created, run, preempted,
+/// moved between CPUs, killed and torn down everywhere at the same time.
+/// Every program must end the way it does alone, the work must really have
+/// been spread over the CPUs, and afterwards no memory is missing: no
+/// address space was freed while a CPU still used it, and none was leaked.
+/// `first.*` is set to the number of the first program that ended wrong.
+/// Must be called with interrupts on. Returns 0, or the number of the
+/// first failing check.
+pub fn parallelPrograms(first: *usize) u32 {
+    const RUNNERS = 8;
+    const live = process.liveCount();
+    par_failures.store(0, .monotonic);
+    par_first_failure.store(0, .monotonic);
+    seen_cpus.store(0, .monotonic);
+    // Until a pass leaves memory exactly as it found it. A pass during
+    // which the heap had to grow does not count: the heap never shrinks,
+    // and its growth takes page tables too. The first pass always grows it,
+    // to what eight programs loading at once need; a later one may, when
+    // more of them happen to load at the same moment.
+    var passes: usize = 0;
+    while (true) : (passes += 1) {
+        const before = settledFootprint(); // with earlier threads freed
+        const heap_before = heap.stats().bytes_mapped;
+        par_done = 0;
+        for (0..RUNNERS) |_| _ = thread.spawn(programRunner, null) catch return 1;
+        waitForDone(&par_done, RUNNERS, &done_queue);
+        // A process structure goes when its thread has been freed, which
+        // another CPU may still be about to do.
+        if (untilFootprint(before)) break;
+        if (heap.stats().bytes_mapped == heap_before or passes == 5) {
+            const now = footprint();
+            kernel_root.print("  parallel programs: memory before {any}, after {any}\n", .{ before, now });
+            return 5; // memory is missing, and not to the heap
+        }
+    }
+    first.* = par_first_failure.load(.monotonic);
+    if (par_failures.load(.monotonic) != 0) return 2;
+    // Eight threads that mostly sleep in `wait`, and their programs: with
+    // more than one CPU taking threads, more than one took part.
+    if (schedulingCpus() > 1 and @popCount(seen_cpus.load(.monotonic)) < 2) return 3;
+    if (process.liveCount() != live) return 4;
+    return if (pmm.consistent()) 0 else 6;
+}
+
+// State of the kernel stress test.
+const STRESS_WORKERS = 8;
+const STRESS_ROUNDS = 250;
+var stress_done: usize = 0;
+var stress_errors: Atomic(usize) = .init(0);
+var stress_spin: SpinLock = .{};
+var stress_spin_count: u64 = 0;
+var stress_mutex: Mutex = .{};
+var stress_mutex_count: u64 = 0;
+var stress_inside: usize = 0;
+var stress_lock: SpinLock = .{};
+var stress_queue: WaitQueue = .{};
+var stress_tokens: u64 = 0;
+var stress_taken: u64 = 0;
+var stress_timeouts: Atomic(u64) = .init(0);
+var stress_next_tag: Atomic(u64) = .init(1);
+
+fn stressError() void {
+    _ = stress_errors.fetchAdd(1, .monotonic);
+}
+
+/// One worker of `kernelStress`: every round uses each shared part of the
+/// kernel once, in a way that shows if another thread got in.
+fn stressWorker() void {
+    const tag = stress_next_tag.fetchAdd(1, .monotonic);
+    var pages: [6]u64 = undefined;
+    for (0..STRESS_ROUNDS) |round| {
+        noteCpu();
+        const stamp = (tag << 32) | round;
+
+        // Page allocator: nobody else gets or scribbles on these pages.
+        var n: usize = 0;
+        while (n < pages.len) : (n += 1) {
+            pages[n] = pmm.alloc() orelse break;
+            @as(*volatile u64, @ptrCast(@alignCast(pmm.physToVirt(pages[n])))).* = stamp;
+        }
+
+        // Heap: a block keeps its contents until it is freed.
+        const size = 24 + (round * 37 + tag * 101) % 700;
+        const block = heap.allocator.alloc(u8, size) catch null;
+        if (block) |b| @memset(b, @truncate(stamp));
+
+        // Spinlock: a read, a pause and a write lose no update.
+        {
+            const held = stress_spin.acquire();
+            const seen = stress_spin_count;
+            std.atomic.spinLoopHint();
+            stress_spin_count = seen + 1;
+            stress_spin.release(held);
+        }
+
+        // Mutex: one thread inside, also while the holder is switched away from.
+        stress_mutex.lock();
+        stress_inside += 1;
+        if (stress_inside != 1) stressError();
+        const seen = stress_mutex_count;
+        if (round % 16 == 0) thread.yield();
+        stress_mutex_count = seen + 1;
+        stress_inside -= 1;
+        stress_mutex.unlock();
+
+        // Wait queue: hand a token to whoever waits, then wait for one,
+        // with a timeout that often runs out at the moment a token comes:
+        // the timer fires on the boot CPU, the waker runs on any.
+        {
+            const held = stress_lock.acquire();
+            defer stress_lock.release(held);
+            stress_tokens += 1;
+            _ = stress_queue.wakeOne();
+            var waited = false;
+            while (stress_tokens == 0 and !waited) {
+                waited = true;
+                if (!stress_queue.waitTimeout(&stress_lock, 1)) _ = stress_timeouts.fetchAdd(1, .monotonic);
+            }
+            if (stress_tokens > 0) {
+                stress_tokens -= 1;
+                stress_taken += 1;
+            }
+            if (thread.current().wait_queue != null) stressError();
+        }
+
+        // Kernel stacks: mapping one and unmapping it again reaches every
+        // CPU's TLB, and a new stack is usable memory from top to bottom.
+        if (round % 8 == tag % 8) {
+            if (kstack.alloc()) |stack| {
+                stack[0] = @truncate(stamp);
+                stack[stack.len - 1] = @truncate(stamp >> 8);
+                if (stack[0] != @as(u8, @truncate(stamp))) stressError();
+                kstack.free(stack);
+            }
+        }
+        if (round % 32 == tag % 32) timer.sleepTicks(1);
+
+        if (block) |b| {
+            for (b) |byte| {
+                if (byte != @as(u8, @truncate(stamp))) {
+                    stressError();
+                    break;
+                }
+            }
+            heap.allocator.free(b);
+        }
+        for (pages[0..n], 0..) |page, i| {
+            if (@as(*volatile u64, @ptrCast(@alignCast(pmm.physToVirt(page)))).* != stamp) stressError();
+            for (pages[0..i]) |other| {
+                if (other == page) stressError();
+            }
+            pmm.free(page);
+        }
+    }
+    signalDone(&stress_done, &done_queue);
+}
+
+/// Use every shared part of the kernel from all CPUs at once: eight kernel
+/// threads allocate and free pages, heap blocks and kernel stacks, count
+/// under a spinlock and under a mutex, pass tokens through a wait queue
+/// with timeouts, sleep and yield. Afterwards nothing was handed out
+/// twice or overwritten, no update was lost, every token was taken once,
+/// no timer is left armed, memory is back, and (with more than one CPU
+/// running threads) the kernel stacks that were freed were flushed from
+/// the other CPUs' TLBs by request. Must be called with interrupts on.
+/// Returns 0, or the number of the first failing check.
+pub fn kernelStress() u32 {
+    const before = footprint();
+    const timers_before = timer.pending();
+    const requests_before = ipi.requestsSent();
+    stress_done = 0;
+    stress_errors.store(0, .monotonic);
+    stress_spin_count = 0;
+    stress_mutex_count = 0;
+    stress_inside = 0;
+    stress_tokens = 0;
+    stress_taken = 0;
+    stress_timeouts.store(0, .monotonic);
+    seen_cpus.store(0, .monotonic);
+    for (0..STRESS_WORKERS) |_| _ = thread.spawn(stressWorker, null) catch return 1;
+    waitForDone(&stress_done, STRESS_WORKERS, &done_queue);
+
+    const total = STRESS_WORKERS * STRESS_ROUNDS;
+    if (stress_errors.load(.monotonic) != 0) return 2;
+    if (stress_spin_count != total) return 3;
+    if (stress_mutex_count != total or stress_mutex.owner != null or stress_mutex.waiterCount() != 0) return 4;
+    {
+        const held = stress_lock.acquire();
+        defer stress_lock.release(held);
+        if (stress_taken + stress_tokens != total) return 5; // a token lost, or taken twice
+        if (stress_queue.waiting() != 0) return 6;
+    }
+    if (timer.pending() != timers_before) return 7;
+    const cpus = schedulingCpus();
+    if (cpus > 1 and @popCount(seen_cpus.load(.monotonic)) < 2) return 8;
+    if (percpu.count() > 1 and ipi.requestsSent() == requests_before) return 9;
+    if (!pmm.consistent()) return 10;
+    return if (untilFootprint(before)) 0 else 11;
+}
+
+// State of the TLB shootdown test.
+const TLB_READERS = 8;
+/// What the readers are to do: read the page and expect this value, or 0: keep off it.
+var tlb_expect: Atomic(u64) = .init(0);
+/// Per reader: the last value of `tlb_expect` it has acted on.
+var tlb_acked: [TLB_READERS]Atomic(u64) = @splat(.init(0));
+var tlb_stop: Atomic(bool) = .init(false);
+var tlb_errors: Atomic(usize) = .init(0);
+var tlb_next_reader: Atomic(usize) = .init(0);
+var tlb_done: usize = 0;
+/// An acknowledgement of "keep off": no value a page holds.
+const TLB_OFF: u64 = ~@as(u64, 0);
+
+/// Read the shared page whenever told to, so that this thread's CPU has it
+/// in its TLB, and say so.
+fn tlbReader() void {
+    const me = tlb_next_reader.fetchAdd(1, .monotonic);
+    const here: *volatile u64 = @ptrFromInt(SPARE_KERNEL_PAGE);
+    while (!tlb_stop.load(.acquire)) {
+        // Interrupts off around "look, then read": the page is only taken
+        // away after this reader has said it keeps off, and it cannot be
+        // switched away from in between and say so late.
+        const flags = cpu.saveAndDisableInterrupts();
+        const want = tlb_expect.load(.acquire);
+        if (want != 0) {
+            if (here.* != want) _ = tlb_errors.fetchAdd(1, .monotonic);
+            _ = seen_cpus.fetchOr(@as(u64, 1) << @intCast(percpu.current().id), .monotonic);
+            tlb_acked[me].store(want, .release);
+        } else tlb_acked[me].store(TLB_OFF, .release);
+        cpu.restoreInterrupts(flags);
+        thread.yield();
+    }
+    signalDone(&tlb_done, &done_queue);
+}
+
+/// Let other threads run until every reader has acted on `value`.
+fn tlbUntilAcked(value: u64) bool {
+    for (0..100_000) |_| {
+        var all = true;
+        for (&tlb_acked) |*a| {
+            if (a.load(.acquire) != value) all = false;
+        }
+        if (all) return true;
+        thread.yield();
+    }
+    return false;
+}
+
+/// Check that removing a kernel mapping reaches every CPU. Eight threads,
+/// spread over the CPUs, read one page of kernel address space until each
+/// has its translation cached; then the page is unmapped, its memory
+/// overwritten, and another page mapped at the same address. A CPU that
+/// still used the old translation would read the old page: its old
+/// contents, or what it was overwritten with. Repeated many times, with
+/// the readers moving between CPUs. Must be called with interrupts on.
+/// Returns 0, or the number of the first failing check.
+pub fn tlbShootdown() u32 {
+    const ROUNDS = 60;
+    const before = footprint();
+    const requests_before = ipi.requestsSent();
+    const kernel_rw = vmm.WRITABLE | vmm.NX;
+    tlb_expect.store(0, .monotonic);
+    tlb_stop.store(false, .monotonic);
+    tlb_errors.store(0, .monotonic);
+    tlb_next_reader.store(0, .monotonic);
+    for (&tlb_acked) |*a| a.store(0, .monotonic);
+    seen_cpus.store(0, .monotonic);
+    tlb_done = 0;
+    for (0..TLB_READERS) |_| _ = thread.spawn(tlbReader, null) catch return 1;
+
+    var failed: u32 = 0;
+    var previous: ?u64 = null;
+    for (1..ROUNDS + 1) |round| {
+        const value: u64 = 0x7100_0000 + round;
+        const page = pmm.alloc() orelse {
+            failed = 2;
+            break;
+        };
+        @as(*volatile u64, @ptrCast(@alignCast(pmm.physToVirt(page)))).* = value;
+        vmm.map(vmm.kernel_root, SPARE_KERNEL_PAGE, page, kernel_rw, false) catch {
+            pmm.free(page);
+            failed = 3;
+            break;
+        };
+        // The page before this one is free to be reused only now, when the
+        // address has stopped meaning it on every CPU.
+        if (previous) |old| pmm.free(old);
+        previous = page;
+
+        tlb_expect.store(value, .release);
+        if (!tlbUntilAcked(value)) failed = 4; // every reader has read it: it is in their CPUs' TLBs
+        tlb_expect.store(0, .release);
+        if (!tlbUntilAcked(TLB_OFF)) failed = 5; // and now nobody touches the address
+        if (vmm.unmap(vmm.kernel_root, SPARE_KERNEL_PAGE) != page) failed = 6;
+        // What a stale translation would now read instead of the next value.
+        @as(*volatile u64, @ptrCast(@alignCast(pmm.physToVirt(page)))).* = 0xDEAD_0000 + round;
+        if (failed != 0) break;
+    }
+    tlb_stop.store(true, .release);
+    waitForDone(&tlb_done, TLB_READERS, &done_queue);
+    if (previous) |old| pmm.free(old);
+    if (failed != 0) return failed;
+    if (tlb_errors.load(.monotonic) != 0) return 7; // a reader saw a page that had been unmapped
+    if (schedulingCpus() > 1 and @popCount(seen_cpus.load(.monotonic)) < 2) return 8;
+    if (percpu.count() > 1 and ipi.requestsSent() < requests_before + ROUNDS) return 9;
+    return if (untilFootprint(before)) 0 else 10;
+}
+
+/// Thread body for the `panic_smp` scenario: print without end.
+fn chatter() void {
+    while (true) kernel_root.print("chatter from thread {d}\n", .{thread.id()});
+}
+
+/// For the `panic_smp` scenario: start a thread for every CPU that prints
+/// without end, and give them time to get going. Returns the number
+/// started, or null if one could not be.
+pub fn startChatter() ?usize {
+    const n = percpu.count();
+    for (0..n) |_| _ = thread.spawn(chatter, null) catch return null;
+    timer.sleepTicks(5);
+    return n;
 }
 
 // ---------------------------------------------------------------------------
