@@ -840,6 +840,9 @@ pub fn dispatch(f: *arch.Frame) void {
         Sys.getrandom => sysGetRandom(f.rdi, f.rsi),
         Sys.uname => sysUname(f.rdi),
         Sys.prlimit64 => sysPrlimit(f.rdi, f.rsi, f.rdx, f.r10),
+        // No option exists here yet. Runtimes try a few (naming their
+        // mappings, for one) and go on without them.
+        Sys.prctl => err(.INVAL),
         Sys.kill => sysKill(f.rdi, f.rsi),
         Sys.tgkill => sysKill(f.rdi, f.rdx),
         Sys.tkill => if (thread.current().process) |p| sysKill(p.pid, f.rsi) else err(.NOSYS),
@@ -861,8 +864,21 @@ pub fn dispatch(f: *arch.Frame) void {
         Sys.gettid => thread.id(),
         Sys.myos_getchar => sysGetChar(),
         Sys.myos_run => sysRun(f.rdi, f.rsi, f.rdx),
-        else => err(.NOSYS),
+        else => unknown(f.rax),
     };
+}
+
+/// Set to have every call the kernel does not know logged, with the
+/// program that made it: how to find out what a new program still needs.
+/// Off by default: a program probing for what exists makes many.
+pub var trace_unknown: bool = false;
+
+fn unknown(number: u64) u64 {
+    if (trace_unknown) {
+        const name = if (thread.current().process) |p| p.name else "kernel";
+        root.print("syscall trace: {s} (thread {d}) made unknown call {d}\n", .{ name, thread.id(), number });
+    }
+    return err(.NOSYS);
 }
 
 /// A syscall is about to return to a state the CPU cannot return to (a

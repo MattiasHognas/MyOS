@@ -227,6 +227,11 @@ pub fn argumentsTooLong() bool {
     return true;
 }
 
+/// Log every system call the kernel does not know, or stop doing so.
+pub fn traceUnknownSyscalls(on: bool) void {
+    kernel_root.kernel.syscall.trace_unknown = on;
+}
+
 /// Wait for `p` like `process.wait`, giving up the caller's reference, and
 /// then until its thread has been freed as well. A process's memory is back
 /// when `wait` returns; its thread and kernel stack follow when the CPU

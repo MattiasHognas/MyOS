@@ -99,6 +99,7 @@ Linux calls, with Linux's numbers:
 | 72 | `fcntl(fd, cmd, arg)` | `F_GETFD`, `F_GETFL`; `F_SETFD` and `F_SETFL` are accepted and change nothing. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, recorded. |
+| 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
 | 202 | `futex(addr, op, val, timeout, addr2, val3)` | `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, with or without `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`. Only within one process. Timeouts have the timer's resolution and never end early. |

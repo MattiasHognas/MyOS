@@ -399,7 +399,7 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 - [ ] Test empty, long, invalid, and multi-argument commands, and check the stack layout from ring 3.
 
 ### 4.2 Minimal syscall set
-- [ ] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs.
+- [x] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs: `syscall.trace_unknown`, which the tests turn on around the fixtures; the test script fails if a fixture made a call the kernel does not know.
 - [ ] Record what the target programs really ask for (musl C, Rust and Go are in `docs/linux-programs.md`; the .NET program and the Loupe runs are open): run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
   - Run them under Loupe as well (`docs/research.md`): it finds which of those calls must really work, which may return `ENOSYS` and which may pretend to succeed. That, not the bare list, is the work order.
 - [ ] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
@@ -541,6 +541,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Check the saved return address and flags that `rt_sigreturn` restores (the remaining `sysretq` item in 2.5): a handler can put anything there.
 - [ ] Test handlers that return, handlers that modify the saved context, nested and masked signals, the alternate stack, and signals sent to another thread on another CPU.
 - [ ] Run a statically linked Go or Rust program (threads, futexes and signals in earnest).
+  - Both run already, without signals: Rust since 4.2, and a Go program with goroutines on every CPU, a channel and a garbage collection since 7 (`tests/fixtures/src/hello.go`). Go sends itself signals to preempt goroutines that do not yield and carries on when they are not delivered. What this item still asks for is the same programs with signals delivered: a Go program whose goroutine spins without yielding and is preempted, and one that recovers from a nil dereference.
 
 **Milestone 8 done when:** A statically linked Go program built on Linux runs unmodified.
 

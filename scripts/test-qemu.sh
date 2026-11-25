@@ -208,6 +208,11 @@ run_scenario() {
             expect_line '^threads: 8 threads, counter 160000 of 160000, baton passed 24 times, timed wait timed out, main.s own count 0$'
             expect_line '^threads: all correct$'
             if grep -q '^threads: WRONG' "$log"; then fail "the pthreads program found a wrong result"; fi
+            # A Go program built for Linux: goroutines on every CPU, a channel, a GC.
+            expect_line '^hello from go: 3 args$'
+            expect_line '^goroutines: 8 sum: 479976 cpus: [0-9]+$'
+            expect_line '^GREETING=hi go$'
+            if grep -q '^syscall trace: ' "$log"; then fail "a fixture made a call the kernel does not know: $(grep -m3 '^syscall trace: ' "$log" | tr '\n' ' ')"; fi
             # A Rust program built for Linux, with its standard library.
             expect_line '^hello from rust: 3 args$'
             expect_line '^argv\[2\]=MyOS$'

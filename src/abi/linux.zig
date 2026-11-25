@@ -64,6 +64,8 @@ pub const Sys = struct {
     pub const gettimeofday = 96;
     /// `sigaltstack(ss, old_ss) -> 0`: the stack signal handlers may run on.
     pub const sigaltstack = 131;
+    /// `prctl(option, ...)`: no option is supported yet (`EINVAL`).
+    pub const prctl = 157;
     /// `arch_prctl(code, addr)`: get or set the thread's FS or GS base (`ARCH`).
     pub const arch_prctl = 158;
     /// `gettid() -> id` of the calling thread.

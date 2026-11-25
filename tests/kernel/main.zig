@@ -976,6 +976,21 @@ fn rustHello() TestError!void {
     try check(helpers.footprint().eql(memory));
 }
 
+/// A Go program built for Linux runs: its runtime's threads, its heap
+/// reservation and its signal setup, then goroutines, a channel and a
+/// garbage collection. The host script checks what it printed.
+fn goHello() TestError!void {
+    _ = helpers.runProgram("/fixtures/go-hello-static"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    helpers.traceUnknownSyscalls(true); // anything it asks for that is missing shows in the log
+    defer helpers.traceUnknownSyscalls(false);
+    const code = helpers.runProgramArgs("/fixtures/go-hello-static", &.{ "go-hello", "from", "MyOS" }, &.{"GREETING=hi go"}) orelse return error.Failed;
+    if (code != 3) report("go hello exit status", code);
+    try check(code == 3);
+    try check(helpers.runPairExpect("/fixtures/go-hello-static", 1)); // two runtimes at once
+    try check(helpers.footprint().eql(memory)); // its threads, its reservations, all gone
+}
+
 /// Programs run, are preempted, crash and are torn down on every CPU at once.
 fn parallelPrograms() TestError!void {
     const irq = helpers.enableInterrupts();
@@ -1607,6 +1622,7 @@ fn runCases() noreturn {
         .{ .name = "threads and futexes (clone, own FS base, join, wake counts, timeouts, requeue, how a threaded process ends)", .func = threadsAndFutexes },
         .{ .name = "a multi-threaded musl program built for Linux runs (pthreads: mutex, condvar, barrier, TLS, join)", .func = muslThreads },
         .{ .name = "a static Rust program built for Linux runs (std: arguments, environment, allocation, println)", .func = rustHello },
+        .{ .name = "a Go program built for Linux runs (runtime threads, goroutines, channel, GC)", .func = goHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },
         .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms },

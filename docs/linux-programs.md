@@ -70,7 +70,7 @@ for the time.
 | Rust with std, static, musl, fixed address | Runs (`tests/fixtures/bin/rust-hello-static`) |
 | C with pthreads, static, musl | Runs, its threads on several CPUs (`tests/fixtures/bin/musl-threads-static`) |
 | The same as position-independent executables | Needs `ET_DYN` loading (4.1) |
-| Go | Has its threads and futexes now; needs signals delivered (8) |
+| Go, static | Runs: the runtime's threads, goroutines on every CPU, a channel, a garbage collection (`tests/fixtures/bin/go-hello-static`). No signal has to be delivered for that; the runtime sends itself some (to preempt goroutines that do not yield) and carries on when they do not arrive |
 | .NET Native AOT | Not measured yet |
 
 ## What this means for the order of work
@@ -82,5 +82,6 @@ for the time.
    handful of calls that may fail. No threads. It is the natural second
    program, ahead of where the roadmap has it.
 3. **Go cannot start without threads, futexes and large lazy reservations**
-   (1.1 GiB of address space, almost none of it touched): milestones 5 and 7
-   in full before its first line of output.
+   (1.1 GiB of address space, almost none of it touched): milestones 5 and 7.
+   With those it runs. The only call it made that the kernel did not know
+   was `prctl`, which it does not need.

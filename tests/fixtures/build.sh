@@ -12,6 +12,8 @@
 #                       musl and clang: `zig cc -target x86_64-linux-musl`)
 #   musl-threads-static C with pthreads: mutex, condition variable, barrier,
 #                       thread-local storage, join, a timed wait
+#   go-hello-static     Go (no cgo): goroutines, a channel, the garbage
+#                       collector
 #   rust-hello-static   Rust with its standard library, statically linked
 #                       against musl at a fixed address (rustup target
 #                       x86_64-unknown-linux-musl)
@@ -26,5 +28,8 @@ zig cc -target x86_64-linux-musl -static -no-pie -O2 -s -pthread \
 
 rustc -O --target x86_64-unknown-linux-musl -C relocation-model=static \
     -C strip=symbols -o bin/rust-hello-static src/hello.rs
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' \
+    -o bin/go-hello-static src/hello.go
 
 ls -l bin
