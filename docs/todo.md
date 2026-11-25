@@ -403,7 +403,8 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 - [ ] Record what the target programs really ask for (musl C, Rust and Go are in `docs/linux-programs.md`; the .NET program and the Loupe runs are open): run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
   - Run them under Loupe as well (`docs/research.md`): it finds which of those calls must really work, which may return `ENOSYS` and which may pretend to succeed. That, not the bare list, is the work order.
 - [ ] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
-  - Done: `writev`, `exit_group`, `set_tid_address`, `ioctl` and `arch_prctl`, which is all the hello-world calls. Open: `brk` and `mmap`, which a program needs as soon as it allocates.
+  - Done: `writev`, `exit_group`, `set_tid_address`, `ioctl` and `arch_prctl`, which is all the hello-world calls, and `brk` and `mmap` with milestone 5.
+- [x] Add the calls a static Rust program makes before `main` on top of those: `poll` (it checks that its standard streams are open), and `rt_sigaction`, `rt_sigprocmask` and `sigaltstack`, which record what is set and return it; nothing is delivered until milestone 8. A Rust hello-world with its standard library, linked statically against musl, runs (`tests/fixtures/src/hello.rs`).
 
 ### 4.3 Fixtures
 - [x] Keep prebuilt fixture binaries (with the commands that built them) and run them as QEMU tests, checking their output: `tests/fixtures/` (`build.sh` has the commands), packaged as `/fixtures/` in the test image and `/bin/` in the normal one.

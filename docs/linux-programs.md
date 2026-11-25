@@ -62,6 +62,16 @@ use `AT_PHDR`, `AT_PHNUM` and `AT_PHENT` (to find their thread-local data),
 None needs a vDSO: without `AT_SYSINFO_EHDR` they make real system calls
 for the time.
 
+## What runs
+
+| Program | Status |
+| --- | --- |
+| C, static, musl | Runs (`tests/fixtures/bin/musl-hello-static`) |
+| Rust with std, static, musl, fixed address | Runs (`tests/fixtures/bin/rust-hello-static`) |
+| The same as position-independent executables | Needs `ET_DYN` loading (4.1) |
+| Go | Needs threads and futexes (7) |
+| .NET Native AOT | Not measured yet |
+
 ## What this means for the order of work
 
 1. **The static musl program needs five new calls and the startup stack**,

@@ -211,8 +211,9 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fd:
         } else unmapLocked(p, addr, len) catch |e| return mapError(e);
     } else {
         // The hint, if it is free; otherwise the highest free place.
-        const wanted = std.mem.alignForward(u64, hint, PAGE);
-        addr = if (hint != 0 and mappable(wanted, len) and p.mem.regions.isFree(wanted, len))
+        // (A hint beyond user space is no hint; rounding it up could wrap.)
+        const wanted = if (hint <= MAP_MAX) std.mem.alignForward(u64, hint, PAGE) else 0;
+        addr = if (wanted != 0 and mappable(wanted, len) and p.mem.regions.isFree(wanted, len))
             wanted
         else
             p.mem.regions.findFree(len, MAP_MIN, p.mem.mmap_top) orelse return abi.err(.NOMEM);

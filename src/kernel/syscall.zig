@@ -19,6 +19,7 @@ const keyboard = @import("../drivers/ps2_keyboard.zig");
 const heap = @import("heap.zig");
 const proc = @import("process.zig");
 const thread = @import("thread.zig");
+const timer = @import("timer.zig");
 const uaccess = @import("uaccess.zig");
 const user_memory = @import("user_memory.zig");
 const user_range = @import("user_range.zig");
@@ -316,6 +317,124 @@ fn sysClose(fd: u64) u64 {
     return 0;
 }
 
+/// Copy a value of type `T` from the user address `ptr`, or null if it
+/// cannot be read.
+fn fromUser(comptime T: type, ptr: u64) ?T {
+    var value: T = undefined;
+    uaccess.copyFromUser(std.mem.asBytes(&value), ptr) catch return null;
+    return value;
+}
+
+/// Copy `value` to the user address `ptr`. False if it cannot be written.
+fn toUser(ptr: u64, value: anytype) bool {
+    uaccess.copyToUser(ptr, std.mem.asBytes(&value)) catch return false;
+    return true;
+}
+
+/// Bits of the signals that cannot be blocked, caught or ignored.
+const UNBLOCKABLE: u64 = (1 << (abi.SIGKILL - 1)) | (1 << (abi.SIGSTOP - 1));
+
+/// `rt_sigaction`: set what signal `sig` does and return what it did
+/// before; either pointer may be null. No signal is delivered yet
+/// (milestone 8: a fault still ends the process), but a program that
+/// installs its handlers at startup, as language runtimes do, finds them
+/// recorded. `EINVAL` for a signal that does not exist, for changing
+/// `SIGKILL` or `SIGSTOP`, and for a mask of the wrong size; `EFAULT`.
+fn sysSigAction(sig: u64, act: u64, old: u64, set_size: u64) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    if (set_size != abi.SIGSET_SIZE or sig < 1 or sig > abi.NSIG) return err(.INVAL);
+    const slot = &p.signal_actions[nospec.index(sig - 1, abi.NSIG)];
+    const before = slot.*;
+    if (act != 0) {
+        if (sig == abi.SIGKILL or sig == abi.SIGSTOP) return err(.INVAL);
+        var new = fromUser(abi.SigAction, act) orelse return err(.FAULT);
+        new.mask &= ~UNBLOCKABLE;
+        if (old != 0 and !toUser(old, before)) return err(.FAULT);
+        slot.* = new;
+        return 0;
+    }
+    if (old != 0 and !toUser(old, before)) return err(.FAULT);
+    return 0;
+}
+
+/// `rt_sigprocmask`: change the calling thread's set of blocked signals
+/// (`how` says whether `set` is added, removed or replaces it) and return
+/// the previous set; either pointer may be null.
+fn sysSigProcMask(how: u64, set: u64, old: u64, set_size: u64) u64 {
+    if (set_size != abi.SIGSET_SIZE) return err(.INVAL);
+    const me = thread.current();
+    const before = me.signal_mask;
+    if (set != 0) {
+        const bits = fromUser(u64, set) orelse return err(.FAULT);
+        const new = switch (how) {
+            abi.SIG.BLOCK => before | bits,
+            abi.SIG.UNBLOCK => before & ~bits,
+            abi.SIG.SETMASK => bits,
+            else => return err(.INVAL),
+        };
+        if (old != 0 and !toUser(old, before)) return err(.FAULT);
+        me.signal_mask = new & ~UNBLOCKABLE;
+        return 0;
+    }
+    if (old != 0 and !toUser(old, before)) return err(.FAULT);
+    return 0;
+}
+
+/// `sigaltstack`: set the stack the calling thread's signal handlers may
+/// run on and return the previous one; either pointer may be null.
+/// `ENOMEM` for a stack smaller than `MINSIGSTKSZ`, `EINVAL` for unknown flags.
+fn sysSigAltStack(new_ptr: u64, old_ptr: u64) u64 {
+    const me = thread.current();
+    const before = me.signal_stack;
+    if (new_ptr != 0) {
+        var new = fromUser(abi.SigStack, new_ptr) orelse return err(.FAULT);
+        if (new.flags & ~@as(i32, abi.SS.DISABLE) != 0) return err(.INVAL);
+        if (new.flags & abi.SS.DISABLE != 0) {
+            new = .{}; // disabled: the rest is not looked at
+        } else if (new.size < abi.SS.MIN_SIZE) return err(.NOMEM);
+        if (old_ptr != 0 and !toUser(old_ptr, before)) return err(.FAULT);
+        me.signal_stack = new;
+        return 0;
+    }
+    if (old_ptr != 0 and !toUser(old_ptr, before)) return err(.FAULT);
+    return 0;
+}
+
+/// `poll`: say which of the `count` descriptors at the user address `fds`
+/// have the events asked for. Console output is always writable, an open
+/// file always readable, the keyboard not readable through a descriptor
+/// yet; a descriptor that is not open gets `POLLNVAL`. If none has an
+/// event the call waits out `timeout_ms` (forever if negative) and returns
+/// 0: nothing here becomes ready later. `EINVAL` for more descriptors than
+/// a process can have open, `EFAULT`.
+fn sysPoll(fds: u64, count: u64, timeout_ms: u64) u64 {
+    if (count > proc.MAX_FILES) return err(.INVAL);
+    var ready: u64 = 0;
+    for (0..count) |i| {
+        const at = fds + i * @sizeOf(abi.PollFd);
+        var entry = fromUser(abi.PollFd, at) orelse return err(.FAULT);
+        entry.revents = 0;
+        if (entry.fd >= 0) {
+            const fd: u64 = @intCast(entry.fd);
+            if (fd == abi.STDOUT or fd == abi.STDERR) {
+                entry.revents = entry.events & abi.POLL.OUT;
+            } else if (fd == abi.STDIN) {
+                // Nothing to read from descriptor 0 yet.
+            } else if (fileOf(fd) != null) {
+                entry.revents = entry.events & abi.POLL.IN;
+            } else entry.revents = abi.POLL.NVAL;
+        }
+        if (entry.revents != 0) ready += 1;
+        if (!toUser(at, entry)) return err(.FAULT);
+    }
+    if (ready == 0) {
+        const timeout: i32 = @truncate(@as(i64, @bitCast(timeout_ms)));
+        if (timeout < 0) while (true) timer.sleepMs(1000);
+        if (timeout > 0) timer.sleepMs(@intCast(timeout));
+    }
+    return ready;
+}
+
 /// The memory calls (`user_memory.zig`), for the calling thread's process.
 fn memory(comptime call: enum { mmap, mprotect, munmap, brk, madvise }, f: *const arch.Frame) u64 {
     const p = thread.current().process orelse return err(.NOSYS);
@@ -342,6 +461,10 @@ pub fn dispatch(f: *arch.Frame) void {
             thread.yield();
             break :blk 0;
         },
+        Sys.poll => sysPoll(f.rdi, f.rsi, f.rdx),
+        Sys.rt_sigaction => sysSigAction(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.rt_sigprocmask => sysSigProcMask(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.sigaltstack => sysSigAltStack(f.rdi, f.rsi),
         Sys.mmap => memory(.mmap, f),
         Sys.mprotect => memory(.mprotect, f),
         Sys.munmap => memory(.munmap, f),

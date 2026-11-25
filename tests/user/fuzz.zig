@@ -9,7 +9,9 @@
 //! pointers, addresses at the edges of user space, small descriptors, huge
 //! lengths.
 //!
-//! Left out on purpose: `exit` and `exit_group` (the run would end early) and `myos_getchar`
+//! Left out on purpose: `exit` and `exit_group` (the run would end early),
+//! the calls that unmap or reprotect memory (the program would take its
+//! own code or stack away), waiting in `poll`, and `myos_getchar`
 //! (it would wait for a key forever). Console writes of readable memory are
 //! steered to a block of text, to keep the serial log printable.
 //!
@@ -33,8 +35,9 @@ var STACK_TOP: u64 = 0;
 const PAGE = 4096;
 
 const implemented = [_]u64{
-    Sys.read,       Sys.write,           Sys.open,   Sys.close, Sys.sched_yield, Sys.gettid, Sys.myos_run,
-    Sys.arch_prctl, Sys.set_tid_address, Sys.writev, Sys.ioctl,
+    Sys.read,        Sys.write,           Sys.open,   Sys.close, Sys.sched_yield, Sys.gettid,       Sys.myos_run,
+    Sys.arch_prctl,  Sys.set_tid_address, Sys.writev, Sys.ioctl, Sys.poll,        Sys.rt_sigaction, Sys.rt_sigprocmask,
+    Sys.sigaltstack, Sys.mmap,            Sys.brk,
 };
 /// Paths a call may be given. Never this program or the shell: one would
 /// recurse, the other waits for the keyboard.
@@ -111,6 +114,12 @@ pub fn main() noreturn {
             if (n == 1) second_readable = readable;
         }
         if (nr == Sys.exit or nr == Sys.exit_group or nr == Sys.myos_getchar) continue;
+        // Calls with which a program takes its own memory away or changes
+        // what it may do with it are a program's right, and its end.
+        if (nr == Sys.munmap or nr == Sys.mprotect or nr == Sys.madvise) continue;
+        if (nr == Sys.mmap) args[3] &= ~@as(u64, lib.abi.MAP.FIXED | lib.abi.MAP.FIXED_NOREPLACE);
+        if (nr == Sys.brk and args[0] != 0) args[0] = 0; // only ask where the heap ends
+        if (nr == Sys.poll) args[2] = 0; // do not wait
         if (nr == Sys.write and (args[0] == 1 or args[0] == 2) and (second_readable or args[1] >= STACK_TOP - 8)) {
             const off = next(&rng) % (text.len - 64);
             args[1] = @intFromPtr(text) + off;

@@ -173,6 +173,10 @@ pub const Process = struct {
     parent: ?*Process = null,
     /// Processes alive below this one (see `Limits.max_descendants`).
     descendants: u32 = 0,
+    /// What each signal does (`rt_sigaction`), by signal number minus
+    /// one. Recorded for when signals are delivered (milestone 8); used
+    /// by the process's own thread only.
+    signal_actions: [abi.NSIG]abi.SigAction = @splat(.{}),
     /// Its regions of memory, `brk` heap and the lock for them and its
     /// page tables (`user_memory.zig`).
     mem: user_memory.UserMemory = .{},

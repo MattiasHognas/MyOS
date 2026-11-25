@@ -16,6 +16,8 @@ pub const Sys = struct {
     pub const open = 2;
     /// `close(fd) -> 0`.
     pub const close = 3;
+    /// `poll(fds, nfds, timeout_ms) -> number of descriptors with events`.
+    pub const poll = 7;
     /// `mmap(addr, length, prot, flags, fd, offset) -> address`: anonymous
     /// memory, given page by page as it is touched.
     pub const mmap = 9;
@@ -25,6 +27,10 @@ pub const Sys = struct {
     pub const munmap = 11;
     /// `brk(addr) -> end of the heap`: move it, or with 0 just ask.
     pub const brk = 12;
+    /// `rt_sigaction(signal, act, oldact, sigsetsize) -> 0`: what a signal does.
+    pub const rt_sigaction = 13;
+    /// `rt_sigprocmask(how, set, oldset, sigsetsize) -> 0`: the thread's blocked signals.
+    pub const rt_sigprocmask = 14;
     /// `ioctl(fd, request, arg)`: no device has requests yet, so `ENOTTY`.
     pub const ioctl = 16;
     /// `writev(fd, iov, iovcnt) -> bytes written`: `write` from several buffers.
@@ -35,6 +41,8 @@ pub const Sys = struct {
     pub const madvise = 28;
     /// `exit(status)`: terminate the calling process. Does not return.
     pub const exit = 60;
+    /// `sigaltstack(ss, old_ss) -> 0`: the stack signal handlers may run on.
+    pub const sigaltstack = 131;
     /// `arch_prctl(code, addr)`: get or set the thread's FS or GS base (`ARCH`).
     pub const arch_prctl = 158;
     /// `gettid() -> id` of the calling thread.
@@ -218,4 +226,54 @@ pub const MAP = struct {
 pub const MADV = struct {
     pub const DONTNEED = 4;
     pub const FREE = 8;
+};
+
+/// Signal numbers go from 1 to this.
+pub const NSIG = 64;
+pub const SIGKILL = 9;
+pub const SIGSTOP = 19;
+/// A signal mask is this many bytes: one bit per signal.
+pub const SIGSET_SIZE = 8;
+
+/// `struct sigaction` as the kernel takes it from `rt_sigaction`.
+pub const SigAction = extern struct {
+    /// The handler's address, or `SIG_DFL` (0) or `SIG_IGN` (1).
+    handler: u64 = 0,
+    flags: u64 = 0,
+    restorer: u64 = 0,
+    mask: u64 = 0,
+};
+
+/// `rt_sigprocmask`'s `how`.
+pub const SIG = struct {
+    pub const BLOCK = 0;
+    pub const UNBLOCK = 1;
+    pub const SETMASK = 2;
+};
+
+/// `stack_t` of `sigaltstack`.
+pub const SigStack = extern struct {
+    sp: u64 = 0,
+    flags: i32 = SS.DISABLE,
+    size: u64 = 0,
+};
+
+pub const SS = struct {
+    pub const ONSTACK = 1;
+    pub const DISABLE = 2;
+    /// Smallest alternate stack (`MINSIGSTKSZ`).
+    pub const MIN_SIZE = 2048;
+};
+
+/// `struct pollfd`.
+pub const PollFd = extern struct {
+    fd: i32,
+    events: i16,
+    revents: i16,
+};
+
+pub const POLL = struct {
+    pub const IN = 0x001;
+    pub const OUT = 0x004;
+    pub const NVAL = 0x020;
 };

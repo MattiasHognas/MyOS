@@ -10,10 +10,16 @@
 #
 #   musl-hello-static   C, statically linked against musl (Zig's bundled
 #                       musl and clang: `zig cc -target x86_64-linux-musl`)
+#   rust-hello-static   Rust with its standard library, statically linked
+#                       against musl at a fixed address (rustup target
+#                       x86_64-unknown-linux-musl)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 zig cc -target x86_64-linux-musl -static -no-pie -O2 -s \
     -o bin/musl-hello-static src/hello.c
+
+rustc -O --target x86_64-unknown-linux-musl -C relocation-model=static \
+    -C strip=symbols -o bin/rust-hello-static src/hello.rs
 
 ls -l bin

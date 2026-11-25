@@ -931,6 +931,11 @@ fn pairRunnerB() void {
 /// by a kernel thread of its own, and wait for both. Returns true if both
 /// exited with status 0.
 pub fn runPair(path: []const u8) bool {
+    return runPairExpect(path, 0);
+}
+
+/// `runPair` for a program that exits with status `want`.
+pub fn runPairExpect(path: []const u8, want: u64) bool {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     pair_path = path;
@@ -939,7 +944,7 @@ pub fn runPair(path: []const u8) bool {
     _ = thread.spawn(pairRunnerA, null) catch return false;
     _ = thread.spawn(pairRunnerB, null) catch return false;
     waitForDone(&pair_done, 2, &done_queue);
-    return pair_codes[0] == 0 and pair_codes[1] == 0;
+    return pair_codes[0] == want and pair_codes[1] == want;
 }
 
 const RFLAGS_IF: u64 = 1 << 9;
@@ -1591,13 +1596,15 @@ pub fn memoryExhaustion() u32 {
 pub fn spawnAllocationFailures(failures: *usize) u32 {
     failures.* = 0;
     // Stands in for a parent process, to see what is counted against it.
-    var parent: process.Process = .{ .root = 0, .entry = 0, .name = "test parent" };
+    // A static: a process structure is too large for a kernel stack frame.
+    const parent = &stand_in_process;
+    parent.* = .{ .root = 0, .entry = 0, .name = "test parent" };
     var n: usize = 0;
     while (n < 2000) : (n += 1) {
         const flags = cpu.saveAndDisableInterrupts();
         const before = footprint();
         pmm.fail_after = n;
-        const result = process.spawnPath("/bin/hello", .{ .parent = &parent });
+        const result = process.spawnPath("/bin/hello", .{ .parent = parent });
         pmm.fail_after = null;
         if (result) |p| {
             const counted = parent.descendants;
@@ -3030,6 +3037,10 @@ pub fn processWaiting() u32 {
     return if (footprint().eql(before)) 0 else 21;
 }
 
+/// A process structure that stands in for a parent in the tests that need
+/// to see what is counted against one. One test at a time uses it.
+var stand_in_process: process.Process = .{ .root = 0, .entry = 0, .name = "stand-in" };
+
 /// Check what happens when a parent exits before its child: the child is
 /// handed to its grandparent, the counts of descendants stay right, and the
 /// child still exits cleanly. A stand-in grandparent shows the counts.
@@ -3037,12 +3048,14 @@ pub fn processWaiting() u32 {
 pub fn orphanedChild() u32 {
     const before = footprint();
     const live = process.liveCount();
-    var grandparent: process.Process = .{ .root = 0, .entry = 0, .name = "test grandparent" };
+    // A static: a process structure is too large for a kernel stack frame.
+    const grandparent = &stand_in_process;
+    grandparent.* = .{ .root = 0, .entry = 0, .name = "test grandparent" };
 
     // Parent and child each wait for a key; the parent has waited longer,
     // so the first key is its, and it exits first.
     while (keyboard.getChar() != null) {}
-    const parent = process.spawnPath("/test/getchar", .{ .parent = &grandparent }) catch return 1;
+    const parent = process.spawnPath("/test/getchar", .{ .parent = grandparent }) catch return 1;
     if (!untilCount(keyboard.waitingReaders, 1)) return 13;
     const child = process.spawnPath("/test/getchar", .{ .parent = parent }) catch return 2;
     if (!untilCount(keyboard.waitingReaders, 2)) return 13;
@@ -3053,7 +3066,7 @@ pub fn orphanedChild() u32 {
     if (process.wait(parent) != 'p') return 4; // `parent` is gone after this
     // The child is still running, and is now the grandparent's.
     if (child.exit_code != null) return 5; // it should have outlived its parent
-    if (child.parent != &grandparent) return 6;
+    if (child.parent != grandparent) return 6;
     if (grandparent.first_child != child or child.next_sibling != null) return 7;
     if (grandparent.descendants != 1) return 8;
 

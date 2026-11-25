@@ -101,6 +101,7 @@
 
 const std = @import("std");
 const root = @import("root");
+const abi = @import("abi");
 
 const context = @import("../arch/x86_64/context.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
@@ -249,6 +250,11 @@ pub const Thread = struct {
     /// Where the thread's exit is to be announced (`set_tid_address`), a
     /// user address; 0 if nowhere. Used once there are threads to wait for.
     clear_child_tid: u64 = 0,
+    /// Signals the thread has blocked (bit n-1 for signal n), and the
+    /// stack it wants its handlers run on. Recorded for when signals are
+    /// delivered (milestone 8); `SIGKILL` and `SIGSTOP` cannot be blocked.
+    signal_mask: u64 = 0,
+    signal_stack: abi.SigStack = .{},
     /// The CPU that runs the thread, or ran it last. Null until it has run.
     cpu: ?*percpu.PerCpu = null,
     /// Heap block holding the saved x87/SSE/AVX state while the thread is

@@ -76,15 +76,19 @@ Linux calls, with Linux's numbers:
 | 1 | `write(fd, buf, count)` | Descriptors 1 and 2 only, both the console (serial port and screen). Files cannot be written (`EBADF`). |
 | 2 | `open(path, flags, mode)` | Read-only: the access mode in `flags` must be `O_RDONLY`. Other flags and `mode` are ignored, except that `O_CREAT` on a missing file gives `EROFS`. |
 | 3 | `close(fd)` | Closing 0, 1 or 2 succeeds and does nothing. |
+| 7 | `poll(fds, nfds, timeout)` | Console output is always writable, open files always readable, descriptor 0 never; a descriptor that is not open gets `POLLNVAL`. With nothing ready it waits out the timeout and returns 0. |
 | 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory only (`MAP_ANONYMOUS` with `MAP_PRIVATE` or `MAP_SHARED`; a file is `ENODEV`). `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, and an address hint that is used if it is free; otherwise placed top down. `MAP_NORESERVE` and `MAP_STACK` are accepted. The memory is given page by page as it is touched. |
 | 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
 | 11 | `munmap(addr, length)` | Any part of any mappings; unmapping what is not mapped succeeds. |
 | 12 | `brk(addr)` | Returns the new end of the heap, or the old one if it cannot move. |
+| 13 | `rt_sigaction(sig, act, oldact, size)` | Recorded and read back. No signal is delivered yet (milestone 8): a fault still ends the process. |
+| 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals, recorded. |
 | 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for the standard streams and open files (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
 | 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. Descriptors 1 and 2 only. |
 | 24 | `sched_yield()` | |
 | 28 | `madvise(addr, length, advice)` | `MADV_DONTNEED` and `MADV_FREE` give the pages back at once: they read as zeroes afterwards. Other advice is accepted and ignored. |
 | 60 | `exit(status)` | The parent sees `status & 0xff`. Ends the process (which has one thread). |
+| 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, recorded. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
 | 218 | `set_tid_address(ptr)` | Returns the thread ID. The address is kept for when threads exist (milestone 7). |
@@ -127,7 +131,9 @@ Every other number returns `ENOSYS`.
   its limit, or the machine has none left) is killed, like any fault it
   cannot continue from; nothing else is killed to make room.
 - **A process the kernel kills** (a fault in ring 3) ends with status 255.
-  There are no signals yet (milestone 8).
+  Signals are not delivered yet (milestone 8): handlers, masks and
+  alternate stacks can be set and read back, which is what language
+  runtimes do at startup, but nothing calls a handler.
 
 ## Program start
 

@@ -106,7 +106,7 @@ pub fn main() noreturn {
 
     // Unknown numbers fail with ENOSYS: unassigned Linux numbers, MyOS's old
     // numbers that Linux uses for calls MyOS lacks, the x32 range, garbage.
-    for ([_]u64{ 4, 5, 6, 7, 8, 59, 231, 999, lib.Sys.PRIVATE_BASE + 2, 0x4000_0001, ~@as(u64, 0) }) |n| {
+    for ([_]u64{ 4, 5, 6, 8, 57, 59, 62, 999, lib.Sys.PRIVATE_BASE + 2, 0x4000_0001, ~@as(u64, 0) }) |n| {
         expect(lib.syscall(n, 0, 0, 0) == err(.NOSYS)); // 49-59
     }
 

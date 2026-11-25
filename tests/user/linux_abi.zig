@@ -146,6 +146,58 @@ pub fn main() noreturn {
     const huge = [_]abi.IoVec{ .{ .base = @intFromPtr(a), .len = 1 << 62 }, .{ .base = @intFromPtr(a), .len = 1 << 62 }, .{ .base = @intFromPtr(a), .len = 1 << 63 } };
     expect(lib.syscall(Sys.writev, 1, @intFromPtr(&huge), 3) == lib.err(.INVAL), 57);
 
+    // Signals: nothing is delivered yet, but what a program sets up at
+    // startup is recorded and reads back.
+    const SIGUSR1 = 10;
+    var act: abi.SigAction = .{ .handler = 0x1234_5000, .flags = 0x0400_0000, .mask = ~@as(u64, 0) };
+    var old: abi.SigAction = undefined;
+    expect(lib.syscall6(Sys.rt_sigaction, SIGUSR1, 0, @intFromPtr(&old), 8, 0, 0) == 0 and old.handler == 0, 60);
+    expect(lib.syscall6(Sys.rt_sigaction, SIGUSR1, @intFromPtr(&act), 0, 8, 0, 0) == 0, 61);
+    expect(lib.syscall6(Sys.rt_sigaction, SIGUSR1, 0, @intFromPtr(&old), 8, 0, 0) == 0, 62);
+    // As set, except that SIGKILL and SIGSTOP are never in a mask.
+    expect(old.handler == 0x1234_5000 and old.flags == 0x0400_0000 and old.mask == ~@as(u64, (1 << 8) | (1 << 18)), 63);
+    expect(lib.syscall6(Sys.rt_sigaction, abi.SIGKILL, @intFromPtr(&act), 0, 8, 0, 0) == lib.err(.INVAL), 64);
+    expect(lib.syscall6(Sys.rt_sigaction, abi.SIGKILL, 0, @intFromPtr(&old), 8, 0, 0) == 0, 65); // asking is fine
+    expect(lib.syscall6(Sys.rt_sigaction, 0, 0, 0, 8, 0, 0) == lib.err(.INVAL), 66);
+    expect(lib.syscall6(Sys.rt_sigaction, 65, 0, 0, 8, 0, 0) == lib.err(.INVAL), 67);
+    expect(lib.syscall6(Sys.rt_sigaction, SIGUSR1, 0, 0, 4, 0, 0) == lib.err(.INVAL), 68);
+    expect(lib.syscall6(Sys.rt_sigaction, SIGUSR1, 8, 0, 8, 0, 0) == lib.err(.FAULT), 69);
+
+    var set: u64 = (1 << (SIGUSR1 - 1)) | (1 << (abi.SIGKILL - 1));
+    var was: u64 = 123;
+    expect(lib.syscall6(Sys.rt_sigprocmask, abi.SIG.BLOCK, @intFromPtr(&set), @intFromPtr(&was), 8, 0, 0) == 0 and was == 0, 70);
+    expect(lib.syscall6(Sys.rt_sigprocmask, abi.SIG.BLOCK, 0, @intFromPtr(&was), 8, 0, 0) == 0 and was == 1 << (SIGUSR1 - 1), 71);
+    expect(lib.syscall6(Sys.rt_sigprocmask, abi.SIG.UNBLOCK, @intFromPtr(&set), 0, 8, 0, 0) == 0, 72);
+    expect(lib.syscall6(Sys.rt_sigprocmask, abi.SIG.SETMASK, 0, @intFromPtr(&was), 8, 0, 0) == 0 and was == 0, 73);
+    expect(lib.syscall6(Sys.rt_sigprocmask, 7, @intFromPtr(&set), 0, 8, 0, 0) == lib.err(.INVAL), 74);
+    expect(lib.syscall6(Sys.rt_sigprocmask, abi.SIG.BLOCK, @intFromPtr(&set), 0, 16, 0, 0) == lib.err(.INVAL), 75);
+
+    var stack: abi.SigStack = undefined;
+    expect(lib.syscall(Sys.sigaltstack, 0, @intFromPtr(&stack), 0) == 0 and stack.flags == abi.SS.DISABLE, 80);
+    var new_stack: abi.SigStack = .{ .sp = @intFromPtr(&fs_block), .flags = 0, .size = 8192 };
+    expect(lib.syscall(Sys.sigaltstack, @intFromPtr(&new_stack), 0, 0) == 0, 81);
+    expect(lib.syscall(Sys.sigaltstack, 0, @intFromPtr(&stack), 0) == 0 and stack.sp == @intFromPtr(&fs_block) and stack.size == 8192 and stack.flags == 0, 82);
+    new_stack.size = 100;
+    expect(lib.syscall(Sys.sigaltstack, @intFromPtr(&new_stack), 0, 0) == lib.err(.NOMEM), 83);
+    new_stack = .{ .flags = abi.SS.DISABLE };
+    expect(lib.syscall(Sys.sigaltstack, @intFromPtr(&new_stack), 0, 0) == 0, 84);
+
+    // poll: the standard streams are open; output can be written.
+    var fds = [_]abi.PollFd{
+        .{ .fd = 0, .events = 0, .revents = -1 },
+        .{ .fd = 1, .events = 0, .revents = -1 },
+        .{ .fd = 2, .events = 0, .revents = -1 },
+    };
+    expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 3, 0) == 0 and fds[0].revents == 0 and fds[2].revents == 0, 90);
+    fds[1].events = abi.POLL.OUT | abi.POLL.IN;
+    fds[2] = .{ .fd = 99, .events = abi.POLL.IN, .revents = 0 };
+    fds[0] = .{ .fd = -1, .events = abi.POLL.IN, .revents = 7 }; // a negative descriptor is skipped
+    expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 3, 0) == 2, 91);
+    expect(fds[0].revents == 0 and fds[1].revents == abi.POLL.OUT and fds[2].revents == abi.POLL.NVAL, 92);
+    expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 1000, 0) == lib.err(.INVAL), 93);
+    expect(lib.syscall(Sys.poll, 8, 1, 0) == lib.err(.FAULT), 94);
+    expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 1, 20) == 0, 95); // waits out the 20 ms, nothing comes
+
     _ = lib.syscall(Sys.exit_group, 0, 0, 0);
     lib.exit(99); // exit_group returned
 }

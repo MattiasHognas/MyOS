@@ -925,6 +925,23 @@ fn muslHello() TestError!void {
     try check(helpers.footprint().eql(memory));
 }
 
+/// A Rust program built for Linux against musl runs with its standard
+/// library: arguments, the environment, heap allocation, formatted
+/// output. The host script checks what it printed.
+fn rustHello() TestError!void {
+    _ = helpers.runProgram("/fixtures/rust-hello-static"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgramArgs(
+        "/fixtures/rust-hello-static",
+        &.{ "rust-hello", "from", "MyOS" },
+        &.{"GREETING=hi rust"},
+    ) orelse return error.Failed;
+    if (code != 3) report("rust hello exit status", code);
+    try check(code == 3);
+    try check(helpers.runPairExpect("/fixtures/rust-hello-static", 1)); // two at once
+    try check(helpers.footprint().eql(memory));
+}
+
 /// Programs run, are preempted, crash and are torn down on every CPU at once.
 fn parallelPrograms() TestError!void {
     const irq = helpers.enableInterrupts();
@@ -1553,6 +1570,7 @@ fn runCases() noreturn {
         .{ .name = "Linux startup: initial stack, FS and GS base, writev, ioctl, set_tid_address, exit_group", .func = linuxStartup },
         .{ .name = "memory on demand: mmap, munmap, mprotect, madvise, brk, stack growth, faults, the limit", .func = userMemory },
         .{ .name = "a static musl program built for Linux runs (arguments, environment, printf)", .func = muslHello },
+        .{ .name = "a static Rust program built for Linux runs (std: arguments, environment, allocation, println)", .func = rustHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },
         .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms },
