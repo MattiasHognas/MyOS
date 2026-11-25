@@ -399,7 +399,7 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
 - [ ] Test empty, long, invalid, and multi-argument commands, and check the stack layout from ring 3.
 
 ### 4.2 Minimal syscall set
-- [x] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs: `syscall.trace_unknown`, which the tests turn on around the fixtures; the test script fails if a fixture made a call the kernel does not know.
+- [x] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs: `syscall.trace_unknown`, which the tests turn on around the fixtures; the test script fails if a fixture made a call the kernel does not know. `syscall.trace_all` logs every call with its arguments and its result, for finding where a program is stuck.
 - [ ] Record what the target programs really ask for (musl C, Rust and Go are in `docs/linux-programs.md`; the .NET program and the Loupe runs are open): run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
   - Run them under Loupe as well (`docs/research.md`): it finds which of those calls must really work, which may return `ENOSYS` and which may pretend to succeed. That, not the bare list, is the work order.
 - [ ] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
@@ -427,7 +427,7 @@ Designed once, demand-paged from the start, instead of an eager `mmap` first and
 - [x] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults. Tested on the host against a page-by-page model.
 - [x] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
 - [ ] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
-  - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations. Open: private file-backed mappings.
+  - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations; `mremap` that shrinks and grows in place. Open: private file-backed mappings; `mremap` that moves a mapping (`MREMAP_MAYMOVE` gets `ENOMEM` today, and allocators copy instead).
 - [x] Implement `mprotect`, `munmap` of partial ranges, `madvise(MADV_DONTNEED)` and `brk`, with resource reclamation.
 - [x] Charge every page a process gets after it has started against its memory limit (`process.Limits.max_pages`, 2.6): pages given on demand to `mmap`, `brk` and stack growth, and the page tables they need; give the charge back on `munmap`. Today the limit is only checked when the program is loaded, because nothing else can allocate. A request over the limit fails with `ENOMEM`; a page fault over it follows the out-of-memory policy below. Test that the charge always equals what left the allocator, as the 2.6 test does at start.
 - [x] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes). The stack's region is 8 MiB, Linux's default limit; below it 1 MiB is kept free of mappings.
@@ -462,7 +462,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Run the tarfs parser in host tests and fuzz it with malformed archives.
 
 ### 6.2 Descriptors and I/O
-- [ ] Reserve FDs 0/1/2 for stdin/stdout/stderr.
+- [x] Reserve FDs 0/1/2 for stdin/stdout/stderr: a process starts with the three open on the console, as one open file with three descriptors (`open_file.zig`). They are closed, duplicated and replaced like any other.
   - [x] The numbers are reserved since 2.5: `open` returns descriptors from 3 up, and `write` to 1 and 2 reaches the console.
   - [ ] Still to do: they are not real descriptors. They cannot be closed, redirected or inherited, and `write` handles them as a special case.
 - [ ] Make `read` on descriptor 0 return keyboard input and remove the private `myos_getchar` syscall (`0x4D5900`). Today `read(0, ...)` returns `EBADF` and the shell reads keys with `myos_getchar`. Do it together with the terminal layer below, so blocking, line editing, echo and end of file are designed once; move `app/sh.zig` to `read` and update `docs/syscalls.md`.
@@ -471,8 +471,10 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling. Keep it small; anything richer belongs in user space.
 - [ ] Support generic open/read/write/close plus `seek` where applicable (`openat`, `lseek`).
 - [ ] Define file-offset, ownership, and descriptor inheritance rules.
-- [ ] Add descriptor duplication and pipes (`dup`/`dup3`, `pipe2`).
+- [x] Add descriptor duplication and pipes (`dup`/`dup2`/`dup3`, `fcntl(F_DUPFD)`, `pipe`/`pipe2`): `pipe.zig`, a page of buffer, readers and writers that wait and are woken, end of file and `EPIPE` when the other end is closed, `O_NONBLOCK`. Tested from ring 3 (`/test/pipes`), with a thread on each end and with a process that ends while a thread sleeps in a pipe.
+  - Open: `SIGPIPE` (8); inheriting descriptors (with `fork`/`execve`, 6.4), for which the reference count of an open file has to stop relying on one process's lock.
 - [ ] Add `poll` to wait on several descriptors at once (needed by network servers in 12.3 and the compositor in 10.3).
+  - Done: `poll` reports the console, files and pipes and waits with a timeout. Open: it looks again every tick instead of being woken by the descriptor.
 - [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
 - [ ] Add `epoll` and `eventfd` on top of `poll`.
 - [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents (the list from 4.2 says which).
@@ -549,11 +551,24 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 
 ## 9. .NET, fast and multicore
 
-**Goal:** Run an unmodified .NET Native AOT program, on several cores, with measured performance. This is the primary goal.
+**Goal:** Anyone can build a program with the ordinary .NET tools for Linux and run the result on Linux or on MyOS: the output of `dotnet publish -r linux-x64 --self-contained` runs unmodified, on several cores, with measured performance. This is the primary goal.
+
+What is supported is what a .NET developer builds with nothing but `dotnet`:
+
+| Build | Supported |
+| --- | --- |
+| `dotnet publish -r linux-x64 --self-contained` | Yes: the goal. It brings the .NET runtime with it |
+| The same with `-p:PublishSingleFile=true` | Yes: the same program, packed into one file |
+| The same with `-p:PublishAot=true` | Yes, and first: no JIT, so it asks less of the kernel |
+| `dotnet build`, framework-dependent publish | No: it needs a .NET runtime installed on the system |
+
+These are dynamically linked against glibc, so MyOS loads the dynamic loader, maps shared libraries from files and ships glibc's libraries in its image, as a Linux distribution does. No build step of MyOS's own is asked of the developer, and there is no MyOS target in .NET: Linux's target is MyOS's.
 
 ### 9.1 .NET Native AOT
 - [ ] Implement what the list from 4.2 shows the .NET runtime still needs. Expected, to be confirmed by the trace: `/proc` and cgroup files for CPU and memory limits, `membarrier`, and thread suspension through signals.
-- [ ] Run a .NET Native AOT hello-world (built for linux-musl, statically linked, invariant globalization).
+  - Done for the Native AOT runtime: `membarrier`, `mlock`, `sysinfo`, `statfs`, `get_mempolicy`, `mremap` in place, pipes and real standard descriptors. It runs without the `/proc` and cgroup files and without signals. Open: those files (it sizes its heap by them), and what the JIT runtime adds.
+- [x] Run a .NET Native AOT hello-world built for linux-musl, statically linked, invariant globalization (`tests/fixtures/src/dotnet-hello`): the runtime starts, eight managed threads allocate, the collector runs, on one and four CPUs, two at once, with its memory back afterwards. A stepping stone and a test fixture, not something a developer is asked to build: it shows what the runtime's core needs before dynamic linking exists. (It is linked with `zig cc`, which brings musl; the build machine has none.)
+- [ ] Run a .NET Native AOT hello-world built the ordinary way (`dotnet publish -r linux-x64 -p:PublishAot=true`): needs 9.3's dynamic linking.
 - [ ] Run one that allocates enough to exercise the GC, then a multi-threaded one.
 - [ ] Add them to the fixture binaries (4.3) and run them as QEMU tests on several CPUs.
 
@@ -578,12 +593,18 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
 
 ### 9.3 Dynamic linking and the JIT runtime
-Does not gate the milestone: the goal is met by a statically linked Native AOT binary.
-- [ ] Load the ELF interpreter named by `PT_INTERP`, so dynamically linked programs run with musl's unmodified loader and shared libraries on disk.
-- [ ] Run a dynamically linked hello-world built on Linux; test malformed `PT_INTERP` headers.
-- [ ] Run the JIT-based .NET runtime (`dotnet app.dll`): it needs dynamic linking, file-backed mappings, many files on disk, and memory that changes from writable to executable (see the permission item in 2.4).
+Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
+- [ ] Load position-independent executables (`ET_DYN`, 4.1) and the ELF interpreter named by `PT_INTERP`, with `AT_BASE`, `AT_PHDR` and `AT_ENTRY` in the auxiliary vector, so dynamically linked programs run with the unmodified loader and shared libraries from the filesystem.
+- [ ] File-backed `mmap` (5), private and copy-on-write, with the permissions of each segment.
+- [ ] The calls a loader finds libraries with: `openat`, `fstat`, `pread64`, `readlink`, `access`, `getdents64`, `getcwd`.
+- [ ] Ship glibc's loader and libraries (`ld-linux-x86-64.so.2`, `libc.so.6`, `libm`, `libstdc++`, `libgcc_s`) in the image.
+- [ ] Run a dynamically linked hello-world built on Linux with plain `gcc`; test malformed `PT_INTERP` headers.
+- [ ] Run the JIT-based runtime: a self-contained `dotnet publish -r linux-x64` hello-world. It needs the above, signal delivery (8), and memory that changes from writable to executable (see the permission item in 2.4); the rest comes from tracing it.
+- [ ] The same published as a single file.
+- [ ] A script that puts a published folder into the image, until there is a writable disk (11) or a network (12).
+- Not supported: framework-dependent builds (`dotnet app.dll` with a runtime installed on the system).
 
-**Milestone 9 done when:** An unmodified .NET Native AOT program runs on MyOS without being rebuilt for it, uses several cores, cannot crash or corrupt the kernel, and its measured performance is recorded against Linux on the same hardware.
+**Milestone 9 done when:** The unmodified output of `dotnet publish -r linux-x64 --self-contained` runs on MyOS as it does on Linux, uses several cores, cannot crash or corrupt the kernel, and its measured performance is recorded against Linux on the same hardware.
 
 ---
 

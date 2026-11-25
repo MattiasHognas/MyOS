@@ -32,16 +32,6 @@ pub const Fs = struct {
     lookup: *const fn (ctx: *anyopaque, path: []const u8) ?Node,
 };
 
-/// What a file descriptor points at: the node plus the current read position.
-pub const OpenFile = struct {
-    node: Node,
-    offset: u64 = 0,
-    /// The descriptor's reference, and one for every system call that is
-    /// using the file right now: another thread may close the descriptor
-    /// meanwhile. Under the process's `files_lock`.
-    refs: u32 = 1,
-};
-
 /// Mount `fs` as the root filesystem, replacing any previous one. The kernel calls this once during boot.
 pub fn mountRoot(fs: Fs) void {
     root_fs = fs;

@@ -19,8 +19,13 @@ const keyboard = @import("../drivers/ps2_keyboard.zig");
 const heap = @import("heap.zig");
 const proc = @import("process.zig");
 const thread = @import("thread.zig");
+const ipi = @import("../arch/x86_64/ipi.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const kfutex = @import("futex.zig");
+const kpipe = @import("pipe.zig");
+const open_file = @import("open_file.zig");
+const OpenFile = open_file.OpenFile;
+const pmm = @import("pmm.zig");
 const futex = kfutex; // its clock helpers read better by this name
 const random = @import("random.zig");
 const timer = @import("timer.zig");
@@ -31,8 +36,6 @@ const vfs = @import("vfs.zig");
 
 /// Size of the kernel bounce buffer used to move data to and from user space.
 const CHUNK = 256;
-/// Descriptors below this are the standard streams; `open` never returns them.
-const FIRST_FILE_FD = 3;
 
 /// `myos_getchar`: return the next key from the keyboard buffer, blocking
 /// the calling thread until one is typed.
@@ -157,8 +160,102 @@ fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
 /// Only descriptors 1 and 2 can be written; anything else is `EBADF` (files
 /// are read-only). Returns the number of bytes written, which is short if a
 /// later part of the buffer cannot be read, or `EFAULT` if none of it can.
+/// Whether the descriptor behind `of` is non-blocking.
+fn nonblocking(of: *OpenFile) bool {
+    const p = thread.current().process.?;
+    const held = p.files_lock.acquire();
+    defer p.files_lock.release(held);
+    return of.nonblock;
+}
+
+/// `read` from a pipe: what is there, up to `len` bytes, waiting only
+/// while there is nothing. The bytes come out of the pipe before they are
+/// copied to the program; if that copy faults they are lost with `EFAULT`.
+fn pipeRead(of: *OpenFile, ptr: u64, len: u64) u64 {
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
+    var chunk: [CHUNK]u8 = undefined;
+    const want: usize = @intCast(@min(CHUNK, len));
+    switch (kpipe.read(of.pipe, chunk[0..want], nonblocking(of))) {
+        .bytes => |n| {
+            uaccess.copyToUser(ptr, chunk[0..n]) catch return err(.FAULT);
+            return n;
+        },
+        .again => return err(.AGAIN),
+        .killed => return err(.INTR),
+    }
+}
+
+/// `write` to a pipe: all of it, a piece at a time, waiting for room;
+/// short only if a later piece cannot be read from the program, would
+/// have to wait on a non-blocking descriptor, or finds the reader gone.
+fn pipeWrite(of: *OpenFile, ptr: u64, len: u64) u64 {
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
+    const nonblock = nonblocking(of);
+    var chunk: [CHUNK]u8 = undefined;
+    var done: u64 = 0;
+    while (done < len) {
+        const part = chunk[0..@intCast(@min(CHUNK, len - done))];
+        uaccess.copyFromUser(part, ptr + done) catch return if (done == 0) err(.FAULT) else done;
+        switch (kpipe.write(of.pipe, part, nonblock)) {
+            .bytes => |n| done += n,
+            .again => return if (done == 0) err(.AGAIN) else done,
+            // Linux also sends SIGPIPE; signals are not delivered yet (8).
+            .broken => return if (done == 0) err(.PIPE) else done,
+            .killed => return if (done == 0) err(.INTR) else done,
+        }
+    }
+    return done;
+}
+
+/// `pipe` and `pipe2`: make a pipe and store its reading and its writing
+/// descriptor at `fds`. `EINVAL` for flags other than `O_NONBLOCK` and
+/// `O_CLOEXEC`, `EMFILE`, `ENOMEM`, `EFAULT` (then nothing stays open).
+fn sysPipe(fds_ptr: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, abi.O.NONBLOCK | abi.O.CLOEXEC) != 0) return err(.INVAL);
+    const p = thread.current().process orelse return err(.BADF);
+    const nonblock = flags & abi.O.NONBLOCK != 0;
+    const r = heap.allocator.create(OpenFile) catch return err(.NOMEM);
+    const w = heap.allocator.create(OpenFile) catch {
+        heap.allocator.destroy(r);
+        return err(.NOMEM);
+    };
+    const pp = kpipe.create() catch {
+        heap.allocator.destroy(r);
+        heap.allocator.destroy(w);
+        return err(.NOMEM);
+    };
+    // From here the open files own the pipe: destroying both frees it.
+    r.* = .{ .kind = .pipe_read, .pipe = pp, .nonblock = nonblock };
+    w.* = .{ .kind = .pipe_write, .pipe = pp, .nonblock = nonblock };
+    const rfd = installFile(p, r, 0) orelse {
+        open_file.destroy(r);
+        open_file.destroy(w);
+        return err(.MFILE);
+    };
+    const wfd = installFile(p, w, 0) orelse {
+        _ = sysClose(rfd);
+        open_file.destroy(w);
+        return err(.MFILE);
+    };
+    const out = [2]i32{ @intCast(rfd), @intCast(wfd) };
+    if (!toUser(fds_ptr, out)) {
+        _ = sysClose(rfd);
+        _ = sysClose(wfd);
+        return err(.FAULT);
+    }
+    return 0;
+}
+
 fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
-    if (fd != abi.STDOUT and fd != abi.STDERR) return err(.BADF);
+    {
+        const of = getFile(fd) orelse return err(.BADF);
+        defer putFile(of);
+        switch (of.kind) {
+            .console => {},
+            .pipe_write => return pipeWrite(of, ptr, @min(count, abi.MAX_RW_COUNT)),
+            .file, .pipe_read => return err(.BADF), // files are read-only
+        }
+    }
     const len = @min(count, abi.MAX_RW_COUNT);
     if (!user_range.valid(ptr, len)) return err(.FAULT);
     var chunk: [CHUNK]u8 = undefined;
@@ -180,7 +277,11 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
 /// `EFAULT` if the array, or the first buffer with anything in it, cannot
 /// be read; `EBADF` as for `write`.
 fn sysWritev(fd: u64, iov: u64, count: u64) u64 {
-    if (fd != abi.STDOUT and fd != abi.STDERR) return err(.BADF);
+    {
+        const of = getFile(fd) orelse return err(.BADF);
+        defer putFile(of);
+        if (of.kind != .console and of.kind != .pipe_write) return err(.BADF);
+    }
     if (count > abi.IOV_MAX) return err(.INVAL);
     var total: u64 = 0;
     // First pass: the lengths, before anything is written.
@@ -215,8 +316,7 @@ fn readIoVec(iov: u64, index: usize) ?abi.IoVec {
 /// library asks whether to buffer its output by line); anything else is
 /// `EBADF`.
 fn sysIoctl(fd: u64) u64 {
-    if (fd <= abi.STDERR or isOpen(fd)) return err(.NOTTY);
-    return err(.BADF);
+    return if (isOpen(fd)) err(.NOTTY) else err(.BADF);
 }
 
 /// `arch_prctl`: set or read the FS or GS base of the calling thread,
@@ -254,7 +354,7 @@ fn sysSetTidAddress(ptr: u64) u64 {
 /// reference taken for the caller, who gives it back with `putFile`; null
 /// if `fd` is out of range, not open, or the thread has no process. The
 /// reference keeps the file there while another thread closes the descriptor.
-fn getFile(fd: u64) ?*vfs.OpenFile {
+fn getFile(fd: u64) ?*OpenFile {
     const p = thread.current().process orelse return null;
     if (fd >= p.files.len) return null;
     const held = p.files_lock.acquire();
@@ -265,7 +365,7 @@ fn getFile(fd: u64) ?*vfs.OpenFile {
 }
 
 /// Give back a reference from `getFile`; the file is freed with its last one.
-fn putFile(of: *vfs.OpenFile) void {
+fn putFile(of: *OpenFile) void {
     const p = thread.current().process.?;
     const last = blk: {
         const held = p.files_lock.acquire();
@@ -273,7 +373,7 @@ fn putFile(of: *vfs.OpenFile) void {
         of.refs -= 1;
         break :blk of.refs == 0;
     };
-    if (last) heap.allocator.destroy(of);
+    if (last) open_file.destroy(of);
 }
 
 /// True if `fd` is an open file.
@@ -299,25 +399,70 @@ fn sysOpen(ptr: u64, flags: u64) u64 {
         return if (flags & abi.O.CREAT != 0) err(.ROFS) else err(.NOENT);
     if (flags & abi.O.ACCMODE != abi.O.RDONLY) return err(.ROFS);
     const p = thread.current().process orelse return err(.BADF);
-    const max_files = @min(p.files.len, p.limits.max_files);
-    if (max_files <= FIRST_FILE_FD) return err(.MFILE);
+
     // Allocated before the table is locked, and freed again if it is full.
-    const of = heap.allocator.create(vfs.OpenFile) catch return err(.NOMEM);
+    const of = heap.allocator.create(OpenFile) catch return err(.NOMEM);
     of.* = .{ .node = node };
-    const fd: ?usize = blk: {
-        const held = p.files_lock.acquire();
-        defer p.files_lock.release(held);
-        for (p.files[FIRST_FILE_FD..max_files], FIRST_FILE_FD..) |*slot, i| {
-            if (slot.* != null) continue;
-            slot.* = of;
-            break :blk i;
-        }
-        break :blk null;
-    };
-    return fd orelse {
+    return installFile(p, of, 0) orelse {
         heap.allocator.destroy(of);
         return err(.MFILE);
     };
+}
+
+/// Put `of` in the lowest free descriptor of `p` that is at least `from`
+/// and within the process's limit, and return it; null if there is none.
+/// The reference the caller holds becomes the descriptor's.
+fn installFile(p: *proc.Process, of: *OpenFile, from: usize) ?usize {
+    const max_files = @min(p.files.len, p.limits.max_files);
+    const held = p.files_lock.acquire();
+    defer p.files_lock.release(held);
+    var fd = from;
+    while (fd < max_files) : (fd += 1) {
+        if (p.files[fd] != null) continue;
+        p.files[fd] = of;
+        return fd;
+    }
+    return null;
+}
+
+/// `dup` and `fcntl(F_DUPFD)`: a second descriptor for what `fd` refers
+/// to, the lowest free one that is at least `from`. Both share the file
+/// and its offset. `EBADF`, `EINVAL` (no such descriptor number), `EMFILE`.
+fn sysDup(fd: u64, from: u64) u64 {
+    const p = thread.current().process orelse return err(.BADF);
+    if (from >= p.files.len) return err(.INVAL);
+    const of = getFile(fd) orelse return err(.BADF);
+    // The reference from `getFile` becomes the new descriptor's.
+    return installFile(p, of, @intCast(from)) orelse {
+        putFile(of);
+        return err(.MFILE);
+    };
+}
+
+/// `dup2` and `dup3`: make `new` refer to what `old` does, closing what
+/// `new` referred to. With `same_is_error`, `old == new` is `EINVAL`
+/// (`dup3`); otherwise it does nothing and returns `new` (`dup2`).
+fn sysDup2(old: u64, new: u64, same_is_error: bool) u64 {
+    const p = thread.current().process orelse return err(.BADF);
+    const of = getFile(old) orelse return err(.BADF);
+    if (new >= @min(p.files.len, p.limits.max_files)) {
+        putFile(of);
+        return err(.BADF);
+    }
+    if (old == new) {
+        putFile(of);
+        return if (same_is_error) err(.INVAL) else new;
+    }
+    const replaced = blk: {
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        const slot = &p.files[nospec.index(new, p.files.len)];
+        const before = slot.*;
+        slot.* = of; // with the reference from `getFile`
+        break :blk before;
+    };
+    if (replaced) |r| putFile(r);
+    return new;
 }
 
 /// `openat`: `open` for a path that is absolute, or relative to the
@@ -336,7 +481,7 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
 /// Read up to `len` bytes of the open file `of` from `offset` into the
 /// user buffer at `ptr`. Returns the number of bytes read, short if a
 /// later part of the buffer cannot be written, or `EFAULT` if none could.
-fn readAt(of: *vfs.OpenFile, offset: u64, ptr: u64, len: u64) u64 {
+fn readAt(of: *OpenFile, offset: u64, ptr: u64, len: u64) u64 {
     if (!user_range.valid(ptr, len)) return err(.FAULT);
     var chunk: [CHUNK]u8 = undefined;
     var done: u64 = 0;
@@ -364,6 +509,12 @@ fn readAt(of: *vfs.OpenFile, offset: u64, ptr: u64, len: u64) u64 {
 fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
     const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
+    switch (of.kind) {
+        .file => {},
+        .pipe_read => return pipeRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
+        // Nothing to read from the console yet.
+        .console, .pipe_write => return err(.BADF),
+    }
     const p = thread.current().process.?;
     const start = blk: {
         const held = p.files_lock.acquire();
@@ -383,8 +534,9 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
 
 /// `pread64`: `read` from `offset`, leaving the file's own offset alone.
 fn sysPread(fd: u64, ptr: u64, count: u64, offset: u64) u64 {
-    const of = getFile(fd) orelse return if (fd <= abi.STDERR) err(.SPIPE) else err(.BADF);
+    const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
+    if (of.kind != .file) return err(.SPIPE);
     if (offset > std.math.maxInt(i64)) return err(.INVAL);
     return readAt(of, offset, ptr, @min(count, abi.MAX_RW_COUNT));
 }
@@ -393,8 +545,9 @@ fn sysPread(fd: u64, ptr: u64, count: u64, offset: u64) u64 {
 /// for the standard streams, `EINVAL` for a position before the start or
 /// an unknown `whence`.
 fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
-    const of = getFile(fd) orelse return if (fd <= abi.STDERR) err(.SPIPE) else err(.BADF);
+    const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
+    if (of.kind != .file) return err(.SPIPE);
     const p = thread.current().process.?;
     const held = p.files_lock.acquire();
     defer p.files_lock.release(held);
@@ -414,36 +567,59 @@ fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
 /// standard streams are character devices.
 fn sysFstat(fd: u64, ptr: u64) u64 {
     var st: abi.Stat = .{};
-    if (fd <= abi.STDERR) {
-        st.mode = abi.S.IFCHR | 0o620;
-        st.rdev = 0x8800; // a pseudo-terminal's device number
-        st.blksize = 1024;
-    } else {
-        const of = getFile(fd) orelse return err(.BADF);
-        defer putFile(of);
-        st.mode = abi.S.IFREG | 0o555;
-        st.size = @intCast(of.node.size);
-        st.blocks = @intCast((of.node.size + 511) / 512);
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    switch (of.kind) {
+        .console => {
+            st.mode = abi.S.IFCHR | 0o620;
+            st.rdev = 0x8800; // a pseudo-terminal's device number
+            st.blksize = 1024;
+        },
+        .pipe_read, .pipe_write => {
+            st.mode = abi.S.IFIFO | 0o600;
+            st.blksize = kpipe.SIZE;
+        },
+        .file => {
+            st.mode = abi.S.IFREG | 0o555;
+            st.size = @intCast(of.node.size);
+            st.blocks = @intCast((of.node.size + 511) / 512);
+        },
     }
     return if (toUser(ptr, st)) 0 else err(.FAULT);
 }
 
 /// `fcntl`: the descriptor and status flags can be read; setting them is
 /// accepted and changes nothing (there is nothing they would change yet).
-fn sysFcntl(fd: u64, command: u64) u64 {
-    if (fd > abi.STDERR and !isOpen(fd)) return err(.BADF);
-    return switch (command) {
-        1, 2, 4 => 0, // F_GETFD, F_SETFD, F_SETFL
-        3 => if (fd == abi.STDOUT or fd == abi.STDERR) abi.O.WRONLY else abi.O.RDONLY, // F_GETFL
-        else => err(.INVAL),
-    };
+fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    const p = thread.current().process.?;
+    switch (command) {
+        // F_DUPFD and F_DUPFD_CLOEXEC. Nothing is closed on exec yet:
+        // there is no exec.
+        0, 1030 => return sysDup(fd, arg),
+        1, 2 => return 0, // F_GETFD, F_SETFD
+        3 => { // F_GETFL
+            const access: u64 = switch (of.kind) {
+                .console => abi.O.RDWR,
+                .file, .pipe_read => abi.O.RDONLY,
+                .pipe_write => abi.O.WRONLY,
+            };
+            return access | if (nonblocking(of)) @as(u64, abi.O.NONBLOCK) else 0;
+        },
+        4 => { // F_SETFL: only O_NONBLOCK can change
+            const held = p.files_lock.acquire();
+            defer p.files_lock.release(held);
+            of.nonblock = arg & abi.O.NONBLOCK != 0;
+            return 0;
+        },
+        else => return err(.INVAL),
+    }
 }
 
-/// `close`: free the open file behind descriptor `fd` and clear its slot.
-/// Returns 0, or `EBADF` if `fd` is not an open file. Closing a standard
-/// stream succeeds and changes nothing, since they cannot be reopened yet.
+/// `close`: make descriptor `fd` free again. What it referred to goes
+/// when its last descriptor does. Returns 0, or `EBADF` if `fd` is not open.
 fn sysClose(fd: u64) u64 {
-    if (fd < FIRST_FILE_FD) return 0;
     const p = thread.current().process orelse return err(.BADF);
     if (fd >= p.files.len) return err(.BADF);
     const of = blk: {
@@ -550,30 +726,56 @@ fn sysSigAltStack(new_ptr: u64, old_ptr: u64) u64 {
 /// a process can have open, `EFAULT`.
 fn sysPoll(fds: u64, count: u64, timeout_ms: u64) u64 {
     if (count > proc.MAX_FILES) return err(.INVAL);
-    var ready: u64 = 0;
-    for (0..count) |i| {
-        const at = fds + i * @sizeOf(abi.PollFd);
-        var entry = fromUser(abi.PollFd, at) orelse return err(.FAULT);
-        entry.revents = 0;
-        if (entry.fd >= 0) {
-            const fd: u64 = @intCast(entry.fd);
-            if (fd == abi.STDOUT or fd == abi.STDERR) {
-                entry.revents = entry.events & abi.POLL.OUT;
-            } else if (fd == abi.STDIN) {
-                // Nothing to read from descriptor 0 yet.
-            } else if (isOpen(fd)) {
-                entry.revents = entry.events & abi.POLL.IN;
-            } else entry.revents = abi.POLL.NVAL;
+    const timeout: i32 = @truncate(@as(i64, @bitCast(timeout_ms)));
+    // Ticks left to wait; null is for ever.
+    var left: ?u64 = if (timeout < 0) null else timer.msToTicks(@intCast(timeout));
+    while (true) {
+        var ready: u64 = 0;
+        for (0..count) |i| {
+            const at = fds + i * @sizeOf(abi.PollFd);
+            var entry = fromUser(abi.PollFd, at) orelse return err(.FAULT);
+            entry.revents = 0;
+            if (entry.fd >= 0) {
+                if (getFile(@intCast(entry.fd))) |of| {
+                    entry.revents = pollState(of, entry.events);
+                    putFile(of);
+                } else entry.revents = abi.POLL.NVAL;
+            }
+            if (entry.revents != 0) ready += 1;
+            if (!toUser(at, entry)) return err(.FAULT);
         }
-        if (entry.revents != 0) ready += 1;
-        if (!toUser(at, entry)) return err(.FAULT);
+        if (ready != 0) return ready;
+        // Nothing yet: look again a tick later. Descriptors have no way
+        // to wake a poller yet; that comes with `epoll`.
+        if (left) |l| {
+            if (l == 0) return 0;
+            left = l - 1;
+        }
+        if (!timer.sleepTicksKillable(1)) return err(.INTR);
     }
-    if (ready == 0) {
-        const timeout: i32 = @truncate(@as(i64, @bitCast(timeout_ms)));
-        if (timeout < 0) while (timer.sleepTicksKillable(timer.HZ)) {};
-        if (timeout > 0) _ = timer.sleepTicksKillable(timer.msToTicks(@intCast(timeout)));
+}
+
+/// What `poll` reports for an open file, of the events asked for; hang-up
+/// and error are reported whether asked for or not.
+fn pollState(of: *OpenFile, events: i16) i16 {
+    switch (of.kind) {
+        // The console can be written to and has nothing to read yet.
+        .console => return events & abi.POLL.OUT,
+        // A file can always be read.
+        .file => return events & abi.POLL.IN,
+        .pipe_read => {
+            const st = kpipe.state(of.pipe);
+            var r: i16 = 0;
+            if (st.readable) r |= events & abi.POLL.IN;
+            if (st.hung_up) r |= abi.POLL.HUP;
+            return r;
+        },
+        .pipe_write => {
+            const st = kpipe.state(of.pipe);
+            if (st.broken) return abi.POLL.ERR;
+            return if (st.writable) events & abi.POLL.OUT else 0;
+        },
     }
-    return ready;
 }
 
 /// Seconds between 1970 and the moment the wall clock is taken to have
@@ -798,14 +1000,86 @@ fn sysKill(pid: u64, sig: u64) u64 {
     return 0;
 }
 
+/// `membarrier`: have every CPU pass a memory barrier before the call
+/// returns, so that a thread of this process on another CPU has seen what
+/// the caller wrote before it. Runtimes with a garbage collector use it
+/// instead of making every thread pay for a barrier of its own. Every
+/// other CPU is interrupted, which is more than asked for and correct.
+/// `EINVAL` for a command that is not offered.
+fn sysMembarrier(command: u64, flags: u64) u64 {
+    if (flags != 0) return err(.INVAL);
+    return switch (command) {
+        abi.MEMBARRIER.QUERY => abi.MEMBARRIER.PRIVATE_EXPEDITED | abi.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED,
+        abi.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED => 0,
+        abi.MEMBARRIER.PRIVATE_EXPEDITED => blk: {
+            ipi.broadcast(.barrier);
+            break :blk 0;
+        },
+        else => err(.INVAL),
+    };
+}
+
+/// `sysinfo`: how much memory the machine has and how much is free, and
+/// how long it has been up. Runtimes size their heaps by it.
+fn sysSysinfo(ptr: u64) u64 {
+    const info: abi.SysInfo = .{
+        .uptime = @intCast(kfutex.monotonicNanos() / NS_PER_SEC),
+        .totalram = pmm.totalPages() * pmm.PAGE_SIZE,
+        .freeram = pmm.free_pages * pmm.PAGE_SIZE,
+        .procs = @truncate(proc.liveCount()),
+        .mem_unit = 1,
+    };
+    return if (toUser(ptr, info)) 0 else err(.FAULT);
+}
+
+/// `statfs`: the only filesystem is the read-only one in memory.
+/// `ENOENT` for a path that does not exist, which is how a program finds
+/// that there are no control groups here.
+fn sysStatfs(path_ptr: u64, ptr: u64) u64 {
+    var path_buf: [abi.PATH_MAX]u8 = undefined;
+    const path = switch (userPath(&path_buf, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    if (vfs.lookup(path) == null and !std.mem.eql(u8, path, "/")) return err(.NOENT);
+    const st: abi.StatFs = .{ .type = abi.TMPFS_MAGIC };
+    return if (toUser(ptr, st)) 0 else err(.FAULT);
+}
+
+/// `get_mempolicy`: which memory nodes a thread allocates from. There is
+/// one node and no policy: mode 0 (`MPOL_DEFAULT`) and an empty node
+/// mask of `maxnode` bits. `EINVAL` for flags (none is supported) and for
+/// a mask of more than a page of bits; `EFAULT`.
+fn sysGetMempolicy(mode_ptr: u64, mask_ptr: u64, maxnode: u64, flags: u64) u64 {
+    if (flags != 0) return err(.INVAL);
+    if (mode_ptr != 0 and !toUser(mode_ptr, @as(i32, 0))) return err(.FAULT);
+    if (mask_ptr != 0) {
+        if (maxnode > 8 * pmm.PAGE_SIZE) return err(.INVAL);
+        const zero: u64 = 0;
+        var at: u64 = 0;
+        while (at < (maxnode + 63) / 64) : (at += 1) {
+            if (!toUser(mask_ptr + at * 8, zero)) return err(.FAULT);
+        }
+    }
+    return 0;
+}
+
+/// `mlock` and `munlock`: memory is never paged out, so there is nothing
+/// to lock; the range only has to be the program's.
+fn sysMlock(addr: u64, len: u64) u64 {
+    if (!user_range.valid(addr, len)) return err(.NOMEM);
+    return 0;
+}
+
 /// The memory calls (`user_memory.zig`), for the calling thread's process.
-fn memory(comptime call: enum { mmap, mprotect, munmap, brk, madvise }, f: *const arch.Frame) u64 {
+fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, f: *const arch.Frame) u64 {
     const p = thread.current().process orelse return err(.NOSYS);
     return switch (call) {
         // The offset (`f.r9`) only means something for a file.
         .mmap => user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, f.r8),
         .mprotect => user_memory.mprotect(p, f.rdi, f.rsi, f.rdx),
         .munmap => user_memory.munmap(p, f.rdi, f.rsi),
+        .mremap => user_memory.mremap(p, f.rdi, f.rsi, f.rdx, f.r10),
         .brk => user_memory.brk(p, f.rdi),
         .madvise => user_memory.madvise(p, f.rdi, f.rsi, f.rdx),
     };
@@ -815,6 +1089,24 @@ fn memory(comptime call: enum { mmap, mprotect, munmap, brk, madvise }, f: *cons
 /// selected by `f.rax` with the arguments from the frame and store its
 /// result in `f.rax`. Unknown numbers return `ENOSYS`.
 pub fn dispatch(f: *arch.Frame) void {
+    if (trace_all) {
+        const number = f.rax;
+        const args = [3]u64{ f.rdi, f.rsi, f.rdx };
+        root.print("syscall: thread {d} call {d}(0x{x}, 0x{x}, 0x{x}) ...\n", .{ thread.id(), number, args[0], args[1], args[2] });
+        dispatchCall(f);
+        root.print("syscall: thread {d} call {d} = 0x{x}\n", .{ thread.id(), number, f.rax });
+        return;
+    }
+    dispatchCall(f);
+}
+
+/// Log every system call of every program, with its first three arguments
+/// when it starts and its result when it returns (calls that wait show
+/// where a program is stuck). For finding out what a program does; off
+/// by default.
+pub var trace_all: bool = false;
+
+fn dispatchCall(f: *arch.Frame) void {
     f.rax = switch (f.rax) {
         Sys.read => sysRead(f.rdi, f.rsi, f.rdx),
         Sys.write => sysWrite(f.rdi, f.rsi, f.rdx),
@@ -828,7 +1120,12 @@ pub fn dispatch(f: *arch.Frame) void {
         Sys.lseek => sysLseek(f.rdi, f.rsi, f.rdx),
         Sys.pread64 => sysPread(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.openat => sysOpenAt(f.rdi, f.rsi, f.rdx),
-        Sys.fcntl => sysFcntl(f.rdi, f.rsi),
+        Sys.fcntl => sysFcntl(f.rdi, f.rsi, f.rdx),
+        Sys.pipe => sysPipe(f.rdi, 0),
+        Sys.pipe2 => sysPipe(f.rdi, f.rsi),
+        Sys.dup => sysDup(f.rdi, 0),
+        Sys.dup2 => sysDup2(f.rdi, f.rsi, false),
+        Sys.dup3 => sysDup2(f.rdi, f.rsi, true),
         Sys.nanosleep => sysSleep(abi.CLOCK.MONOTONIC, false, f.rdi),
         Sys.clock_nanosleep => sysSleep(f.rdi, f.rsi & 1 != 0, f.rdx),
         Sys.clock_gettime => sysClockGetTime(f.rdi, f.rsi),
@@ -843,6 +1140,12 @@ pub fn dispatch(f: *arch.Frame) void {
         // No option exists here yet. Runtimes try a few (naming their
         // mappings, for one) and go on without them.
         Sys.prctl => err(.INVAL),
+        Sys.membarrier => sysMembarrier(f.rdi, f.rsi),
+        Sys.sysinfo => sysSysinfo(f.rdi),
+        Sys.get_mempolicy => sysGetMempolicy(f.rdi, f.rsi, f.rdx, f.r8),
+        Sys.mremap => memory(.mremap, f),
+        Sys.statfs => sysStatfs(f.rdi, f.rsi),
+        Sys.mlock, Sys.munlock => sysMlock(f.rdi, f.rsi),
         Sys.kill => sysKill(f.rdi, f.rsi),
         Sys.tgkill => sysKill(f.rdi, f.rdx),
         Sys.tkill => if (thread.current().process) |p| sysKill(p.pid, f.rsi) else err(.NOSYS),

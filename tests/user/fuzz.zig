@@ -11,7 +11,8 @@
 //!
 //! Left out on purpose: `exit` and `exit_group` (the run would end early),
 //! the calls that unmap or reprotect memory (the program would take its
-//! own code or stack away), waiting in `poll`, and `myos_getchar`
+//! own code or stack away), closing or replacing the standard descriptors,
+//! making pipes, waiting in `poll`, and `myos_getchar`
 //! (it would wait for a key forever). Console writes of readable memory are
 //! steered to a block of text, to keep the serial log printable.
 //!
@@ -118,7 +119,7 @@ pub fn main() noreturn {
         if (nr == Sys.exit or nr == Sys.exit_group or nr == Sys.myos_getchar) continue;
         // Calls with which a program takes its own memory away or changes
         // what it may do with it are a program's right, and its end.
-        if (nr == Sys.munmap or nr == Sys.mprotect or nr == Sys.madvise) continue;
+        if (nr == Sys.munmap or nr == Sys.mprotect or nr == Sys.madvise or nr == Sys.mremap) continue;
         if (nr == Sys.mmap) args[3] &= ~@as(u64, lib.abi.MAP.FIXED | lib.abi.MAP.FIXED_NOREPLACE);
         if (nr == Sys.brk and args[0] != 0) args[0] = 0; // only ask where the heap ends
         if (nr == Sys.poll) args[2] = 0; // do not wait
@@ -128,7 +129,13 @@ pub fn main() noreturn {
         if (nr == Sys.futex) args[1] = (args[1] & ~@as(u64, 0x7F)) | lib.abi.FUTEX.WAKE;
         if (nr == Sys.kill or nr == Sys.tkill) args[1] = 0;
         if (nr == Sys.tgkill) args[2] = 0;
-        if (nr == Sys.write and (args[0] == 1 or args[0] == 2) and (second_readable or args[1] >= STACK_TOP - 8)) {
+        // The standard descriptors stay what they are: the last line of
+        // this program goes to one. And nothing reads a pipe made here,
+        // so a read from one would wait for ever.
+        if (nr == Sys.close and args[0] <= 2) continue;
+        if ((nr == Sys.dup2 or nr == Sys.dup3) and args[1] <= 2) continue;
+        if (nr == Sys.pipe or nr == Sys.pipe2) continue;
+        if (nr == Sys.write and args[0] <= 2 and (second_readable or args[1] >= STACK_TOP - 8)) {
             const off = next(&rng) % (text.len - 64);
             args[1] = @intFromPtr(text) + off;
             args[2] %= 64;

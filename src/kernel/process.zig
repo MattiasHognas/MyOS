@@ -92,6 +92,7 @@ const pmm = @import("pmm.zig");
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
 const thread = @import("thread.zig");
+const open_file = @import("open_file.zig");
 const vfs = @import("vfs.zig");
 const random = @import("random.zig");
 const startup_stack = @import("startup_stack.zig");
@@ -172,9 +173,10 @@ pub const Process = struct {
     entry_rsp: u64 = STACK_TOP_MAX,
     /// Heap-allocated copy of the name the process was spawned with.
     name: []const u8,
-    /// File descriptor table, indexed by fd. Slots 0-2 are the standard
-    /// streams and stay null: the console is not a file yet.
-    files: [MAX_FILES]?*vfs.OpenFile = @splat(null),
+    /// File descriptor table, indexed by fd. A process starts with 0, 1
+    /// and 2 open on the console. Several descriptors can refer to one
+    /// open file (`dup`), which is counted (`OpenFile.refs`).
+    files: [MAX_FILES]?*open_file.OpenFile = @splat(null),
     /// What this process may use.
     limits: Limits = .{},
     /// Pages of physical memory the process takes (see `Limits.max_pages`).
@@ -555,7 +557,10 @@ var live: usize = 0;
 /// Close every open file of `p`.
 fn closeFiles(p: *Process) void {
     for (&p.files) |*slot| {
-        if (slot.*) |of| heap.allocator.destroy(of);
+        if (slot.*) |of| {
+            of.refs -= 1;
+            if (of.refs == 0) open_file.destroy(of);
+        }
         slot.* = null;
     }
 }
@@ -671,6 +676,10 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     errdefer heap.allocator.destroy(p);
     const name_copy = try heap.allocator.dupe(u8, name);
     errdefer heap.allocator.free(name_copy);
+    // The standard streams: three descriptors for one open console.
+    const console = try heap.allocator.create(open_file.OpenFile);
+    errdefer heap.allocator.destroy(console);
+    console.* = .{ .kind = .console, .refs = 3 };
     p.* = .{
         .root = root,
         .entry = loaded.entry,
@@ -688,6 +697,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
             .mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE,
         },
     };
+    for (p.files[0..3]) |*slot| slot.* = console;
     // (On an error below, the list is freed through `regions`, which
     // still refers to it; the structure goes separately.)
 

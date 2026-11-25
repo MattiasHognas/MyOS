@@ -72,33 +72,41 @@ Linux calls, with Linux's numbers:
 
 | Number | Call | Notes |
 | --- | --- | --- |
-| 0 | `read(fd, buf, count)` | Regular files only. Descriptor 0 is not readable yet (`EBADF`); use `myos_getchar`. |
-| 1 | `write(fd, buf, count)` | Descriptors 1 and 2 only, both the console (serial port and screen). Files cannot be written (`EBADF`). |
+| 0 | `read(fd, buf, count)` | Files and pipes. A pipe gives what it holds, waiting only while it is empty and has a writer; 0 at its end. The console is not readable yet (`EBADF`); use `myos_getchar`. |
+| 1 | `write(fd, buf, count)` | The console (serial port and screen), which descriptors 0, 1 and 2 start out as, and pipes. A pipe takes all of it, waiting for room; `EPIPE` when no reader is left (no `SIGPIPE` yet). Files are read-only (`EBADF`). |
 | 2 | `open(path, flags, mode)` | Read-only: the access mode in `flags` must be `O_RDONLY`. Other flags and `mode` are ignored, except that `O_CREAT` on a missing file gives `EROFS`. |
-| 3 | `close(fd)` | Closing 0, 1 or 2 succeeds and does nothing. |
-| 5 | `fstat(fd, statbuf)` | The standard streams are character devices; an open file is a regular file with its size. |
-| 7 | `poll(fds, nfds, timeout)` | Console output is always writable, open files always readable, descriptor 0 never; a descriptor that is not open gets `POLLNVAL`. With nothing ready it waits out the timeout and returns 0. |
-| 8 | `lseek(fd, offset, whence)` | Open files; `ESPIPE` for the standard streams. |
+| 3 | `close(fd)` | Any open descriptor, the standard ones too. What it referred to goes with its last descriptor. |
+| 5 | `fstat(fd, statbuf)` | The console is a character device, a pipe a FIFO, an open file a regular file with its size. |
+| 7 | `poll(fds, nfds, timeout)` | The console is writable, a file readable, a pipe when it has bytes or room; `POLLHUP` and `POLLERR` for a pipe whose other end is closed, `POLLNVAL` for a descriptor that is not open. Waits by looking again every tick. |
+| 8 | `lseek(fd, offset, whence)` | Open files; `ESPIPE` for the console and pipes. |
 | 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory only (`MAP_ANONYMOUS` with `MAP_PRIVATE` or `MAP_SHARED`; a file is `ENODEV`). `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, and an address hint that is used if it is free; otherwise placed top down. `MAP_NORESERVE` and `MAP_STACK` are accepted. The memory is given page by page as it is touched. |
 | 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
 | 11 | `munmap(addr, length)` | Any part of any mappings; unmapping what is not mapped succeeds. |
 | 12 | `brk(addr)` | Returns the new end of the heap, or the old one if it cannot move. |
 | 13 | `rt_sigaction(sig, act, oldact, size)` | Recorded and read back. No signal is delivered yet (milestone 8): a fault still ends the process. |
 | 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals, recorded. |
-| 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for the standard streams and open files (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
+| 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for every open descriptor (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
 | 17 | `pread64(fd, buf, count, offset)` | |
-| 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. Descriptors 1 and 2 only. |
+| 20 | `writev(fd, iov, iovcnt)` | `write` from up to 1024 buffers. |
+| 22 | `pipe(fds)` | See `pipe2`. |
 | 24 | `sched_yield()` | |
+| 25 | `mremap(old, old_size, new_size, flags, new)` | Shrinks a mapping, or grows it into free addresses after it. Never moves one: `ENOMEM` where Linux would (`MREMAP_MAYMOVE`), as when there is no room. `EFAULT` if the old range is not mapped. |
 | 28 | `madvise(addr, length, advice)` | `MADV_DONTNEED` and `MADV_FREE` give the pages back at once: they read as zeroes afterwards. Other advice is accepted and ignored. |
+| 32 | `dup(fd)` | The lowest free descriptor, for the same open file: they share its offset. |
+| 33 | `dup2(old, new)` | Closes what `new` was. |
 | 35 | `nanosleep(req, rem)` | Resolution is one timer tick (10 ms), rounded up. `rem` is never written: nothing interrupts a sleep yet. |
 | 39 | `getpid()` | The ID of the process's first thread. |
 | 56 | `clone(flags, stack, ptid, ctid, tls)` | New threads only: `flags` must include `CLONE_VM`, `CLONE_SIGHAND` and `CLONE_THREAD` (`EINVAL` otherwise; there is no `fork` yet). `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. |
 | 60 | `exit(status)` | Ends the calling thread. The last thread's status is the process's: the parent sees `status & 0xff`. |
 | 62 | `kill(pid, sig)` | The calling process only. Signals are not delivered yet: signal 0 checks; a signal with no handler whose default is to end the process ends it with status 128 + the signal (that is `abort`); anything else is dropped. `tkill` (200) and `tgkill` (234) likewise. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
-| 72 | `fcntl(fd, cmd, arg)` | `F_GETFD`, `F_GETFL`; `F_SETFD` and `F_SETFL` are accepted and change nothing. |
+| 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
 | 96 | `gettimeofday(tv, tz)` | |
+| 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, recorded. |
+| 137 | `statfs(path, buf)` | One filesystem, in memory and read-only, reported as `tmpfs`. `ENOENT` for a path that does not exist. |
+| 149 | `mlock(addr, length)` | Memory is never paged out: checks the range and succeeds. |
+| 150 | `munlock(addr, length)` | The same. |
 | 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
@@ -108,9 +116,13 @@ Linux calls, with Linux's numbers:
 | 228 | `clock_gettime(clock, ts)` | Monotonic clocks count from boot. The real-time clock is time since boot counted from 2026-01-01: there is no clock chip driver yet. CPU-time clocks return time since boot. |
 | 230 | `clock_nanosleep(clock, flags, req, rem)` | With `TIMER_ABSTIME` too. |
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
+| 239 | `get_mempolicy(mode, nodemask, maxnode, addr, flags)` | One memory node, the default policy: mode 0 and an empty mask. No flags. |
 | 257 | `openat(dirfd, path, flags, mode)` | `AT_FDCWD` or an absolute path. |
+| 292 | `dup3(old, new, flags)` | `dup2`, with `EINVAL` if `old` is `new`. |
+| 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
 | 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
 | 318 | `getrandom(buf, len, flags)` | Never blocks. |
+| 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
 
 MyOS calls with no Linux equivalent yet. Their numbers start at
 `0x4D5900`, far above Linux's (which end below 500) and below the x32 bit
@@ -130,9 +142,10 @@ Every other number returns `ENOSYS`.
 - **Threads** share their process's address space, descriptors and signal
   handlers, and each has its own registers, FS and GS base and signal
   mask. `getpid` is the same in all of them, `gettid` different.
-- **Descriptors.** A process has 16: 0, 1 and 2 are the standard streams,
-  so 13 files can be open at once. `open` returns the lowest free one from 3
-  up. Descriptors are not inherited by programs started with `myos_run`.
+- **Descriptors.** A process has 16. It starts with 0, 1 and 2 open on the
+  console; they can be closed, duplicated and replaced like any other.
+  `open`, `dup` and `pipe2` return the lowest free one. Descriptors are
+  not inherited by programs started with `myos_run`.
 - **Counts** above `0x7ffff000` are shortened to that, as on Linux.
 - **Limits.** Every process has limits, inherited from the process that
   started it: 256 MiB of memory (its program, stack, page tables and kernel

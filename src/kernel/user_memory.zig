@@ -223,6 +223,45 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fd:
 }
 
 /// `munmap`.
+/// `mremap`: change the size of the mapping at `addr` from `old_length`
+/// to `new_length` and return its address.
+///
+/// Shrinking unmaps the end. Growing takes the addresses after the
+/// mapping if they are free; the new part is anonymous memory with the
+/// mapping's protection. A mapping is never moved: where Linux would move
+/// it (`MREMAP_MAYMOVE`), this fails with `ENOMEM` like growing without
+/// that flag does, and the caller maps anew and copies, which it has to
+/// be able to do anyway.
+///
+/// `EINVAL` for an unaligned address, a zero length, or flags other than
+/// `MREMAP_MAYMOVE`; `EFAULT` if the old range is not all mapped as one
+/// mapping; `ENOMEM` if it cannot grow where it is.
+pub fn mremap(p: *Process, addr: u64, old_length: u64, new_length: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, abi.MREMAP.MAYMOVE) != 0) return abi.err(.INVAL);
+    if (addr % PAGE != 0 or old_length == 0 or new_length == 0) return abi.err(.INVAL);
+    if (old_length > MAP_MAX or new_length > MAP_MAX) return abi.err(.NOMEM);
+    const old_len = std.mem.alignForward(u64, old_length, PAGE);
+    const new_len = std.mem.alignForward(u64, new_length, PAGE);
+    if (!mappable(addr, old_len)) return abi.err(.FAULT);
+
+    const held = p.mem.lock.acquire();
+    defer p.mem.lock.release(held);
+    const region = p.mem.regions.find(addr) orelse return abi.err(.FAULT);
+    if (region.end - addr < old_len) return abi.err(.FAULT);
+    if (new_len == old_len) return addr;
+    if (new_len < old_len) {
+        unmapLocked(p, addr + new_len, old_len - new_len) catch |e| return mapError(e);
+        return addr;
+    }
+    // Only the end of a mapping can grow, into free addresses.
+    const tail = addr + old_len;
+    const more = new_len - old_len;
+    if (tail != region.end or !mappable(tail, more) or tail + more > p.mem.mmap_top or
+        !p.mem.regions.isFree(tail, more)) return abi.err(.NOMEM);
+    p.mem.regions.add(heap.allocator, tail, more, region.prot, .anon) catch |e| return mapError(e);
+    return addr;
+}
+
 pub fn munmap(p: *Process, addr: u64, length: u64) u64 {
     if (length == 0 or addr % PAGE != 0 or length > MAP_MAX) return abi.err(.INVAL);
     const len = std.mem.alignForward(u64, length, PAGE);

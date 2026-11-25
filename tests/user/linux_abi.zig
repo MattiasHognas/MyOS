@@ -198,6 +198,46 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.poll, 8, 1, 0) == lib.err(.FAULT), 94);
     expect(lib.syscall(Sys.poll, @intFromPtr(&fds), 1, 20) == 0, 95); // waits out the 20 ms, nothing comes
 
+    // membarrier: the expedited private barrier is offered, registered and made.
+    const MB = abi.MEMBARRIER;
+    expect(lib.syscall(Sys.membarrier, MB.QUERY, 0, 0) == MB.PRIVATE_EXPEDITED | MB.REGISTER_PRIVATE_EXPEDITED, 100);
+    expect(lib.syscall(Sys.membarrier, MB.REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0, 101);
+    expect(lib.syscall(Sys.membarrier, MB.PRIVATE_EXPEDITED, 0, 0) == 0, 102);
+    expect(lib.syscall(Sys.membarrier, 1, 0, 0) == lib.err(.INVAL), 103); // the global one is not
+    expect(lib.syscall(Sys.membarrier, MB.PRIVATE_EXPEDITED, 1, 0) == lib.err(.INVAL), 104);
+
+    // sysinfo: there is memory, some of it free, and one process at least.
+    var info: abi.SysInfo = undefined;
+    expect(lib.syscall(Sys.sysinfo, @intFromPtr(&info), 0, 0) == 0, 105);
+    expect(info.mem_unit == 1 and info.totalram >= 16 << 20 and info.freeram != 0 and info.freeram < info.totalram, 106);
+    expect(info.procs >= 1 and info.totalswap == 0, 107);
+    expect(lib.syscall(Sys.sysinfo, 8, 0, 0) == lib.err(.FAULT), 108);
+
+    // statfs: the filesystem is in memory and read-only; a missing path is missing.
+    var fs: abi.StatFs = undefined;
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/etc/motd"), @intFromPtr(&fs), 0) == 0, 109);
+    expect(fs.type == abi.TMPFS_MAGIC and fs.bsize == 4096 and fs.flags & 1 == 1, 110);
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/"), @intFromPtr(&fs), 0) == 0, 111);
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs), 0) == lib.err(.NOENT), 112);
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/etc/motd"), 8, 0) == lib.err(.FAULT), 113);
+    expect(lib.syscall(Sys.statfs, 8, @intFromPtr(&fs), 0) == lib.err(.FAULT), 114);
+
+    // get_mempolicy: the default policy and no node chosen.
+    var mode: i32 = -1;
+    var mask: [2]u64 = .{ ~@as(u64, 0), ~@as(u64, 0) };
+    expect(lib.syscall6(Sys.get_mempolicy, @intFromPtr(&mode), @intFromPtr(&mask), 65, 0, 0, 0) == 0, 115);
+    expect(mode == 0 and mask[0] == 0 and mask[1] == 0, 116);
+    expect(lib.syscall6(Sys.get_mempolicy, 0, 0, 0, 0, 0, 0) == 0, 117);
+    expect(lib.syscall6(Sys.get_mempolicy, 8, 0, 0, 0, 0, 0) == lib.err(.FAULT), 118);
+    expect(lib.syscall6(Sys.get_mempolicy, @intFromPtr(&mode), 0, 0, 0, 1, 0) == lib.err(.INVAL), 119);
+
+    // mlock and munlock: nothing is ever paged out; the range must be the program's.
+    expect(lib.syscall(Sys.mlock, @intFromPtr(&mode), 4, 0) == 0 and lib.syscall(Sys.munlock, @intFromPtr(&mode), 4, 0) == 0, 120);
+    expect(lib.syscall(Sys.mlock, 0xFFFF_8000_0000_0000, 4096, 0) == lib.err(.NOMEM), 121);
+
+    // prctl: no option is known.
+    expect(lib.syscall(Sys.prctl, 15, 0, 0) == lib.err(.INVAL), 122);
+
     _ = lib.syscall(Sys.exit_group, 0, 0, 0);
     lib.exit(99); // exit_group returned
 }

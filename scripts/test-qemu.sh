@@ -213,6 +213,10 @@ run_scenario() {
             expect_line '^goroutines: 8 sum: 479976 cpus: [0-9]+$'
             expect_line '^GREETING=hi go$'
             if grep -q '^syscall trace: ' "$log"; then fail "a fixture made a call the kernel does not know: $(grep -m3 '^syscall trace: ' "$log" | tr '\n' ' ')"; fi
+            # A .NET program compiled ahead of time for Linux: managed threads, a GC.
+            expect_line '^hello from dotnet: 2 args$'
+            expect_line '^threads: 8 sum: 12188000 cpus: [0-9]+ collected: True$'
+            expect_line '^GREETING=hi dotnet$'
             # A Rust program built for Linux, with its standard library.
             expect_line '^hello from rust: 3 args$'
             expect_line '^argv\[2\]=MyOS$'

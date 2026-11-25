@@ -189,8 +189,32 @@ pub fn main() noreturn {
     expect(lib.mprotect(a + 15 * PAGE, 2 * PAGE, RW) == lib.err(.NOMEM) or lib.mprotect(a + 15 * PAGE, 2 * PAGE, RW) == 0, 62);
     expect(lib.syscall(Sys.madvise, hint, PAGE, abi.MADV.DONTNEED) == lib.err(.NOMEM), 63);
 
+    // --- mremap: a mapping shrinks and grows where it is.
+    const m = lib.mmap(0, 8 * PAGE, RW, 0);
+    bytes(m, 1)[0] = 0x5A;
+    bytes(m + 3 * PAGE, 1)[0] = 0x5B;
+    expect(lib.syscall6(Sys.mremap, m, 8 * PAGE, 4 * PAGE, 0, 0, 0) == m, 64); // the end goes
+    expect(lib.mprotect(m + 4 * PAGE, PAGE, RW) == lib.err(.NOMEM), 65);
+    expect(lib.syscall6(Sys.mremap, m, 4 * PAGE, 6 * PAGE, 0, 0, 0) == m, 66); // and comes back, empty
+    expect(bytes(m, 1)[0] == 0x5A and bytes(m + 3 * PAGE, 1)[0] == 0x5B and bytes(m + 5 * PAGE, 1)[0] == 0, 67);
+    expect(lib.syscall6(Sys.mremap, m, 6 * PAGE, 6 * PAGE, 0, 0, 0) == m, 68); // the same size
+    // Not into what is mapped already, with or without leave to move:
+    // mappings are not moved.
+    const stop = lib.mmap(m + 6 * PAGE, PAGE, RW, MAP.FIXED_NOREPLACE);
+    expect(stop == m + 6 * PAGE, 69);
+    expect(lib.syscall6(Sys.mremap, m, 6 * PAGE, 8 * PAGE, 0, 0, 0) == lib.err(.NOMEM), 71);
+    expect(lib.syscall6(Sys.mremap, m, 6 * PAGE, 8 * PAGE, abi.MREMAP.MAYMOVE, 0, 0) == lib.err(.NOMEM), 72);
+    // Nor the middle of a mapping; nor what is not mapped.
+    expect(lib.syscall6(Sys.mremap, m, 2 * PAGE, 3 * PAGE, 0, 0, 0) == lib.err(.NOMEM), 73);
+    expect(lib.syscall6(Sys.mremap, hint, PAGE, 2 * PAGE, 0, 0, 0) == lib.err(.FAULT), 74);
+    expect(lib.syscall6(Sys.mremap, m + 1, PAGE, 2 * PAGE, 0, 0, 0) == lib.err(.INVAL), 75);
+    expect(lib.syscall6(Sys.mremap, m, 0, PAGE, 0, 0, 0) == lib.err(.INVAL), 76);
+    expect(lib.syscall6(Sys.mremap, m, PAGE, 0, 0, 0, 0) == lib.err(.INVAL), 77);
+    expect(lib.syscall6(Sys.mremap, m, PAGE, 2 * PAGE, abi.MREMAP.FIXED, 0, 0) == lib.err(.INVAL), 78);
+    expect(lib.munmap(m, 7 * PAGE) == 0, 79);
+
     // --- The stack grows as it is used.
-    expect(recurse(512) < 512 * 256, 70); // half a megabyte
+    expect(recurse(512) < 512 * 256, 80); // half a megabyte
 
     lib.exit(0);
 }

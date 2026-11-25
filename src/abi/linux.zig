@@ -45,6 +45,11 @@ pub const Sys = struct {
     pub const sched_yield = 24;
     /// `madvise(addr, length, advice) -> 0`.
     pub const madvise = 28;
+    /// `dup(fd) -> new fd`, and `dup2(old, new)`.
+    pub const dup = 32;
+    pub const dup2 = 33;
+    /// `pipe(fds) -> 0`: a pipe's reading and writing descriptors.
+    pub const pipe = 22;
     /// `nanosleep(request, remaining) -> 0`.
     pub const nanosleep = 35;
     /// `getpid() -> id` of the calling process.
@@ -62,8 +67,18 @@ pub const Sys = struct {
     pub const fcntl = 72;
     /// `gettimeofday(tv, tz) -> 0`.
     pub const gettimeofday = 96;
+    /// `sysinfo(info) -> 0`: memory and uptime.
+    pub const sysinfo = 99;
+    /// `mremap(old, old_size, new_size, flags, new) -> address`: grow or
+    /// shrink a mapping where it is.
+    pub const mremap = 25;
     /// `sigaltstack(ss, old_ss) -> 0`: the stack signal handlers may run on.
     pub const sigaltstack = 131;
+    /// `statfs(path, buf) -> 0`: what kind of filesystem a path is on.
+    pub const statfs = 137;
+    /// `mlock(addr, length) -> 0` and `munlock`: memory is never paged out.
+    pub const mlock = 149;
+    pub const munlock = 150;
     /// `prctl(option, ...)`: no option is supported yet (`EINVAL`).
     pub const prctl = 157;
     /// `arch_prctl(code, addr)`: get or set the thread's FS or GS base (`ARCH`).
@@ -89,10 +104,20 @@ pub const Sys = struct {
     pub const tgkill = 234;
     /// `openat(dirfd, path, flags, mode) -> fd`.
     pub const openat = 257;
+    /// `pipe2(fds, flags) -> 0`: `pipe` with `O_NONBLOCK` and `O_CLOEXEC`.
+    pub const pipe2 = 293;
+    /// `dup3(old, new, flags) -> new`.
+    pub const dup3 = 292;
     /// `prlimit64(pid, resource, new, old) -> 0`.
     pub const prlimit64 = 302;
     /// `getrandom(buf, length, flags) -> bytes written`.
     pub const getrandom = 318;
+    /// `get_mempolicy(mode, nodemask, maxnode, addr, flags) -> 0`: there
+    /// is one memory node and the default policy.
+    pub const get_mempolicy = 239;
+    /// `membarrier(command, flags, cpu)`: make every CPU running the
+    /// process pass a memory barrier.
+    pub const membarrier = 324;
 
     /// First private (non-Linux) syscall number, far above Linux's range
     /// (under 500) and below the x32 bit (0x4000_0000). Milestone 6 replaces
@@ -147,6 +172,8 @@ pub const E = enum(u16) {
     NOSYS = 38,
     /// Illegal seek: the descriptor has no position.
     SPIPE = 29,
+    /// Broken pipe: nobody is left to read what is written.
+    PIPE = 32,
     /// The time ran out.
     TIMEDOUT = 110,
 };
@@ -188,6 +215,8 @@ pub const O = struct {
     pub const CREAT = 0o100;
     pub const TRUNC = 0o1000;
     pub const APPEND = 0o2000;
+    pub const NONBLOCK = 0o4000;
+    pub const CLOEXEC = 0o2000000;
 };
 
 /// The low 8 bits of an exit status are what the parent sees, as on Linux.
@@ -260,6 +289,12 @@ pub const PROT = struct {
     pub const EXEC = 4;
 };
 
+/// `mremap` flags.
+pub const MREMAP = struct {
+    pub const MAYMOVE = 1;
+    pub const FIXED = 2;
+};
+
 /// `mmap` flags.
 pub const MAP = struct {
     pub const SHARED = 0x01;
@@ -324,6 +359,8 @@ pub const PollFd = extern struct {
 pub const POLL = struct {
     pub const IN = 0x001;
     pub const OUT = 0x004;
+    pub const ERR = 0x008;
+    pub const HUP = 0x010;
     pub const NVAL = 0x020;
 };
 
@@ -381,7 +418,10 @@ pub const Stat = extern struct {
 
 /// File types in `Stat.mode`.
 pub const S = struct {
+    /// Mask of the file type bits.
+    pub const IFMT = 0o170000;
     pub const IFCHR = 0o020000;
+    pub const IFIFO = 0o010000;
     pub const IFREG = 0o100000;
 };
 
@@ -411,3 +451,49 @@ pub const RLIMIT = struct {
     pub const STACK = 3;
     pub const NOFILE = 7;
 };
+
+/// `membarrier` commands.
+pub const MEMBARRIER = struct {
+    pub const QUERY = 0;
+    pub const PRIVATE_EXPEDITED = 1 << 3;
+    pub const REGISTER_PRIVATE_EXPEDITED = 1 << 4;
+};
+
+/// `struct sysinfo`.
+pub const SysInfo = extern struct {
+    uptime: i64 = 0,
+    loads: [3]u64 = .{ 0, 0, 0 },
+    totalram: u64 = 0,
+    freeram: u64 = 0,
+    sharedram: u64 = 0,
+    bufferram: u64 = 0,
+    totalswap: u64 = 0,
+    freeswap: u64 = 0,
+    procs: u16 = 0,
+    _pad: u16 = 0,
+    _pad2: u32 = 0,
+    totalhigh: u64 = 0,
+    freehigh: u64 = 0,
+    /// Size of the unit the memory fields are in, in bytes.
+    mem_unit: u32 = 1,
+    _reserved: u32 = 0,
+};
+
+/// `struct statfs`.
+pub const StatFs = extern struct {
+    type: i64 = 0,
+    bsize: i64 = 4096,
+    blocks: u64 = 0,
+    bfree: u64 = 0,
+    bavail: u64 = 0,
+    files: u64 = 0,
+    ffree: u64 = 0,
+    fsid: [2]i32 = .{ 0, 0 },
+    namelen: i64 = 255,
+    frsize: i64 = 4096,
+    flags: i64 = 1, // read-only
+    spare: [4]i64 = .{ 0, 0, 0, 0 },
+};
+/// The magic number of a RAM-backed filesystem (`TMPFS_MAGIC`), which is
+/// the nearest thing to the initrd.
+pub const TMPFS_MAGIC = 0x01021994;

@@ -48,7 +48,7 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.write, 1, NEAR_USER_END, 32) == err(.FAULT)); // 2
     expect(lib.syscall(Sys.write, 1, bufp, 0) == 0); // 3
     expect(lib.syscall(Sys.write, 2, bufp, 0) == 0); // 4: stderr is the console too
-    expect(lib.syscall(Sys.write, 0, bufp, 4) == err(.BADF)); // 5: stdin
+    expect(lib.syscall(Sys.write, 0, bufp, 0) == 0); // 5: descriptor 0 is open on the console as well
     expect(lib.syscall(Sys.write, 99, bufp, 4) == err(.BADF)); // 6
     expect(lib.syscall(Sys.write, ~@as(u64, 0), bufp, 4) == err(.BADF)); // 7
     // A count over the 2 GiB limit is shortened to it; here the shortened
@@ -106,9 +106,10 @@ pub fn main() noreturn {
 
     // Unknown numbers fail with ENOSYS: unassigned Linux numbers, MyOS's old
     // numbers that Linux uses for calls MyOS lacks, the x32 range, garbage.
-    for ([_]u64{ 4, 6, 22, 41, 57, 59, 61, 999, lib.Sys.PRIVATE_BASE + 2, 0x4000_0001, ~@as(u64, 0) }) |n| {
-        expect(lib.syscall(n, 0, 0, 0) == err(.NOSYS)); // 49-59
+    for ([_]u64{ 4, 6, 41, 57, 59, 61, 999, lib.Sys.PRIVATE_BASE + 2, 0x4000_0001, ~@as(u64, 0) }) |n| {
+        expect(lib.syscall(n, 0, 0, 0) == err(.NOSYS)); // 49-58
     }
+    check_no += 1; // keeps the numbers below
 
     // run: bad paths and files that are not programs.
     expect(lib.run("/does/not/exist") == err(.NOENT)); // 60

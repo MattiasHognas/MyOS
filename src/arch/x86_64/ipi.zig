@@ -53,6 +53,10 @@ pub const Request = union(enum) {
     /// Stop using the address space `root`: a CPU that has it loaded
     /// switches to the kernel's own page tables.
     unload_root: u64,
+    /// Nothing but to have been interrupted: taking the interrupt and
+    /// returning from it is a full memory barrier on that CPU, which is
+    /// what `membarrier` promises a program.
+    barrier,
 };
 
 /// Held by the CPU whose request is in flight.
@@ -94,6 +98,7 @@ pub fn poll() void {
         .flush_kernel => |r| vmm.flushLocal(r.start, r.pages),
         .flush_user => |r| if (c.loaded_root == r.root) vmm.flushLocal(r.start, r.pages),
         .unload_root => |root| if (c.loaded_root == root) vmm.loadRoot(vmm.kernel_root),
+        .barrier => {},
     }
     @atomicStore(bool, &c.ipi_pending, false, .release); // last: the sender goes on
 }

@@ -945,6 +945,22 @@ fn threadsAndFutexes() TestError!void {
     try check(helpers.footprint().eql(memory)); // every thread, stack and futex waiter is gone
 }
 
+/// Descriptors that are more than files: the standard streams, `dup`,
+/// pipes with their waiting and their ends; and a process that ends with
+/// a thread asleep in a pipe takes the thread and the pipe with it.
+fn descriptorsAndPipes() TestError!void {
+    _ = helpers.runProgram("/test/pipes"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/pipes") orelse return error.Failed;
+    if (code != 0) report("/test/pipes failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/pipes"));
+    const status = helpers.runProgramArgs("/test/pipes", &.{ "pipes", "blocked" }, &.{}) orelse return error.Failed;
+    if (status != 9) report("/test/pipes blocked exit status", status);
+    try check(status == 9);
+    try check(helpers.footprint().eql(memory)); // open files and pipes are all gone
+}
+
 /// A multi-threaded C program built for Linux against musl runs: eight
 /// pthreads with a mutex, a condition variable, a barrier, thread-local
 /// storage, a timed wait and joins. It checks its own numbers and says
@@ -989,6 +1005,22 @@ fn goHello() TestError!void {
     try check(code == 3);
     try check(helpers.runPairExpect("/fixtures/go-hello-static", 1)); // two runtimes at once
     try check(helpers.footprint().eql(memory)); // its threads, its reservations, all gone
+}
+
+/// A .NET program compiled ahead of time for Linux (Native AOT, linked
+/// statically against musl) runs: the runtime starts, managed threads
+/// allocate, the garbage collector stops them and collects. The host
+/// script checks what it printed.
+fn dotnetHello() TestError!void {
+    _ = helpers.runProgramArgs("/fixtures/dotnet-hello-static", &.{"dotnet-hello"}, &.{}); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    helpers.traceUnknownSyscalls(true);
+    defer helpers.traceUnknownSyscalls(false);
+    const code = helpers.runProgramArgs("/fixtures/dotnet-hello-static", &.{ "dotnet-hello", "from", "MyOS" }, &.{"GREETING=hi dotnet"}) orelse return error.Failed;
+    if (code != 2) report("dotnet hello exit status", code);
+    try check(code == 2); // .NET's `args` leaves the program's name out
+    try check(helpers.runPairExpect("/fixtures/dotnet-hello-static", 0)); // two runtimes at once
+    try check(helpers.footprint().eql(memory)); // its threads, its heap, its pipe: all gone
 }
 
 /// Programs run, are preempted, crash and are torn down on every CPU at once.
@@ -1623,6 +1655,8 @@ fn runCases() noreturn {
         .{ .name = "a multi-threaded musl program built for Linux runs (pthreads: mutex, condvar, barrier, TLS, join)", .func = muslThreads },
         .{ .name = "a static Rust program built for Linux runs (std: arguments, environment, allocation, println)", .func = rustHello },
         .{ .name = "a Go program built for Linux runs (runtime threads, goroutines, channel, GC)", .func = goHello },
+        .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
+        .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },
         .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms },

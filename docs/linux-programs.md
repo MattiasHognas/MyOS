@@ -10,10 +10,20 @@ The programs are the smallest ones each toolchain produces, statically
 linked. `tests/fixtures/` will hold them with the commands that built them
 ([roadmap 4.3](todo.md#43-fixtures)).
 
-Measured on 2026-11-25 with Zig's bundled musl, Go 1.27 and Rust 1.95. The
-.NET Native AOT program and the Rust program linked against musl are still
-to be measured; so is which of the calls must really work and which may
-fail (the Loupe method, [research](research.md)).
+Measured on 2026-11-25 with Zig's bundled musl, Go 1.27 and Rust 1.95.
+Which of the calls must really work and which may fail is still to be
+measured (the Loupe method, [research](research.md)).
+
+The .NET Native AOT program (.NET 10, linux-musl, static) was not traced
+into the table; it was run on MyOS with every unknown call logged
+(`syscall.trace_unknown`) until none was left. Beyond what Go and Rust
+use it asked for: `pipe2` (the console setup makes one), `fcntl` with
+real descriptors behind 0, 1 and 2, `membarrier` (and `mlock` if that is
+missing), `sysinfo`, `statfs` (it looks for control groups), `mremap`
+(musl measures the main thread's stack with it, and loops for ever on an
+answer other than `EFAULT` below the stack), and `get_mempolicy`. It
+opens `/proc/self/mountinfo`, `/proc/self/cgroup`, `/proc/meminfo` and
+files under `/sys/devices/system/cpu`, and goes on without them.
 
 ## System calls, by program
 
@@ -71,7 +81,8 @@ for the time.
 | C with pthreads, static, musl | Runs, its threads on several CPUs (`tests/fixtures/bin/musl-threads-static`) |
 | The same as position-independent executables | Needs `ET_DYN` loading (4.1) |
 | Go, static | Runs: the runtime's threads, goroutines on every CPU, a channel, a garbage collection (`tests/fixtures/bin/go-hello-static`). No signal has to be delivered for that; the runtime sends itself some (to preempt goroutines that do not yield) and carries on when they do not arrive |
-| .NET Native AOT | Not measured yet |
+| .NET Native AOT, static, musl, fixed address | Runs: the runtime, eight managed threads that allocate, a garbage collection that stops them (`tests/fixtures/bin/dotnet-hello-static`). No signal has to be delivered: the collector stops threads through `membarrier` and the checks compiled into managed code |
+| .NET as its tools build it (`dotnet publish -r linux-x64 --self-contained`) | The goal ([roadmap 9](todo.md)). Dynamically linked against glibc: needs `ET_DYN` and `PT_INTERP` loading, file-backed `mmap`, glibc in the image, and for the JIT runtime signals |
 
 ## What this means for the order of work
 
