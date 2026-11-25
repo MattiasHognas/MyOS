@@ -360,7 +360,7 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [ ] Give the kernel heap size classes with a per-CPU cache of free objects, replacing the first-fit list under one lock (`docs/research.md`: magazines, snmalloc).
 - [ ] Preempt on wake-up, or otherwise bound how long a woken thread waits: with every CPU busy it goes to the tail of the queue and waits for a running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
 - [x] Stress-test simultaneous allocations, processes, interrupts, and I/O. Three tests run with every CPU taking threads:
-  - programs: eight threads each run seven programs (extended state, long syscalls, a crash, fresh memory), so processes start, are preempted, move between CPUs, die and are torn down everywhere at once, and memory is back afterwards;
+  - programs: six threads each run seven programs (extended state, long syscalls, a crash, fresh memory), so processes start, are preempted, move between CPUs, die and are torn down everywhere at once, and memory is back afterwards;
   - the kernel: eight threads use the page allocator, the heap, kernel stacks, a spinlock, a mutex and a wait queue with timeouts that run out as the wake-up comes (the timer fires on the boot CPU, the waker runs anywhere);
   - the TLB: threads on every CPU read a kernel page until it is in their TLBs, then it is unmapped and replaced, and nobody may see the old page.
   - Not covered: I/O, of which there is none to do in parallel yet.

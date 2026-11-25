@@ -37,6 +37,8 @@
 //! - Running out of memory is an error to the caller, never a panic, once
 //!   boot is over.
 
+const std = @import("std");
+
 const limine = @import("../../boot/limine.zig");
 const cpu = @import("cpu.zig");
 const assert = @import("../../kernel/debug/assert.zig");
@@ -67,6 +69,17 @@ pub const PCD: u64 = 1 << 4;
 
 // Separate from the HHDM, so these 4 KiB mappings never collide with its 2 MiB pages.
 var mmio_next: usize = 0xFFFF_A000_0000_0000;
+/// Page tables added to the kernel half since `init`, minus those freed
+/// again: what the heap, the kernel stacks and the device window have had
+/// to add to map their memory. For accounting (tests compare memory use
+/// before and after; the heap never gives its tables back).
+var kernel_table_pages: std.atomic.Value(usize) = .init(0);
+
+/// See `kernel_table_pages`.
+pub fn kernelTablePages() usize {
+    return kernel_table_pages.load(.monotonic);
+}
+
 /// Protects the device window: `mmio_next` and the page tables under it.
 var mmio_lock: SpinLock = .{ .rank = .kernel_region };
 
@@ -173,11 +186,13 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) MapError!voi
     // Entries this call filled in with new tables, outermost first.
     var created: [3]*u64 = undefined;
     var created_len: usize = 0;
+    const kernel_half = virt >= KERNEL_BASE and kernel_root != 0 and root == kernel_root;
     errdefer while (created_len > 0) {
         created_len -= 1;
         const entry = created[created_len];
         pmm.free(entry.* & ADDR_MASK);
         entry.* = 0;
+        if (kernel_half and counting_tables) _ = kernel_table_pages.fetchSub(1, .monotonic);
     };
 
     var t = table(root);
@@ -188,6 +203,7 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) MapError!voi
             entry.* = (try allocTable()) | PRESENT | WRITABLE | USER;
             created[created_len] = entry;
             created_len += 1;
+            if (kernel_half and counting_tables) _ = kernel_table_pages.fetchAdd(1, .monotonic);
         } else if (entry.* & HUGE != 0) return error.AlreadyMapped; // inside a 2 MiB page
         t = table(entry.* & ADDR_MASK);
     }
@@ -235,6 +251,7 @@ fn pruneTables(root: u64, virt: u64) void {
         const parent = &tables[level + 1][index(virt, level + 1)];
         pmm.free(parent.* & ADDR_MASK);
         parent.* = 0;
+        if (virt >= KERNEL_BASE and root == kernel_root) _ = kernel_table_pages.fetchSub(1, .monotonic);
     }
 }
 
@@ -483,7 +500,11 @@ pub fn init(mm: *const limine.MemmapResponse, k: *const limine.KernelAddressResp
 
     enterKernelTables();
     noteKernelTables();
+    counting_tables = true; // the tables built here are the baseline
 }
+
+/// False while `init` builds the kernel's first page tables.
+var counting_tables = false;
 
 /// Move this CPU from the bootloader's page tables to the kernel's: allow
 /// the NX bit, which they use, and load them. Global pages go off for the

@@ -44,7 +44,8 @@ boot (the test kernel prints `MYOS_KERNEL_SLIDE`): with KASLR the addresses
 must not all be the same.
 
 Run a subset with `scripts/test-qemu.sh tests panic` (after `zig build test-kernel`
-and `zig build`). The timeout per boot is 45 s, or `MYOS_QEMU_TIMEOUT` seconds.
+and `zig build`). A boot that takes longer than 180 s (or `MYOS_QEMU_TIMEOUT` seconds) is
+ended as hung; the suite takes 15 to 30 s on a developer's machine.
 
 Each scenario keeps its logs in `zig-out/test/<scenario>/serial.log` (raw) and
 `serial-clean.log` (CR removed). When a check fails, the script prints the

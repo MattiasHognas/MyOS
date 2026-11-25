@@ -54,10 +54,28 @@ fn drawGlyph(c: u8, cx: usize, cy: usize) void {
 }
 
 /// Move every text row up by one and clear the bottom row.
+///
+/// The move is one `rep movsl` (source above destination, so copying
+/// upwards is safe). A copy loop in Zig does the same on a real CPU, but
+/// under QEMU's emulation its speed depends on where the linker happens to
+/// put it: when the loop straddles a page boundary it runs at half speed,
+/// and since nearly every line printed scrolls the screen, so does
+/// everything that prints. That made test runs twice as slow from one
+/// build to the next for no reason in the code.
 fn scroll() void {
     const line_px = stride * font.h;
     const total = line_px * rows;
-    std.mem.copyForwards(u32, fb[0 .. total - line_px], fb[line_px..total]);
+    var dst: [*]u32 = fb;
+    var src: [*]u32 = fb + line_px;
+    var count: usize = total - line_px;
+    asm volatile ("rep movsl"
+        : [dst] "={rdi}" (dst),
+          [src] "={rsi}" (src),
+          [count] "={rcx}" (count),
+        : [d] "{rdi}" (dst),
+          [s] "{rsi}" (src),
+          [c] "{rcx}" (count),
+        : .{ .memory = true });
     @memset(fb[total - line_px .. total], bg);
 }
 

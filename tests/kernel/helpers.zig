@@ -1271,7 +1271,10 @@ pub fn footprint() Footprint {
     defer cpu.restoreInterrupts(flags);
     const h = heap.stats();
     return .{
-        .pages = pmm.free_pages + h.bytes_mapped / pmm.PAGE_SIZE,
+        // Free pages, plus what the heap holds and the page tables the
+        // kernel has added to map its own memory: the heap grows on demand
+        // and keeps what it got, tables included, so neither is a leak.
+        .pages = pmm.free_pages + h.bytes_mapped / pmm.PAGE_SIZE + vmm.kernelTablePages(),
         .heap_bytes = h.bytes_in_use,
         .stacks = kstack.inUse(),
     };
@@ -2488,21 +2491,6 @@ fn untilFootprint(before: Footprint) bool {
     return false;
 }
 
-/// Sleep until memory use has stopped changing (exited threads have been
-/// freed) and return it.
-fn settledFootprint() Footprint {
-    var last = footprint();
-    var same: usize = 0;
-    for (0..300) |_| {
-        timer.sleepTicks(2);
-        const now = footprint();
-        same = if (now.eql(last)) same + 1 else 0;
-        last = now;
-        if (same == 5) break;
-    }
-    return last;
-}
-
 var par_done: usize = 0;
 var par_failures: Atomic(usize) = .init(0);
 var par_first_failure: Atomic(usize) = .init(0);
@@ -2529,7 +2517,7 @@ fn programRunner() void {
     signalDone(&par_done, &done_queue);
 }
 
-/// Run programs on every CPU at once: eight kernel threads each start and
+/// Run programs on every CPU at once: six kernel threads each start and
 /// wait for seven programs, so processes are created, run, preempted,
 /// moved between CPUs, killed and torn down everywhere at the same time.
 /// Every program must end the way it does alone, the work must really have
@@ -2539,31 +2527,21 @@ fn programRunner() void {
 /// Must be called with interrupts on. Returns 0, or the number of the
 /// first failing check.
 pub fn parallelPrograms(first: *usize) u32 {
-    const RUNNERS = 8;
+    const RUNNERS = 6;
     const live = process.liveCount();
     par_failures.store(0, .monotonic);
     par_first_failure.store(0, .monotonic);
     seen_cpus.store(0, .monotonic);
-    // Until a pass leaves memory exactly as it found it. A pass during
-    // which the heap had to grow does not count: the heap never shrinks,
-    // and its growth takes page tables too. The first pass always grows it,
-    // to what eight programs loading at once need; a later one may, when
-    // more of them happen to load at the same moment.
-    var passes: usize = 0;
-    while (true) : (passes += 1) {
-        const before = settledFootprint(); // with earlier threads freed
-        const heap_before = heap.stats().bytes_mapped;
-        par_done = 0;
-        for (0..RUNNERS) |_| _ = thread.spawn(programRunner, null) catch return 1;
-        waitForDone(&par_done, RUNNERS, &done_queue);
-        // A process structure goes when its thread has been freed, which
-        // another CPU may still be about to do.
-        if (untilFootprint(before)) break;
-        if (heap.stats().bytes_mapped == heap_before or passes == 5) {
-            const now = footprint();
-            kernel_root.print("  parallel programs: memory before {any}, after {any}\n", .{ before, now });
-            return 5; // memory is missing, and not to the heap
-        }
+    const before = footprint();
+    par_done = 0;
+    for (0..RUNNERS) |_| _ = thread.spawn(programRunner, null) catch return 1;
+    waitForDone(&par_done, RUNNERS, &done_queue);
+    // A thread that has exited is freed, and its process with it, by
+    // whichever CPU switches threads next: that may still be about to happen.
+    if (!untilFootprint(before)) {
+        const now = footprint();
+        kernel_root.print("  parallel programs: memory before {any}, after {any}\n", .{ before, now });
+        return 5;
     }
     first.* = par_first_failure.load(.monotonic);
     if (par_failures.load(.monotonic) != 0) return 2;

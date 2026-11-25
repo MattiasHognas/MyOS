@@ -49,7 +49,9 @@ bash scripts/build.sh --package-test
 
 out="zig-out/test"
 iso="$out/os.iso"
-timeout_s="${MYOS_QEMU_TIMEOUT:-45}"
+# Only there to end a boot that hangs: a full run takes 15 to 30 s on a
+# developer's machine and two to three times that on a CI runner.
+timeout_s="${MYOS_QEMU_TIMEOUT:-180}"
 
 # Boot one scenario on the CPU model $2 (default: max, every feature QEMU
 # emulates; "host" runs on the host's CPU with KVM) with $3 CPUs (default:
