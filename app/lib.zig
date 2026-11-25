@@ -92,6 +92,26 @@ pub fn brk(addr: u64) u64 {
     return syscall(Sys.brk, addr, 0, 0);
 }
 
+/// Pages from the kernel, for the allocator.
+const MappedPages = struct {
+    pub fn map(len: usize) ?[*]u8 {
+        const addr = mmap(0, len, abi.PROT.READ | abi.PROT.WRITE, 0);
+        return if (isError(addr)) null else @ptrFromInt(addr);
+    }
+
+    pub fn unmap(ptr: [*]u8, len: usize) void {
+        _ = munmap(@intFromPtr(ptr), len);
+    }
+};
+
+var heap_state: @import("alloc.zig").Allocator(MappedPages) = .{};
+
+/// The program's heap: a `std.mem.Allocator` on top of `mmap`
+/// (`alloc.zig`), for the standard library's containers and for
+/// `allocator.alloc`/`create`/`free`. For one thread; a program with
+/// threads puts a lock around its use.
+pub const allocator: std.mem.Allocator = heap_state.allocator();
+
 /// Give the CPU to another ready thread.
 pub fn yield() void {
     _ = syscall(Sys.sched_yield, 0, 0, 0);

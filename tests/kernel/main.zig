@@ -1128,6 +1128,18 @@ fn filesAndProc() TestError!void {
     try expectFootprint(memory); // generated files and grown tables are freed
 }
 
+/// The heap of MyOS's own programs: the standard library's containers on
+/// the user library's allocator, which sits on `mmap`.
+fn programHeap() TestError!void {
+    _ = helpers.runProgram("/test/alloc"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/alloc") orelse return error.Failed;
+    if (code != 0) report("/test/alloc failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/alloc"));
+    try expectFootprint(memory);
+}
+
 /// A multi-threaded C program built for Linux against musl runs: eight
 /// pthreads with a mutex, a condition variable, a barrier, thread-local
 /// storage, a timed wait and joins. It checks its own numbers and says
@@ -1829,6 +1841,7 @@ fn runCases() noreturn {
         .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
+        .{ .name = "the program heap: standard containers on the user library's allocator (ring 3)", .func = programHeap },
         .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },
         .{ .name = "on every CPU at once: allocators, locks, wait queues with timeouts, kernel stacks", .func = kernelStress },

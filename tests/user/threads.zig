@@ -257,6 +257,29 @@ fn outlives(code: usize) callconv(.c) u32 {
     return @intCast(code); // the last thread's exit status is the process's
 }
 
+const FAULT_PAGES = 512;
+var fault_area: u64 = 0;
+var fault_go: std.atomic.Value(u32) = .init(0);
+var fault_wrong: std.atomic.Value(u32) = .init(0);
+
+/// Touch every page of `fault_area`, in an order of this thread's own so
+/// that the threads meet on pages rather than follow each other.
+fn touches(index: usize) callconv(.c) u32 {
+    while (fault_go.load(.acquire) == 0) _ = futex(&fault_go, FUTEX.WAIT, 0, null);
+    for (0..FAULT_PAGES) |n| {
+        const page = if (index % 2 == 0) n else FAULT_PAGES - 1 - n;
+        const bytes: [*]volatile u8 = @ptrFromInt(fault_area + page * 4096);
+        // What is there is zero, or another thread's mark in its own place.
+        for (0..4) |other| {
+            const seen = bytes[other * 64];
+            if (seen != 0 and seen != other + 1) fault_wrong.store(1, .release);
+        }
+        if (bytes[4095] != 0) fault_wrong.store(1, .release);
+        bytes[index * 64] = @intCast(index + 1);
+    }
+    return 0;
+}
+
 var marked: std.atomic.Value(u32) = .init(0);
 
 fn marks(value: usize) callconv(.c) u32 {
@@ -354,37 +377,58 @@ pub fn main() noreturn {
     expect(clone_raw(THREAD_FLAGS | CLONE_SETTLS, 0, 0, 0, 0xFFFF_8000_0000_0000) == lib.err(.PERM), 42);
     expect(clone_raw(THREAD_FLAGS | CLONE_PARENT_SETTID, 0, 8, 0, 0) == lib.err(.FAULT), 43); // nowhere to write the ID
 
+    // --- Page faults on several CPUs at once in one address space: four
+    // threads go through the same untouched memory, so that the same page
+    // is asked for by more than one of them at the same moment. Each must
+    // find zeroes or what another has written, never anything else, and
+    // nothing any of them wrote may be lost.
+    fault_area = lib.mmap(0, FAULT_PAGES * 4096, abi.PROT.READ | abi.PROT.WRITE, 100);
+    expect(!lib.isError(fault_area), 130);
+    fault_wrong.store(0, .release);
+    fault_go.store(0, .release);
+    for (&handles, 0..) |*h, i| expect(!lib.isError(start(h, touches, i)), 131);
+    fault_go.store(1, .release);
+    _ = futex(&fault_go, FUTEX.WAKE, 4, null);
+    for (&handles) |*h| join(h);
+    expect(fault_wrong.load(.acquire) == 0, 132);
+    for (0..FAULT_PAGES) |page| {
+        const bytes: [*]const u8 = @ptrFromInt(fault_area + page * 4096);
+        for (0..handles.len) |i| expect(bytes[i * 64] == i + 1, 133); // every thread's mark is there
+        expect(bytes[4095] == 0, 134);
+    }
+    expect(lib.munmap(fault_area, FAULT_PAGES * 4096) == 0, 135);
+
     // --- clone3: the same thread, asked for with a structure.
     const all_flags = THREAD_FLAGS | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
     const tid3 = start3(&handles[0], marks, 77, @sizeOf(abi.CloneArgs), all_flags);
-    expect(!lib.isError(tid3) and tid3 != 0, 40);
+    expect(!lib.isError(tid3) and tid3 != 0, 140);
     join(&handles[0]);
-    expect(marked.load(.acquire) == 77, 41);
+    expect(marked.load(.acquire) == 77, 141);
     // A later, longer version of the structure with nothing in the new fields.
-    expect(!lib.isError(start3(&handles[0], marks, 78, @sizeOf(abi.CloneArgs) + 16, all_flags)), 42);
+    expect(!lib.isError(start3(&handles[0], marks, 78, @sizeOf(abi.CloneArgs) + 16, all_flags)), 142);
     join(&handles[0]);
-    expect(marked.load(.acquire) == 78, 43);
+    expect(marked.load(.acquire) == 78, 143);
     // What is refused: nothing below starts a thread.
     var ca: extern struct { known: abi.CloneArgs, later: [2]u64 } = .{
         .known = .{ .flags = all_flags, .pidfd = 0, .child_tid = 0, .parent_tid = 0, .exit_signal = 0, .stack = 0, .stack_size = 0, .tls = 0 },
         .later = .{ 0, 1 },
     };
     const cap = @intFromPtr(&ca);
-    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs) + 16, 0) == lib.err(.INVAL), 44); // a field this kernel does not know
-    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs) - 8, 0) == lib.err(.INVAL), 45); // shorter than the first version
-    expect(lib.syscall(Sys.clone3, cap, 8192, 0) == lib.err(.INVAL), 46);
-    expect(lib.syscall(Sys.clone3, 8, @sizeOf(abi.CloneArgs), 0) == lib.err(.FAULT), 47);
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs) + 16, 0) == lib.err(.INVAL), 144); // a field this kernel does not know
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs) - 8, 0) == lib.err(.INVAL), 145); // shorter than the first version
+    expect(lib.syscall(Sys.clone3, cap, 8192, 0) == lib.err(.INVAL), 146);
+    expect(lib.syscall(Sys.clone3, 8, @sizeOf(abi.CloneArgs), 0) == lib.err(.FAULT), 147);
     ca.known.flags = CLONE_VM; // a process of its own: no fork yet
-    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 48);
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 148);
     ca.known.flags = all_flags;
     ca.known.exit_signal = 17;
-    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 49);
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 149);
     ca.known.exit_signal = 0;
     ca.known.stack_size = 4096; // a size and no stack
-    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 55);
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 155);
     ca.known.stack = ~@as(u64, 0xFFF); // the end wraps around
     ca.known.stack_size = 8192;
-    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 56);
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 156);
 
     // --- Time, and the number of CPUs.
     const before = nowNs();
@@ -395,8 +439,8 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.clock_gettime, 99, @intFromPtr(&real), 0) == lib.err(.INVAL), 52);
     var seconds: i64 = 0;
     const t = lib.syscall(Sys.time, @intFromPtr(&seconds), 0, 0);
-    expect(t >= @as(u64, @intCast(real.sec)) and t <= @as(u64, @intCast(real.sec)) + 2 and seconds == @as(i64, @intCast(t)), 57);
-    expect(lib.syscall(Sys.time, 0, 0, 0) >= t and lib.syscall(Sys.time, 8, 0, 0) == lib.err(.FAULT), 58);
+    expect(t >= @as(u64, @intCast(real.sec)) and t <= @as(u64, @intCast(real.sec)) + 2 and seconds == @as(i64, @intCast(t)), 157);
+    expect(lib.syscall(Sys.time, 0, 0, 0) >= t and lib.syscall(Sys.time, 8, 0, 0) == lib.err(.FAULT), 158);
     var mask: u64 = 0;
     expect(lib.syscall(Sys.sched_getaffinity, 0, 8, @intFromPtr(&mask)) == 8 and mask & 1 == 1, 53);
     expect(lib.syscall(Sys.sched_getaffinity, 0, 4, @intFromPtr(&mask)) == lib.err(.INVAL), 54);

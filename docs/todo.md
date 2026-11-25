@@ -396,13 +396,13 @@ This is the smallest end-to-end slice of Linux compatibility. It comes early on 
   - `arch_prctl(ARCH_SET_GS)` and `ARCH_SET_FS` must refuse addresses outside user space.
   - The kernel does not set up the TLS block from `PT_TLS`: on Linux the C library does that itself, from the program headers it finds through `AT_PHDR`.
 - [x] Extend the syscall ABI document from 2.5 with the startup stack, the auxiliary vector and TLS.
-- [ ] Test empty, long, invalid, and multi-argument commands, and check the stack layout from ring 3.
+- [x] Test empty, long, invalid, and multi-argument commands, and check the stack layout from ring 3: the command-line splitter on the host (`tests/host/cmdline_test.zig`), the stack from ring 3 with an argument that has a space and one that is empty (`/test/linux_abi`), and argument lists too long or too many, which are refused with nothing started.
 
 ### 4.2 Minimal syscall set
 - [x] Return `-ENOSYS` for unknown syscalls and add a syscall trace option that logs them, to see what a program still needs: `syscall.trace_unknown`, which the tests turn on around the fixtures; the test script fails if a fixture made a call the kernel does not know. `syscall.trace_all` logs every call with its arguments and its result, for finding where a program is stuck.
 - [ ] Record what the target programs really ask for (musl C, Rust and Go are in `docs/linux-programs.md`; the .NET program and the Loupe runs are open): run the fixture binaries (musl hello, a Go hello, the .NET Native AOT hello and a GC workload) under `strace -f` on Linux and keep the list of syscalls and files in `docs/`. Use it to order the work in milestones 5 to 9.
   - Run them under Loupe as well (`docs/research.md`): it finds which of those calls must really work, which may return `ENOSYS` and which may pretend to succeed. That, not the bare list, is the work order.
-- [ ] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
+- [x] Add the calls a static musl hello-world makes: `writev`, `exit_group`, `set_tid_address`, `brk`, a minimal anonymous `mmap` (milestone 5 replaces it), and `ioctl` answering `-ENOTTY`.
   - Done: `writev`, `exit_group`, `set_tid_address`, `ioctl` and `arch_prctl`, which is all the hello-world calls, and `brk` and `mmap` with milestone 5.
 - [x] Add the calls a static Rust program makes before `main` on top of those: `poll` (it checks that its standard streams are open), and `rt_sigaction`, `rt_sigprocmask` and `sigaltstack`, which record what is set and return it; nothing is delivered until milestone 8. A Rust hello-world with its standard library, linked statically against musl, runs (`tests/fixtures/src/hello.rs`).
 
@@ -426,16 +426,16 @@ Designed once, demand-paged from the start, instead of an eager `mmap` first and
   - Decided: a list of regions per process next to the page tables, under one lock per address space (`vm_regions.zig`, `user_memory.zig`). The regions say what a fault means without reading page tables, and reserving a gigabyte costs one entry. One lock is right while a process has one thread; it is the thing to revisit when many threads of one process fault at once (7), and the two designs in the research notes are the candidates then.
 - [x] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults. Tested on the host against a page-by-page model.
 - [x] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
-- [ ] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
+- [x] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
   - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations; `mremap` that shrinks and grows in place. Private file-backed mappings since 9.3. Open: `mremap` that moves a mapping (`MREMAP_MAYMOVE` gets `ENOMEM` today, and allocators copy instead).
 - [x] Implement `mprotect`, `munmap` of partial ranges, `madvise(MADV_DONTNEED)` and `brk`, with resource reclamation.
 - [x] Charge every page a process gets after it has started against its memory limit (`process.Limits.max_pages`, 2.6): pages given on demand to `mmap`, `brk` and stack growth, and the page tables they need; give the charge back on `munmap`. Today the limit is only checked when the program is loaded, because nothing else can allocate. A request over the limit fails with `ENOMEM`; a page fault over it follows the out-of-memory policy below. Test that the charge always equals what left the allocator, as the 2.6 test does at start.
 - [x] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes). The stack's region is 8 MiB, Linux's default limit; below it 1 MiB is kept free of mappings.
 - [x] Shoot down TLB entries on the other CPUs on `munmap` and `mprotect` (3.4).
 - [x] Define the out-of-memory policy: when a page fault cannot be given a page, the process is killed and the kernel carries on; tie it to the per-process limits of 2.6.
-- [ ] Add a small userspace allocator for the Zig programs on top of `mmap`.
-- [ ] Test reserve-then-commit of a multi-gigabyte range, permission changes, partial unmaps, faults on `PROT_NONE` pages, stack growth up to its limit, the out-of-memory kill, and page faults on several CPUs at once in one address space (once threads exist, 7).
-  - Done (`/test/vm`, alone and two at once): reserve 4 GiB and commit 1 MiB of it, permission changes that keep the data, partial unmaps, the kills for touching `PROT_NONE`, read-only and unmapped pages and for a stack past its limit, the kill at the memory limit, and system calls reading into memory nothing has touched. Open: faults on several CPUs in one address space, which needs threads.
+- [x] Add a small userspace allocator for the Zig programs on top of `mmap`: `lib.allocator`, a `std.mem.Allocator` (`app/alloc.zig`). Blocks of up to 2048 bytes come in powers of two from free lists filled 64 KiB at a time; larger ones get pages of their own and give them back. For one thread. Host tests with random allocation and freeing; `/test/alloc` runs the standard library's list and hash map on it.
+- [x] Test reserve-then-commit of a multi-gigabyte range, permission changes, partial unmaps, faults on `PROT_NONE` pages, stack growth up to its limit, the out-of-memory kill, and page faults on several CPUs at once in one address space (once threads exist, 7).
+  - Done (`/test/vm`, alone and two at once): reserve 4 GiB and commit 1 MiB of it, permission changes that keep the data, partial unmaps, the kills for touching `PROT_NONE`, read-only and unmapped pages and for a stack past its limit, the kill at the memory limit, and system calls reading into memory nothing has touched. Faults on several CPUs in one address space: `/test/threads` has four threads go through the same untouched memory from both ends.
 
 **Milestone 5 done when:** A program can reserve a multi-gigabyte range and commit it piece by piece, and a program that exhausts memory is the only casualty.
 
@@ -450,7 +450,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 ### 6.1 VFS and directories
 - [ ] Distinguish regular files from directories in VFS nodes.
 - [ ] Add directory lookup and `readdir` operations (`getdents64`).
-- [ ] Add `stat`-like metadata queries (`fstat`/`newfstatat`).
+- [x] Add `stat`-like metadata queries (`fstat`/`newfstatat`). Done with 9.3: `fstat`, `newfstatat`, `stat`, `lstat`, for files, directories, pipes, the console and the entries of `/proc` and `/dev`.
 - [ ] Normalize paths and handle `.` and `..`.
 - [ ] Raise the longest path from 255 bytes to Linux's 4095 (`PATH_MAX` 4096). Paths are copied to a buffer on the 16 KiB kernel stack today (2.5), which is why the limit is low; the buffer has to move to the heap first. Relative paths and a current directory belong here too.
 - [ ] Add mount-point traversal so multiple filesystems can coexist.
@@ -460,6 +460,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Test directory lookup, `readdir`, `stat`, `.`/`..` normalization, mount traversal and error codes (host tests with fake filesystems, plus initrd tests in QEMU).
 - [ ] Test ramfs create, write, read-back, truncate, unlink and out-of-memory on the host and from ring 3.
 - [ ] Run the tarfs parser in host tests and fuzz it with malformed archives.
+  - Done: the archive format is `fs/tar.zig`, with host tests for walking headers, truncated archives and names stored in two parts (`tests/host/tar_test.zig`). Open: fuzzing it with malformed archives.
 
 ### 6.2 Descriptors and I/O
 - [x] Reserve FDs 0/1/2 for stdin/stdout/stderr: a process starts with the three open on the console, as one open file with three descriptors (`open_file.zig`). They are closed, duplicated and replaced like any other.
@@ -469,17 +470,18 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Route console I/O through descriptor-backed devices.
 - [ ] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 6.3 depend on it.
 - [ ] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling. Keep it small; anything richer belongs in user space.
-- [ ] Support generic open/read/write/close plus `seek` where applicable (`openat`, `lseek`).
+- [x] Support generic open/read/write/close plus `seek` where applicable (`openat`, `lseek`). Done: `open`, `openat`, `read`, `pread64`, `write`, `writev`, `close`, `lseek`, over files, pipes, the console and devices.
 - [ ] Define file-offset, ownership, and descriptor inheritance rules.
 - [x] Add descriptor duplication and pipes (`dup`/`dup2`/`dup3`, `fcntl(F_DUPFD)`, `pipe`/`pipe2`): `pipe.zig`, a page of buffer, readers and writers that wait and are woken, end of file and `EPIPE` when the other end is closed, `O_NONBLOCK`. Tested from ring 3 (`/test/pipes`), with a thread on each end and with a process that ends while a thread sleeps in a pipe.
   - Open: `SIGPIPE` (8); inheriting descriptors (with `fork`/`execve`, 6.4), for which the reference count of an open file has to stop relying on one process's lock.
 - [ ] Add `poll` to wait on several descriptors at once (needed by network servers in 12.3 and the compositor in 10.3).
   - Done: `poll` reports the console, files and pipes and waits with a timeout. Open: it looks again every tick instead of being woken by the descriptor.
 - [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
+  - Done: `fcntl` (`F_DUPFD`, `F_GETFL`, `F_SETFL`, `F_GETFD`), `readlink`, `pread64`, `ioctl` answering `ENOTTY`. Open: `readv`, `pwrite64` (nothing can be written yet), a terminal's `ioctl`s (with the terminal).
 - [ ] Add `epoll` and `eventfd` on top of `poll`.
 - [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents (the list from 4.2 says which).
   - Done: `/dev/null`, `/dev/urandom`, `/dev/random`, `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/meminfo` (`procfs.zig`: text made when the file is opened). Open: `/proc/cpuinfo`, `/proc/stat`, `/proc/self/mountinfo` and `cgroup`, `/sys/devices/system/cpu/*`, which the .NET runtime looks for and does without.
-- [ ] Test EOF, partial I/O, invalid descriptors, and cleanup.
+- [x] Test EOF, partial I/O, invalid descriptors, and cleanup. Done: `/test/syscalls`, `/test/pipes` and `/test/files` from ring 3, with the kernel test checking that nothing stays allocated.
 - [ ] Test terminal line editing and `poll` (ready, blocking, and timeout cases) with input injected over serial.
 
 ### 6.3 Commands and shell features
@@ -501,6 +503,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Add monotonic timekeeping and a sleep syscall (`clock_gettime`, `nanosleep`), on a calibrated TSC clock where the TSC is invariant and HPET otherwise: runtimes read the clock constantly. `nanosleep` sits on the kernel timers of 2.8, whose resolution is one tick (10 ms): decide whether that is enough or sleeps need a one-shot timer.
 - [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 11.5 need it).
 - [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.
+  - Done: all of those exist, `prlimit64` for reading. Open: the two points below.
   - `prlimit64` reads and lowers the limits of 2.6: `RLIMIT_AS` or `RLIMIT_DATA` for memory, `RLIMIT_NOFILE` for descriptors, `RLIMIT_NPROC` for processes (MyOS counts descendants, Linux counts per user: decide how to present that). A process may lower its limits and never raise them above what it was given.
   - Make the default memory limit follow the machine: a share of physical memory instead of a fixed 256 MiB, so one program cannot take everything on a small machine and is not held back on a large one.
 - [ ] Start an `init` process that launches the shell, restarts it when it exits, and adopts orphans (2.7).
@@ -571,12 +574,12 @@ These are dynamically linked against glibc, so MyOS loads the dynamic loader, ma
 - [x] Run a .NET Native AOT hello-world built for linux-musl, statically linked, invariant globalization (`tests/fixtures/src/dotnet-hello`): the runtime starts, eight managed threads allocate, the collector runs, on one and four CPUs, two at once, with its memory back afterwards. A stepping stone and a test fixture, not something a developer is asked to build: it shows what the runtime's core needs before dynamic linking exists. (It is linked with `zig cc`, which brings musl; the build machine has none.)
 - [x] Run a .NET Native AOT hello-world built the ordinary way (`dotnet publish -r linux-x64 -p:PublishAot=true`): `tests/fixtures/bin/dotnet-hello-aot`, position independent and dynamically linked against glibc, with managed threads and a collection, on one and four CPUs. It added `clone3` and `time` to what the kernel knows.
   - The fixture is linked against a plain glibc, not the build machine's: a distribution built for newer CPUs only marks every program linked on it as needing one (`x86-64-v4` here, which also needs AVX-512 state the kernel does not save yet: 9.2).
-- [ ] Run one that allocates enough to exercise the GC, then a multi-threaded one.
-- [ ] Add them to the fixture binaries (4.3) and run them as QEMU tests on several CPUs.
+- [x] Run one that allocates enough to exercise the GC, then a multi-threaded one. The fixture does both: eight managed threads each allocate a megabyte in small arrays, then a collection is forced and counted.
+- [x] Add them to the fixture binaries (4.3) and run them as QEMU tests on several CPUs. Four .NET fixtures: static ahead-of-time, ahead-of-time against glibc, the self-contained folder with the JIT, each on one and four CPUs and under KVM.
 
 ### 9.2 Fast and multicore
 "Fast" is part of the goal, so it is measured rather than assumed.
-- [ ] Run foreign multi-threaded programs on all CPUs: threads of one process on different cores, cross-CPU futex wakeups and TLB shootdowns on `munmap`/`mprotect`.
+- [x] Run foreign multi-threaded programs on all CPUs: threads of one process on different cores, cross-CPU futex wakeups and TLB shootdowns on `munmap`/`mprotect`. Done by the fixtures: pthreads in C, goroutines in Go and managed threads in .NET, each with its threads spread over four CPUs (emulated and under KVM), futex wake-ups between CPUs, and the runtimes' `munmap`/`mprotect`/`madvise` while their other threads run.
 - [ ] Add a benchmark suite run in QEMU with KVM and on real hardware: syscall round trip, context switch, page fault, thread create/join, futex ping-pong, and `mmap`/`munmap` churn.
 - [ ] Benchmark a multi-threaded .NET workload (allocation-heavy and CPU-bound) for throughput and scaling from 1 to N cores, and compare with the same binary on Linux on the same machine.
 - [ ] Profile and remove the hot spots the benchmarks show (the profiling items in 13 move up when this starts); candidates are per-CPU run queues, lock contention in the PMM and VMM, PCID to avoid TLB flushes, 2 MiB pages for large anonymous mappings, and a vDSO so `clock_gettime` needs no syscall.
@@ -606,7 +609,7 @@ Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
 - [x] Run the JIT-based runtime: a self-contained `dotnet publish -r linux-x64` hello-world (`tests/fixtures/bin/dotnet-hello-app`, completed with the runtime's native libraries by `scripts/fetch-dotnet-runtime.sh`). The host program finds itself through `/proc/self/exe`, loads the runtime from its folder, and the runtime compiles and runs the program, with eight managed threads and a garbage collection, on one and four CPUs, two at once, its memory back afterwards. The untrimmed 80 MB folder runs too (tried by hand with `MYOS_INITRD_EXTRA`); the fixture is the trimmed one.
   - What it needed beyond the ahead-of-time build: directories that exist, `/proc/self/exe`, `/proc/self/maps` (glibc finds the main stack there; without it the runtime reports that it is out of memory), `stat`, more than 16 descriptors, the scheduling-policy calls and `sched_setaffinity`, `getsid`. No signal was delivered.
   - Open, each tolerated by the runtime today: `memfd_create` with shared mappings (it wants its code mapped twice, writable in one place and executable in another; without that it uses memory that is both), sockets for its diagnostics, FIFOs in `/tmp`, `/proc/self/mountinfo` and cgroup files, `/sys/devices/system/cpu`.
-- [ ] The same published as a single file.
+- [x] The same published as a single file. Runs (`-p:PublishSingleFile=true -p:PublishTrimmed=true`, one file of 15 MB). Tried by hand with `MYOS_INITRD_EXTRA`; not a fixture, since it would be 15 MB in the repository for what the folder already tests.
 - [x] A way to put a published folder into the image, until there is a writable disk (11) or a network (12): `MYOS_INITRD_EXTRA=<dir> scripts/build.sh` copies the tree under `<dir>` over the image's root.
 - Not supported: framework-dependent builds (`dotnet app.dll` with a runtime installed on the system).
 
