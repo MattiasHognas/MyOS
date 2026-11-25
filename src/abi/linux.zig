@@ -68,6 +68,8 @@ pub const Sys = struct {
     pub const uname = 63;
     /// `fcntl(fd, command, arg)`.
     pub const fcntl = 72;
+    /// `time(tloc) -> seconds`.
+    pub const time = 201;
     /// `getcwd(buf, size) -> length with the NUL`: always "/".
     pub const getcwd = 79;
     /// `readlink(path, buf, size)`: there are no symbolic links (`EINVAL`).
@@ -116,6 +118,9 @@ pub const Sys = struct {
     pub const newfstatat = 262;
     /// `readlinkat(dirfd, path, buf, size)`.
     pub const readlinkat = 267;
+    /// `clone3(args, size) -> thread ID`: `clone` with its arguments in a
+    /// structure.
+    pub const clone3 = 435;
     /// `faccessat(dirfd, path, mode)` and `faccessat2(..., flags)`.
     pub const faccessat = 269;
     pub const faccessat2 = 439;
@@ -537,3 +542,17 @@ pub const AT_EMPTY_PATH = 0x1000;
 pub const AT_SYMLINK_NOFOLLOW = 0x100;
 /// Size of the structure `set_robust_list` registers.
 pub const ROBUST_LIST_HEAD_SIZE = 24;
+
+/// `struct clone_args` of `clone3`, as far as its first version goes
+/// (64 bytes); later versions add fields at the end.
+pub const CloneArgs = extern struct {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    /// Lowest address of the new thread's stack, and its size.
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+};

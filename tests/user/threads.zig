@@ -60,6 +60,56 @@ comptime {
 }
 extern fn clone_raw(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) callconv(.c) u64;
 
+// clone3_raw(args: rdi, size: rsi) -> tid. The new thread starts as one
+// made by `clone_raw` does.
+comptime {
+    asm (
+        \\.section .text
+        \\.global clone3_raw
+        \\.type clone3_raw, @function
+        \\clone3_raw:
+        \\  mov $435, %eax
+        \\  syscall
+        \\  test %rax, %rax
+        \\  jnz 1f
+        \\  pop %rdi
+        \\  pop %rax
+        \\  call *%rax
+        \\  mov %eax, %edi
+        \\  mov $60, %eax
+        \\  syscall
+        \\  ud2
+        \\1:
+        \\  ret
+    );
+}
+extern fn clone3_raw(args: *const abi.CloneArgs, size: u64) callconv(.c) u64;
+
+/// `start` through `clone3`, as newer C libraries make their threads: the
+/// stack is given by its lowest address and its size.
+fn start3(h: *Handle, func: ThreadFn, arg: usize, size: u64, flags: u64) u64 {
+    h.stack = lib.mmap(0, STACK_SIZE, abi.PROT.READ | abi.PROT.WRITE, abi.MAP.STACK);
+    if (lib.isError(h.stack)) lib.exit(90);
+    const top: [*]u64 = @ptrFromInt(h.stack + STACK_SIZE);
+    (top - 1)[0] = @intFromPtr(func);
+    (top - 2)[0] = arg;
+    // Two words longer than the first version, as a later version is.
+    const args: extern struct { known: abi.CloneArgs, later: [2]u64 } = .{
+        .known = .{
+            .flags = flags,
+            .pidfd = 0,
+            .child_tid = @intFromPtr(&h.tid),
+            .parent_tid = @intFromPtr(&h.tid),
+            .exit_signal = 0,
+            .stack = h.stack,
+            .stack_size = STACK_SIZE - 16,
+            .tls = @intFromPtr(&h.tls),
+        },
+        .later = .{ 0, 0 },
+    };
+    return clone3_raw(&args.known, size);
+}
+
 const ThreadFn = *const fn (usize) callconv(.c) u32;
 const STACK_SIZE = 64 * 1024;
 
@@ -207,6 +257,13 @@ fn outlives(code: usize) callconv(.c) u32 {
     return @intCast(code); // the last thread's exit status is the process's
 }
 
+var marked: std.atomic.Value(u32) = .init(0);
+
+fn marks(value: usize) callconv(.c) u32 {
+    marked.store(@intCast(value), .release);
+    return 0;
+}
+
 fn eql(s: [*:0]const u8, want: []const u8) bool {
     return std.mem.eql(u8, std.mem.span(s), want);
 }
@@ -297,6 +354,38 @@ pub fn main() noreturn {
     expect(clone_raw(THREAD_FLAGS | CLONE_SETTLS, 0, 0, 0, 0xFFFF_8000_0000_0000) == lib.err(.PERM), 42);
     expect(clone_raw(THREAD_FLAGS | CLONE_PARENT_SETTID, 0, 8, 0, 0) == lib.err(.FAULT), 43); // nowhere to write the ID
 
+    // --- clone3: the same thread, asked for with a structure.
+    const all_flags = THREAD_FLAGS | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+    const tid3 = start3(&handles[0], marks, 77, @sizeOf(abi.CloneArgs), all_flags);
+    expect(!lib.isError(tid3) and tid3 != 0, 40);
+    join(&handles[0]);
+    expect(marked.load(.acquire) == 77, 41);
+    // A later, longer version of the structure with nothing in the new fields.
+    expect(!lib.isError(start3(&handles[0], marks, 78, @sizeOf(abi.CloneArgs) + 16, all_flags)), 42);
+    join(&handles[0]);
+    expect(marked.load(.acquire) == 78, 43);
+    // What is refused: nothing below starts a thread.
+    var ca: extern struct { known: abi.CloneArgs, later: [2]u64 } = .{
+        .known = .{ .flags = all_flags, .pidfd = 0, .child_tid = 0, .parent_tid = 0, .exit_signal = 0, .stack = 0, .stack_size = 0, .tls = 0 },
+        .later = .{ 0, 1 },
+    };
+    const cap = @intFromPtr(&ca);
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs) + 16, 0) == lib.err(.INVAL), 44); // a field this kernel does not know
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs) - 8, 0) == lib.err(.INVAL), 45); // shorter than the first version
+    expect(lib.syscall(Sys.clone3, cap, 8192, 0) == lib.err(.INVAL), 46);
+    expect(lib.syscall(Sys.clone3, 8, @sizeOf(abi.CloneArgs), 0) == lib.err(.FAULT), 47);
+    ca.known.flags = CLONE_VM; // a process of its own: no fork yet
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 48);
+    ca.known.flags = all_flags;
+    ca.known.exit_signal = 17;
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 49);
+    ca.known.exit_signal = 0;
+    ca.known.stack_size = 4096; // a size and no stack
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 55);
+    ca.known.stack = ~@as(u64, 0xFFF); // the end wraps around
+    ca.known.stack_size = 8192;
+    expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 56);
+
     // --- Time, and the number of CPUs.
     const before = nowNs();
     sleepMs(20);
@@ -304,6 +393,10 @@ pub fn main() noreturn {
     var real: abi.TimeSpec = undefined;
     expect(lib.syscall(Sys.clock_gettime, abi.CLOCK.REALTIME, @intFromPtr(&real), 0) == 0 and real.sec > 1_700_000_000, 51);
     expect(lib.syscall(Sys.clock_gettime, 99, @intFromPtr(&real), 0) == lib.err(.INVAL), 52);
+    var seconds: i64 = 0;
+    const t = lib.syscall(Sys.time, @intFromPtr(&seconds), 0, 0);
+    expect(t >= @as(u64, @intCast(real.sec)) and t <= @as(u64, @intCast(real.sec)) + 2 and seconds == @as(i64, @intCast(t)), 57);
+    expect(lib.syscall(Sys.time, 0, 0, 0) >= t and lib.syscall(Sys.time, 8, 0, 0) == lib.err(.FAULT), 58);
     var mask: u64 = 0;
     expect(lib.syscall(Sys.sched_getaffinity, 0, 8, @intFromPtr(&mask)) == 8 and mask & 1 == 1, 53);
     expect(lib.syscall(Sys.sched_getaffinity, 0, 4, @intFromPtr(&mask)) == lib.err(.INVAL), 54);

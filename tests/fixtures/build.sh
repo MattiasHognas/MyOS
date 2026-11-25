@@ -30,7 +30,10 @@
 #                       Not how a .NET developer builds (docs/todo.md, 9):
 #                       it shows what the runtime's core asks of the kernel
 #                       before the kernel can load shared libraries. Linked
-#                       with Zig (zig-musl-link) for want of an installed musl
+#                       with Zig (zig-link) for want of an installed musl
+#   dotnet-hello-aot    .NET as `dotnet publish -r linux-x64
+#                       -p:PublishAot=true` builds it: dynamically linked
+#                       against glibc, position independent
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -59,11 +62,24 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' \
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cp src/dotnet-hello/hello.csproj src/dotnet-hello/Program.cs "$work"
-dotnet publish "$work/hello.csproj" -c Release -r linux-musl-x64 \
+ZIG_LINK_TARGET=x86_64-linux-musl dotnet publish "$work/hello.csproj" -c Release -r linux-musl-x64 \
     -p:PublishAot=true -p:StaticExecutable=true \
     -p:PositionIndependentExecutable=false \
-    -p:CppCompilerAndLinker="$PWD/zig-musl-link" -p:LinkerFlavor=lld \
+    -p:CppCompilerAndLinker="$PWD/zig-link" -p:LinkerFlavor=lld \
     -o "$work/out" >/dev/null
 cp "$work/out/hello" bin/dotnet-hello-static
+
+# The same program as `dotnet publish -r linux-x64 -p:PublishAot=true`
+# builds it: position independent, dynamically linked against glibc. The
+# one thing that differs from that command is the linker's C library:
+# Zig's stand-in for a plain glibc instead of this machine's own, because
+# a distribution built for newer CPUs only (x86-64-v3, -v4) marks every
+# program linked on it as needing such a CPU.
+rm -rf "$work/out" "$work/bin" "$work/obj"
+ZIG_LINK_TARGET=x86_64-linux-gnu.2.36 dotnet publish "$work/hello.csproj" -c Release -r linux-x64 \
+    -p:PublishAot=true \
+    -p:CppCompilerAndLinker="$PWD/zig-link" -p:LinkerFlavor=lld \
+    -o "$work/out" >/dev/null
+cp "$work/out/hello" bin/dotnet-hello-aot
 
 ls -l bin

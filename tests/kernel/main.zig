@@ -1011,6 +1011,27 @@ fn dynamicHello() TestError!void {
     try check(helpers.footprint().eql(memory));
 }
 
+/// A .NET program published the ordinary way for Linux, ahead of time
+/// (`dotnet publish -r linux-x64 -p:PublishAot=true`): dynamically
+/// linked against glibc, position independent. Nothing of MyOS went into
+/// building it.
+fn dotnetAot() TestError!void {
+    const path = "/fixtures/dotnet-hello-aot";
+    if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
+        root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
+        return;
+    }
+    _ = helpers.runProgramArgs(path, &.{"dotnet-hello-aot"}, &.{}); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    helpers.traceUnknownSyscalls(true);
+    defer helpers.traceUnknownSyscalls(false);
+    const code = helpers.runProgramArgs(path, &.{ "dotnet-hello-aot", "stock", "build" }, &.{"GREETING=hi dotnet aot"}) orelse return error.Failed;
+    if (code != 2) report("dotnet aot exit status", code);
+    try check(code == 2);
+    try check(helpers.runPairExpect(path, 0)); // two runtimes at once
+    try check(helpers.footprint().eql(memory));
+}
+
 /// Threads and futexes through the raw calls: a lock made of a futex,
 /// each thread's own FS base, join through the exit announcement, wake
 /// counts, timeouts, requeue; and the ways a threaded process ends.
@@ -1744,6 +1765,7 @@ fn runCases() noreturn {
         .{ .name = "position-independent programs built for Linux run, at a random address", .func = positionIndependent },
         .{ .name = "a program's ELF interpreter is loaded and started in its place", .func = elfInterpreter },
         .{ .name = "a dynamically linked C program runs with its loader and C library from files", .func = dynamicHello },
+        .{ .name = "a .NET program published ahead of time for linux-x64 (glibc, dynamic) runs", .func = dotnetAot },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },
         .{ .name = "on every CPU at once: removed kernel mappings leave every TLB", .func = tlbShootdown },

@@ -125,7 +125,7 @@ pub fn main() noreturn {
         if (nr == Sys.poll) args[2] = 0; // do not wait
         // Nor in a futex or a sleep; and a new thread started with random
         // registers would be this program's end, as would a signal to itself.
-        if (nr == Sys.nanosleep or nr == Sys.clock_nanosleep or nr == Sys.clone) continue;
+        if (nr == Sys.nanosleep or nr == Sys.clock_nanosleep or nr == Sys.clone or nr == Sys.clone3) continue;
         if (nr == Sys.futex) args[1] = (args[1] & ~@as(u64, 0x7F)) | lib.abi.FUTEX.WAKE;
         if (nr == Sys.kill or nr == Sys.tkill) args[1] = 0;
         if (nr == Sys.tgkill) args[2] = 0;

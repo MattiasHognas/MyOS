@@ -227,6 +227,11 @@ run_scenario() {
                 expect_line '^env GREETING=hi dynamic$'
                 expect_line '^argv\[2\]=at run time$'
             fi
+            # .NET published ahead of time the ordinary way: dynamic, glibc.
+            if [[ -f zig-out/test/initrd/lib64/ld-linux-x86-64.so.2 ]]; then
+                expect_line '^hello from dotnet: 2 args$'
+                expect_line '^GREETING=hi dotnet aot$'
+            fi
             # The same C and Rust programs as position-independent executables.
             expect_line '^env GREETING=hi pie$'
             expect_line '^GREETING=hi rust pie$'

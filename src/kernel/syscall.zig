@@ -900,6 +900,14 @@ fn sysClockGetTime(clock: u64, ptr: u64) u64 {
     return if (toUser(ptr, timeSpec(ns))) 0 else err(.FAULT);
 }
 
+/// `time`: seconds of the real-time clock, also stored at `tloc` if that
+/// is not null.
+fn sysTime(tloc: u64) u64 {
+    const seconds: i64 = @intCast(clockNanos(abi.CLOCK.REALTIME).? / NS_PER_SEC);
+    if (tloc != 0 and !toUser(tloc, seconds)) return err(.FAULT);
+    return @intCast(seconds);
+}
+
 /// `gettimeofday`: seconds and microseconds; the time zone is not filled in.
 fn sysGetTimeOfDay(tv: u64) u64 {
     if (tv == 0) return 0;
@@ -1003,6 +1011,35 @@ fn sysClone(f: *const arch.Frame) u64 {
     if (thread.current().process == null) return err(.NOSYS);
     // The order of the last arguments is x86-64's: child_tid, then tls.
     const tid = proc.cloneThread(f, .{ .flags = flags, .stack = f.rsi, .parent_tid = f.rdx, .child_tid = f.r10, .tls = f.r8 }) catch |e| return switch (e) {
+        error.OutOfMemory => err(.NOMEM),
+        error.Fault => err(.FAULT),
+        error.BadAddress => err(.PERM),
+        error.ProcessEnding => err(.INTR),
+    };
+    return tid;
+}
+
+/// `clone3`: `clone` with its arguments in a structure of `size` bytes,
+/// which newer C libraries try first. The same rules: a new thread of the
+/// calling process and nothing else. The stack is given by its lowest
+/// address and its size. `EINVAL` for a size below the first version of
+/// the structure or above a page, for nonzero fields this kernel does
+/// not know (as Linux does for fields it does not know), for a signal on
+/// exit, and for a stack with a size and no address or the reverse.
+fn sysClone3(f: *const arch.Frame) u64 {
+    const size = f.rsi;
+    if (size < @sizeOf(abi.CloneArgs) or size > pmm.PAGE_SIZE) return err(.INVAL);
+    const args = fromUser(abi.CloneArgs, f.rdi) orelse return err(.FAULT);
+    var extra: u64 = @sizeOf(abi.CloneArgs);
+    while (extra < size) : (extra += 1) {
+        const byte = fromUser(u8, f.rdi + extra) orelse return err(.FAULT);
+        if (byte != 0) return err(.INVAL); // set_tid, cgroup: not offered
+    }
+    if (args.flags & proc.CLONE.THREAD_FLAGS != proc.CLONE.THREAD_FLAGS) return err(.INVAL);
+    if (args.exit_signal != 0 or (args.stack == 0) != (args.stack_size == 0)) return err(.INVAL);
+    const top = std.math.add(u64, args.stack, args.stack_size) catch return err(.INVAL);
+    if (thread.current().process == null) return err(.NOSYS);
+    const tid = proc.cloneThread(f, .{ .flags = args.flags, .stack = top, .parent_tid = args.parent_tid, .child_tid = args.child_tid, .tls = args.tls }) catch |e| return switch (e) {
         error.OutOfMemory => err(.NOMEM),
         error.Fault => err(.FAULT),
         error.BadAddress => err(.PERM),
@@ -1233,6 +1270,8 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.gettimeofday => sysGetTimeOfDay(f.rdi),
         Sys.getpid => if (thread.current().process) |p| p.pid else err(.NOSYS),
         Sys.clone => sysClone(f),
+        Sys.clone3 => sysClone3(f),
+        Sys.time => sysTime(f.rdi),
         Sys.futex => sysFutex(f),
         Sys.sched_getaffinity => sysSchedGetAffinity(f.rsi, f.rdx),
         Sys.getrandom => sysGetRandom(f.rdi, f.rsi),

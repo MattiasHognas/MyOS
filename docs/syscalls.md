@@ -113,6 +113,7 @@ Linux calls, with Linux's numbers:
 | 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
+| 201 | `time(tloc)` | Seconds of the real-time clock. |
 | 202 | `futex(addr, op, val, timeout, addr2, val3)` | `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, with or without `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`. Only within one process. Timeouts have the timer's resolution and never end early. |
 | 204 | `sched_getaffinity(pid, size, mask)` | Every CPU that is up; 8 bytes. |
 | 218 | `set_tid_address(ptr)` | Returns the thread ID. When the thread exits, zero is written to `ptr` and one futex waiter on it is woken. |
@@ -131,6 +132,7 @@ Linux calls, with Linux's numbers:
 | 318 | `getrandom(buf, len, flags)` | Never blocks. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
 | 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
+| 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules: new threads only. Fields past the first version of the structure must be zero. |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`. |
 
 MyOS calls with no Linux equivalent yet. Their numbers start at

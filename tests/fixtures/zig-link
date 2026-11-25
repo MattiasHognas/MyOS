@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Stand in for clang as the linker of a .NET Native AOT build: link with
+# Zig's bundled clang and lld against the C library ZIG_LINK_TARGET names
+# (x86_64-linux-musl, x86_64-linux-gnu.2.36, ...), so that the result does
+# not depend on the C library of the machine it is built on. Used by
+# build.sh only: a .NET developer links with the system's compiler.
+args=()
+for a in "$@"; do
+    case "$a" in
+        --target=*|-fuse-ld=*|-gz=*) ;;   # zig cc sets these itself
+        -Wl,--defsym,*) ;;                # not passed on by zig cc; unused here
+        -Wl,-pie) ;;                      # said by -pie already
+        *) args+=("$a") ;;
+    esac
+done
+exec zig cc -target "${ZIG_LINK_TARGET:?}" "${args[@]}"
