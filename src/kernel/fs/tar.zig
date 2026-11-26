@@ -13,6 +13,8 @@ pub const Entry = struct {
     name: []const u8,
     typ: u8,
     data: []const u8,
+    /// For a symbolic link (type '2'): what it points to, as stored.
+    link: []const u8 = "",
 
     /// Whether the entry's full name is `want` (normalized).
     pub fn named(e: Entry, want: []const u8) bool {
@@ -75,7 +77,7 @@ pub const MAX_NAME = 155 + 1 + 100;
 /// the member that gave it. Each name is given once, where it first
 /// appears: as a file, as a directory with an entry of its own, or as a
 /// directory that exists only because something is inside it.
-pub fn nextInDirectory(archive: []const u8, dir: []const u8, offset: *usize, name_buf: []u8) ?struct { name: []const u8, directory: bool } {
+pub fn nextInDirectory(archive: []const u8, dir: []const u8, offset: *usize, name_buf: []u8) ?struct { name: []const u8, directory: bool, link: bool = false } {
     var full_buf: [MAX_NAME]u8 = undefined;
     var earlier_buf: [MAX_NAME]u8 = undefined;
     while (true) {
@@ -110,8 +112,24 @@ pub fn nextInDirectory(archive: []const u8, dir: []const u8, offset: *usize, nam
             }
         }
         @memcpy(name_buf[0..child.name.len], child.name);
-        return .{ .name = name_buf[0..child.name.len], .directory = directory };
+        const link = child.exact and isLink(e);
+        return .{ .name = name_buf[0..child.name.len], .directory = directory and !link, .link = link };
     }
+}
+
+/// Whether `e` is a symbolic link (type flag '2').
+pub fn isLink(e: Entry) bool {
+    return e.typ == '2';
+}
+
+/// The target of the symbolic link `path` (normalized) in `archive`, or
+/// null if no member of that name is one.
+pub fn linkTarget(archive: []const u8, path: []const u8) ?[]const u8 {
+    var off: usize = 0;
+    while (next(archive, &off)) |e| {
+        if (isLink(e) and e.named(path)) return e.link;
+    }
+    return null;
 }
 
 /// Parse an octal number from a tar header field, stopping at the first
@@ -151,7 +169,7 @@ pub fn next(archive: []const u8, off: *usize) ?Entry {
     off.* = start + std.mem.alignForward(u64, size, 512);
     // The prefix field belongs to the ustar format only ("ustar" at 257).
     const prefix = if (std.mem.eql(u8, h[257..262], "ustar")) normalize(cstr(h[345..500])) else "";
-    return .{ .prefix = prefix, .name = normalize(cstr(h[0..100])), .typ = h[156], .data = archive[start..][0..size] };
+    return .{ .prefix = prefix, .name = normalize(cstr(h[0..100])), .typ = h[156], .data = archive[start..][0..size], .link = cstr(h[157..257]) };
 }
 
 /// Return true if `e` is a regular file (type flag '0', or NUL in old archives).

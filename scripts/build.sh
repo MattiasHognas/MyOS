@@ -40,10 +40,22 @@ iso_root="$out_dir/iso_root"
 initrd="$out_dir/initrd"
 mkdir -p "$out_dir"
 rm -rf "$iso_root" "$initrd"
-mkdir -p "$iso_root/boot/limine" "$iso_root/EFI/BOOT" "$initrd/bin" "$initrd/etc"
+mkdir -p "$iso_root/boot/limine" "$iso_root/EFI/BOOT"
 
-cp zig-out/bin/sh.elf "$initrd/bin/sh"
-cp zig-out/bin/hello.elf "$initrd/bin/hello"
+# The layout is Linux's (the Filesystem Hierarchy Standard), with /usr
+# merged as Debian, Fedora and Arch have it: programs in /usr/bin,
+# libraries in /usr/lib, and /bin, /sbin, /lib, /lib64 links into /usr,
+# so that paths programs have written into them (/bin/sh, the loader in
+# /lib64) lead there. docs/architecture.md says what goes where.
+mkdir -p "$initrd/usr/bin" "$initrd/usr/lib" "$initrd/usr/lib64" "$initrd/etc" \
+    "$initrd/home" "$initrd/root" "$initrd/opt" "$initrd/var" "$initrd/mnt" "$initrd/media" "$initrd/run"
+ln -s usr/bin "$initrd/bin"
+ln -s usr/bin "$initrd/sbin"
+ln -s usr/lib "$initrd/lib"
+ln -s usr/lib64 "$initrd/lib64"
+
+cp zig-out/bin/sh.elf "$initrd/usr/bin/sh"
+cp zig-out/bin/hello.elf "$initrd/usr/bin/hello"
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
 # The C library dynamically linked Linux programs expect on the system:
 # the loader and shared libraries of scripts/fetch-sysroot.sh, fetched the
@@ -57,7 +69,13 @@ if [[ "$mode" != --release ]]; then
         bash scripts/fetch-sysroot.sh >/dev/null || echo "warning: could not fetch the C library (scripts/fetch-sysroot.sh): dynamically linked programs will not start" >&2
     fi
     if [[ -f sysroot/.complete ]]; then
-        cp -r sysroot/lib64 sysroot/lib "$initrd/"
+        # Where Debian has them: the libraries and the loader in
+        # /usr/lib/x86_64-linux-gnu, and the loader's name in /usr/lib64
+        # (which /lib64 is) a link to it.
+        mkdir -p "$initrd/usr/lib/x86_64-linux-gnu"
+        cp sysroot/lib/x86_64-linux-gnu/* "$initrd/usr/lib/x86_64-linux-gnu/"
+        cp sysroot/lib64/ld-linux-x86-64.so.2 "$initrd/usr/lib/x86_64-linux-gnu/"
+        ln -s ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 "$initrd/usr/lib64/ld-linux-x86-64.so.2"
     fi
 fi
 if [[ "$mode" == --package-test ]]; then

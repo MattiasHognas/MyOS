@@ -65,12 +65,13 @@ pub fn freePages() usize {
 
 /// Return true if a file exists at `path`.
 pub fn hasFile(path: []const u8) bool {
-    return vfs.lookup(path) != null;
+    return fileExists(path);
 }
 
 /// Return the size of the file at `path`, or null if it doesn't exist.
 pub fn fileSize(path: []const u8) ?u64 {
-    const node = vfs.lookup(path) orelse return null;
+    const node = process.lookupFollowing(path) catch return null;
+    defer vfs.release(&node);
     return node.size;
 }
 
@@ -81,7 +82,8 @@ pub fn readFileAt(
     offset: u64,
     buf: []u8,
 ) ?usize {
-    const node = vfs.lookup(path) orelse return null;
+    const node = process.lookupFollowing(path) catch return null;
+    defer vfs.release(&node);
     return vfs.read(&node, offset, buf);
 }
 
@@ -161,7 +163,8 @@ pub fn elfLoadError(image: []const u8) ?elf.Error {
 
 /// `elfProbe` on the file at `path`.
 pub fn elfProbePath(path: []const u8, addr: u64, out: []u8) ?ElfProbe {
-    const node = vfs.lookup(path) orelse return null;
+    const node = process.lookupFollowing(path) catch return null;
+    defer vfs.release(&node);
     const image = heap.allocator.alloc(u8, node.size) catch return null;
     defer heap.allocator.free(image);
     if (vfs.read(&node, 0, image) != node.size) return null;
@@ -210,7 +213,9 @@ pub fn haveFixtures(names: []const []const u8) bool {
 
 /// Whether the filesystem has a file at `path`.
 pub fn fileExists(path: []const u8) bool {
-    return vfs.lookup(path) != null;
+    const node = process.lookupFollowing(path) catch return false;
+    vfs.release(&node);
+    return true;
 }
 
 /// Start the program in `image` and wait for it. Returns its exit status,

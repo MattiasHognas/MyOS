@@ -118,7 +118,7 @@ Linux calls, with Linux's numbers:
 | 83 | `mkdir(path, mode)` | `EEXIST`, `ENOENT`, `ENOTDIR`, `EROFS`. |
 | 84 | `rmdir(path)` | An empty directory: `ENOTEMPTY`, `ENOTDIR`, `EBUSY` for a mount point. |
 | 87 | `unlink(path)` | Takes the name away; the file lives while it is open. `EISDIR`, `EROFS`, `ENOENT`. |
-| 89 | `readlink(path, buf, size)` | The one symbolic link is `/proc/self/exe` (also `/proc/<own pid>/exe`): the path of the program the process runs, cut to `size`. `EINVAL` for anything else that exists, `ENOENT` otherwise. |
+| 89 | `readlink(path, buf, size)` | What a symbolic link points to, cut to `size`: the links of the image (`/bin` and the rest) and `/proc/self/exe`. `EINVAL` for anything else that exists, `ENOENT` otherwise. |
 | 91 | `fchmod(fd, mode)` | No permissions exist: accepted for a file that can be written, `EROFS` otherwise. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
@@ -196,6 +196,12 @@ Every other number returns `ENOSYS`.
   away and ends the program the shell is running, with exit status 130
   (`SIGINT`'s; signals are not delivered yet, so it cannot be caught).
   When the shell gets the terminal back, the settings are put back.
+- **Symbolic links** are followed in every part of a path, at most 40
+  of them (`ELOOP`); not in the last part for `lstat`, `readlink`,
+  `unlink`, `rename` and `open` with `O_NOFOLLOW` (`ELOOP`). Paths are
+  made plain before links are followed, so ".." after a link goes back
+  to where the link is, not up from where it points, as Linux has it.
+  The image has the links of a merged `/usr`; none can be made yet.
 - **Paths** are at most 4095 bytes, each name in them at most 255
   (`ENAMETOOLONG`). A relative path starts at the working directory, or
   at a directory descriptor for the `...at` calls. "." and ".." and

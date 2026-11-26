@@ -60,7 +60,7 @@ var mounts: [MAX_MOUNTS]?Mount = @splat(null);
 pub const DirEntry = struct {
     /// In the buffer the caller gave.
     name: []const u8,
-    kind: enum { file, directory },
+    kind: enum { file, directory, symlink },
 };
 
 /// A file as the rest of the kernel sees it.
@@ -109,6 +109,10 @@ pub const Fs = struct {
     /// the filesystem's business, as long as it stays below 2^63. A
     /// filesystem without the function has only empty directories.
     next: ?*const fn (ctx: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?DirEntry = null,
+    /// What the symbolic link `path` points to, as it was stored (absolute,
+    /// or relative to the directory the link is in); null if `path` is
+    /// not a link. A filesystem without the function has none.
+    readlink: ?*const fn (ctx: *anyopaque, path: []const u8) ?[]const u8 = null,
     /// The functions that change the filesystem; all null for one that
     /// cannot be changed. `create` makes an empty file and returns its
     /// node (to be released, like one from `lookup`).
@@ -155,18 +159,20 @@ fn within(path: []const u8, dir: []const u8) bool {
 
 /// The filesystem `path` belongs to and the path inside it (which starts
 /// with a slash; the mount point itself is "/").
-fn resolve(path: []const u8) ?struct { fs: Fs, rest: []const u8, skipped: usize } {
+fn resolve(path: []const u8) ?struct { fs: *const Fs, rest: []const u8, skipped: usize } {
     if (path.len == 0 or path[0] != '/') return null;
-    var best: ?Mount = null;
-    for (mounts) |slot| {
-        const m = slot orelse continue;
+    // By pointer: a mount is large (all of a filesystem's functions), and
+    // copies of the table would fill a kernel stack frame.
+    var best: ?*const Mount = null;
+    for (&mounts) |*slot| {
+        const m = &(slot.* orelse continue);
         if (within(path, m.path) and (best == null or m.path.len > best.?.path.len)) best = m;
     }
     const m = best orelse return null;
     // How much of a path the mount point takes: nothing for the root.
     const skipped = if (m.path.len == 1) 0 else m.path.len;
     const rest = path[skipped..];
-    return .{ .fs = m.fs, .rest = if (rest.len == 0) "/" else rest, .skipped = skipped };
+    return .{ .fs = &m.fs, .rest = if (rest.len == 0) "/" else rest, .skipped = skipped };
 }
 
 /// Look up the file at `path`. Returns null if there is none (or it is a
@@ -249,7 +255,7 @@ pub fn mkdir(path: []const u8) Error!void {
 pub fn unlink(path: []const u8) Error!void {
     const at = resolve(path) orelse return error.NotFound;
     if (holdsMount(path)) return error.IsDirectory;
-    const f = at.fs.unlink orelse return if (lookupExists(path)) error.ReadOnly else if (isDirectory(path)) error.IsDirectory else error.NotFound;
+    const f = at.fs.unlink orelse return if (lookupExists(path) or readLink(path) != null) error.ReadOnly else if (isDirectory(path)) error.IsDirectory else error.NotFound;
     return f(at.fs.ctx, at.rest);
 }
 
@@ -267,7 +273,7 @@ pub fn rename(old: []const u8, new: []const u8) Error!void {
     const to = resolve(new) orelse return error.NotFound;
     if (holdsMount(old) or holdsMount(new)) return error.Busy;
     if (from.fs.ctx != to.fs.ctx or from.skipped != to.skipped) return error.CrossDevice;
-    const f = from.fs.rename orelse return if (lookupExists(old) or isDirectory(old)) error.ReadOnly else error.NotFound;
+    const f = from.fs.rename orelse return if (lookupExists(old) or isDirectory(old) or readLink(old) != null) error.ReadOnly else error.NotFound;
     return f(from.fs.ctx, from.rest, to.rest);
 }
 
@@ -338,6 +344,71 @@ pub fn next(dir: []const u8, cookie: *u64, name_buf: []u8) ?DirEntry {
     }
     cookie.* = MOUNTS_PHASE | mounts.len;
     return null;
+}
+
+/// What the symbolic link at `path` (normalized; links before its last
+/// part already followed) points to, or null if it is not one.
+pub fn readLink(path: []const u8) ?[]const u8 {
+    const at = resolve(path) orelse return null;
+    if (at.rest.len == 1) return null; // a mount point is a directory
+    const f = at.fs.readlink orelse return null;
+    return f(at.fs.ctx, at.rest);
+}
+
+/// Most links one path may go through, as on Linux (`ELOOP` beyond).
+pub const MAX_LINKS = 40;
+
+/// Follow the symbolic links in the normalized path `path`, in every part
+/// of it, the last too unless `follow_last` is false. The result, also
+/// normalized, is in `out`; `scratch` is space of the same size to work
+/// in. A link's target is taken relative to the directory the link is
+/// in, unless it is absolute.
+///
+/// Paths are made plain before links are followed (`normalize`), so ".."
+/// after a link goes back to where the link is, not up from where it
+/// points: Linux does the latter. Programs rarely notice.
+///
+/// `error.Loop` after `MAX_LINKS` links, `error.NameTooLong` if the result
+/// does not fit.
+pub fn followLinks(out: []u8, scratch: []u8, path: []const u8, follow_last: bool) (Error || error{Loop})![]const u8 {
+    if (out.len < path.len) return error.NameTooLong;
+    @memcpy(out[0..path.len], path);
+    var len = path.len;
+    var hops: usize = 0;
+    // Each pass looks at the parts of the path from the first on, and
+    // starts again after replacing a link with its target.
+    outer: while (true) {
+        var end: usize = 1;
+        while (end < len) {
+            // The next part ends at the next slash or at the end.
+            end = (std.mem.indexOfScalarPos(u8, out[0..len], end, '/') orelse len);
+            const last = end == len;
+            if (last and !follow_last) break;
+            const target = readLink(out[0..end]) orelse {
+                end += 1;
+                continue;
+            };
+            hops += 1;
+            if (hops > MAX_LINKS) return error.Loop;
+            // What it comes to: the target in place of the link, the rest
+            // of the path after it, made plain again.
+            const dir_end = std.mem.lastIndexOfScalar(u8, out[0..end], '/').?;
+            const base = if (dir_end == 0) "/" else out[0..dir_end];
+            const rest = out[end..len];
+            if (target.len + rest.len > scratch.len) return error.NameTooLong;
+            @memcpy(scratch[0..target.len], target);
+            @memcpy(scratch[target.len..][0..rest.len], rest);
+            const joined = scratch[0 .. target.len + rest.len];
+            // `normalize` writes `out` while reading `base` from it: the
+            // base is copied first, behind the joined path.
+            if (joined.len + base.len > scratch.len) return error.NameTooLong;
+            @memcpy(scratch[joined.len..][0..base.len], base);
+            const plain = try normalize(out, scratch[joined.len..][0..base.len], if (joined.len == 0) "." else joined);
+            len = plain.len;
+            continue :outer;
+        }
+        return out[0..len];
+    }
 }
 
 /// Make an absolute, normalized path of `path` in `out`: relative to the

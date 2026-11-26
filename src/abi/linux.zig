@@ -253,6 +253,8 @@ pub const E = enum(u16) {
     RANGE = 34,
     /// Directory not empty.
     NOTEMPTY = 39,
+    /// Too many symbolic links.
+    LOOP = 40,
     /// Address family not supported.
     AFNOSUPPORT = 97,
     /// Invalid argument.
@@ -329,6 +331,7 @@ pub const O = struct {
     pub const APPEND = 0o2000;
     pub const NONBLOCK = 0o4000;
     pub const DIRECTORY = 0o200000;
+    pub const NOFOLLOW = 0o400000;
     pub const CLOEXEC = 0o2000000;
 };
 

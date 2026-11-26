@@ -56,15 +56,30 @@ const Path = struct {
         heap.allocator.free(self.storage);
     }
 
+    const Result = union(enum) { path: Path, fail: u64 };
+
     /// The path at the user address `ptr`, relative to `dirfd` (`CWD` for
     /// the working directory). Errors are system call results: `EFAULT`
     /// if it cannot be read, `ENAMETOOLONG` if it or what it comes to does
     /// not fit `PATH_MAX` bytes or has a part of more than 255, `ENOENT`
     /// if it is empty, `EBADF` and `ENOTDIR` for a `dirfd` that is not an
-    /// open directory (only looked at for a relative path), `ENOMEM`.
-    fn from(dirfd: u64, ptr: u64) union(enum) { path: Path, fail: u64 } {
+    /// open directory (only looked at for a relative path), `ENOMEM`,
+    /// `ELOOP` for more than 40 symbolic links.
+    ///
+    /// Symbolic links are followed in every part of the path, the last
+    /// too: `fromNoFollow` leaves the last one alone (unless the path ends
+    /// in a slash, which asks for what it points to).
+    fn from(dirfd: u64, ptr: u64) Result {
+        return fromFollowing(dirfd, ptr, true);
+    }
+
+    fn fromNoFollow(dirfd: u64, ptr: u64) Result {
+        return fromFollowing(dirfd, ptr, false);
+    }
+
+    fn fromFollowing(dirfd: u64, ptr: u64, follow_last: bool) Result {
         const p = thread.current().process orelse return .{ .fail = err(.NOSYS) };
-        const storage = heap.allocator.alloc(u8, 2 * abi.PATH_MAX) catch return .{ .fail = err(.NOMEM) };
+        const storage = heap.allocator.alloc(u8, 3 * abi.PATH_MAX) catch return .{ .fail = err(.NOMEM) };
         const raw_buf = storage[0..abi.PATH_MAX];
         // One byte less than the buffer: a path is at most `PATH_MAX - 1`
         // bytes, so that it fits a buffer of `PATH_MAX` with its NUL.
@@ -92,7 +107,14 @@ const Path = struct {
                 if (of.kind != .directory) break :blk err(.NOTDIR);
                 break :with_dir vfs.normalize(out, of.path, raw);
             };
-            const text = result catch |e| break :blk vfsError(e);
+            const plain = result catch |e| break :blk vfsError(e);
+            // What the program gave is no longer needed: its buffer is
+            // space to work in.
+            const followed_buf = storage[2 * abi.PATH_MAX ..][0 .. abi.PATH_MAX - 1];
+            const text = vfs.followLinks(followed_buf, raw_buf, plain, follow_last or directory_wanted) catch |e| break :blk switch (e) {
+                error.Loop => err(.LOOP),
+                else => |other| vfsError(other),
+            };
             return .{ .path = .{ .storage = storage, .text = text, .directory_wanted = directory_wanted } };
         };
         heap.allocator.free(storage);
@@ -186,39 +208,11 @@ fn copyStringList(ptr: u64, bytes_left: *usize, count_left: *usize) union(enum) 
 /// larger than the caller's memory limit) or `EAGAIN` (the caller, or a
 /// process above it, has as many descendants as it may).
 fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
-    var given = switch (Path.from(CWD, ptr)) {
-        .path => |p| p,
+    const child = switch (startChild(ptr, argv, envp)) {
+        .child => |c| c,
         .fail => |e| return e,
     };
-    defer given.deinit();
-    const path = given.text;
-    var bytes_left: usize = abi.ARG_MAX;
-    var count_left: usize = abi.ARG_COUNT_MAX;
-    const args = switch (copyStringList(argv, &bytes_left, &count_left)) {
-        .list => |l| l,
-        .fail => |e| return e,
-    };
-    defer args.deinit();
-    const env = switch (copyStringList(envp, &bytes_left, &count_left)) {
-        .list => |l| l,
-        .fail => |e| return e,
-    };
-    defer env.deinit();
-    // The child starts in the directory this process is in now.
     const me = thread.current().process.?;
-    const cwd = blk: {
-        const held = me.files_lock.acquire();
-        defer me.files_lock.release(held);
-        break :blk heap.allocator.dupe(u8, me.cwd);
-    } catch return err(.NOMEM);
-    defer heap.allocator.free(cwd);
-    const child = proc.spawnPath(path, .{ .parent = me, .argv = args.items(), .envp = env.items(), .cwd = cwd }) catch |e| return switch (e) {
-        error.FileNotFound => err(.NOENT),
-        error.OutOfMemory, error.TooLarge => err(.NOMEM),
-        error.TooManyProcesses => err(.AGAIN),
-        error.ArgumentsTooLong => err(.@"2BIG"),
-        else => err(.NOEXEC), // unreadable, or refused by the ELF loader
-    };
     // The child has the terminal while it runs: Ctrl+C ends it, not this
     // process. Whether it is still running or already gone. If this
     // process is ended meanwhile, the child runs on with nobody waiting.
@@ -237,6 +231,50 @@ fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
         proc.release(child);
         return err(.INTR);
     };
+}
+
+/// The start half of `myos_run`: the program at the path, started as a
+/// child of the calling process, or the system call's error. Everything it
+/// needs (the path, the copied arguments and environment) is freed when it
+/// returns, before the caller waits: a chain of programs starting programs
+/// would otherwise hold all of it for as long as the chain is.
+fn startChild(ptr: u64, argv: u64, envp: u64) union(enum) { child: *proc.Process, fail: u64 } {
+    var given = switch (Path.from(CWD, ptr)) {
+        .path => |p| p,
+        .fail => |e| return .{ .fail = e },
+    };
+    defer given.deinit();
+    const path = given.text;
+    var bytes_left: usize = abi.ARG_MAX;
+    var count_left: usize = abi.ARG_COUNT_MAX;
+    const args = switch (copyStringList(argv, &bytes_left, &count_left)) {
+        .list => |l| l,
+        .fail => |e| return .{ .fail = e },
+    };
+    defer args.deinit();
+    const env = switch (copyStringList(envp, &bytes_left, &count_left)) {
+        .list => |l| l,
+        .fail => |e| return .{ .fail = e },
+    };
+    defer env.deinit();
+    // The child starts in the directory this process is in now.
+    const me = thread.current().process.?;
+    const cwd = blk: {
+        const held = me.files_lock.acquire();
+        defer me.files_lock.release(held);
+        break :blk heap.allocator.dupe(u8, me.cwd);
+    } catch return .{ .fail = err(.NOMEM) };
+    defer heap.allocator.free(cwd);
+    const child = proc.spawnPath(path, .{ .parent = me, .argv = args.items(), .envp = env.items(), .cwd = cwd }) catch |e| return .{
+        .fail = switch (e) {
+            error.FileNotFound => err(.NOENT),
+            error.OutOfMemory, error.TooLarge => err(.NOMEM),
+            error.TooManyProcesses => err(.AGAIN),
+            error.ArgumentsTooLong => err(.@"2BIG"),
+            else => err(.NOEXEC), // unreadable, or refused by the ELF loader
+        },
+    };
+    return .{ .child = child };
 }
 
 /// `write`: print `count` bytes at the user address `ptr` to the console.
@@ -420,7 +458,7 @@ fn sysTruncate(path_ptr: u64, length: u64) u64 {
 /// `mkdir` and `mkdirat`: make an empty directory. `EEXIST`, `ENOENT` or
 /// `ENOTDIR` for the directory it is to go into, `EROFS`, `ENOSPC`.
 fn sysMkdir(dirfd: u64, path_ptr: u64) u64 {
-    var given = switch (Path.from(dirfd, path_ptr)) {
+    var given = switch (Path.fromNoFollow(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
@@ -436,7 +474,7 @@ fn sysMkdir(dirfd: u64, path_ptr: u64) u64 {
 /// `EROFS`, `EBUSY` for a mount point, `EINVAL` for unknown flags.
 fn sysUnlink(dirfd: u64, path_ptr: u64, flags: u64) u64 {
     if (flags & ~@as(u64, abi.AT_REMOVEDIR) != 0) return err(.INVAL);
-    var given = switch (Path.from(dirfd, path_ptr)) {
+    var given = switch (Path.fromNoFollow(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
@@ -446,6 +484,7 @@ fn sysUnlink(dirfd: u64, path_ptr: u64, flags: u64) u64 {
         .none => return err(.NOENT),
         .file => if (directory or given.directory_wanted) return err(.NOTDIR),
         .directory => if (!directory) return err(.ISDIR),
+        .symlink => if (directory) return err(.NOTDIR), // the link goes, not what it points to
         // What this kernel itself puts into /proc and /dev stays.
         else => return err(.PERM),
     }
@@ -460,19 +499,19 @@ fn sysUnlink(dirfd: u64, path_ptr: u64, flags: u64) u64 {
 /// supported), `EROFS`, `EBUSY`, `ENOSPC`.
 fn sysRename(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: u64) u64 {
     if (flags != 0) return err(.INVAL);
-    var old = switch (Path.from(old_dirfd, old_ptr)) {
+    var old = switch (Path.fromNoFollow(old_dirfd, old_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
     defer old.deinit();
-    var new = switch (Path.from(new_dirfd, new_ptr)) {
+    var new = switch (Path.fromNoFollow(new_dirfd, new_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
     defer new.deinit();
     switch (named(old.text)) {
         .none => return err(.NOENT),
-        .file, .directory => {},
+        .file, .directory, .symlink => {},
         else => return err(.PERM),
     }
     vfs.rename(old.text, new.text) catch |e| return vfsError(e);
@@ -716,7 +755,9 @@ fn isOpen(fd: u64) bool {
 /// names something else. `ENOENT`, `EMFILE`, `ENOMEM`, and what `Path.from`
 /// says.
 fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
-    var given = switch (Path.from(dirfd, ptr)) {
+    // O_NOFOLLOW: a link as the last part is refused (ELOOP) instead of
+    // followed.
+    var given = switch (if (flags & abi.O.NOFOLLOW != 0) Path.fromNoFollow(dirfd, ptr) else Path.from(dirfd, ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
@@ -730,6 +771,7 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
     if (access == abi.O.ACCMODE) return err(.INVAL);
     if (what != .none and flags & (abi.O.CREAT | abi.O.EXCL) == abi.O.CREAT | abi.O.EXCL) return err(.EXIST);
     switch (what) {
+        .symlink => return err(.LOOP),
         .none => {
             if (flags & abi.O.CREAT == 0) return err(.NOENT);
             if (directory_wanted) return err(.ISDIR); // Linux's answer to creating "name/"
@@ -967,8 +1009,11 @@ const Named = union(enum) {
     file,
     directory,
     /// A symbolic link to the program the calling process runs
-    /// (`/proc/self/exe`): the only links there are.
+    /// (`/proc/self/exe`).
     exe_link,
+    /// A symbolic link of a filesystem, not followed (the path came from
+    /// `Path.fromNoFollow`): what it points to is `vfs.readLink`'s.
+    symlink,
     /// A text file made when it is opened (`procfs.zig`).
     generated: procfs.File,
     /// `/dev/null`, `/dev/urandom`, `/dev/random`.
@@ -981,6 +1026,7 @@ const Named = union(enum) {
 /// are directories, and `exe` in the last two is a link to its program.
 fn named(path: []const u8) Named {
     if (procEntry(path)) |entry| return entry;
+    if (vfs.readLink(path) != null) return .symlink;
     if (std.mem.eql(u8, path, "/dev/null")) return .{ .device = .null_device };
     if (std.mem.eql(u8, path, "/dev/urandom") or std.mem.eql(u8, path, "/dev/random")) return .{ .device = .random_device };
     if (std.mem.eql(u8, std.mem.trimEnd(u8, path, "/"), "/dev")) return .directory;
@@ -1019,7 +1065,7 @@ fn fileAt(path: []const u8) ?vfs.Node {
     return switch (named(path)) {
         .file => vfs.lookup(path), // null if it was removed just now
         .exe_link => vfs.lookup(thread.current().process.?.name),
-        .none, .directory, .generated, .device => null,
+        .none, .directory, .generated, .device, .symlink => null,
     };
 }
 
@@ -1078,7 +1124,7 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
         const first = fromUser(u8, path_ptr) orelse return err(.FAULT);
         if (first == 0) return sysFstat(dirfd, stat_ptr);
     }
-    var given = switch (Path.from(dirfd, path_ptr)) {
+    var given = switch ((if (flags & abi.AT_SYMLINK_NOFOLLOW != 0) Path.fromNoFollow(dirfd, path_ptr) else Path.from(dirfd, path_ptr))) {
         .path => |p| p,
         .fail => |e| return e,
     };
@@ -1096,6 +1142,16 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
         },
         .generated => generatedStat(),
         .device => deviceStat(),
+        // Only seen with AT_SYMLINK_NOFOLLOW: the link itself.
+        .symlink => blk: {
+            var link: abi.Stat = .{};
+            const target = vfs.readLink(path) orelse "";
+            link.mode = abi.S.IFLNK | 0o777;
+            link.size = @intCast(target.len);
+            link.dev = 1;
+            link.ino = @intFromPtr(target.ptr) | 1;
+            break :blk link;
+        },
         .exe_link => blk: {
             if (flags & abi.AT_SYMLINK_NOFOLLOW != 0) {
                 var link: abi.Stat = .{};
@@ -1116,7 +1172,7 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
 /// nothing can be made at all, `EPERM` otherwise (after the errors of
 /// the path, and `EEXIST`).
 fn sysMknod(dirfd: u64, path_ptr: u64) u64 {
-    var given = switch (Path.from(dirfd, path_ptr)) {
+    var given = switch (Path.fromNoFollow(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
@@ -1144,21 +1200,21 @@ fn sysAccess(dirfd: u64, path_ptr: u64, mode: u64) u64 {
 /// `/proc/self/exe`, by which a program finds its own file. `EINVAL` for
 /// what exists and is no link, or a size of zero; `ENOENT`; `EFAULT`.
 fn sysReadlink(dirfd: u64, path_ptr: u64, buf: u64, size: u64) u64 {
-    var given = switch (Path.from(dirfd, path_ptr)) {
+    var given = switch (Path.fromNoFollow(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
     defer given.deinit();
     const path = given.text;
-    switch (named(path)) {
+    const target = switch (named(path)) {
         .none => return err(.NOENT),
         .file, .directory, .generated, .device => return err(.INVAL),
-        .exe_link => {},
-    }
+        .symlink => vfs.readLink(path) orelse return err(.NOENT),
+        // The name can change under another thread's feet only by the
+        // process ending, and then this thread ends too.
+        .exe_link => thread.current().process.?.name,
+    };
     if (size == 0) return err(.INVAL);
-    // The name can change under another thread's feet only by the process
-    // ending, and then this thread ends too.
-    const target = thread.current().process.?.name;
     const n = @min(target.len, size);
     uaccess.copyToUser(buf, target[0..n]) catch return err(.FAULT);
     return n;
@@ -1320,7 +1376,11 @@ fn nextEntry(dir: []const u8, position: *u64, name_buf: []u8) ?ListEntry {
         var listed = false;
         for (extra) |e| listed = listed or std.mem.eql(u8, e.name, entry.name);
         if (listed) continue;
-        return .{ .name = entry.name, .type = if (entry.kind == .directory) abi.DT.DIR else abi.DT.REG };
+        return .{ .name = entry.name, .type = switch (entry.kind) {
+            .directory => abi.DT.DIR,
+            .file => abi.DT.REG,
+            .symlink => abi.DT.LNK,
+        } };
     }
     return null;
 }

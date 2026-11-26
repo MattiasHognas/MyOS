@@ -67,6 +67,21 @@ fn listing(fd: u64) []const u8 {
     return list_buf[0..len];
 }
 
+/// The `d_type` the directory `fd` gives for `name`, or 0.
+fn linkType(fd: u64, name: []const u8) u8 {
+    _ = lib.syscall(Sys.lseek, fd, 0, abi.SEEK.SET);
+    while (true) {
+        const n = lib.syscall(Sys.getdents64, fd, @intFromPtr(&dents), dents.len);
+        if (lib.isError(n) or n == 0) return 0;
+        var at: usize = 0;
+        while (at < n) {
+            const reclen = std.mem.readInt(u16, dents[at + 16 ..][0..2], .little);
+            if (std.mem.eql(u8, std.mem.sliceTo(dents[at + 19 .. at + reclen], 0), name)) return dents[at + 18];
+            at += reclen;
+        }
+    }
+}
+
 /// Whether the listing `names` has the name `name`.
 fn has(names: []const u8, name: []const u8) bool {
     var it = std.mem.splitScalar(u8, names, ' ');
@@ -206,6 +221,34 @@ pub fn main() noreturn {
     long_path[256] = 'b';
     long_path[257] = 0; // and of 256
     expect(lib.syscall(Sys.stat, @intFromPtr(&long_path), @intFromPtr(&st), 0) == lib.err(.NAMETOOLONG), 174);
+
+    // --- Symbolic links: the layout is Linux's, with /usr merged.
+    expect(lib.syscall(Sys.readlink, @intFromPtr("/bin"), bufp, buf.len) == 7 and std.mem.eql(u8, buf[0..7], "usr/bin"), 180);
+    expect(lib.syscall(Sys.lstat, @intFromPtr("/bin"), @intFromPtr(&st), 0) == 0 and st.mode & S.IFMT == S.IFLNK and st.size == 7, 181);
+    expect(kind("/bin") == S.IFDIR and kind("/sbin") == S.IFDIR and kind("/lib") == S.IFDIR and kind("/lib64") == S.IFDIR, 182); // followed
+    expect(kind("/bin/sh") == S.IFREG and kind("/usr/bin/sh") == S.IFREG and kind("/bin/") == S.IFDIR, 183);
+    expect(statOf("/bin/hello").?.ino == statOf("/usr/bin/hello").?.ino, 184); // one file, two ways
+    const by_link = lib.open("/bin/hello");
+    expect(!lib.isError(by_link) and lib.read(by_link, buf[0..4]) == 4 and std.mem.eql(u8, buf[0..4], "\x7fELF"), 185);
+    _ = lib.close(by_link);
+    expect(lib.run("/bin/entry_regs") == lib.err(.NOENT) and lib.run("/bin/hello") == 0, 186); // started through a link
+    // Not followed where Linux does not: the last part of O_NOFOLLOW,
+    // unlink and rename, and a path ending in a slash is followed after all.
+    expect(lib.syscall(Sys.open, @intFromPtr("/bin"), abi.O.NOFOLLOW, 0) == lib.err(.LOOP), 187);
+    expect(!lib.isError(lib.syscall(Sys.open, @intFromPtr("/bin/hello"), abi.O.NOFOLLOW, 0)), 188); // only the last part counts
+    expect(lib.syscall(Sys.unlink, @intFromPtr("/bin"), 0, 0) == lib.err(.ROFS) and lib.syscall(Sys.rmdir, @intFromPtr("/bin"), 0, 0) == lib.err(.NOTDIR), 189);
+    expect(lib.syscall(Sys.lstat, @intFromPtr("/bin/"), @intFromPtr(&st), 0) == 0 and st.mode & S.IFMT == S.IFDIR, 190);
+    // In a listing, a link is a link.
+    const top = lib.open("/");
+    expect(linkType(top, "bin") == abi.DT.LNK and linkType(top, "usr") == abi.DT.DIR and linkType(top, "lib64") == abi.DT.LNK, 191);
+    _ = lib.close(top);
+    // Working directories through links, and ".." from there.
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/bin"), 0, 0) == 0, 192);
+    expect(lib.syscall(Sys.getcwd, bufp, buf.len, 0) == "/usr/bin".len + 1 and std.mem.eql(u8, buf[0..8], "/usr/bin"), 193);
+    expect(kind("sh") == S.IFREG and kind("../lib64") == S.IFDIR, 194);
+    expect(lib.syscall(Sys.chdir, @intFromPtr("/"), 0, 0) == 0, 195);
+    // The standard directories are there, empty.
+    for ([_][*:0]const u8{ "/home", "/root", "/opt", "/var", "/mnt", "/media", "/run", "/usr/lib", "/usr/lib64" }) |d| expect(kind(d) == S.IFDIR, 196);
 
     // --- /proc/self/exe: how a program finds its own file.
     const pid = lib.syscall(Sys.getpid, 0, 0, 0);

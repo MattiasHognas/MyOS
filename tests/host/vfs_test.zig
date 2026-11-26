@@ -373,3 +373,103 @@ test "VFS: a path goes to the filesystem mounted nearest above it" {
     };
     try std.testing.expect(failed);
 }
+
+/// `ListFs` with symbolic links: `links` pairs a path with its target.
+const LinkFs = struct {
+    list: ListFs,
+    links: []const [2][]const u8,
+
+    fn readlink(ctx: *anyopaque, path: []const u8) ?[]const u8 {
+        const self: *LinkFs = @ptrCast(@alignCast(ctx));
+        for (self.links) |l| {
+            if (std.mem.eql(u8, l[0], path)) return l[1];
+        }
+        return null;
+    }
+
+    fn lookup(ctx: *anyopaque, path: []const u8) ?vfs.Node {
+        const self: *LinkFs = @ptrCast(@alignCast(ctx));
+        return ListFs.lookup(&self.list, path);
+    }
+
+    fn isDir(ctx: *anyopaque, path: []const u8) bool {
+        const self: *LinkFs = @ptrCast(@alignCast(ctx));
+        return ListFs.isDir(&self.list, path);
+    }
+
+    fn fs(self: *LinkFs) vfs.Fs {
+        return .{ .ctx = self, .lookup = lookup, .is_dir = isDir, .readlink = readlink };
+    }
+};
+
+fn follow(path: []const u8, follow_last: bool) ![]const u8 {
+    const S = struct {
+        var out: [256]u8 = undefined;
+        var scratch: [256]u8 = undefined;
+    };
+    return vfs.followLinks(&S.out, &S.scratch, path, follow_last);
+}
+
+test "VFS: symbolic links are followed in every part of a path" {
+    vfs.unmountAll();
+    defer vfs.unmountAll();
+    // The layout of a merged /usr, with a chain for the loader as Debian
+    // has it, a link to a link, one pointing upwards, one absolute.
+    var root: LinkFs = .{
+        .list = .{ .files = &.{ "/usr/bin/sh", "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "/etc/motd", "/tmp/note" } },
+        .links = &.{
+            .{ "/bin", "usr/bin" },
+            .{ "/lib", "usr/lib" },
+            .{ "/lib64", "usr/lib64" },
+            .{ "/usr/lib64", "lib" },
+            .{ "/usr/lib/ld.so", "x86_64-linux-gnu/ld-linux-x86-64.so.2" },
+            .{ "/usr/lib/x86_64-linux-gnu/loader", "../ld.so" },
+            .{ "/etc/welcome", "/etc/motd" },
+            .{ "/etc/self", "self" },
+            .{ "/etc/a", "b" },
+            .{ "/etc/b", "a" },
+            .{ "/etc/nowhere", "does/not/exist" },
+            .{ "/etc/empty", "" },
+        },
+    };
+    vfs.mountRoot(root.fs());
+
+    try std.testing.expectEqualStrings("/usr/bin/sh", try follow("/bin/sh", true));
+    try std.testing.expectEqualStrings("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", try follow("/lib64/x86_64-linux-gnu/ld-linux-x86-64.so.2", true)); // two links
+    try std.testing.expectEqualStrings("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", try follow("/lib/x86_64-linux-gnu/loader", true)); // three, one upwards
+    try std.testing.expectEqualStrings("/etc/motd", try follow("/etc/welcome", true));
+    try std.testing.expectEqualStrings("/usr/bin", try follow("/bin", true));
+    // The last part is left alone when asked: what lstat and readlink see.
+    try std.testing.expectEqualStrings("/bin", try follow("/bin", false));
+    try std.testing.expectEqualStrings("/usr/lib/ld.so", try follow("/lib/ld.so", false));
+    // Paths without links, and links to what does not exist (followed: it
+    // is for the caller to find nothing there).
+    try std.testing.expectEqualStrings("/etc/motd", try follow("/etc/motd", true));
+    try std.testing.expectEqualStrings("/", try follow("/", true));
+    try std.testing.expectEqualStrings("/etc/does/not/exist", try follow("/etc/nowhere", true));
+    try std.testing.expectEqualStrings("/etc", try follow("/etc/empty", true));
+    // Loops end.
+    try std.testing.expectError(error.Loop, follow("/etc/self", true));
+    try std.testing.expectError(error.Loop, follow("/etc/a", true));
+    try std.testing.expectError(error.Loop, follow("/etc/a/x", false)); // a loop in the middle, too
+    try std.testing.expectEqualStrings("/etc/a", try follow("/etc/a", false));
+    // What does not fit.
+    var small_out: [8]u8 = undefined;
+    var small_scratch: [8]u8 = undefined;
+    try std.testing.expectError(error.NameTooLong, vfs.followLinks(&small_out, &small_scratch, "/bin/sh", true));
+    try std.testing.expectEqual(@as(?[]const u8, "usr/bin"), vfs.readLink("/bin"));
+    try std.testing.expectEqual(@as(?[]const u8, null), vfs.readLink("/etc/motd"));
+}
+
+test "VFS: a link may lead into another filesystem" {
+    vfs.unmountAll();
+    defer vfs.unmountAll();
+    var root: LinkFs = .{ .list = .{ .files = &.{"/etc/motd"} }, .links = &.{ .{ "/var/tmp", "/tmp" }, .{ "/scratch", "tmp/inner" } } };
+    var tmp: LinkFs = .{ .list = .{ .files = &.{"/inner/file"} }, .links = &.{.{ "/up", "../etc" }} };
+    vfs.mountRoot(root.fs());
+    try vfs.mount("/tmp", tmp.fs());
+    try std.testing.expectEqualStrings("/tmp/inner/file", try follow("/var/tmp/inner/file", true));
+    try std.testing.expectEqualStrings("/tmp/inner/file", try follow("/scratch/file", true));
+    try std.testing.expectEqualStrings("/etc/motd", try follow("/tmp/up/motd", true)); // and out of it again
+    try std.testing.expect(vfs.lookup("/tmp/inner/file") != null);
+}

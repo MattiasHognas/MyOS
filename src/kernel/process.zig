@@ -729,13 +729,25 @@ pub fn growFiles(p: *Process, slots: usize) bool {
     return true;
 }
 
+/// The file at the absolute path `path`, symbolic links followed: what
+/// `/bin/sh` or `/lib64/ld-linux-x86-64.so.2` is. Released with
+/// `vfs.release`. `error.FileNotFound`, `error.NameTooLong`,
+/// `error.OutOfMemory`.
+pub fn lookupFollowing(path: []const u8) !vfs.Node {
+    const storage = try heap.allocator.alloc(u8, 3 * abi.PATH_MAX);
+    defer heap.allocator.free(storage);
+    const plain = vfs.normalize(storage[0..abi.PATH_MAX], "/", path) catch return error.FileNotFound;
+    const followed = vfs.followLinks(storage[abi.PATH_MAX..][0..abi.PATH_MAX], storage[2 * abi.PATH_MAX ..], plain, true) catch return error.FileNotFound;
+    return vfs.lookup(followed) orelse error.FileNotFound;
+}
+
 /// Load the executable at `path` from the VFS and start it as a new process.
 ///
 /// Returns immediately without waiting for the process. Returns
 /// `error.FileNotFound` if the file doesn't exist, `error.ReadFailed` if it
 /// can't be read completely, or any error from `spawn`.
 pub fn spawnPath(path: []const u8, options: SpawnOptions) !*Process {
-    const node = vfs.lookup(path) orelse return error.FileNotFound;
+    const node = try lookupFollowing(path);
     defer vfs.release(&node);
     const size = vfs.sizeOf(&node);
     const image = try heap.allocator.alloc(u8, size);
@@ -831,7 +843,7 @@ noinline fn loadProgram(root: u64, image: []const u8, limits: elf_image.Limits, 
 /// A function of its own, never inlined, to keep the image and its
 /// headers off the stack frame of `spawn`.
 noinline fn loadInterpreter(root: u64, path: []const u8, limits: elf_image.Limits, regions: *vm_regions.Regions, mmap_top: u64) !elf.Loaded {
-    const node = vfs.lookup(path) orelse return error.FileNotFound;
+    const node = try lookupFollowing(path);
     defer vfs.release(&node);
     const size = vfs.sizeOf(&node);
     const image = try heap.allocator.alloc(u8, size);

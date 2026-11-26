@@ -69,7 +69,7 @@ The test kernel runs the test scenario QEMU asked for instead
 ([testing](testing.md)).
 
 The initrd is a tar archive built by `scripts/build.sh`: `/bin/sh`,
-`/bin/hello`, `/etc/motd`, and `/test/*` in the test image.
+`/usr/bin/hello` (also `/bin/hello`: `/bin` is a link to `usr/bin`), `/etc/motd`, and `/test/*` in the test image.
 
 ## Address-space layout
 
@@ -161,6 +161,33 @@ refused. Read: roadmap sections 2.9 and 2.10, `src/kernel/random.zig`,
 **Diagnostics.** Log levels, assertions per subsystem, symbolized
 backtraces, and fault reports. Read: [debugging](debugging.md),
 `src/kernel/debug/`.
+
+## The filesystem layout
+
+Linux's, as the Filesystem Hierarchy Standard has it, in the "merged
+`/usr`" form of Debian, Fedora and Arch: programs built for Linux have
+paths written into them (`/bin/sh`, the loader in `/lib64`, `/etc/...`),
+so MyOS uses those names rather than names of its own.
+
+| Path | Holds |
+| --- | --- |
+| `/usr/bin` | Programs: MyOS's own (`sh`, `hello`) and installed ones |
+| `/usr/lib`, `/usr/lib/x86_64-linux-gnu` | Libraries; glibc's in the second, where Debian puts them, with its loader |
+| `/usr/lib64` | The loader's name programs ask for (`ld-linux-x86-64.so.2`), a link into `/usr/lib/x86_64-linux-gnu` |
+| `/bin`, `/sbin`, `/lib`, `/lib64` | Links into `/usr` |
+| `/etc` | Settings |
+| `/home`, `/root` | Users' files |
+| `/opt/<app>` | Self-contained applications, such as a `dotnet publish` folder |
+| `/var`, `/run` | State the system keeps; what is only there while it runs |
+| `/tmp` | Temporary files, in memory (`fs/tmpfs.zig`) |
+| `/mnt`, `/media` | Other disks, once there are any |
+| `/proc`, `/dev` | Made by the kernel (`procfs.zig`, `syscall.zig`) |
+| `/boot` | The kernel and the boot loader, on the ISO |
+| `/test`, `/fixtures` | Test images only: MyOS's test programs, and programs built for Linux by `tests/fixtures/build.sh` |
+
+glibc is in development and test images (`scripts/fetch-sysroot.sh`), not
+in release images: it is to be installed on a running MyOS once there is
+a disk and a network, so that it comes from Debian to whoever installs it.
 
 ## What is tested, and how
 

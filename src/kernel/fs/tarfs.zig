@@ -50,7 +50,12 @@ fn nextEntry(_: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?vfs.
     var offset: usize = @intCast(cookie.*);
     defer cookie.* = offset;
     const entry = tar.nextInDirectory(archive, tar.normalize(dir), &offset, name_buf) orelse return null;
-    return .{ .name = entry.name, .kind = if (entry.directory) .directory else .file };
+    return .{ .name = entry.name, .kind = if (entry.link) .symlink else if (entry.directory) .directory else .file };
+}
+
+/// `vfs.Fs.readlink` implementation.
+fn readLink(_: *anyopaque, path: []const u8) ?[]const u8 {
+    return tar.linkTarget(archive, tar.normalize(path));
 }
 
 /// `vfs.Ops.read` implementation: copy up to `buf.len` bytes starting at
@@ -74,5 +79,5 @@ pub fn init(image: []const u8) vfs.Fs {
     while (tar.next(archive, &off)) |e| {
         if (tar.isFile(e)) log.debug("/{s}{s}{s} ({d} bytes)", .{ e.prefix, if (e.prefix.len != 0) "/" else "", e.name, e.data.len });
     }
-    return .{ .ctx = undefined, .lookup = lookup, .is_dir = isDirectory, .next = nextEntry };
+    return .{ .ctx = undefined, .lookup = lookup, .is_dir = isDirectory, .next = nextEntry, .readlink = readLink };
 }

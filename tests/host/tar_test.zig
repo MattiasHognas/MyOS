@@ -15,6 +15,7 @@ const Member = struct {
     typ: u8 = '0',
     data: []const u8 = "",
     ustar: bool = true,
+    link: []const u8 = "",
 };
 
 var archive_buf: [16 * 512]u8 = undefined;
@@ -30,6 +31,7 @@ fn build(members: []const Member) []const u8 {
         h[156] = m.typ;
         if (m.ustar) @memcpy(h[257..262], "ustar");
         @memcpy(h[345..][0..m.prefix.len], m.prefix);
+        @memcpy(h[157..][0..m.link.len], m.link);
         @memcpy(archive_buf[off + 512 ..][0..m.data.len], m.data);
         off += 512 + std.mem.alignForward(usize, m.data.len, 512);
     }
@@ -238,4 +240,29 @@ test "tar: fuzz with damaged archives" {
             }
         }
     }
+}
+
+test "tar: symbolic links, and where they show" {
+    const archive = build(&.{
+        .{ .name = "./usr/bin/sh", .data = "x" },
+        .{ .name = "./bin", .typ = '2', .link = "usr/bin" },
+        .{ .name = "./usr/lib64/ld.so", .typ = '2', .link = "../lib/x86_64-linux-gnu/ld.so" },
+        .{ .name = "./usr/lib/x86_64-linux-gnu/ld.so", .data = "elf" },
+    });
+    try testing.expectEqualStrings("usr/bin", tar.linkTarget(archive, "bin").?);
+    try testing.expectEqualStrings("../lib/x86_64-linux-gnu/ld.so", tar.linkTarget(archive, "usr/lib64/ld.so").?);
+    try expectEqual(null, tar.linkTarget(archive, "usr/bin/sh")); // a file is no link
+    try expectEqual(null, tar.linkTarget(archive, "nothing"));
+    // A link is neither a file nor a directory in a listing, even one that
+    // points to a directory.
+    var out: [128]u8 = undefined;
+    try testing.expectEqualStrings("usr/ bin", listing(archive, "", &out));
+    var off: usize = 0;
+    var name_buf: [32]u8 = undefined;
+    while (tar.nextInDirectory(archive, "", &off, &name_buf)) |e| {
+        if (std.mem.eql(u8, e.name, "bin")) try expect(e.link and !e.directory);
+        if (std.mem.eql(u8, e.name, "usr")) try expect(!e.link and e.directory);
+    }
+    var off2: usize = 0;
+    try expect(tar.nextInDirectory(archive, "usr/lib64", &off2, &name_buf).?.link);
 }
