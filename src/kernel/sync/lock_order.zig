@@ -28,6 +28,8 @@ pub const Rank = enum(u8) {
     /// A region of kernel address space and its page tables: the heap, the
     /// kernel stacks, the device window. Never two of them at once.
     kernel_region,
+    /// One CPU's cache of free pages (`pmm.zig`). Never two at once.
+    page_cache,
     /// The page bitmaps.
     page_allocator,
     /// The random generator's state.

@@ -355,7 +355,8 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
   - `vmm.unmap` clears the entries, has every CPU concerned flush, and only then frees page tables and hands back the page. A kernel stack is unmapped with one flush for all its pages (`vmm.unmapRange`).
   - An address space is taken away from every CPU that has it loaded before it is freed (`vmm.unloadRoot`).
   - A CPU whose thread has exited no longer sits on that thread's stack until something else is ready: it moves to a thread of its own, so the thread, its stack and its process are freed at once.
-- [ ] Decide the page allocator for several CPUs: per-CPU caches of free pages in front of the bitmap, or a lock-free design on bitmaps such as LLFree (`docs/research.md`), which also hands out 2 MiB frames cheaply (9.2).
+- [x] Decide the page allocator for several CPUs: per-CPU caches of free pages in front of the bitmap, or a lock-free design on bitmaps such as LLFree (`docs/research.md`), which also hands out 2 MiB frames cheaply (9.2).
+  - Decided: per-CPU caches of free pages in front of the bitmap, as Linux's per-CPU page lists (`pmm.zig`). Each CPU keeps up to 64 pages under a lock of its own and moves 32 at a time to and from the bitmap; a third bitmap marks cached pages, so double frees are still caught. When the bitmap is empty the other CPUs' caches are emptied before an allocation fails. LLFree stays the candidate for when 2 MiB frames are needed (9.2): it is a change to the bitmap behind the caches, not to them.
 - [ ] Give the kernel heap size classes with a per-CPU cache of free objects, replacing the first-fit list under one lock (`docs/research.md`: magazines, snmalloc).
 - [ ] Preempt on wake-up, or otherwise bound how long a woken thread waits: with every CPU busy it goes to the tail of the queue and waits for a running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
 - [x] Stress-test simultaneous allocations, processes, interrupts, and I/O. Three tests run with every CPU taking threads:
@@ -364,7 +365,7 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
   - the TLB: threads on every CPU read a kernel page until it is in their TLBs, then it is unmapped and replaced, and nobody may see the old page.
   - Not covered: I/O, of which there is none to do in parallel yet.
 - [x] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run: `tests_smp` runs the whole suite on four CPUs, and `panic_smp` a crash.
-  - All but six of the in-kernel tests run with every CPU taking threads; the six say why they cannot (`docs/testing.md`).
+  - All but seven of the in-kernel tests run with every CPU taking threads; the seven say why they cannot (`docs/testing.md`).
   - Getting there showed two things the kernel had wrong on several CPUs. A process's memory was freed only when its thread was, after its waiters had been woken, so a parent could find its last child's memory still taken: `process.exit` frees the address space first now. And two keyboard readers woken for two keys could take them in the wrong order: readers are served by number now.
 - [ ] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
   - `scripts/test-qemu.sh` has it as scenario `tests_kvm` (four CPUs, the host's own CPU), skipped where `/dev/kvm` cannot be used or the kernel refuses the host CPU. It passes on the development machine (AMD Zen 5), also run a hundred times over.

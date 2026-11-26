@@ -1907,7 +1907,9 @@ fn runCases() noreturn {
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },
         .{ .name = "syscall fuzzing from ring 3", .func = syscallFuzz },
         .{ .name = "PMM concurrent alloc/free under preemption", .func = pmmConcurrentStress },
-        .{ .name = "PMM critical sections exclude other threads", .func = pmmLock },
+        // Alone: each CPU's page cache has a critical section of its own,
+        // so two threads exclude each other only when they share a CPU.
+        .{ .name = "PMM critical sections exclude other threads", .func = pmmLock, .alone = true },
         .{ .name = "memory exhaustion fails cleanly (page tables, stacks, heap, processes)", .func = memoryExhaustion },
         // Alone: makes page allocation fail for the whole machine, and counts on which allocation is which.
         .{ .name = "process, kernel stack and heap growth fail cleanly at every allocation", .func = spawnAllocationFailures, .alone = true },

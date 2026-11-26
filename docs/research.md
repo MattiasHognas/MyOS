@@ -96,9 +96,10 @@ reservations and cheap 2 MiB frames. Up to 88% less time for concurrent 4 KiB
 allocations and 98% for 2 MiB than Linux's allocator. Rust and C
 implementations are public.
 
-*For MyOS:* **adopt** as the design to evaluate in
-[3.4](todo.md#34-smp-scheduling-and-memory). Our allocator is already a
-bitmap, so it is a step, not a rewrite.
+*For MyOS:* evaluated in [3.4](todo.md#34-smp-scheduling-and-memory),
+which chose per-CPU caches of free pages in front of the bitmap instead
+(simpler, and what Linux does). LLFree stays the candidate for the bitmap
+behind the caches once 2 MiB frames are needed (9.2).
 
 ### Per-CPU object caches: magazines, sheaves, snmalloc, mimalloc
 
