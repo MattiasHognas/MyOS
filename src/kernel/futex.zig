@@ -142,7 +142,7 @@ pub fn wait(p: *Process, addr: u64, expected: u32, bitset: u32, ticks: ?u64) Wai
         // One tick more than asked for: the first tick may be about to
         // happen, and a wait must not end before its time.
         if (ticks) |n| timer.add(&timeout.timer, n + 1);
-        while (!waiter.woken and !timeout.hasFired() and !thread.dying()) {
+        while (!waiter.woken and !timeout.hasFired() and !thread.interrupted()) {
             lock.drop();
             thread.block();
             lock.take();

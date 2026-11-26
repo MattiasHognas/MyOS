@@ -137,6 +137,12 @@ fn eql(s: [*:0]const u8, want: []const u8) bool {
 
 pub fn main() noreturn {
     const args = lib.argv();
+    if (args.len > 1 and eql(args[1], "sigpipe")) {
+        const p = pipe(0);
+        _ = lib.close(fd(p[0]));
+        _ = writeAll(fd(p[1]), "nobody reads"); // SIGPIPE: the end, by default
+        lib.exit(1);
+    }
     if (args.len > 1 and eql(args[1], "blocked")) {
         const p = pipe(0);
         start(readsForEver, fd(p[0]));
@@ -236,6 +242,10 @@ pub fn main() noreturn {
     expect(lib.read(fd(p[0]), &buf) == 0, 89); // then the end, not EAGAIN
     expect(poll(p[0], POLL.IN, 0) == POLL.HUP, 90);
     expect(lib.close(fd(p[0])) == 0, 91);
+    // EPIPE comes with SIGPIPE, which would end this program: ignored here
+    // (the kernel test checks the default in a mode of its own).
+    const ignore = abi.SigAction{ .handler = 1 };
+    expect(lib.syscall6(Sys.rt_sigaction, 13, @intFromPtr(&ignore), 0, abi.SIGSET_SIZE, 0, 0) == 0, 97);
     const q = pipe(O.NONBLOCK | O.CLOEXEC);
     expect(lib.syscall(Sys.fcntl, fd(q[1]), F_GETFL, 0) == O.WRONLY | O.NONBLOCK, 92);
     expect(lib.close(fd(q[0])) == 0, 93);

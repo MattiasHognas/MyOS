@@ -2391,6 +2391,16 @@ pub fn terminalSession() u32 {
     if (status != tty.INTERRUPTED) return 6;
     // The half line went with it.
     if (tty.available() != 0 or tty.readable()) return 7;
+
+    // A program that catches SIGINT is told, and goes on.
+    const catcher = process.spawnPath("/test/terminal", .{ .argv = &.{ "terminal", "catch" } }) catch return 8;
+    tries = 0;
+    while (tty.waitingReaders() == 0 and tries < 500) : (tries += 1) timer.sleepTicks(1);
+    _ = process.setForeground(catcher);
+    tty.inject("\x03");
+    const caught = waitUntilGone(catcher);
+    _ = process.setForeground(null);
+    if (caught != 0) return @intCast(20 + caught);
     return 0;
 }
 

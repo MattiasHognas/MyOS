@@ -4,9 +4,8 @@
 //! interrupt handlers), go through the line discipline (`tty_core.zig`:
 //! line editing, echo, Ctrl+C and Ctrl+D) and wait for a program's `read`.
 //! What is to be shown for them goes to the console. Ctrl+C ends the
-//! foreground program (`process.setForeground`) with the status a program
-//! killed by `SIGINT` has; signals are not delivered yet (milestone 8),
-//! so a program cannot catch it.
+//! foreground program (`process.setForeground`) by sending it `SIGINT`,
+//! unless it handles or ignores that.
 //!
 //! One terminal, as there is one console. Readers are served in the order
 //! they asked, as the keyboard used to serve them: each stands in a line

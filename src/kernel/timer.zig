@@ -170,7 +170,7 @@ pub fn sleepTicksKillable(n: u64) bool {
         defer lock.release(held);
         queue.add(&sleeper.timer, ticks + n + 1);
     }
-    while (!sleeper.hasFired() and !thread.dying()) thread.block();
+    while (!sleeper.hasFired() and !thread.interrupted()) thread.block();
     sleeper.finish();
     return sleeper.hasFired();
 }

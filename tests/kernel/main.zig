@@ -1156,6 +1156,8 @@ fn descriptorsAndPipes() TestError!void {
     const status = helpers.runProgramArgs("/test/pipes", &.{ "pipes", "blocked" }, &.{}) orelse return error.Failed;
     if (status != 9) report("/test/pipes blocked exit status", status);
     try check(status == 9);
+    // Writing to a pipe nobody reads: SIGPIPE, which ends it by default.
+    try check(helpers.runProgramArgs("/test/pipes", &.{ "pipes", "sigpipe" }, &.{}) == 128 + 13);
     try expectFootprint(memory); // open files and pipes are all gone
 }
 
@@ -1171,6 +1173,37 @@ fn filesAndProc() TestError!void {
     try check(code == 0);
     try check(helpers.runPair("/test/files"));
     try expectFootprint(memory); // generated files and grown tables are freed
+}
+
+/// `eventfd` and `epoll`: a counter, a set of descriptors waited on
+/// together with a timeout, woken by another thread.
+fn eventLoop() TestError!void {
+    _ = helpers.runProgram("/test/epoll"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/epoll") orelse return error.Failed;
+    if (code != 0) report("/test/epoll failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/epoll"));
+    try expectFootprint(memory);
+}
+
+/// Signals: handlers with their arguments, a context they may change and
+/// that comes back, masks, faults that become signals, the alternate
+/// stack, EINTR and SA_RESTART, rt_sigsuspend; and the ways a signal ends
+/// a program.
+fn signals() TestError!void {
+    _ = helpers.runProgram("/test/signals"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/signals") orelse return error.Failed;
+    if (code != 0) report("/test/signals failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/signals"));
+    inline for (.{ .{ "term", 128 + 15 }, .{ "kill", 128 + 9 }, .{ "resethand", 128 + 10 }, .{ "norestorer", 255 }, .{ "fault", 255 } }) |mode| {
+        const status = helpers.runProgramArgs("/test/signals", &.{ "signals", mode[0] }, &.{}) orelse return error.Failed;
+        if (status != mode[1]) report("/test/signals " ++ mode[0] ++ " exit status", status);
+        try check(status == mode[1]);
+    }
+    try expectFootprint(memory);
 }
 
 /// The terminal: lines edited and handed over whole, Ctrl+D, keys without
@@ -1914,6 +1947,8 @@ fn runCases() noreturn {
         .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
+        .{ .name = "eventfd and epoll: counters, waiting on several descriptors (ring 3)", .func = eventLoop },
+        .{ .name = "signals: handlers, masks, faults, alternate stack, EINTR and SA_RESTART (ring 3)", .func = signals },
         .{ .name = "the terminal: line editing, Ctrl+D, raw keys, settings, Ctrl+C ends the foreground (ring 3)", .func = terminal },
         .{ .name = "a writable filesystem at /tmp: files, directories, rename, a program run from it (ring 3)", .func = writableFiles },
         .{ .name = "the program heap: standard containers on the user library's allocator (ring 3)", .func = programHeap },

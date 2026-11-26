@@ -3,7 +3,9 @@
 //! waits). Exits with 0, or with the number of the first failing check.
 //!
 //! With the argument `wait` it only waits for a line, for ever: the
-//! kernel test makes it the foreground program and types Ctrl+C.
+//! kernel test makes it the foreground program and types Ctrl+C. With
+//! `catch` it does the same with a handler for SIGINT, and exits with 0
+//! if the handler ran and the read was interrupted.
 //!
 //! What the kernel test types, in order:
 //!   "helo\x7f\x7flo wrld\x15hello, world\n"   one line, corrected twice
@@ -38,11 +40,34 @@ fn readLine() []const u8 {
     return buf[0..n];
 }
 
+comptime {
+    asm (
+        \\.section .text
+        \\.global restorer
+        \\restorer:
+        \\  mov $15, %eax
+        \\  syscall
+        \\  ud2
+    );
+}
+extern fn restorer() callconv(.c) void;
+
+var interrupted = false;
+fn onInterrupt(_: i32) callconv(.c) void {
+    interrupted = true;
+}
+
 pub fn main() noreturn {
     const args = lib.argv();
     if (args.len > 1 and eql(args[1], "wait")) {
         _ = lib.read(0, &buf);
         lib.exit(1); // Ctrl+C should have ended it before a line came
+    }
+    if (args.len > 1 and eql(args[1], "catch")) {
+        const act = abi.SigAction{ .handler = @intFromPtr(&onInterrupt), .flags = 0x0400_0000, .restorer = @intFromPtr(&restorer) };
+        if (lib.syscall6(Sys.rt_sigaction, 2, @intFromPtr(&act), 0, abi.SIGSET_SIZE, 0, 0) != 0) lib.exit(2);
+        const n = lib.read(0, &buf);
+        lib.exit(if (interrupted and n == lib.err(.INTR)) 0 else 3);
     }
 
     // It is a terminal, with line editing and echo, and a size.

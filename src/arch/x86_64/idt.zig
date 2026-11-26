@@ -41,6 +41,7 @@ const apic = @import("../../arch/x86_64/apic.zig");
 const backtrace = @import("../../kernel/debug/backtrace.zig");
 const kstack = @import("../../kernel/kstack.zig");
 const process = @import("../../kernel/process.zig");
+const signal = @import("../../kernel/signal.zig");
 const user_memory = @import("../../kernel/user_memory.zig");
 const thread = @import("../../kernel/thread.zig");
 const gdt = @import("gdt.zig");
@@ -273,6 +274,7 @@ pub fn setGateIst(vector: u8, ist: u3) void {
 const VECTOR_DEBUG = 1;
 const VECTOR_NMI = 2;
 const VECTOR_BREAKPOINT = 3;
+const VECTOR_OVERFLOW = 4;
 const VECTOR_DOUBLE_FAULT = 8;
 const VECTOR_PAGE_FAULT = 14;
 const VECTOR_MACHINE_CHECK = 18;
@@ -304,7 +306,11 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
         apic.eoi(); // BEFORE the handler: it may switch threads
         if (handlers[f.vector]) |h| h(f) else root.print("unhandled vector {d}\n", .{f.vector});
         // On the way back to a program whose process is ending: not there.
-        if (f.cs & 3 == 3) process.dieIfKilled();
+        // A signal for it is delivered now.
+        if (f.cs & 3 == 3) {
+            process.dieIfKilled();
+            signal.atInterruptReturn(f);
+        }
         return;
     }
     const name = names[f.vector];
@@ -326,6 +332,15 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
                 .present = f.error_code & 1 != 0,
             };
             if (user_memory.handleFault(p, readCr2(), access)) |_| return else |e| out_of_memory = e == error.OutOfMemory;
+        }
+    }
+    if (from_user and !kernel_fatal and !out_of_memory) {
+        // A program that handles the signal for this fault is told, and
+        // goes on in its handler.
+        const cr2 = if (f.vector == VECTOR_PAGE_FAULT) readCr2() else 0;
+        if (signal.fault(f.vector, f.error_code, cr2, f.rip, false)) {
+            signal.atInterruptReturn(f);
+            return;
         }
     }
     if (from_user and !kernel_fatal) { // kill the process, keep the kernel
@@ -457,6 +472,12 @@ pub fn init() void {
         break :blk table;
     };
     for (stubs, 0..) |entry, i| setGate(i, @intFromPtr(entry), istFor(i));
+    // `int3` and `into` may be used from user mode, as on Linux: a
+    // breakpoint is a SIGTRAP for the program (a debugger's, or a
+    // runtime's own), not a protection fault. Every other gate stays
+    // closed to `int n` from ring 3.
+    idt[VECTOR_BREAKPOINT].type_attr = 0xEE; // present | ring 3 | 64-bit interrupt gate
+    idt[VECTOR_OVERFLOW].type_attr = 0xEE;
     load();
 }
 

@@ -479,7 +479,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
   - Done: `poll` reports the console, files and pipes and waits with a timeout. Open: it looks again every tick instead of being woken by the descriptor.
 - [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
   - Done: `fcntl` (`F_DUPFD`, `F_GETFL`, `F_SETFL`, `F_GETFD`), `readlink`, `pread64`, `ioctl` answering `ENOTTY`. `readv` and `pwrite64` since `/tmp`. Open: a terminal's `ioctl`s (with the terminal).
-- [ ] Add `epoll` and `eventfd` on top of `poll`.
+- [x] Add `epoll` and `eventfd` on top of `poll`: `epoll.zig`; Go's timers sit on them. Readiness is polled each tick, and `EPOLLET` is treated as level-triggered; descriptors waking waiters themselves would remove both limits.
 - [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents (the list from 4.2 says which).
   - Done: `/dev/null`, `/dev/urandom`, `/dev/random`, `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/meminfo` (`procfs.zig`: text made when the file is opened). Open: `/proc/cpuinfo`, `/proc/stat`, `/proc/self/mountinfo` and `cgroup`, `/sys/devices/system/cpu/*`, which the .NET runtime looks for and does without.
 - [x] Test EOF, partial I/O, invalid descriptors, and cleanup. Done: `/test/syscalls`, `/test/pipes` and `/test/files` from ring 3, with the kernel test checking that nothing stays allocated.
@@ -542,13 +542,13 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 
 **Goal:** Deliver signals the way Linux does, so runtimes can handle their own faults and stop their own threads.
 
-- [ ] Implement `rt_sigaction`, `rt_sigprocmask`, `sigaltstack` and `rt_sigreturn`, delivering signals on the return to user mode.
-- [ ] Turn user faults into `SIGSEGV`, `SIGBUS`, `SIGFPE` and `SIGILL` with `siginfo` and a register context (including the extended state from 2.5), instead of always killing the process (2.2); runtimes use this for null checks and stack probes.
-- [ ] Implement `kill`/`tgkill` and default actions; deliver Ctrl+C (6.4) as `SIGINT`.
-- [ ] Interrupt blocking syscalls with `EINTR` or restart them.
-- [ ] Check the saved return address and flags that `rt_sigreturn` restores (the remaining `sysretq` item in 2.5): a handler can put anything there.
-- [ ] Test handlers that return, handlers that modify the saved context, nested and masked signals, the alternate stack, and signals sent to another thread on another CPU.
-- [ ] Run a statically linked Go or Rust program (threads, futexes and signals in earnest).
+- [x] Implement `rt_sigaction`, `rt_sigprocmask`, `sigaltstack` and `rt_sigreturn`, delivering signals on the return to user mode. `signal.zig`, with the frame laid out as Linux's (`signal_frame.zig`, tested on the host against its offsets). Also `rt_sigpending`, `rt_sigsuspend`, `pause`.
+- [x] Turn user faults into `SIGSEGV`, `SIGBUS`, `SIGFPE` and `SIGILL` with `siginfo` and a register context (including the extended state from 2.5), instead of always killing the process (2.2); runtimes use this for null checks and stack probes. For a program that handles the signal; one that does not is killed as before. `int3` and `into` became usable from user mode for it.
+- [x] Implement `kill`/`tgkill` and default actions; deliver Ctrl+C (6.4) as `SIGINT`. Within the calling process; job-control signals are ignored for now.
+- [x] Interrupt blocking syscalls with `EINTR` or restart them. `thread.interrupted` ends killable waits; `SA_RESTART` restarts the calls Linux restarts; `myos_run` waits through signals, since its child is running already.
+- [x] Check the saved return address and flags that `rt_sigreturn` restores (the remaining `sysretq` item in 2.5): a handler can put anything there. Selectors forced, flags sanitized, RIP classified on the way out like any return; FP images sanitized so `XRSTOR` cannot fault.
+- [x] Test handlers that return, handlers that modify the saved context, nested and masked signals, the alternate stack, and signals sent to another thread on another CPU. `/test/signals` (with another thread sending, on another CPU in the four-CPU runs), the terminal's Ctrl+C reaching a handler, and the fixtures: .NET turning null dereferences and divisions by zero into exceptions, Go recovering from a nil pointer and preempting a spinning goroutine.
+- [x] Run a statically linked Go or Rust program (threads, futexes and signals in earnest).
   - Both run already, without signals: Rust since 4.2, and a Go program with goroutines on every CPU, a channel and a garbage collection since 7 (`tests/fixtures/src/hello.go`). Go sends itself signals to preempt goroutines that do not yield and carries on when they are not delivered. What this item still asks for is the same programs with signals delivered: a Go program whose goroutine spins without yielding and is preempted, and one that recovers from a nil dereference.
 
 **Milestone 8 done when:** A statically linked Go program built on Linux runs unmodified.

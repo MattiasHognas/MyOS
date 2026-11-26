@@ -35,6 +35,15 @@ pub const Sys = struct {
     pub const rt_sigaction = 13;
     /// `rt_sigprocmask(how, set, oldset, sigsetsize) -> 0`: the thread's blocked signals.
     pub const rt_sigprocmask = 14;
+    /// `rt_sigreturn()`: back from a signal handler, to what its frame says.
+    pub const rt_sigreturn = 15;
+    /// `pause()`: wait for a signal; returns `EINTR` once it has been handled.
+    pub const pause = 34;
+    /// `rt_sigpending(set, size)`: the signals pending and blocked.
+    pub const rt_sigpending = 127;
+    /// `rt_sigsuspend(mask, size)`: wait for a signal with `mask` blocked
+    /// meanwhile; returns `EINTR` once it has been handled.
+    pub const rt_sigsuspend = 130;
     /// `pread64(fd, buf, count, offset) -> bytes read`, leaving the file's offset.
     pub const pread64 = 17;
     /// `ioctl(fd, request, arg)`: no device has requests yet, so `ENOTTY`.
@@ -174,6 +183,19 @@ pub const Sys = struct {
     pub const newfstatat = 262;
     /// `readlinkat(dirfd, path, buf, size)`.
     pub const readlinkat = 267;
+    /// `eventfd(initval)`, `eventfd2(initval, flags)`: a counter to wait on.
+    pub const eventfd = 284;
+    pub const eventfd2 = 290;
+    /// `epoll_create(size)`, `epoll_create1(flags)`, `epoll_ctl(epfd, op,
+    /// fd, event)`, `epoll_wait(epfd, events, max, timeout_ms)`,
+    /// `epoll_pwait(..., sigmask, sigsetsize)`, `epoll_pwait2(..., timeout
+    /// as timespec, sigmask, sigsetsize)`.
+    pub const epoll_create = 213;
+    pub const epoll_wait = 232;
+    pub const epoll_ctl = 233;
+    pub const epoll_pwait = 281;
+    pub const epoll_create1 = 291;
+    pub const epoll_pwait2 = 441;
     /// `clone3(args, size) -> thread ID`: `clone` with its arguments in a
     /// structure.
     pub const clone3 = 435;
@@ -709,4 +731,33 @@ pub const TIOC = struct {
     pub const TIOCSPGRP = 0x5410;
     pub const TIOCGWINSZ = 0x5413;
     pub const FIONREAD = 0x541B;
+};
+
+/// `struct epoll_event`: packed on x86-64, 12 bytes.
+pub const EpollEvent = extern struct {
+    events: u32 align(1),
+    data: u64 align(1),
+};
+
+pub const EPOLL = struct {
+    pub const IN = 0x001;
+    pub const PRI = 0x002;
+    pub const OUT = 0x004;
+    pub const ERR = 0x008;
+    pub const HUP = 0x010;
+    pub const RDHUP = 0x2000;
+    pub const EXCLUSIVE = 1 << 28;
+    pub const WAKEUP = 1 << 29;
+    pub const ONESHOT = 1 << 30;
+    pub const ET = 1 << 31;
+    pub const CTL_ADD = 1;
+    pub const CTL_DEL = 2;
+    pub const CTL_MOD = 3;
+    pub const CLOEXEC = 0o2000000;
+};
+
+pub const EFD = struct {
+    pub const SEMAPHORE = 1;
+    pub const NONBLOCK = 0o4000;
+    pub const CLOEXEC = 0o2000000;
 };

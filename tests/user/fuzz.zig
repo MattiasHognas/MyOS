@@ -132,6 +132,13 @@ pub fn main() noreturn {
         // Nor in a futex or a sleep; and a new thread started with random
         // registers would be this program's end, as would a signal to itself.
         if (nr == Sys.nanosleep or nr == Sys.clock_nanosleep or nr == Sys.clone or nr == Sys.clone3) continue;
+        // Back from a signal handler there was none of: the program's end,
+        // as on Linux. And waiting for a signal nobody sends.
+        if (nr == Sys.rt_sigreturn or nr == Sys.pause or nr == Sys.rt_sigsuspend) continue;
+        // Counters and descriptor sets made here would be waited on with
+        // nothing to end the wait.
+        if (nr == Sys.eventfd or nr == Sys.eventfd2 or nr == Sys.epoll_create or nr == Sys.epoll_create1) continue;
+        if (nr == Sys.epoll_wait or nr == Sys.epoll_pwait or nr == Sys.epoll_pwait2) continue;
         if (nr == Sys.futex) args[1] = (args[1] & ~@as(u64, 0x7F)) | lib.abi.FUTEX.WAKE;
         if (nr == Sys.kill or nr == Sys.tkill) args[1] = 0;
         if (nr == Sys.tgkill) args[2] = 0;

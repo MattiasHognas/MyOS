@@ -22,6 +22,7 @@ test {
     std.testing.refAllDecls(@import("alloc_test.zig"));
     std.testing.refAllDecls(@import("ramfs_test.zig"));
     std.testing.refAllDecls(@import("tty_test.zig"));
+    std.testing.refAllDecls(@import("signal_frame_test.zig"));
     std.testing.refAllDecls(@import("timer_queue_test.zig"));
     std.testing.refAllDecls(@import("random_core_test.zig"));
     std.testing.refAllDecls(@import("meltdown_rule_test.zig"));

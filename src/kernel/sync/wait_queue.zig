@@ -109,10 +109,22 @@ pub const WaitQueue = struct {
 
     /// Like `wait`, for a wait that may last as long as a program likes
     /// (for a key, for a child): it also ends when the calling thread's
-    /// process is ending (`thread.dying`). Returns true if the thread was
+    /// process is ending or a signal has come for it (`thread.interrupted`). Returns true if the thread was
     /// woken through the queue, false if it is to die; then it is off the
     /// queue, and the caller gets out of the way without what it waited for.
     pub fn waitKillable(self: *WaitQueue, lock: *SpinLock) bool {
+        assertOnlyLock(lock);
+        const me = thread.current();
+        self.append(me);
+        while (me.wait_queue == self and !thread.interrupted()) sleep(lock);
+        return !self.remove(me);
+    }
+
+    /// Like `waitKillable`, but only the end of the calling thread's
+    /// process ends the wait early, not a signal: for a wait that cannot
+    /// be made again from the start (`myos_run`, whose child is running
+    /// already).
+    pub fn waitUnlessEnding(self: *WaitQueue, lock: *SpinLock) bool {
         assertOnlyLock(lock);
         const me = thread.current();
         self.append(me);

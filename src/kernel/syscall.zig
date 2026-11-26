@@ -16,6 +16,7 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const nospec = @import("../arch/x86_64/nospec.zig");
 const arch = @import("../arch/x86_64/syscall.zig");
 const tty = @import("tty.zig");
+const signal = @import("signal.zig");
 const heap = @import("heap.zig");
 const proc = @import("process.zig");
 const thread = @import("thread.zig");
@@ -23,6 +24,7 @@ const ipi = @import("../arch/x86_64/ipi.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const kfutex = @import("futex.zig");
 const kpipe = @import("pipe.zig");
+const kepoll = @import("epoll.zig");
 const open_file = @import("open_file.zig");
 const procfs = @import("procfs.zig");
 const OpenFile = open_file.OpenFile;
@@ -320,8 +322,13 @@ fn pipeWrite(of: *OpenFile, ptr: u64, len: u64) u64 {
         switch (kpipe.write(of.pipe, part, nonblock)) {
             .bytes => |n| done += n,
             .again => return if (done == 0) err(.AGAIN) else done,
-            // Linux also sends SIGPIPE; signals are not delivered yet (8).
-            .broken => return if (done == 0) err(.PIPE) else done,
+            // And SIGPIPE, which ends the program unless it handles or
+            // ignores it (as most that use pipes do).
+            .broken => {
+                const me = thread.current();
+                _ = proc.withThread(me.process.?, me.id, signal.sendThreadLocked, 13);
+                return if (done == 0) err(.PIPE) else done;
+            },
             .killed => return if (done == 0) err(.INTR) else done,
         }
     }
@@ -542,7 +549,8 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
                 if (!of.writable) return err(.BADF);
                 return fileWrite(of, ptr, @min(count, abi.MAX_RW_COUNT), null);
             },
-            .pipe_read, .directory => return err(.BADF),
+            .eventfd => return eventFdWrite(of, ptr, count),
+            .pipe_read, .directory, .epoll => return err(.BADF),
         }
     }
     const len = @min(count, abi.MAX_RW_COUNT);
@@ -937,6 +945,8 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
         .null_device => return 0,
         .random_device => return sysGetRandom(ptr, count),
         .directory => return err(.ISDIR),
+        .eventfd => return eventFdRead(of, ptr, count),
+        .epoll => return err(.INVAL),
         .console => return consoleRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
         .pipe_write => return err(.BADF),
     }
@@ -1411,6 +1421,8 @@ fn sysFstat(fd: u64, ptr: u64) u64 {
         },
         .null_device, .random_device => st = deviceStat(),
         .directory => st = directoryStat(),
+        // No file of any kind: what Linux says of its anonymous files.
+        .eventfd, .epoll => st.mode = 0o600,
         .file => st = fileStat(of.node),
     }
     return if (toUser(ptr, st)) 0 else err(.FAULT);
@@ -1429,7 +1441,8 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
         1, 2 => return 0, // F_GETFD, F_SETFD
         3 => { // F_GETFL
             const access: u64 = switch (of.kind) {
-                .console, .null_device, .random_device => abi.O.RDWR,
+                .console, .null_device, .random_device, .eventfd => abi.O.RDWR,
+                .epoll => abi.O.RDONLY,
                 .file => (if (!of.readable) @as(u64, abi.O.WRONLY) else if (of.writable) @as(u64, abi.O.RDWR) else abi.O.RDONLY) |
                     (if (of.append) @as(u64, abi.O.APPEND) else 0),
                 .pipe_read => abi.O.RDONLY,
@@ -1483,24 +1496,31 @@ fn toUser(ptr: u64, value: anytype) bool {
 const UNBLOCKABLE: u64 = (1 << (abi.SIGKILL - 1)) | (1 << (abi.SIGSTOP - 1));
 
 /// `rt_sigaction`: set what signal `sig` does and return what it did
-/// before; either pointer may be null. No signal is delivered yet
-/// (milestone 8: a fault still ends the process), but a program that
-/// installs its handlers at startup, as language runtimes do, finds them
-/// recorded. `EINVAL` for a signal that does not exist, for changing
+/// before; either pointer may be null (`signal.zig` delivers them). `EINVAL` for a signal that does not exist, for changing
 /// `SIGKILL` or `SIGSTOP`, and for a mask of the wrong size; `EFAULT`.
 fn sysSigAction(sig: u64, act: u64, old: u64, set_size: u64) u64 {
     const p = thread.current().process orelse return err(.NOSYS);
     if (set_size != abi.SIGSET_SIZE or sig < 1 or sig > abi.NSIG) return err(.INVAL);
-    const slot = &p.signal_actions[nospec.index(sig - 1, abi.NSIG)];
-    const before = slot.*;
+    // Copied in and out without the lock: the program's memory may fault.
+    var new: ?abi.SigAction = null;
     if (act != 0) {
         if (sig == abi.SIGKILL or sig == abi.SIGSTOP) return err(.INVAL);
-        var new = fromUser(abi.SigAction, act) orelse return err(.FAULT);
-        new.mask &= ~UNBLOCKABLE;
-        if (old != 0 and !toUser(old, before)) return err(.FAULT);
-        slot.* = new;
-        return 0;
+        var a = fromUser(abi.SigAction, act) orelse return err(.FAULT);
+        a.mask &= ~UNBLOCKABLE;
+        new = a;
     }
+    const before = blk: {
+        const held = p.signal_lock.acquire();
+        defer p.signal_lock.release(held);
+        const slot = &p.signal_actions[nospec.index(sig - 1, abi.NSIG)];
+        const b = slot.*;
+        if (new) |a| slot.* = a;
+        break :blk b;
+    };
+    // Set to ignored: what is pending of it goes (POSIX).
+    if (new) |a| if (a.handler == 1) {
+        _ = p.signal_pending.fetchAnd(~signal.bit(@intCast(sig)), .acq_rel);
+    };
     if (old != 0 and !toUser(old, before)) return err(.FAULT);
     return 0;
 }
@@ -1608,6 +1628,161 @@ fn pollState(of: *OpenFile, events: i16) i16 {
             if (st.broken) return abi.POLL.ERR;
             return if (st.writable) events & abi.POLL.OUT else 0;
         },
+        .eventfd => {
+            const st = kepoll.eventState(of.eventfd);
+            var r: i16 = 0;
+            if (st.readable) r |= events & abi.POLL.IN;
+            if (st.writable) r |= events & abi.POLL.OUT;
+            return r;
+        },
+        // Ready when one of what it watches is; that is for `epoll_wait`
+        // to find out, and nothing waits on an epoll inside another yet.
+        .epoll => return 0,
+    }
+}
+
+/// `eventfd` and `eventfd2`: a new counter, starting at `initial`.
+/// `EFD_SEMAPHORE`, `EFD_NONBLOCK`, `EFD_CLOEXEC` (accepted: no exec yet).
+fn sysEventFd(initial: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, abi.EFD.SEMAPHORE | abi.EFD.NONBLOCK | abi.EFD.CLOEXEC) != 0) return err(.INVAL);
+    const p = thread.current().process orelse return err(.BADF);
+    const e = kepoll.createEventFd(@truncate(initial), flags & abi.EFD.SEMAPHORE != 0) catch return err(.NOMEM);
+    const of = heap.allocator.create(OpenFile) catch {
+        kepoll.destroyEventFd(e);
+        return err(.NOMEM);
+    };
+    of.* = .{ .kind = .eventfd, .eventfd = e, .readable = true, .writable = true, .nonblock = flags & abi.EFD.NONBLOCK != 0 };
+    return installFile(p, of, 0) orelse {
+        open_file.destroy(of);
+        return err(.MFILE);
+    };
+}
+
+/// `read` of an eventfd: its 8-byte counter, taken. `EINVAL` for a
+/// buffer shorter than 8 bytes.
+fn eventFdRead(of: *OpenFile, ptr: u64, len: u64) u64 {
+    if (len < 8) return err(.INVAL);
+    return switch (kepoll.eventRead(of.eventfd, nonblocking(of))) {
+        .value => |v| if (toUser(ptr, v)) 8 else err(.FAULT),
+        .again => err(.AGAIN),
+        .killed => err(.INTR),
+    };
+}
+
+/// `write` to an eventfd: 8 bytes, added to its counter. `EINVAL` for a
+/// shorter buffer or the value 2^64-1.
+fn eventFdWrite(of: *OpenFile, ptr: u64, len: u64) u64 {
+    if (len < 8) return err(.INVAL);
+    const n = fromUser(u64, ptr) orelse return err(.FAULT);
+    if (n == std.math.maxInt(u64)) return err(.INVAL);
+    return switch (kepoll.eventWrite(of.eventfd, n, nonblocking(of))) {
+        .value => 8,
+        .again => err(.AGAIN),
+        .killed => err(.INTR),
+    };
+}
+
+/// `epoll_create` and `epoll_create1`: a new, empty instance.
+fn sysEpollCreate(flags: u64) u64 {
+    if (flags & ~@as(u64, abi.EPOLL.CLOEXEC) != 0) return err(.INVAL);
+    const p = thread.current().process orelse return err(.BADF);
+    const ep = kepoll.createEpoll() catch return err(.NOMEM);
+    const of = heap.allocator.create(OpenFile) catch {
+        kepoll.destroyEpoll(ep);
+        return err(.NOMEM);
+    };
+    of.* = .{ .kind = .epoll, .epoll = ep };
+    return installFile(p, of, 0) orelse {
+        open_file.destroy(of);
+        return err(.MFILE);
+    };
+}
+
+/// `epoll_ctl`: watch `fd`, change how, or stop. `EBADF`, `EINVAL` for an
+/// instance that is not one or watching itself, `EPERM` for what cannot be
+/// waited on (files and directories, which are always ready, as on Linux),
+/// `EEXIST`, `ENOENT`, `ENOSPC`, `ENOMEM`.
+fn sysEpollCtl(epfd: u64, op_code: u64, fd: u64, event_ptr: u64) u64 {
+    const ep_file = getFile(epfd) orelse return err(.BADF);
+    defer putFile(ep_file);
+    if (ep_file.kind != .epoll or epfd == fd) return err(.INVAL);
+    const target = getFile(fd) orelse return err(.BADF);
+    const kind = target.kind;
+    putFile(target);
+    switch (kind) {
+        .file, .directory => return err(.PERM),
+        .epoll => return err(.INVAL), // one inside another: not yet
+        else => {},
+    }
+    const op: kepoll.Op = switch (op_code) {
+        abi.EPOLL.CTL_ADD => .add,
+        abi.EPOLL.CTL_DEL => .del,
+        abi.EPOLL.CTL_MOD => .mod,
+        else => return err(.INVAL),
+    };
+    var event: abi.EpollEvent = .{ .events = 0, .data = 0 };
+    if (op != .del) event = fromUser(abi.EpollEvent, event_ptr) orelse return err(.FAULT);
+    kepoll.control(ep_file.epoll, op, @intCast(fd), event.events, event.data) catch |e| return switch (e) {
+        error.Exists => err(.EXIST),
+        error.NotFound => err(.NOENT),
+        error.TooMany => err(.NOSPC),
+        error.OutOfMemory => err(.NOMEM),
+    };
+    return 0;
+}
+
+/// `epoll_wait` and the `epoll_pwait` calls: the watched descriptors that
+/// are ready, at most `max` of them, waiting up to `timeout_ms` (for ever
+/// if negative) for one to be. With `sigmask`, those signals are blocked
+/// instead while it waits. Interrupted by a signal: `EINTR`, never made
+/// again. `EBADF`, `EINVAL`, `EFAULT`.
+fn sysEpollWait(epfd: u64, events_ptr: u64, max: u64, timeout_ms: i64, sigmask_ptr: u64, sigsetsize: u64) u64 {
+    const max_events: i32 = @truncate(@as(i64, @bitCast(max)));
+    if (max_events <= 0 or max_events > 1 << 20) return err(.INVAL);
+    if (!user_range.valid(events_ptr, @as(u64, @intCast(max_events)) * @sizeOf(abi.EpollEvent))) return err(.FAULT);
+    const ep_file = getFile(epfd) orelse return err(.BADF);
+    defer putFile(ep_file);
+    if (ep_file.kind != .epoll) return err(.INVAL);
+    const t = thread.current();
+    if (sigmask_ptr != 0) {
+        if (sigsetsize != abi.SIGSET_SIZE) return err(.INVAL);
+        const mask = fromUser(u64, sigmask_ptr) orelse return err(.FAULT);
+        t.signal_saved_mask = t.signal_mask;
+        t.signal_mask = mask & ~signal.UNBLOCKABLE;
+    }
+    defer if (sigmask_ptr != 0) {
+        // With a handler about to run, its frame takes the saved mask
+        // (`signal.zig`); otherwise it is put back here.
+        if (!signal.pending(t)) {
+            if (t.signal_saved_mask) |m| t.signal_mask = m;
+            t.signal_saved_mask = null;
+        }
+    };
+    var left: ?u64 = if (timeout_ms < 0) null else timer.msToTicks(@intCast(timeout_ms));
+    var small: [16]kepoll.Interest = undefined;
+    const big = heap.allocator.alloc(kepoll.Interest, kepoll.MAX_WATCHED) catch return err(.NOMEM);
+    defer heap.allocator.free(big);
+    while (true) {
+        const watched = kepoll.snapshot(ep_file.epoll, &small) orelse kepoll.snapshot(ep_file.epoll, big).?;
+        var n: u64 = 0;
+        for (watched) |w| {
+            if (w.disabled or n == @as(u64, @intCast(max_events))) continue;
+            const of = getFile(w.fd) orelse continue; // closed: no events
+            const asked: i16 = @truncate(@as(i32, @bitCast(w.events & (abi.EPOLL.IN | abi.EPOLL.OUT | abi.EPOLL.PRI))));
+            const ready = pollState(of, asked);
+            putFile(of);
+            if (ready == 0) continue;
+            const ev: abi.EpollEvent = .{ .events = @as(u32, @bitCast(@as(i32, ready))) & 0xFFFF, .data = w.data };
+            if (!toUser(events_ptr + n * @sizeOf(abi.EpollEvent), ev)) return err(.FAULT);
+            if (w.events & abi.EPOLL.ONESHOT != 0) kepoll.disable(ep_file.epoll, w.fd);
+            n += 1;
+        }
+        if (n != 0) return n;
+        if (left) |l| {
+            if (l == 0) return 0;
+            left = l - 1;
+        }
+        if (!timer.sleepTicksKillable(1)) return err(.INTR);
     }
 }
 
@@ -1904,25 +2079,50 @@ fn sysPrlimit(pid: u64, resource: u64, new: u64, old: u64) u64 {
     return if (toUser(old, limit)) 0 else err(.FAULT);
 }
 
-/// `kill`, `tkill` and `tgkill`. Signals are not delivered yet (milestone
-/// 8), so this does what can be done without that: signal 0 only checks
-/// that the target exists; a signal whose default is to end the process,
-/// sent to the calling process when no handler is set for it, ends it
-/// (that is how `abort` works); anything else is accepted and dropped.
-/// Only the calling process can be signalled (`ESRCH` for another).
+/// `kill`: send `sig` to the process `pid`, which must be the caller's
+/// own: other processes cannot be reached yet. Signal 0 only checks that
+/// it exists. `EINVAL` for a number above 64, `ESRCH`.
 fn sysKill(pid: u64, sig: u64) u64 {
     const p = thread.current().process orelse return err(.NOSYS);
     if (sig > abi.NSIG) return err(.INVAL);
     if (pid != p.pid) return err(.SRCH);
     if (sig == 0) return 0;
-    const action = p.signal_actions[nospec.index(sig - 1, abi.NSIG)];
-    const ignored_by_default = switch (sig) {
-        17, 18, 23, 28 => true, // SIGCHLD, SIGCONT, SIGURG, SIGWINCH
-        else => false,
-    };
-    const unhandled = action.handler == 0 or sig == abi.SIGKILL; // SIG_DFL
-    if (unhandled and !ignored_by_default) proc.exit(128 + sig);
+    proc.signalProcess(p, @intCast(sig));
     return 0;
+}
+
+/// `tgkill` and `tkill`: send `sig` to the thread `tid` of the process
+/// `tgid` (the caller's own). `ESRCH` for a thread that is not one of it.
+fn sysTgkill(tgid: u64, tid: u64, sig: u64) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    if (sig > abi.NSIG) return err(.INVAL);
+    if (tgid != p.pid) return err(.SRCH);
+    if (sig == 0) return if (proc.hasThread(p, tid)) 0 else err(.SRCH);
+    return if (proc.withThread(p, tid, signal.sendThreadLocked, @intCast(sig))) 0 else err(.SRCH);
+}
+
+/// `rt_sigpending`: the signals waiting for the calling thread that it
+/// blocks.
+fn sysSigPending(set: u64, size: u64) u64 {
+    if (size != abi.SIGSET_SIZE) return err(.INVAL);
+    const t = thread.current();
+    const bits = signal.pendingSet(t) & t.signal_mask;
+    return if (toUser(set, bits)) 0 else err(.FAULT);
+}
+
+/// `rt_sigsuspend` (and `pause`, with no `mask`): wait, with `mask`
+/// blocked instead of the thread's own, until a signal is handled; the
+/// own mask is back when the handler returns. Always `EINTR`.
+fn sysSigSuspend(mask_ptr: u64, size: u64) u64 {
+    if (size != abi.SIGSET_SIZE) return err(.INVAL);
+    const t = thread.current();
+    if (mask_ptr != 0) {
+        const mask = fromUser(u64, mask_ptr) orelse return err(.FAULT);
+        t.signal_saved_mask = t.signal_mask;
+        t.signal_mask = mask & ~signal.UNBLOCKABLE;
+    }
+    while (!thread.interrupted()) _ = timer.sleepTicksKillable(timer.HZ);
+    return err(.INTR);
 }
 
 /// `membarrier`: have every CPU pass a memory barrier before the call
@@ -2042,6 +2242,15 @@ pub fn dispatch(f: *arch.Frame) void {
 pub var trace_all: bool = false;
 
 fn dispatchCall(f: *arch.Frame) void {
+    // It replaces every register, RAX included, with what the frame of
+    // the signal handler that is returning says.
+    if (f.rax == Sys.rt_sigreturn) {
+        if (thread.current().process == null) {
+            f.rax = err(.NOSYS);
+            return;
+        }
+        return signal.sigreturn(f);
+    }
     f.rax = switch (f.rax) {
         Sys.read => sysRead(f.rdi, f.rsi, f.rdx),
         Sys.write => sysWrite(f.rdi, f.rsi, f.rdx),
@@ -2093,6 +2302,23 @@ fn dispatchCall(f: *arch.Frame) void {
         // Restartable sequences are not offered; a C library asks once
         // and does without.
         Sys.rseq => err(.NOSYS),
+        Sys.eventfd => sysEventFd(f.rdi, 0),
+        Sys.eventfd2 => sysEventFd(f.rdi, f.rsi),
+        Sys.epoll_create => if (@as(i32, @truncate(@as(i64, @bitCast(f.rdi)))) <= 0) err(.INVAL) else sysEpollCreate(0),
+        Sys.epoll_create1 => sysEpollCreate(f.rdi),
+        Sys.epoll_ctl => sysEpollCtl(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.epoll_wait => sysEpollWait(f.rdi, f.rsi, f.rdx, @as(i32, @truncate(@as(i64, @bitCast(f.r10)))), 0, 0),
+        Sys.epoll_pwait => sysEpollWait(f.rdi, f.rsi, f.rdx, @as(i32, @truncate(@as(i64, @bitCast(f.r10)))), f.r8, f.r9),
+        Sys.epoll_pwait2 => blk: {
+            // The timeout as a timespec, or null for ever.
+            var ms: i64 = -1;
+            if (f.r10 != 0) {
+                const ts = fromUser(abi.TimeSpec, f.r10) orelse break :blk err(.FAULT);
+                if (ts.sec < 0 or ts.nsec < 0 or ts.nsec >= 1_000_000_000) break :blk err(.INVAL);
+                ms = @min(ts.sec, 1 << 40) * 1000 + @divTrunc(ts.nsec + 999_999, 1_000_000);
+            }
+            break :blk sysEpollWait(f.rdi, f.rsi, f.rdx, ms, f.r8, f.r9);
+        },
         Sys.pipe => sysPipe(f.rdi, 0),
         Sys.pipe2 => sysPipe(f.rdi, f.rsi),
         Sys.dup => sysDup(f.rdi, 0),
@@ -2128,8 +2354,11 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.statfs => sysStatfs(f.rdi, f.rsi),
         Sys.mlock, Sys.munlock => sysMlock(f.rdi, f.rsi),
         Sys.kill => sysKill(f.rdi, f.rsi),
-        Sys.tgkill => sysKill(f.rdi, f.rdx),
-        Sys.tkill => if (thread.current().process) |p| sysKill(p.pid, f.rsi) else err(.NOSYS),
+        Sys.tgkill => sysTgkill(f.rdi, f.rsi, f.rdx),
+        Sys.tkill => if (thread.current().process) |p| sysTgkill(p.pid, f.rdi, f.rsi) else err(.NOSYS),
+        Sys.rt_sigpending => sysSigPending(f.rdi, f.rsi),
+        Sys.rt_sigsuspend => sysSigSuspend(f.rdi, f.rsi),
+        Sys.pause => sysSigSuspend(0, abi.SIGSET_SIZE),
         Sys.poll => sysPoll(f.rdi, f.rsi, f.rdx),
         Sys.rt_sigaction => sysSigAction(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.rt_sigprocmask => sysSigProcMask(f.rdi, f.rsi, f.rdx, f.r10),

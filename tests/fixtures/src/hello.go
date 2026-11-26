@@ -9,7 +9,20 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 )
+
+var sink *int
+
+func nilWrite() (msg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg = fmt.Sprint("recovered: ", r)
+		}
+	}()
+	*sink = 1
+	return "no fault"
+}
 
 func main() {
 	fmt.Println("hello from go:", len(os.Args), "args")
@@ -43,6 +56,23 @@ func main() {
 	}
 	runtime.GC()
 	fmt.Println("goroutines:", workers, "sum:", total, "cpus:", runtime.NumCPU())
+
+	// A nil pointer: the runtime turns the fault (a signal) into a panic,
+	// which recover catches.
+	fmt.Println("nil pointer:", nilWrite())
+
+	// With one processor, a goroutine that spins without a function call
+	// gives the CPU back only when the runtime preempts it with a signal.
+	old := runtime.GOMAXPROCS(1)
+	stop := false
+	go func() {
+		for !stop {
+		}
+	}()
+	time.Sleep(20 * time.Millisecond) // main runs again only if the spinner was preempted
+	stop = true
+	runtime.GOMAXPROCS(old)
+	fmt.Println("preempted a spinning goroutine")
 	if v := os.Getenv("GREETING"); v != "" {
 		fmt.Println("GREETING=" + v)
 	}

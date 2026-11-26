@@ -229,8 +229,12 @@ pub const Process = struct {
     /// Protects `files` and the reference counts of the open files.
     files_lock: SpinLock = .{ .rank = .descriptor_table },
     /// What each signal does (`rt_sigaction`), by signal number minus
-    /// one. Recorded for when signals are delivered (milestone 8).
+    /// one, under `signal_lock`.
     signal_actions: [abi.NSIG]abi.SigAction = @splat(.{}),
+    signal_lock: SpinLock = .{ .rank = .descriptor_table },
+    /// Signals sent to the process as a whole (`kill`) and not yet
+    /// delivered: any of its threads that does not block one takes it.
+    signal_pending: std.atomic.Value(u64) = .init(0),
     /// Its regions of memory, `brk` heap and the lock for them and its
     /// page tables (`user_memory.zig`).
     mem: user_memory.UserMemory = .{},
@@ -452,11 +456,37 @@ pub fn setForeground(p: ?*Process) ?*Process {
 /// the terminal's Ctrl+C: callable from an interrupt handler holding no
 /// lock. True if there was one.
 pub fn terminateForeground(code: u64) bool {
+    _ = code;
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
     const p = foreground orelse return false;
-    requestExit(p, code);
+    // SIGINT, which ends it unless it handles or ignores it.
+    @import("signal.zig").sendProcessLocked(p, @import("signal.zig").SIG.INT);
     return true;
+}
+
+/// Send `sig` to the process `p` (`signal.sendProcessLocked`, with the
+/// tree lock taken here). `p` must be alive: a reference, or the caller.
+pub fn signalProcess(p: *Process, sig: u32) void {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    @import("signal.zig").sendProcessLocked(p, sig);
+}
+
+/// The thread of `p` with ID `tid`, alive, with a reference? Threads have
+/// none: so this calls `f` with it under the tree lock, which keeps it
+/// from being freed meanwhile. False if there is no such thread.
+pub fn withThread(p: *Process, tid: u64, f: *const fn (*Process, *thread.Thread, u32) void, sig: u32) bool {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        if (one.id == tid) {
+            f(p, one, sig);
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Have the process `p` end with status `code`, as if it had called
@@ -473,6 +503,10 @@ pub fn terminate(p: *Process, code: u64) void {
 }
 
 /// `terminate` with the tree lock held.
+pub fn requestExitLocked(p: *Process, code: u64) void {
+    requestExit(p, code);
+}
+
 fn requestExit(p: *Process, code: u64) void {
     if (p.killed.load(.acquire)) return;
     _ = p.exit_request.cmpxchgStrong(NO_REQUEST, code, .acq_rel, .acquire);
@@ -632,7 +666,9 @@ pub fn waitKillable(p: *Process) ?u64 {
         const held = tree_lock.acquire();
         defer tree_lock.release(held);
         while (p.exit_code == null) {
-            if (!p.exited.waitKillable(&tree_lock)) return null;
+            // Not ended by a signal: the child runs already, and the call
+            // could not be made again.
+            if (!p.exited.waitUnlessEnding(&tree_lock)) return null;
         }
         break :blk p.exit_code.?;
     };

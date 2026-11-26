@@ -6,6 +6,7 @@
 //! using it any more.
 
 const heap = @import("heap.zig");
+const epoll = @import("epoll.zig");
 const pipe = @import("pipe.zig");
 const vfs = @import("vfs.zig");
 
@@ -30,6 +31,9 @@ pub const OpenFile = struct {
     /// For a directory: its path, absolute and normalized, in memory of
     /// the open file's own. `offset` is then the place in its listing.
     path: []u8 = &.{},
+    /// The counter, for an eventfd; the watch list, for an epoll instance.
+    eventfd: *epoll.EventFd = undefined,
+    epoll: *epoll.Epoll = undefined,
     /// The pipe, for the two pipe kinds.
     pipe: *pipe.Pipe = undefined,
     /// `O_NONBLOCK`: reads and writes that would wait fail with `EAGAIN`.
@@ -60,6 +64,10 @@ pub const Kind = enum {
     /// `/dev/urandom` and `/dev/random`: reads give random bytes, writes
     /// are thrown away.
     random_device,
+    /// A counter to wait on (`eventfd`), and a set of descriptors to wait
+    /// on together (`epoll_create1`): `epoll.zig`.
+    eventfd,
+    epoll,
 };
 
 /// A node for a file that is `text` in memory.
@@ -84,6 +92,8 @@ pub fn destroy(of: *OpenFile) void {
         .pipe_read => pipe.closeEnd(of.pipe, .read),
         .pipe_write => pipe.closeEnd(of.pipe, .write),
         .file => if (of.generated == null) vfs.release(&of.node),
+        .eventfd => epoll.destroyEventFd(of.eventfd),
+        .epoll => epoll.destroyEpoll(of.epoll),
         .console, .null_device, .random_device, .directory => {},
     }
     freeContents(of);

@@ -83,6 +83,15 @@ pub fn areaSize() usize {
     return area_size;
 }
 
+/// The MXCSR bits this CPU has (MXCSR_MASK of an FXSAVE image; 0 there
+/// means the default, 0xFFBF). Set by `init`. A value with other bits
+/// makes `FXRSTOR` and `XRSTOR` fault.
+var mxcsr_mask: u32 = 0xFFBF;
+
+pub fn mxcsrMask() u32 {
+    return mxcsr_mask;
+}
+
 /// True if AVX state is enabled (and so saved and restored).
 pub fn avxEnabled() bool {
     return xcr0 & XCR0_AVX != 0;
@@ -147,6 +156,15 @@ pub fn init() void {
     if (mode == .xsave) {
         if (size < FXSAVE_SIZE + 64 or size > MAX_AREA_SIZE) @panic("fpu: unexpected XSAVE area size");
         area_size = size;
+    }
+    {
+        // The CPU says in a saved image which MXCSR bits it has.
+        const S = struct {
+            var probe: [MAX_AREA_SIZE]u8 align(AREA_ALIGN) = undefined;
+        };
+        save(&S.probe);
+        const mask = std.mem.readInt(u32, S.probe[28..32], .little);
+        if (mask != 0) mxcsr_mask = mask;
     }
     switch (mode) {
         .xsave => log.info("extended state: XSAVE, {d} bytes, AVX {s}, AVX-512 {s}", .{

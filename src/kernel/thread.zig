@@ -261,10 +261,20 @@ pub const Thread = struct {
     /// need the address-space lock (`futex.zig`).
     no_fault: bool = false,
     /// Signals the thread has blocked (bit n-1 for signal n), and the
-    /// stack it wants its handlers run on. Recorded for when signals are
-    /// delivered (milestone 8); `SIGKILL` and `SIGSTOP` cannot be blocked.
+    /// stack it wants its handlers run on; `SIGKILL` and `SIGSTOP` cannot
+    /// be blocked. Changed by the thread itself only (`signal.zig`).
     signal_mask: u64 = 0,
     signal_stack: abi.SigStack = .{},
+    /// Signals sent to this thread and not yet delivered (`tgkill`, and
+    /// those from its faults). Others set bits, the thread clears them.
+    signal_pending: std.atomic.Value(u64) = .init(0),
+    /// What the fault that became a pending signal was: delivered with
+    /// it, on the way back to the program that made it.
+    signal_fault: ?@import("signal_frame.zig").SigInfo = null,
+    signal_fault_regs: struct { err: u64 = 0, trapno: u64 = 0, cr2: u64 = 0 } = .{},
+    /// The mask to go back to after `rt_sigsuspend`'s handler: saved in
+    /// its frame instead of the one that waited.
+    signal_saved_mask: ?u64 = null,
     /// The CPU that runs the thread, or ran it last. Null until it has run.
     cpu: ?*percpu.PerCpu = null,
     /// Heap block holding the saved x87/SSE/AVX state while the thread is
@@ -472,6 +482,15 @@ pub fn interrupt(t: *Thread) void {
 pub fn dying() bool {
     const p = current().process orelse return false;
     return proc.ending(p);
+}
+
+/// True if the calling thread is to stop waiting: its process is ending,
+/// or a signal it does not block has come for it, which it is to take on
+/// its way back to the program (`signal.zig`). Waits a program may be in
+/// for as long as it likes look at this; the system call then returns
+/// `EINTR` (and may be made again).
+pub fn interrupted() bool {
+    return dying() or @import("signal.zig").pending(current());
 }
 
 /// Create a thread that runs `entry` and put it in the ready queue: `create`

@@ -19,14 +19,16 @@
 //! 2. `swapgs` makes the per-CPU area reachable; the user RSP is parked in
 //!    it and RSP becomes the top of the thread's kernel stack. Nothing is
 //!    ever pushed on the user's stack.
-//! 3. The user state is pushed as a `Frame` (18 words, so RSP is 16-byte
+//! 3. The user state is pushed as a `Frame` (20 words, so RSP is 16-byte
 //!    aligned at the `call`, as the C ABI requires): every general-purpose
 //!    register, so the frame is the thread's whole user state.
 //! 4. `syscall_handler_c` turns interrupts on, runs the handler, turns them
 //!    off again and decides how to return (`sysret.zig`).
 //! 5. The registers are restored from the frame, so a program gets every
-//!    register back except RAX (the result), RCX and R11. No register
-//!    holds a kernel value on exit.
+//!    register back except RAX (the result), and RCX and R11, which hold
+//!    RIP and RFLAGS as `syscall` left them. No register holds a kernel
+//!    value on exit. After `rt_sigreturn` the frame is a context the
+//!    thread had anywhere, RCX and R11 included, and `iretq` restores it.
 //! 6. `swapgs`, then `sysretq`, or `iretq` when `sysretq` cannot restore the
 //!    state (RF or TF set).
 //!
@@ -41,6 +43,7 @@ const root = @import("root");
 const assert = @import("../../kernel/debug/assert.zig");
 const dispatcher = @import("../../kernel/syscall.zig");
 const process = @import("../../kernel/process.zig");
+const signal = @import("../../kernel/signal.zig");
 const cpu = @import("cpu.zig");
 const gdt = @import("gdt.zig");
 const sysret = @import("sysret.zig");
@@ -78,6 +81,13 @@ pub const Frame = extern struct {
     r12: u64,
     rbp: u64,
     rbx: u64,
+    /// RFLAGS and RIP as the `syscall` instruction left them in R11 and
+    /// RCX, which is what a program finds there after a system call. A
+    /// return with `iretq` restores these two as they are here: after
+    /// `rt_sigreturn` they are whatever the thread had when the signal
+    /// came, which may have been in the middle of anything.
+    r11: u64,
+    rcx: u64,
     r9: u64,
     r8: u64,
     r10: u64,
@@ -100,9 +110,9 @@ pub const Frame = extern struct {
 
 comptime {
     // The entry code pushes exactly this, and the stack must stay 16-byte aligned.
-    std.debug.assert(@sizeOf(Frame) == 18 * 8);
+    std.debug.assert(@sizeOf(Frame) == 20 * 8);
     std.debug.assert(@sizeOf(Frame) % 16 == 0);
-    std.debug.assert(@offsetOf(Frame, "rip") == 13 * 8);
+    std.debug.assert(@offsetOf(Frame, "rip") == 15 * 8);
     std.debug.assert(sysret.USER_CS == gdt.USER_CODE and sysret.USER_SS == gdt.USER_DATA);
 }
 
@@ -129,6 +139,8 @@ comptime {
         \\  push %r10
         \\  push %r8
         \\  push %r9
+        \\  push %rcx               # RCX and R11 again, as registers of their own
+        \\  push %r11
         \\  push %rbx
         \\  push %rbp
         \\  push %r12
@@ -144,6 +156,8 @@ comptime {
         \\  pop %r12
         \\  pop %rbp
         \\  pop %rbx
+        \\  pop %r11
+        \\  pop %rcx
         \\  pop %r9
         \\  pop %r8
         \\  pop %r10
@@ -159,9 +173,7 @@ comptime {
         \\  swapgs
         \\  sysretq
         \\1:
-        \\  mov 0(%rsp), %rcx      # same RCX and R11 as the sysretq path
-        \\  mov 16(%rsp), %r11
-        \\  swapgs
+        \\  swapgs                 # RCX and R11 as the frame has them
         \\  iretq
         \\.size syscall_entry, . - syscall_entry
     );
@@ -180,10 +192,15 @@ extern fn syscall_entry() callconv(.c) void;
 export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     assert.check(.syscall, @intFromPtr(f) % 16 == 0, "syscall frame at 0x{x} is not 16-byte aligned", .{@intFromPtr(f)});
     asm volatile ("sti"); // long syscalls may be preempted
+    const number = f.rax;
     if (comptime replaceable) handler(f) else dispatcher.dispatch(f);
     process.dieIfKilled(); // its process is ending: no return to the program
+    // A signal to deliver, or an interrupted call to make again: either
+    // rewrites the registers, which `iretq` then restores whole.
+    const rewritten = signal.atSyscallReturn(f, number);
     f.rflags = sysret.sanitizeFlags(f.rflags);
-    const how = sysret.classify(f.rip, f.rflags, f.cs, f.ss);
+    var how = sysret.classify(f.rip, f.rflags, f.cs, f.ss);
+    if (rewritten and how == .sysret) how = .iret;
     if (how == .invalid) dispatcher.badReturn(f);
     asm volatile ("cli"); // the exit path must not be interrupted
     if (how == .iret) iret_returns += 1;
@@ -235,6 +252,8 @@ comptime {
         \\  pop %r12
         \\  pop %rbp
         \\  pop %rbx
+        \\  pop %r11
+        \\  pop %rcx
         \\  pop %r9
         \\  pop %r8
         \\  pop %r10
@@ -242,8 +261,6 @@ comptime {
         \\  pop %rsi
         \\  pop %rdi
         \\  pop %rax
-        \\  mov 0(%rsp), %rcx
-        \\  mov 16(%rsp), %r11
         \\  swapgs
         \\  iretq
         \\.size enter_user_frame, . - enter_user_frame

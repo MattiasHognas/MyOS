@@ -349,6 +349,15 @@ pub fn describe(p: *Process) error{OutOfMemory}![]u8 {
     }
 }
 
+/// Whether `addr` is in one of the mappings of `p`: what tells a fault on
+/// memory the program may not touch that way (`SEGV_ACCERR`) from one on
+/// memory that is not there (`SEGV_MAPERR`).
+pub fn isMapped(p: *Process, addr: u64) bool {
+    const held = p.mem.lock.acquire();
+    defer p.mem.lock.release(held);
+    return p.mem.regions.find(addr) != null;
+}
+
 /// `munmap`.
 pub fn munmap(p: *Process, addr: u64, length: u64) u64 {
     if (length == 0 or addr % PAGE != 0 or length > MAP_MAX) return abi.err(.INVAL);

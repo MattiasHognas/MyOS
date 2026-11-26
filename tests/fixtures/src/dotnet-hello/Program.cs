@@ -26,4 +26,25 @@ GC.Collect();
 
 Console.WriteLine($"threads: {threads.Length} sum: {sum} cpus: {Environment.ProcessorCount} collected: {GC.CollectionCount(0) > 0}");
 Console.WriteLine($"GREETING={Environment.GetEnvironmentVariable("GREETING")}");
+
+// Faults that the runtime turns into exceptions (through signals: a null
+// dereference is a SIGSEGV, a division by zero a SIGFPE).
+try
+{
+    string? nothing = args.Length > 100 ? "x" : null;
+    Console.WriteLine(nothing!.Length);
+}
+catch (NullReferenceException)
+{
+    Console.WriteLine("caught: NullReferenceException");
+}
+try
+{
+    int zero = args.Length > 100 ? 1 : 0;
+    Console.WriteLine(1 / zero);
+}
+catch (DivideByZeroException)
+{
+    Console.WriteLine("caught: DivideByZeroException");
+}
 return args.Length;

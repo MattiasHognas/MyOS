@@ -85,8 +85,9 @@ Linux calls, with Linux's numbers:
 | 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
 | 11 | `munmap(addr, length)` | Any part of any mappings; unmapping what is not mapped succeeds. |
 | 12 | `brk(addr)` | Returns the new end of the heap, or the old one if it cannot move. |
-| 13 | `rt_sigaction(sig, act, oldact, size)` | Recorded and read back. No signal is delivered yet (milestone 8): a fault still ends the process. |
-| 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals, recorded. |
+| 13 | `rt_sigaction(sig, act, oldact, size)` | What a signal does: default, ignore, or a handler with `SA_SIGINFO`, `SA_ONSTACK`, `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND` and `sa_mask`. A handler needs `SA_RESTORER` (C libraries always set it); without, delivering to it kills the program, as on Linux. `EINVAL` for `SIGKILL` and `SIGSTOP`. |
+| 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals; `SIGKILL` and `SIGSTOP` cannot be blocked. A signal unblocked here is delivered as the call returns. |
+| 15 | `rt_sigreturn()` | Back from a handler: registers, signal mask, alternate stack and FP state as the frame says, with what the handler changed in it. Selectors are user mode's whatever it says, flags only user-settable ones, the return address checked like any; an FP image cannot make the kernel fault. A frame that cannot be read kills the program. |
 | 16 | `ioctl(fd, request, arg)` | The terminal: `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` (line editing, echo, Ctrl+C, CR to newline; other settings are ignored), `TIOCGWINSZ` (80 by 25), `FIONREAD`, `TCFLSH`, `TIOCGPGRP` (the caller) and `TIOCSPGRP` (accepted). `EINVAL` for other requests; `ENOTTY` for every descriptor that is not the terminal (how a C library finds out that its output is not one), `EBADF` otherwise. |
 | 17 | `pread64(fd, buf, count, offset)` | |
 | 18 | `pwrite64(fd, buf, count, offset)` | `write` to a file at an offset; the descriptor's own stays. |
@@ -99,12 +100,13 @@ Linux calls, with Linux's numbers:
 | 28 | `madvise(addr, length, advice)` | `MADV_DONTNEED` and `MADV_FREE` give the pages back at once: they read as zeroes afterwards. Other advice is accepted and ignored. |
 | 32 | `dup(fd)` | The lowest free descriptor, for the same open file: they share its offset. |
 | 33 | `dup2(old, new)` | Closes what `new` was. |
+| 34 | `pause()` | Waits for a signal to be handled; `EINTR`. |
 | 35 | `nanosleep(req, rem)` | Resolution is one timer tick (10 ms), rounded up. `rem` is never written: nothing interrupts a sleep yet. |
 | 39 | `getpid()` | The ID of the process's first thread. |
 | 41 | `socket(domain, type, protocol)` | No networking yet: `EAFNOSUPPORT`. |
 | 56 | `clone(flags, stack, ptid, ctid, tls)` | New threads only: `flags` must include `CLONE_VM`, `CLONE_SIGHAND` and `CLONE_THREAD` (`EINVAL` otherwise; there is no `fork` yet). `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. |
 | 60 | `exit(status)` | Ends the calling thread. The last thread's status is the process's: the parent sees `status & 0xff`. |
-| 62 | `kill(pid, sig)` | The calling process only. Signals are not delivered yet: signal 0 checks; a signal with no handler whose default is to end the process ends it with status 128 + the signal (that is `abort`); anything else is dropped. `tkill` (200) and `tgkill` (234) likewise. |
+| 62 | `kill(pid, sig)` | The calling process only (`ESRCH` otherwise): any of its threads that does not block the signal takes it. Signal 0 checks. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
 | 74 | `fsync(fd)` | Nothing is ever waiting to be written: 0. |
@@ -123,7 +125,9 @@ Linux calls, with Linux's numbers:
 | 96 | `gettimeofday(tv, tz)` | |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
 | 124 | `getsid(pid)` | Every process is its own session. |
-| 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, recorded. |
+| 127 | `rt_sigpending(set, size)` | The signals waiting that the thread blocks. |
+| 130 | `rt_sigsuspend(mask, size)` | Waits with `mask` blocked instead until a signal is handled; the old mask is back after the handler. `EINTR`. |
+| 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, used by handlers with `SA_ONSTACK`; reported as `SS_ONSTACK` while in use. |
 | 137 | `statfs(path, buf)` | One filesystem, in memory and read-only, reported as `tmpfs`. `ENOENT` for a path that does not exist. |
 | 142 | `sched_setparam(pid, param)` | One policy, `SCHED_OTHER`, with priority 0: that may be set, anything else is `EINVAL`. `pid` is 0 or a thread of the calling process. |
 | 143 | `sched_getparam(pid, param)` | Priority 0. |
@@ -136,6 +140,7 @@ Linux calls, with Linux's numbers:
 | 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
+| 200 | `tkill(tid, sig)` | As `tgkill` with the calling process. |
 | 201 | `time(tloc)` | Seconds of the real-time clock. |
 | 202 | `futex(addr, op, val, timeout, addr2, val3)` | `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, with or without `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`. Only within one process. Timeouts have the timer's resolution and never end early. |
 | 203 | `sched_setaffinity(pid, size, mask)` | Accepted if the mask has a CPU that is up, and changes nothing: threads run on any CPU. |
@@ -145,6 +150,9 @@ Linux calls, with Linux's numbers:
 | 228 | `clock_gettime(clock, ts)` | Monotonic clocks count from boot. The real-time clock is time since boot counted from 2026-01-01: there is no clock chip driver yet. CPU-time clocks return time since boot. |
 | 230 | `clock_nanosleep(clock, flags, req, rem)` | With `TIMER_ABSTIME` too. |
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
+| 232 | `epoll_wait(epfd, events, max, timeout)` | The watched descriptors that are ready, waiting up to `timeout` ms (for ever if negative). Readiness is looked at again each timer tick. Edge-triggered watching (`EPOLLET`) is reported as level-triggered; `EPOLLONESHOT` works. A signal ends the wait with `EINTR`. |
+| 233 | `epoll_ctl(epfd, op, fd, event)` | `EPOLL_CTL_ADD`, `MOD`, `DEL`. A descriptor is watched by its number: closing it ends the watch. `EPERM` for files and directories (always ready), `EINVAL` for an epoll instance (not inside another yet). |
+| 234 | `tgkill(tgid, tid, sig)` | A thread of the calling process (`ESRCH` otherwise). |
 | 239 | `get_mempolicy(mode, nodemask, maxnode, addr, flags)` | One memory node, the default policy: mode 0 and an empty mask. No flags. |
 | 257 | `openat(dirfd, path, flags, mode)` | `open` with a relative path starting at the directory `dirfd` is open on, or at the working directory for `AT_FDCWD`. `ENOTDIR` if `dirfd` is open on something else, `EBADF` if it is not open; neither matters for an absolute path. |
 | 258 | `mkdirat(dirfd, path, mode)` | As `mkdir`. |
@@ -155,6 +163,10 @@ Linux calls, with Linux's numbers:
 | 267 | `readlinkat(dirfd, path, buf, size)` | As `readlink`. |
 | 269 | `faccessat(dirfd, path, mode)` | As `access`. |
 | 273 | `set_robust_list(head, size)` | Accepted and not used: a thread that dies takes its process with it. |
+| 281 | `epoll_pwait(epfd, events, max, timeout, sigmask, size)` | `epoll_wait` with `sigmask` blocked meanwhile. |
+| 284 | `eventfd(initval)` | See `eventfd2`. |
+| 290 | `eventfd2(initval, flags)` | A 64-bit counter: a write adds, a read takes all (one with `EFD_SEMAPHORE`) and waits while it is zero unless `EFD_NONBLOCK`. |
+| 291 | `epoll_create1(flags)` | A new instance; `epoll_create(size)` (213) the same. |
 | 292 | `dup3(old, new, flags)` | `dup2`, with `EINVAL` if `old` is `new`. |
 | 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
 | 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
@@ -165,6 +177,7 @@ Linux calls, with Linux's numbers:
 | 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
 | 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules: new threads only. Fields past the first version of the structure must be zero. |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`. |
+| 441 | `epoll_pwait2(epfd, events, max, timeout_ts, sigmask, size)` | `epoll_pwait` with the timeout as a `timespec`. |
 
 MyOS calls with no Linux equivalent yet. Their numbers start at
 `0x4D5900`, far above Linux's (which end below 500) and below the x32 bit
@@ -193,8 +206,8 @@ Every other number returns `ENOSYS`.
   from the keyboard and the serial line. With line editing on (the
   default) a line is shown as it is typed and handed over on Enter;
   backspace, Ctrl+U and Ctrl+D work as on Linux. Ctrl+C throws the line
-  away and ends the program the shell is running, with exit status 130
-  (`SIGINT`'s; signals are not delivered yet, so it cannot be caught).
+  away and sends `SIGINT` to the program the shell is running: it ends
+  with exit status 130, unless it handles or ignores the signal.
   When the shell gets the terminal back, the settings are put back.
 - **Symbolic links** are followed in every part of a path, at most 40
   of them (`ELOOP`); not in the last part for `lstat`, `readlink`,
@@ -238,10 +251,23 @@ Every other number returns `ENOSYS`.
   `ENOMEM`. A program that touches a page it cannot be given (it is at
   its limit, or the machine has none left) is killed, like any fault it
   cannot continue from; nothing else is killed to make room.
-- **A process the kernel kills** (a fault in ring 3) ends with status 255.
-  Signals are not delivered yet (milestone 8): handlers, masks and
-  alternate stacks can be set and read back, which is what language
-  runtimes do at startup, but nothing calls a handler.
+- **Signals** are delivered as on Linux, on the way back to user mode
+  after a system call or an interrupt: the handler gets Linux's frame
+  (`rt_sigframe`: return address, `ucontext` with the registers and the
+  mask, `siginfo`, the XSAVE state with Linux's markers), on the
+  alternate stack if it asks for it. A fault in ring 3 becomes `SIGSEGV`
+  (`SEGV_MAPERR` or `SEGV_ACCERR`, the address in `si_addr`), `SIGFPE`,
+  `SIGILL`, `SIGBUS` or `SIGTRAP` for a program that handles it, and
+  `int3` is a breakpoint from user mode. A blocking call a signal ends
+  returns `EINTR`, or with `SA_RESTART` (for `read`, `write`, `futex`,
+  `ioctl`, `open` and the like) is made again; if no handler ran it is
+  always made again. A signal no handler catches ends the process with
+  status 128 + its number; one that ignores by default (`SIGCHLD`,
+  `SIGURG`, `SIGWINCH`) does nothing.
+  Not yet: stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT` are
+  ignored), queued real-time signals, signals to other processes.
+- **A process the kernel kills** for a fault it does not handle ends
+  with status 255.
 
 ## Program start
 

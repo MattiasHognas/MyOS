@@ -222,6 +222,16 @@ run_scenario() {
                 expect_line '^hello from go: 3 args$'
                 expect_line '^goroutines: 8 sum: 479976 cpus: [0-9]+$'
                 expect_line '^GREETING=hi go$'
+                # Signals: a nil pointer recovered as a panic, a spinning
+                # goroutine preempted.
+                expect_line '^nil pointer: recovered: runtime error: invalid memory address or nil pointer dereference$'
+                expect_line '^preempted a spinning goroutine$'
+            fi
+            # .NET: faults become exceptions, through signals.
+            if fixture dotnet-hello-static || fixture dotnet-hello-aot || fixture dotnet-hello-app/hello; then
+                expect_line '^caught: NullReferenceException$'
+                expect_line '^caught: DivideByZeroException$'
+                if grep -q 'Unhandled exception' "$log"; then fail "a .NET program had an unhandled exception: $(grep -m1 -A3 'Unhandled exception' "$log" | tr '\n' ' ')"; fi
             fi
             # .NET compiled ahead of time: managed threads, a GC.
             if fixture dotnet-hello-static; then
