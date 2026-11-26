@@ -3949,3 +3949,42 @@ pub noinline fn writeTextThroughDirectMap() void {
 pub fn syscallHandlerReplaceable() bool {
     return arch_syscall.replaceable;
 }
+
+// ---------------------------------------------------------------------------
+// Wake-up latency (roadmap 3.4)
+
+var lat_stop: Atomic(bool) = .init(false);
+var lat_done: usize = 0;
+var lat_worst: u64 = 0;
+const LAT_SLEEPS = 20;
+
+fn latencySpinner() void {
+    while (!lat_stop.load(.acquire)) std.atomic.spinLoopHint();
+    signalDone(&lat_done, &done_queue);
+}
+
+fn latencySleeper() void {
+    for (0..LAT_SLEEPS) |_| {
+        // The timer fires at the tick `sleepTicks` waits for; how many
+        // ticks later this thread runs again is the latency.
+        const due = timer.now() + 2 + 1;
+        timer.sleepTicks(2);
+        lat_worst = @max(lat_worst, timer.now() -| due);
+    }
+    lat_stop.store(true, .release);
+    signalDone(&lat_done, &done_queue);
+}
+
+/// With a spinning thread on every CPU, a thread that sleeps 2 ticks over
+/// and over: returns the most ticks it took to be running again after its
+/// timer fired. Without preemption on wake-up that is up to a time slice.
+pub fn wakeLatency() ?u64 {
+    lat_stop.store(false, .release);
+    lat_done = 0;
+    lat_worst = 0;
+    const n = schedulingCpus();
+    for (0..n) |_| _ = thread.spawn(latencySpinner, null) catch return null;
+    _ = thread.spawn(latencySleeper, null) catch return null;
+    waitForDone(&lat_done, n + 1, &done_queue);
+    return lat_worst;
+}

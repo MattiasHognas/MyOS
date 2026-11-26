@@ -1187,6 +1187,14 @@ fn eventLoop() TestError!void {
     try expectFootprint(memory);
 }
 
+/// A woken thread runs soon even when every CPU is busy: within a few
+/// ticks, not after a time slice (`thread.preemptForWoken`).
+fn wakeLatency() TestError!void {
+    const worst = helpers.wakeLatency() orelse return error.Failed;
+    if (worst > 1) report("ticks from a wake-up to running", worst);
+    try check(worst <= 1); // the tick it fired in, or the next (a slice is 5)
+}
+
 /// Signals: handlers with their arguments, a context they may change and
 /// that comes back, masks, faults that become signals, the alternate
 /// stack, EINTR and SA_RESTART, rt_sigsuspend; and the ways a signal ends
@@ -1949,6 +1957,7 @@ fn runCases() noreturn {
         .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
+        .{ .name = "a woken thread preempts a busy CPU", .func = wakeLatency },
         .{ .name = "eventfd and epoll: counters, waiting on several descriptors (ring 3)", .func = eventLoop },
         .{ .name = "signals: handlers, masks, faults, alternate stack, EINTR and SA_RESTART (ring 3)", .func = signals },
         .{ .name = "the terminal: line editing, Ctrl+D, raw keys, settings, Ctrl+C ends the foreground (ring 3)", .func = terminal },
@@ -1998,15 +2007,20 @@ fn runCases() noreturn {
     if (!helpers.setOthersParked(true)) @panic("tests: the other CPUs did not park");
     helpers.restoreInterrupts(irq);
 
-    inline for (cases) |case| {
-        const alone = @hasField(@TypeOf(case), "alone") and case.alone;
-        if (runCase(case.func, alone)) {
-            passed += 1;
-            serial.puts("[PASS] " ++ case.name ++ "\n");
-        } else {
-            failed += 1;
-            serial.puts("[FAIL] " ++ case.name ++ "\n");
-        }
+    // A loop over a table, not an unrolled one: each unrolled case would
+    // add to this function's stack frame.
+    const Case = struct { name: []const u8, func: *const fn () TestError!void, alone: bool };
+    const table = comptime blk: {
+        var t: [cases.len]Case = undefined;
+        for (cases, 0..) |case, i| t[i] = .{ .name = case.name, .func = case.func, .alone = @hasField(@TypeOf(case), "alone") and case.alone };
+        break :blk t;
+    };
+    for (&table) |*case| {
+        const ok = runCase(case.func, case.alone);
+        if (ok) passed += 1 else failed += 1;
+        serial.puts(if (ok) "[PASS] " else "[FAIL] ");
+        serial.puts(case.name);
+        serial.puts("\n");
     }
 
     failed += reportStackPeaks();

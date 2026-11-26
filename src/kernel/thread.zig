@@ -345,15 +345,56 @@ fn idleOnce() void {
 /// nothing to run, end its halt so it picks the thread up. One thread, one
 /// CPU: the CPU is marked as no longer idle, so the next thread wakes
 /// another. The scheduler lock must be held.
-fn kickIdleCpu() void {
+fn kickIdleCpu() bool {
     const me = percpu.current();
     for (0..percpu.count()) |i| {
         const c = percpu.get(i);
         if (c == me or !c.idle or !c.runs_threads) continue;
         c.idle = false;
         ipi.wake(c);
-        return;
+        return true;
     }
+    return false;
+}
+
+/// A woken thread is in the ready queue and no CPU is idle to take it:
+/// have the CPU whose thread has used most of its time slice switch now,
+/// so the woken one does not wait for a slice to end (up to
+/// `SLICE_TICKS`). A thread that has not run for a tick yet is left alone,
+/// so threads waking each other cannot keep a third from running. On this
+/// CPU the switch happens at the next tick (at once, if it is a timer that
+/// woke the thread: the tick comes right after); another is interrupted.
+/// The scheduler lock must be held.
+fn preemptForWoken() void {
+    const me = percpu.current();
+    var best: ?*percpu.PerCpu = null;
+    for (0..percpu.count()) |i| {
+        const c = percpu.get(i);
+        if (!c.runs_threads or c.idle or c.preempt_requested) continue;
+        if (c.thread == c.idle_thread) continue; // halting in its own thread
+        if (c.slice_left >= SLICE_TICKS) continue; // has not run a tick yet
+        if (best == null or c.slice_left < best.?.slice_left) best = c;
+    }
+    const c = best orelse return;
+    c.preempt_requested = true;
+    if (c == me) {
+        c.slice_left = 0;
+    } else {
+        ipi.preempt(c);
+    }
+}
+
+/// The interrupt `preemptForWoken` sends: switch threads, if the request
+/// still stands.
+pub fn preemptRequested() void {
+    const c = percpu.current();
+    {
+        const held = lock.acquire();
+        defer lock.release(held);
+        if (!c.preempt_requested) return;
+        c.preempt_requested = false;
+    }
+    if (c.runs_threads) yield();
 }
 
 /// Wake thread `t`: if it is blocked, make it runnable; otherwise leave a
@@ -379,7 +420,7 @@ pub fn wake(t: *Thread) void {
     } else {
         t.state = .ready;
         enqueue(t);
-        kickIdleCpu();
+        if (!kickIdleCpu()) preemptForWoken();
     }
 }
 
@@ -457,7 +498,7 @@ pub fn start(t: *Thread) void {
         next_id += 1;
     }
     enqueue(t);
-    kickIdleCpu();
+    _ = kickIdleCpu();
 }
 
 /// Make thread `t` notice, soon, that something has changed for it (its
@@ -612,13 +653,14 @@ fn switchToNext() bool {
     if (prev.state == .running) {
         prev.state = .ready;
         enqueue(prev);
-        kickIdleCpu(); // it need not wait for this CPU to come back to it
+        _ = kickIdleCpu(); // it need not wait for this CPU to come back to it
     }
     next.state = .running;
     next.on_cpu = true;
     next.cpu = c;
     c.thread = next;
     c.slice_left = SLICE_TICKS;
+    c.preempt_requested = false;
     switches += 1;
 
     if (next.stack) |s| {

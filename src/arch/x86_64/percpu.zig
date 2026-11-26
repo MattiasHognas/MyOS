@@ -80,6 +80,9 @@ pub const PerCpu = extern struct {
     /// when it is parked or the thread it ran last has exited. Null on the
     /// boot CPU until the other CPUs are started.
     idle_thread: ?*anyopaque = null,
+    /// Another CPU has asked this one to switch threads, for a thread it
+    /// woke (`thread.wake`). Guarded by the scheduler lock.
+    preempt_requested: bool = false,
     /// Times this CPU halted because no thread was ready.
     halts: u64 = 0,
     /// Timer interrupts this CPU has taken.

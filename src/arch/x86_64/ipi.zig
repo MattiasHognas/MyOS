@@ -42,6 +42,8 @@ const vmm = @import("vmm.zig");
 pub const CALL_VECTOR: u8 = 49;
 /// Interrupt vector that only wakes a halted CPU.
 pub const WAKE_VECTOR: u8 = 50;
+/// Interrupt vector that asks a CPU to switch threads (`thread.zig`).
+pub const PREEMPT_VECTOR: u8 = 51;
 
 /// What the other CPUs are asked to do.
 pub const Request = union(enum) {
@@ -77,6 +79,16 @@ var stopped: std.atomic.Value(u32) = .init(0);
 pub fn init() void {
     idt.register(CALL_VECTOR, onCall);
     idt.register(WAKE_VECTOR, onWake);
+    idt.register(PREEMPT_VECTOR, onPreempt);
+}
+
+fn onPreempt(_: *idt.Frame) void {
+    @import("../../kernel/thread.zig").preemptRequested();
+}
+
+/// Ask CPU `c` to switch threads.
+pub fn preempt(c: *const percpu.PerCpu) void {
+    apic.sendIpi(c.apic_id, PREEMPT_VECTOR);
 }
 
 fn onCall(_: *idt.Frame) void {
