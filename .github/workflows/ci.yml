@@ -167,6 +167,19 @@ jobs:
       - name: Syscall dispatch is direct in the normal kernel
         run: zig build check-dispatch -Doptimize=${{ matrix.optimize }}
 
+      # The hosted Linux runners have KVM; only the device's permissions
+      # keep the runner's user from it. The scenario tests_kvm then runs
+      # on the runner's own CPU, whatever it is.
+      - name: Enable KVM
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          else
+            echo "no /dev/kvm on this runner: tests_kvm is skipped"
+          fi
+
       - name: QEMU integration tests
         run: zig build test-qemu -Doptimize=${{ matrix.optimize }}
         env:
