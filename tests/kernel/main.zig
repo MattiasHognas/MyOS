@@ -1090,10 +1090,9 @@ fn dotnetSelfContained() TestError!void {
 
 /// The C, Rust and Go programs built the way a developer builds them, with
 /// no flags: `gcc hello.c`, `cargo build --release`, `go build`. The first
-/// two are linked against glibc; this build machine's toolchain marks the
-/// C one as needing an x86-64-v4 CPU (AVX-512), so where the CPU has none
-/// glibc's loader refuses it, as it would on Linux, and that is checked
-/// instead.
+/// two are linked against glibc. A toolchain built for newer CPUs (some
+/// distributions') marks the C one as needing an x86-64-v4 CPU (AVX-512);
+/// where the CPU has none, glibc's loader then refuses it, as on Linux.
 fn plainBuilds() TestError!void {
     if (!helpers.haveFixtures(&.{ "c-hello-gcc", "go-hello-plain", "rust-hello-cargo" })) return;
     if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
@@ -1111,12 +1110,14 @@ fn plainBuilds() TestError!void {
         try check(code == 3);
     }
     const c = helpers.runProgramArgs("/fixtures/c-hello-gcc", &args, &.{}) orelse return error.Failed;
-    if (helpers.cpuHasX86_64V4()) {
+    // Whether it asks for x86-64-v4 depends on the machine it was built
+    // on: where the CPU has that, it must run; where not, it runs or is
+    // refused by glibc's loader (status 127), as on Linux.
+    if (c == 127 and !helpers.cpuHasX86_64V4()) {
+        root.print("  the gcc build asks for x86-64-v4 and this CPU is not: refused, as on Linux\n", .{});
+    } else {
         if (c != 3) report("gcc build exit status", c);
         try check(c == 3);
-    } else {
-        root.print("  this CPU is not x86-64-v4: the gcc build is refused, as on Linux\n", .{});
-        try check(c == 127); // what glibc's loader exits with
     }
     try expectFootprint(memory);
 }
