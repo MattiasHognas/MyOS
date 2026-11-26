@@ -1128,6 +1128,15 @@ fn filesAndProc() TestError!void {
     try expectFootprint(memory); // generated files and grown tables are freed
 }
 
+/// The terminal: lines edited and handed over whole, Ctrl+D, keys without
+/// line editing, its settings and size; Ctrl+C ends the foreground
+/// program.
+fn terminal() TestError!void {
+    const memory = helpers.footprint();
+    try expectChecks("terminal", helpers.terminalSession());
+    try expectFootprint(memory);
+}
+
 /// A filesystem that can be written, at `/tmp`: files, directories,
 /// renames, a program copied there and run, from two processes at once;
 /// and nothing of it left when they are done.
@@ -1855,6 +1864,7 @@ fn runCases() noreturn {
         .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
+        .{ .name = "the terminal: line editing, Ctrl+D, raw keys, settings, Ctrl+C ends the foreground (ring 3)", .func = terminal },
         .{ .name = "a writable filesystem at /tmp: files, directories, rename, a program run from it (ring 3)", .func = writableFiles },
         .{ .name = "the program heap: standard containers on the user library's allocator (ring 3)", .func = programHeap },
         .{ .name = "a .NET Native AOT program built for Linux runs (runtime, managed threads, GC)", .func = dotnetHello },

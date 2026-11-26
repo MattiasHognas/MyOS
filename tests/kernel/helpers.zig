@@ -29,7 +29,7 @@ const apic = kernel_root.arch.x86_64.apic;
 const arch_syscall = kernel_root.arch.x86_64.syscall;
 const abi = kernel_root.abi;
 const hpet = kernel_root.drivers.hpet;
-const keyboard = kernel_root.drivers.ps2_keyboard;
+const tty = kernel_root.kernel.tty;
 const timer = kernel_root.kernel.timer;
 const SpinLock = kernel_root.kernel.sync.spinlock.SpinLock;
 const WaitQueue = kernel_root.kernel.sync.wait_queue.WaitQueue;
@@ -275,11 +275,16 @@ pub fn waitUntilGone(p: *process.Process) u64 {
     process.retain(p); // to look at it after `wait` has given up one reference
     const code = process.wait(p);
     // Each of its threads holds one reference until it is freed; then ours
-    // is the last. Bounded by time, not by tries: under a hypervisor the
-    // CPU that has to let go of a stack can be off the host's CPU for
-    // many milliseconds, longer than any number of yields here takes.
+    // is the last. Bounded by time as well as by tries: under a hypervisor
+    // the CPU that has to let go of a stack can be off the host's CPU for
+    // many milliseconds, longer than a fixed number of yields takes; and a
+    // caller with interrupts off sees no time pass, so the tries end it.
     const deadline = timer.now() + 10 * timer.HZ;
-    while (@atomicLoad(u32, &p.refs, .monotonic) != 1 and timer.now() < deadline) thread.yield();
+    var tries: usize = 0;
+    while (@atomicLoad(u32, &p.refs, .monotonic) != 1) : (tries += 1) {
+        if (tries >= 100_000 and (timer.now() >= deadline or tries >= 20_000_000)) break;
+        thread.yield();
+    }
     process.release(p);
     return code;
 }
@@ -2314,6 +2319,59 @@ pub fn mutexChecks() u32 {
     return if (footprint().eql(before)) 0 else 15;
 }
 
+/// Check the terminal from ring 3: `/test/terminal` waits, and is typed
+/// to, once each time; then Ctrl+C ends a foreground program that waits
+/// for a line. Returns 0, or the number of the first failing check
+/// (100 and more: the program's own check, plus 100).
+pub fn terminalSession() u32 {
+    tty.reset();
+    defer tty.reset();
+    const p = process.spawnPath("/test/terminal", .{}) catch return 1;
+    const typed = [_][]const u8{ "helo\x7f\x7flo wrld\x15hello, world\n", "first\nsecond\n", "partial\x04", "\x04", "k" };
+    for (typed) |keys| {
+        // Until it waits for this; or it ended early (a failed check).
+        var tries: usize = 0;
+        while (tty.waitingReaders() == 0 and p.exit_code == null and tries < 500) : (tries += 1) timer.sleepTicks(1);
+        if (p.exit_code != null) break;
+        tty.inject(keys);
+        // Until it has taken it (the next read, or the end).
+        tries = 0;
+        while (tty.available() != 0 and p.exit_code == null and tries < 500) : (tries += 1) timer.sleepTicks(1);
+        timer.sleepTicks(1);
+    }
+    const code = waitUntilGone(p);
+    if (code != 0) return @intCast(100 + code);
+    // It left the terminal without line editing; nobody put it back, so
+    // it is still so (the shell's `run` puts it back for its programs).
+    if (tty.getAttributes().lflag & abi.TERMIOS.ICANON != 0) return 2;
+    tty.reset();
+
+    // Ctrl+C ends the foreground program, and only that.
+    const waiter = process.spawnPath("/test/terminal", .{ .argv = &.{ "terminal", "wait" } }) catch return 3;
+    var tries: usize = 0;
+    while (tty.waitingReaders() == 0 and tries < 500) : (tries += 1) timer.sleepTicks(1);
+    tty.inject("\x03"); // nobody is the foreground: only the line is gone
+    timer.sleepTicks(2);
+    if (waiter.exit_code != null) return 4;
+    if (process.setForeground(waiter) != null) return 5;
+    tty.inject("half a line\x03");
+    const status = waitUntilGone(waiter);
+    _ = process.setForeground(null);
+    if (status != tty.INTERRUPTED) return 6;
+    // The half line went with it.
+    if (tty.available() != 0 or tty.readable()) return 7;
+    return 0;
+}
+
+/// The terminal without line editing and echo, with nothing typed: each
+/// key typed is one `read`. `tty.reset` puts it back.
+fn rawTerminal() void {
+    tty.reset();
+    var t = tty.getAttributes();
+    t.lflag &= ~@as(u32, abi.TERMIOS.ICANON | kernel_root.abi.TERMIOS.ECHO);
+    tty.setAttributes(t, true);
+}
+
 /// Check that keyboard readers wait on a queue: three programs each wait
 /// for a key and get one each, in the order they started waiting; a key
 /// typed with nobody waiting is kept for the next reader. Returns 0, or
@@ -2322,27 +2380,28 @@ pub fn keyboardReaders() u32 {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const before = footprint();
-    while (keyboard.getChar() != null) {} // start with an empty buffer
+    rawTerminal(); // start with nothing typed, and a key is a read
     var readers: [3]*process.Process = undefined;
     for (&readers, 0..) |*r, i| {
         r.* = process.spawnPath("/test/getchar", .{}) catch return 1;
-        if (!untilCount(keyboard.waitingReaders, i + 1)) return 2;
+        if (!untilCount(tty.waitingReaders, i + 1)) return 2;
     }
     // One key wakes one reader: the first.
-    keyboard.inject('a');
+    tty.inject("a");
     if (process.wait(readers[0]) != 'a') return 3;
-    if (keyboard.waitingReaders() != 2) return 4;
+    if (tty.waitingReaders() != 2) return 4;
     // Two keys at once: one each, in order.
-    keyboard.inject('b');
-    keyboard.inject('c');
+    tty.inject("b");
+    tty.inject("c");
     if (process.wait(readers[1]) != 'b') return 5;
     if (process.wait(readers[2]) != 'c') return 6;
-    if (keyboard.waitingReaders() != 0) return 7;
+    if (tty.waitingReaders() != 0) return 7;
     // A key with nobody waiting stays in the buffer.
-    keyboard.inject('d');
+    tty.inject("d");
     const late = process.spawnPath("/test/getchar", .{}) catch return 8;
     if (process.wait(late) != 'd') return 9;
-    if (keyboard.getChar() != null) return 10;
+    if (tty.available() != 0) return 10;
+    tty.reset();
     quiesce();
     if (!footprint().eql(before)) {
         const now = footprint();
@@ -3106,15 +3165,15 @@ pub fn orphanedChild() u32 {
 
     // Parent and child each wait for a key; the parent has waited longer,
     // so the first key is its, and it exits first.
-    while (keyboard.getChar() != null) {}
+    rawTerminal();
     const parent = process.spawnPath("/test/getchar", .{ .parent = grandparent }) catch return 1;
-    if (!untilCount(keyboard.waitingReaders, 1)) return 13;
+    if (!untilCount(tty.waitingReaders, 1)) return 13;
     const child = process.spawnPath("/test/getchar", .{ .parent = parent }) catch return 2;
-    if (!untilCount(keyboard.waitingReaders, 2)) return 13;
+    if (!untilCount(tty.waitingReaders, 2)) return 13;
     if (grandparent.descendants != 2 or parent.descendants != 1 or
         grandparent.first_child != parent or parent.first_child != child or child.parent != parent) return 3;
 
-    keyboard.inject('p');
+    tty.inject("p");
     if (process.wait(parent) != 'p') return 4; // `parent` is gone after this
     // The child is still running, and is now the grandparent's.
     if (child.exit_code != null) return 5; // it should have outlived its parent
@@ -3122,8 +3181,9 @@ pub fn orphanedChild() u32 {
     if (grandparent.first_child != child or child.next_sibling != null) return 7;
     if (grandparent.descendants != 1) return 8;
 
-    keyboard.inject('k');
+    tty.inject("k");
     if (process.wait(child) != 'k') return 9;
+    tty.reset();
     if (grandparent.descendants != 0 or grandparent.first_child != null) return 10;
     if (!untilLive(live)) return 11;
     timer.sleepTicks(1);

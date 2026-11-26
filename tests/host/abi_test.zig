@@ -30,7 +30,6 @@ test "syscall numbers are Linux's x86-64 numbers" {
 test "private syscall numbers are clear of Linux's and of the x32 bit" {
     try std.testing.expect(abi.Sys.PRIVATE_BASE > 100_000);
     try std.testing.expect(abi.Sys.myos_run < 0x4000_0000);
-    try std.testing.expect(abi.Sys.myos_getchar != abi.Sys.myos_run);
 }
 
 test "error numbers are Linux's" {

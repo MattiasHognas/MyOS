@@ -148,7 +148,9 @@ pub fn main() noreturn {
     // --- The standard streams are descriptors like any other: the console.
     expect(fstatMode(0) == abi.S.IFCHR and fstatMode(1) == abi.S.IFCHR and fstatMode(2) == abi.S.IFCHR, 1);
     expect(lib.syscall(Sys.fcntl, 1, F_GETFL, 0) == O.RDWR, 2);
-    expect(lib.read(0, &buf) == lib.err(.BADF), 3); // no console input through read yet
+    // Nothing typed: a read that will not wait says so.
+    expect(lib.syscall(Sys.fcntl, 0, F_SETFL, O.NONBLOCK) == 0 and lib.read(0, &buf) == lib.err(.AGAIN), 3);
+    expect(lib.syscall(Sys.fcntl, 0, F_SETFL, 0) == 0, 4);
 
     // --- dup gives the lowest free descriptor for the same open file.
     const file = lib.open("/etc/motd");

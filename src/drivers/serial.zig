@@ -1,7 +1,10 @@
-//! Polling driver for the COM1 serial port (16550 UART).
+//! Driver for the COM1 serial port (16550 UART).
 //!
-//! Used for kernel logging from the very first instruction, before the
-//! framebuffer console exists. QEMU forwards it to the host terminal.
+//! Output is polled: it is used for kernel logging from the very first
+//! instruction, before the framebuffer console exists, and from panics.
+//! QEMU forwards it to the host terminal. Input comes by interrupt (IRQ 4,
+//! `initInput`) and goes to the terminal like a typed key, so that a
+//! session can be driven over the serial line, by a person or a test.
 
 const COM1 = 0x3F8;
 
@@ -40,6 +43,31 @@ pub fn init() void {
     outb(COM1 + 3, 0x03);
     outb(COM1 + 2, 0xC7);
     outb(COM1 + 4, 0x03);
+}
+
+/// Where received characters go (`initInput`).
+var receiver: ?*const fn (u8) void = null;
+
+/// IRQ 4: take every character the UART has received.
+fn onIrq() void {
+    while (inb(COM1 + 5) & 0x01 != 0) {
+        const c = inb(COM1);
+        if (receiver) |f| f(c);
+    }
+}
+
+/// Have the UART interrupt when a character arrives, and give each one to
+/// `to`. The caller routes IRQ 4 to `irqHandler`.
+pub fn initInput(to: *const fn (u8) void) void {
+    receiver = to;
+    while (inb(COM1 + 5) & 0x01 != 0) _ = inb(COM1); // what came before
+    outb(COM1 + 4, 0x0B); // DTR, RTS and OUT2: OUT2 lets the interrupt reach the CPU
+    outb(COM1 + 1, 0x01); // interrupt on received data
+}
+
+/// The handler to register for IRQ 4.
+pub fn irqHandler() void {
+    onIrq();
 }
 
 /// Write the string `s` to the serial port.

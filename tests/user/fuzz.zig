@@ -12,7 +12,7 @@
 //! Left out on purpose: `exit` and `exit_group` (the run would end early),
 //! the calls that unmap or reprotect memory (the program would take its
 //! own code or stack away), closing or replacing the standard descriptors,
-//! making pipes, waiting in `poll`, and `myos_getchar`
+//! making pipes, waiting in `poll`, and reading the terminal
 //! (it would wait for a key forever). Console writes of readable memory are
 //! steered to a block of text, to keep the serial log printable.
 //!
@@ -116,7 +116,13 @@ pub fn main() noreturn {
             a.* = pickArg(&rng, &readable);
             if (n == 1) second_readable = readable;
         }
-        if (nr == Sys.exit or nr == Sys.exit_group or nr == Sys.myos_getchar) continue;
+        if (nr == Sys.exit or nr == Sys.exit_group) continue;
+        // Reading the terminal waits for someone to type (any descriptor
+        // may be one: a duplicate), and settings it makes would outlive
+        // the run.
+        if (nr == Sys.read or nr == Sys.readv or nr == Sys.ioctl or nr == Sys.pread64) {
+            if (args[0] < 3 or args[0] >= 16) continue;
+        }
         // Calls with which a program takes its own memory away or changes
         // what it may do with it are a program's right, and its end.
         if (nr == Sys.munmap or nr == Sys.mprotect or nr == Sys.madvise or nr == Sys.mremap) continue;
@@ -134,6 +140,8 @@ pub fn main() noreturn {
         // so a read from one would wait for ever.
         if (nr == Sys.close and args[0] <= 2) continue;
         if ((nr == Sys.dup2 or nr == Sys.dup3) and args[1] <= 2) continue;
+        // Nor copied to where reads go (above).
+        if ((nr == Sys.dup or nr == Sys.dup2 or nr == Sys.dup3 or nr == Sys.fcntl) and args[0] <= 2) continue;
         if (nr == Sys.pipe or nr == Sys.pipe2) continue;
         if (nr == Sys.write and args[0] <= 2 and (second_readable or args[1] >= STACK_TOP - 8)) {
             const off = next(&rng) % (text.len - 64);

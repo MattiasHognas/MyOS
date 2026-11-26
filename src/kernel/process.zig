@@ -219,6 +219,10 @@ pub const Process = struct {
     start_ticks: u64 = 0,
     /// Set, once, when the process is ending: its threads are to end too.
     killed: std.atomic.Value(bool) = .init(false),
+    /// Set by someone else who wants the process ended (`terminate`): the
+    /// exit status for it, or `NO_REQUEST`. The first of its threads to
+    /// come through the kernel ends it with that status.
+    exit_request: std.atomic.Value(u64) = .init(NO_REQUEST),
     /// Where the thread that ends the process waits for the others to go.
     /// Under the process-tree lock.
     threads_gone: WaitQueue = .{},
@@ -373,12 +377,112 @@ fn die() noreturn {
     thread.exit();
 }
 
-/// End the calling thread if its process is ending. Called where a thread
-/// is about to return to its program: after a system call and after an
-/// interrupt taken in ring 3. No lock may be held.
+/// End the calling thread if its process is ending, and the process if
+/// someone asked for that. Called where a thread is about to return to
+/// its program: after a system call and after an interrupt taken in ring
+/// 3. No lock may be held.
 pub fn dieIfKilled() void {
     const p = thread.current().process orelse return;
     if (p.killed.load(.acquire)) die();
+    const code = p.exit_request.load(.acquire);
+    if (code != NO_REQUEST) exit(code);
+}
+
+const NO_REQUEST = std.math.maxInt(u64);
+
+/// The program the terminal's Ctrl+C ends: the one the shell started and
+/// waits for. Under the tree lock. Whoever sets it holds a reference to it
+/// until it has taken it back.
+var foreground: ?*Process = null;
+
+/// What `giveForeground` did.
+pub const Handover = enum {
+    /// Another program has the terminal: nothing changed.
+    not_given,
+    /// Nobody had it; now `to` does.
+    from_nobody,
+    /// The caller had it; now `to` does.
+    from_caller,
+};
+
+/// Give the terminal to `to`, a program `from` has started and waits
+/// for, if `from` has the terminal or nobody has. A program that does not
+/// have it cannot take it from the one that does (two programs started at
+/// once by two others: the first keeps it). The caller holds a reference
+/// to `to` until `takeForegroundBack`.
+pub fn giveForeground(from: *Process, to: *Process) Handover {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    if (foreground == null) {
+        foreground = to;
+        return .from_nobody;
+    }
+    if (foreground == from) {
+        foreground = to;
+        return .from_caller;
+    }
+    return .not_given;
+}
+
+/// Undo `giveForeground` once `to` has ended: the terminal goes back to
+/// `from` or to nobody, whichever had it, unless `to` passed it on and the
+/// program it went to still has it (which cannot happen once `to` has
+/// waited for that program).
+pub fn takeForegroundBack(from: *Process, to: *Process, handover: Handover) void {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    if (foreground != to) return;
+    foreground = switch (handover) {
+        .not_given => return,
+        .from_nobody => null,
+        .from_caller => from,
+    };
+}
+
+/// Make `p` the foreground program, or nobody: for tests.
+pub fn setForeground(p: ?*Process) ?*Process {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    const before = foreground;
+    foreground = p;
+    return before;
+}
+
+/// End the foreground program, if there is one, with status `code`. For
+/// the terminal's Ctrl+C: callable from an interrupt handler holding no
+/// lock. True if there was one.
+pub fn terminateForeground(code: u64) bool {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    const p = foreground orelse return false;
+    requestExit(p, code);
+    return true;
+}
+
+/// Have the process `p` end with status `code`, as if it had called
+/// `exit_group`, the next time one of its threads comes through the
+/// kernel: at once for a thread that is running a program (it is
+/// interrupted) or waiting in a way it may be woken from. What its
+/// threads hold is freed by the process itself, as in any exit. A process
+/// that is ending already ends as it was going to. Callable with
+/// interrupts off and from any thread; `p` must be alive (a reference).
+pub fn terminate(p: *Process, code: u64) void {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    requestExit(p, code);
+}
+
+/// `terminate` with the tree lock held.
+fn requestExit(p: *Process, code: u64) void {
+    if (p.killed.load(.acquire)) return;
+    _ = p.exit_request.cmpxchgStrong(NO_REQUEST, code, .acq_rel, .acquire);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) thread.interrupt(one);
+}
+
+/// Whether someone has asked `p` to end (`terminate`) or it is ending.
+pub fn ending(p: *const Process) bool {
+    return p.killed.load(.acquire) or p.exit_request.load(.acquire) != NO_REQUEST;
 }
 
 /// Terminate the calling thread with status `code` (the `exit` syscall).

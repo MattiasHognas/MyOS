@@ -467,10 +467,10 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [x] Reserve FDs 0/1/2 for stdin/stdout/stderr: a process starts with the three open on the console, as one open file with three descriptors (`open_file.zig`). They are closed, duplicated and replaced like any other.
   - [x] The numbers are reserved since 2.5: `open` returns descriptors from 3 up, and `write` to 1 and 2 reaches the console.
   - [ ] Still to do: they are not real descriptors. They cannot be closed, redirected or inherited, and `write` handles them as a special case.
-- [ ] Make `read` on descriptor 0 return keyboard input and remove the private `myos_getchar` syscall (`0x4D5900`). Today `read(0, ...)` returns `EBADF` and the shell reads keys with `myos_getchar`. Do it together with the terminal layer below, so blocking, line editing, echo and end of file are designed once; move `app/sh.zig` to `read` and update `docs/syscalls.md`.
-- [ ] Route console I/O through descriptor-backed devices.
-- [ ] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 6.3 depend on it.
-- [ ] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling. Keep it small; anything richer belongs in user space.
+- [x] Make `read` on descriptor 0 return keyboard input and remove the private `myos_getchar` syscall (`0x4D5900`). Today `read(0, ...)` returns `EBADF` and the shell reads keys with `myos_getchar`. Do it together with the terminal layer below, so blocking, line editing, echo and end of file are designed once; move `app/sh.zig` to `read` and update `docs/syscalls.md`. Done: the shell reads its lines with `read(0)`; `lib.readKey` waits for one key with line editing off.
+- [x] Route console I/O through descriptor-backed devices. The console is one open file behind descriptors 0, 1 and 2; reading it goes through the terminal (`tty.zig`).
+- [x] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 6.3 depend on it. IRQ 4 into the terminal, like a typed key.
+- [x] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling. Keep it small; anything richer belongs in user space. `tty_core.zig` (the line discipline alone, host-tested, also against a model of random typing) and `tty.zig` (the lock, the readers in the order they asked, echo to the console, Ctrl+C ending the foreground program). `termios` through `ioctl`, and the size of the window.
 - [x] Support generic open/read/write/close plus `seek` where applicable (`openat`, `lseek`). Done: `open`, `openat`, `read`, `pread64`, `write`, `writev`, `close`, `lseek`, over files, pipes, the console and devices.
 - [ ] Define file-offset, ownership, and descriptor inheritance rules.
 - [x] Add descriptor duplication and pipes (`dup`/`dup2`/`dup3`, `fcntl(F_DUPFD)`, `pipe`/`pipe2`): `pipe.zig`, a page of buffer, readers and writers that wait and are woken, end of file and `EPIPE` when the other end is closed, `O_NONBLOCK`. Tested from ring 3 (`/test/pipes`), with a thread on each end and with a process that ends while a thread sleeps in a pipe.
@@ -484,6 +484,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
   - Done: `/dev/null`, `/dev/urandom`, `/dev/random`, `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/meminfo` (`procfs.zig`: text made when the file is opened). Open: `/proc/cpuinfo`, `/proc/stat`, `/proc/self/mountinfo` and `cgroup`, `/sys/devices/system/cpu/*`, which the .NET runtime looks for and does without.
 - [x] Test EOF, partial I/O, invalid descriptors, and cleanup. Done: `/test/syscalls`, `/test/pipes` and `/test/files` from ring 3, with the kernel test checking that nothing stays allocated.
 - [ ] Test terminal line editing and `poll` (ready, blocking, and timeout cases) with input injected over serial.
+  - Done for the terminal from ring 3 with keys put in from the kernel test (`/test/terminal`: editing, two lines at once, short reads, Ctrl+D, `FIONREAD`, `poll`, raw mode, non-blocking, Ctrl+C ending the foreground program and only that). Open: input over the real serial line from the test script, which the scripted shell sessions of 6.3 need.
 
 ### 6.3 Commands and shell features
 - [ ] Implement `echo`, `cat`, `ls`, `pwd`, `cd`, and `clear`.
@@ -500,7 +501,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Decide how programs are started, and replace the private `run` syscall: either `clone(CLONE_VM|CLONE_VFORK)` plus `execve` (what musl's `posix_spawn` uses; no `fork` or copy-on-write needed), or one private spawn syscall kept outside Linux's numbers.
 - [ ] Assign stable PIDs and track parent-child relationships.
 - [ ] Define generalized process waiting and exit-code handling (`wait4`).
-- [ ] Support Ctrl+C termination of foreground jobs.
+- [x] Support Ctrl+C termination of foreground jobs. A program the shell runs is the foreground while the shell waits for it (`process.giveForeground`: only from whoever has the terminal, or from nobody); Ctrl+C ends it with status 130 through `process.terminate`, which any thread can now ask of a process.
 - [ ] Add monotonic timekeeping and a sleep syscall (`clock_gettime`, `nanosleep`), on a calibrated TSC clock where the TSC is invariant and HPET otherwise: runtimes read the clock constantly. `nanosleep` sits on the kernel timers of 2.8, whose resolution is one tick (10 ms): decide whether that is enough or sleeps need a one-shot timer.
 - [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 11.5 need it).
 - [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.

@@ -204,8 +204,8 @@ pub const Sys = struct {
     /// (under 500) and below the x32 bit (0x4000_0000). Milestone 6 replaces
     /// the private calls with Linux ones.
     pub const PRIVATE_BASE = 0x4D59_00; // "MY"
-    /// `getchar() -> character`: block until a key is pressed.
-    pub const myos_getchar = PRIVATE_BASE + 0;
+    // PRIVATE_BASE + 0 was `myos_getchar`: keys come through `read` on
+    // descriptor 0 now. The number stays unused.
     /// `run(path, argv, envp) -> exit status`: start the program at the
     /// NUL-terminated `path` and wait for it to exit. `argv` and `envp` are
     /// NULL-terminated arrays of NUL-terminated strings, as for `execve`;
@@ -651,3 +651,59 @@ pub const SCHED = struct {
 
 /// `unlinkat`: remove a directory, as `rmdir` does.
 pub const AT_REMOVEDIR = 0x200;
+
+/// `struct termios` as the kernel has it (`TCGETS`, `TCSETS`).
+pub const Termios = extern struct {
+    iflag: u32 = 0,
+    oflag: u32 = 0,
+    cflag: u32 = 0,
+    lflag: u32 = 0,
+    line: u8 = 0,
+    cc: [19]u8 = @splat(0),
+};
+
+pub const TERMIOS = struct {
+    // iflag
+    pub const ICRNL = 0o400;
+    // oflag
+    pub const OPOST = 0o1;
+    pub const ONLCR = 0o4;
+    // cflag
+    pub const B38400 = 0o17;
+    pub const CS8 = 0o60;
+    pub const CREAD = 0o200;
+    // lflag
+    pub const ISIG = 0o1;
+    pub const ICANON = 0o2;
+    pub const ECHO = 0o10;
+    pub const ECHOE = 0o20;
+    pub const ECHOK = 0o40;
+    // cc
+    pub const VINTR = 0;
+    pub const VERASE = 2;
+    pub const VKILL = 3;
+    pub const VEOF = 4;
+    pub const VTIME = 5;
+    pub const VMIN = 6;
+};
+
+/// `struct winsize` (`TIOCGWINSZ`).
+pub const WinSize = extern struct {
+    rows: u16,
+    cols: u16,
+    xpixel: u16 = 0,
+    ypixel: u16 = 0,
+};
+
+/// The terminal's `ioctl` requests.
+pub const TIOC = struct {
+    pub const TCGETS = 0x5401;
+    pub const TCSETS = 0x5402;
+    pub const TCSETSW = 0x5403;
+    pub const TCSETSF = 0x5404;
+    pub const TCFLSH = 0x540B;
+    pub const TIOCGPGRP = 0x540F;
+    pub const TIOCSPGRP = 0x5410;
+    pub const TIOCGWINSZ = 0x5413;
+    pub const FIONREAD = 0x541B;
+};

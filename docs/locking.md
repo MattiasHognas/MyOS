@@ -52,7 +52,7 @@ belongs to this CPU.
 | Process-tree lock (one, global) | `process_tree` | Parent and child links, descendant counts, reference counts, exit statuses and the threads waiting for them | `process.zig` |
 | A process's address-space lock | `address_space` | Its regions, its `brk` heap and its user page tables | `user_memory.zig` |
 | A process's descriptor-table lock | `descriptor_table` | Its open files and their reference counts | `syscall.zig` |
-| A condition's lock | `condition` | A condition some thread waits for, together with the wait queue for it: the keyboard buffer and its readers, a mutex's owner and its waiters, every futex and its waiters (one lock for all of them), a pipe's buffer with its readers and writers (one lock per pipe) | `ps2_keyboard.zig`, `sync/mutex.zig`, `futex.zig`, `pipe.zig` |
+| A condition's lock | `condition` | A condition some thread waits for, together with the wait queue for it: the keyboard's modifier state, a mutex's owner and its waiters, every futex and its waiters (one lock for all of them), a pipe's buffer with its readers and writers (one lock per pipe), the terminal's input with its readers | `ps2_keyboard.zig`, `sync/mutex.zig`, `futex.zig`, `pipe.zig`, `tty.zig` |
 | Timer lock | `timer` | The timer queue and the tick count | `timer.zig` |
 | Scheduler lock (one, global, to begin with) | `scheduler` | The ready queue, every thread's `state`, `link`, `on_cpu` and wake-up permit, the zombie list | `thread.zig` |
 | Heap lock | `kernel_region` | The kernel heap, and the page tables of the heap's region | `heap.zig` |
@@ -337,7 +337,7 @@ with a definite answer: must they contend? The calls that exist today:
 | `read` on different open files | Yes | Nothing (the initrd is read-only; the offset is the file's own) | As it should be |
 | `read` twice on one open file | No: each moves the offset | The offset | Cannot be avoided; needs the file's lock once two threads can share one (7) |
 | `write` to the console, twice | No: the order shows on the screen | Console lock | Cannot be avoided |
-| `myos_getchar`, twice | No: who gets which key | Keyboard lock | Cannot be avoided |
+| `read` of the terminal, twice | No: who gets which line | Terminal lock, readers served in the order they asked | Cannot be avoided |
 | `open` twice in one process | No: `open` returns the lowest free descriptor, so each sees the other | The descriptor table | Cannot be avoided (POSIX); needs the descriptor-table lock with threads (7) |
 | `open` or `close` in different processes | Yes | Heap lock (the open-file structure) | To fix: per-CPU heap caches (3.4) |
 | `close` of different descriptors in one process | Yes | Heap lock; the table with threads | To fix with the heap; a lock per table is enough for the rest |

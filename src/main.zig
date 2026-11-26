@@ -56,6 +56,7 @@ pub const firmware = struct {
 
 /// Architecture-independent kernel core: memory, threads, processes, syscalls and files.
 pub const kernel = struct {
+    pub const tty = @import("kernel/tty.zig");
     pub const console = @import("kernel/console.zig");
     pub const elf = @import("kernel/elf.zig");
     pub const elf_image = @import("kernel/elf_image.zig");
@@ -240,9 +241,13 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     write(std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n");
 }
 
+fn serialIrq(_: *idt.Frame) void {
+    serial.irqHandler();
+}
+
 /// Write `s` to the serial port and (once initialized) the console, under
 /// the console lock so the whole message comes out in one piece.
-fn write(s: []const u8) void {
+pub fn write(s: []const u8) void {
     if (console_seized) return writeUnlocked(s);
     const held = console_lock.acquire();
     defer console_lock.release(held);
@@ -349,6 +354,13 @@ fn kmainOnStack() callconv(.c) noreturn {
     vfs.mountRoot(tarfs.init(initrd_image));
     // The image cannot be written to; /tmp can, and forgets at power-off.
     vfs.mount("/tmp", tmpfs.init()) catch unreachable; // the second of eight mounts
+
+    // The terminal: keys from the keyboard and the serial line, what is
+    // shown for them on the console.
+    kernel.tty.init(write);
+    serial.initInput(kernel.tty.input);
+    idt.register(apic.IRQ_BASE + 4, serialIrq);
+    apic.route(4, apic.IRQ_BASE + 4);
 
     // The test kernel runs an integration-test scenario (tests/kernel/) instead of the shell.
     if (comptime build_options.is_test) @import("kernel_tests").run();

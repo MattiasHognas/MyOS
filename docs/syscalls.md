@@ -72,7 +72,7 @@ Linux calls, with Linux's numbers:
 
 | Number | Call | Notes |
 | --- | --- | --- |
-| 0 | `read(fd, buf, count)` | Files and pipes. A pipe gives what it holds, waiting only while it is empty and has a writer; 0 at its end. `/dev/null` is at its end at once, the random devices give random bytes. The console is not readable yet (`EBADF`); use `myos_getchar`. |
+| 0 | `read(fd, buf, count)` | Files, pipes, the terminal. The terminal gives one line once Enter is typed (with line editing on), or each key at once (off); 0 after Ctrl+D on an empty line. A pipe gives what it holds, waiting only while it is empty and has a writer; 0 at its end. `/dev/null` is at its end at once, the random devices give random bytes. |
 | 1 | `write(fd, buf, count)` | The console (serial port and screen), which descriptors 0, 1 and 2 start out as; files opened for writing (in `/tmp`), at the descriptor's offset or at the end with `O_APPEND`; pipes; `/dev/null` and the random devices, which throw it away. A pipe takes all of it, waiting for room; `EPIPE` when no reader is left (no `SIGPIPE` yet). `ENOSPC`, `EFBIG`. |
 | 2 | `open(path, flags, mode)` | In `/tmp`, which can be written: `O_CREAT` (with `O_EXCL`: `EEXIST`), `O_TRUNC`, `O_APPEND`, any access mode. Elsewhere opening for writing or creating is `EROFS`. `/dev/null`, `/dev/urandom` and `/dev/random` may be opened for writing. The text files of `/proc` (see below) are made when they are opened. A directory is opened for reading only (`EISDIR`), to be listed or to start paths from; `O_DIRECTORY` or a slash at the end of the path on anything else is `ENOTDIR`. `O_NONBLOCK` is kept; `mode` and other flags are ignored: there are no permissions. |
 | 3 | `close(fd)` | Any open descriptor, the standard ones too. What it referred to goes with its last descriptor. |
@@ -87,7 +87,7 @@ Linux calls, with Linux's numbers:
 | 12 | `brk(addr)` | Returns the new end of the heap, or the old one if it cannot move. |
 | 13 | `rt_sigaction(sig, act, oldact, size)` | Recorded and read back. No signal is delivered yet (milestone 8): a fault still ends the process. |
 | 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals, recorded. |
-| 16 | `ioctl(fd, request, arg)` | No device has requests yet: `ENOTTY` for every open descriptor (how a C library finds out that its output is not a terminal), `EBADF` otherwise. |
+| 16 | `ioctl(fd, request, arg)` | The terminal: `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` (line editing, echo, Ctrl+C, CR to newline; other settings are ignored), `TIOCGWINSZ` (80 by 25), `FIONREAD`, `TCFLSH`, `TIOCGPGRP` (the caller) and `TIOCSPGRP` (accepted). `EINVAL` for other requests; `ENOTTY` for every descriptor that is not the terminal (how a C library finds out that its output is not one), `EBADF` otherwise. |
 | 17 | `pread64(fd, buf, count, offset)` | |
 | 18 | `pwrite64(fd, buf, count, offset)` | `write` to a file at an offset; the descriptor's own stays. |
 | 19 | `readv(fd, iov, iovcnt)` | `read` into up to 1024 buffers. |
@@ -172,7 +172,6 @@ MyOS calls with no Linux equivalent yet. Their numbers start at
 
 | Number | Call | Notes |
 | --- | --- | --- |
-| `0x4D5900` | `myos_getchar()` | Block until a key is pressed; returns the character. |
 | `0x4D5901` | `myos_run(path, argv, envp)` | Start the program at `path` with the arguments and environment given as for `execve` (either may be null: then the path is the only argument, and the environment is empty), and wait for it. Returns its exit status (0-255; 255 if the kernel killed it), or an error; `E2BIG` if arguments and environment do not fit. |
 
 Every other number returns `ENOSYS`.
@@ -190,6 +189,13 @@ Every other number returns `ENOSYS`.
   console; they can be closed, duplicated and replaced like any other.
   `open`, `dup` and `pipe2` return the lowest free one. Descriptors are
   not inherited by programs started with `myos_run`.
+- **The terminal.** Descriptors 0, 1 and 2 start out on it. Keys come
+  from the keyboard and the serial line. With line editing on (the
+  default) a line is shown as it is typed and handed over on Enter;
+  backspace, Ctrl+U and Ctrl+D work as on Linux. Ctrl+C throws the line
+  away and ends the program the shell is running, with exit status 130
+  (`SIGINT`'s; signals are not delivered yet, so it cannot be caught).
+  When the shell gets the terminal back, the settings are put back.
 - **Paths** are at most 4095 bytes, each name in them at most 255
   (`ENAMETOOLONG`). A relative path starts at the working directory, or
   at a directory descriptor for the `...at` calls. "." and ".." and

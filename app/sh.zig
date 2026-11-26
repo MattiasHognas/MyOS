@@ -12,32 +12,30 @@ comptime {
     _ = lib; // its `_start` calls `main`
 }
 
-/// Read one line from the keyboard into `buf`, echoing it and handling
-/// backspace. Ctrl+C discards the line. Returns the line without the newline.
+/// Read one line from the terminal into `buf` and return it without its
+/// newline. The terminal does the editing: echo, backspace, Ctrl+U, and
+/// Ctrl+C, which throws the line away. At the end of input (Ctrl+D on an
+/// empty line) the shell goes on: there is nothing yet that would start
+/// another one.
 fn readLine(buf: []u8) []u8 {
     var len: usize = 0;
-    while (true) {
-        const c = lib.getChar();
-        switch (c) {
-            '\n' => {
-                lib.write("\n");
-                return buf[0..len];
-            },
-            0x08 => if (len > 0) {
-                len -= 1;
-                lib.write("\x08 \x08");
-            },
-            3 => { // Ctrl+C: drop the line
-                lib.write("^C\n");
-                return buf[0..0];
-            },
-            else => if (c >= ' ' and len < buf.len) {
-                buf[len] = c;
-                len += 1;
-                lib.write(&.{c});
-            },
+    while (len < buf.len) {
+        const n = lib.read(0, buf[len..]);
+        if (lib.isError(n)) return buf[0..0]; // interrupted, say: an empty line
+        if (n == 0) {
+            if (len == 0) lib.write("\n");
+            return buf[0..len];
         }
+        len += n;
+        if (buf[len - 1] == '\n') return buf[0 .. len - 1];
     }
+    // Longer than the buffer: the rest of the line is dropped.
+    var rest: [64]u8 = undefined;
+    while (true) {
+        const n = lib.read(0, &rest);
+        if (lib.isError(n) or n == 0 or rest[n - 1] == '\n') break;
+    }
+    return buf[0..len];
 }
 
 /// Program entry point: the read-run loop.

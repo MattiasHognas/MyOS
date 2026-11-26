@@ -69,7 +69,7 @@ pub fn main() noreturn {
     // read/close on descriptors that are out of range or not open.
     expect(lib.read(99, &buf) == err(.BADF)); // 18
     expect(lib.read(5, &buf) == err(.BADF)); // 19
-    expect(lib.read(0, &buf) == err(.BADF)); // 20: no console input through read yet
+    expect(lib.read(1, buf[0..0]) == 0); // 20: an empty read of the terminal does not wait
     expect(lib.close(99) == err(.BADF)); // 21
     expect(lib.close(~@as(u64, 0)) == err(.BADF)); // 22
 
@@ -106,7 +106,7 @@ pub fn main() noreturn {
 
     // Unknown numbers fail with ENOSYS: unassigned Linux numbers, MyOS's old
     // numbers that Linux uses for calls MyOS lacks, the x32 range, garbage.
-    for ([_]u64{ 5000, 6000, 40, 57, 59, 61, 999, lib.Sys.PRIVATE_BASE + 2, 0x4000_0001, ~@as(u64, 0) }) |n| {
+    for ([_]u64{ 5000, 6000, 40, 57, 59, 61, 999, lib.Sys.PRIVATE_BASE + 0, 0x4000_0001, ~@as(u64, 0) }) |n| {
         expect(lib.syscall(n, 0, 0, 0) == err(.NOSYS)); // 49-58
     }
     check_no += 1; // keeps the numbers below

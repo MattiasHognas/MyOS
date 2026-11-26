@@ -15,7 +15,7 @@ const err = abi.err;
 const cpu = @import("../arch/x86_64/cpu.zig");
 const nospec = @import("../arch/x86_64/nospec.zig");
 const arch = @import("../arch/x86_64/syscall.zig");
-const keyboard = @import("../drivers/ps2_keyboard.zig");
+const tty = @import("tty.zig");
 const heap = @import("heap.zig");
 const proc = @import("process.zig");
 const thread = @import("thread.zig");
@@ -37,12 +37,6 @@ const vfs = @import("vfs.zig");
 
 /// Size of the kernel bounce buffer used to move data to and from user space.
 const CHUNK = 256;
-
-/// `myos_getchar`: return the next key from the keyboard buffer, blocking
-/// the calling thread until one is typed.
-fn sysGetChar() u64 {
-    return keyboard.read() orelse err(.INTR); // the process is ending: the result goes nowhere
-}
 
 /// `AT_FDCWD` as a system call argument.
 const CWD: u64 = @bitCast(@as(i64, abi.AT_FDCWD));
@@ -225,9 +219,21 @@ fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
         error.ArgumentsTooLong => err(.@"2BIG"),
         else => err(.NOEXEC), // unreadable, or refused by the ELF loader
     };
-    // Whether it is still running or already gone. If this process is
-    // ended meanwhile, the child runs on with nobody waiting for it.
-    return proc.waitKillable(child) orelse {
+    // The child has the terminal while it runs: Ctrl+C ends it, not this
+    // process. Whether it is still running or already gone. If this
+    // process is ended meanwhile, the child runs on with nobody waiting.
+    // A reference of its own for that, so that it is not freed while the
+    // terminal still points at it.
+    proc.retain(child);
+    const handover = proc.giveForeground(me, child);
+    const status = proc.waitKillable(child);
+    proc.takeForegroundBack(me, child, handover);
+    proc.release(child);
+    // A program that changed the terminal's settings and ended without
+    // changing them back leaves them to the next one: the shell, which
+    // took the terminal from nobody, puts them back.
+    if (handover == .from_nobody) tty.restoreSettings();
+    return status orelse {
         proc.release(child);
         return err(.INTR);
     };
@@ -585,8 +591,53 @@ fn readIoVec(iov: u64, index: usize) ?abi.IoVec {
 /// and open files answer `ENOTTY` ("not a terminal", which is how a C
 /// library asks whether to buffer its output by line); anything else is
 /// `EBADF`.
-fn sysIoctl(fd: u64) u64 {
-    return if (isOpen(fd)) err(.NOTTY) else err(.BADF);
+fn sysIoctl(fd: u64, request: u64, arg: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    const kind = of.kind;
+    putFile(of);
+    // Only the terminal has requests; for everything else this is how a
+    // C library finds out that its output is not a terminal.
+    if (kind != .console) return err(.NOTTY);
+    switch (request) {
+        abi.TIOC.TCGETS => return if (toUser(arg, tty.getAttributes())) 0 else err(.FAULT),
+        abi.TIOC.TCSETS, abi.TIOC.TCSETSW, abi.TIOC.TCSETSF => {
+            const t = fromUser(abi.Termios, arg) orelse return err(.FAULT);
+            // TCSETSW waits for output to be sent; output is sent at once.
+            tty.setAttributes(t, request == abi.TIOC.TCSETSF);
+            return 0;
+        },
+        abi.TIOC.TIOCGWINSZ => return if (toUser(arg, tty.windowSize())) 0 else err(.FAULT),
+        abi.TIOC.FIONREAD => return if (toUser(arg, @as(i32, @intCast(tty.available())))) 0 else err(.FAULT),
+        abi.TIOC.TCFLSH => {
+            // 0 and 2 flush what was typed; 1, output, has nothing waiting.
+            if (arg > 2) return err(.INVAL);
+            if (arg != 1) tty.flushInput();
+            return 0;
+        },
+        // There are no process groups yet: every process is its own, and
+        // the terminal's foreground is the one the shell runs.
+        abi.TIOC.TIOCGPGRP => {
+            const p = thread.current().process.?;
+            return if (toUser(arg, @as(i32, @intCast(p.pid)))) 0 else err(.FAULT);
+        },
+        abi.TIOC.TIOCSPGRP => return 0,
+        else => return err(.INVAL),
+    }
+}
+
+/// `read` from the terminal: a line, or each key without line editing.
+fn consoleRead(of: *OpenFile, ptr: u64, len: u64) u64 {
+    if (!user_range.valid(ptr, len)) return err(.FAULT);
+    var chunk: [CHUNK]u8 = undefined;
+    const want: usize = @intCast(@min(CHUNK, len));
+    switch (tty.read(chunk[0..want], nonblocking(of))) {
+        .bytes => |n| {
+            uaccess.copyToUser(ptr, chunk[0..n]) catch return err(.FAULT);
+            return n;
+        },
+        .again => return err(.AGAIN),
+        .killed => return err(.INTR),
+    }
 }
 
 /// `arch_prctl`: set or read the FS or GS base of the calling thread,
@@ -844,8 +895,8 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
         .null_device => return 0,
         .random_device => return sysGetRandom(ptr, count),
         .directory => return err(.ISDIR),
-        // Nothing to read from the console yet.
-        .console, .pipe_write => return err(.BADF),
+        .console => return consoleRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
+        .pipe_write => return err(.BADF),
     }
     const p = thread.current().process.?;
     const start = blk: {
@@ -1479,8 +1530,8 @@ fn sysPoll(fds: u64, count: u64, timeout_ms: u64) u64 {
 /// and error are reported whether asked for or not.
 fn pollState(of: *OpenFile, events: i16) i16 {
     switch (of.kind) {
-        // The console can be written to and has nothing to read yet.
-        .console => return events & abi.POLL.OUT,
+        // The console can be written to, and read once a line is typed.
+        .console => return events & (abi.POLL.OUT | if (tty.readable()) @as(i16, abi.POLL.IN) else 0),
         .null_device, .random_device => return events & (abi.POLL.IN | abi.POLL.OUT),
         .directory => return events & abi.POLL.IN,
         // A file can always be read.
@@ -2028,14 +2079,13 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.munmap => memory(.munmap, f),
         Sys.brk => memory(.brk, f),
         Sys.madvise => memory(.madvise, f),
-        Sys.ioctl => sysIoctl(f.rdi),
+        Sys.ioctl => sysIoctl(f.rdi, f.rsi, f.rdx),
         Sys.writev => sysWritev(f.rdi, f.rsi, f.rdx),
         Sys.arch_prctl => sysArchPrctl(f.rdi, f.rsi),
         Sys.set_tid_address => sysSetTidAddress(f.rdi),
         Sys.exit => proc.exitThread(abi.exitStatus(f.rdi)),
         Sys.exit_group => proc.exit(abi.exitStatus(f.rdi)),
         Sys.gettid => thread.id(),
-        Sys.myos_getchar => sysGetChar(),
         Sys.myos_run => sysRun(f.rdi, f.rsi, f.rdx),
         else => unknown(f.rax),
     };

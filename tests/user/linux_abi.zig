@@ -119,8 +119,10 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.arch_prctl, abi.ARCH.GET_FS, 0xFFFF_8000_0000_0000, 0) == lib.err(.FAULT), 31);
     expect(lib.syscall(Sys.arch_prctl, abi.ARCH.GET_FS, 8, 0) == lib.err(.FAULT), 32);
 
-    // ioctl: nothing is a terminal yet.
-    expect(lib.syscall(Sys.ioctl, 1, 0x5413, 0) == lib.err(.NOTTY), 40);
+    // ioctl: the standard streams are a terminal.
+    // The standard streams are a terminal now: it has a size.
+    var ws: abi.WinSize = undefined;
+    expect(lib.syscall(Sys.ioctl, 1, abi.TIOC.TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.cols == 80 and ws.rows == 25, 40);
     expect(lib.syscall(Sys.ioctl, 99, 0x5413, 0) == lib.err(.BADF), 41);
 
     // writev.

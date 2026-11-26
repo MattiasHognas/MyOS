@@ -471,7 +471,7 @@ pub fn interrupt(t: *Thread) void {
 /// program (`process.dieIfKilled`).
 pub fn dying() bool {
     const p = current().process orelse return false;
-    return p.killed.load(.acquire);
+    return proc.ending(p);
 }
 
 /// Create a thread that runs `entry` and put it in the ready queue: `create`

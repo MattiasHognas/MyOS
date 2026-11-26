@@ -122,9 +122,27 @@ pub fn gettid() u64 {
     return syscall(Sys.gettid, 0, 0, 0);
 }
 
-/// Block until a key is pressed and return its character.
-pub fn getChar() u8 {
-    return @truncate(syscall(Sys.myos_getchar, 0, 0, 0));
+/// Read the terminal's settings into `t`, or set them from it. Returns 0,
+/// or an error (`ENOTTY` for a descriptor that is no terminal).
+pub fn tcgetattr(fd: u64, t: *abi.Termios) u64 {
+    return syscall(Sys.ioctl, fd, abi.TIOC.TCGETS, @intFromPtr(t));
+}
+
+pub fn tcsetattr(fd: u64, t: *const abi.Termios) u64 {
+    return syscall(Sys.ioctl, fd, abi.TIOC.TCSETS, @intFromPtr(t));
+}
+
+/// Wait for one key and return it: the terminal without line editing and
+/// echo for the time it takes. Null at the end of input or on an error.
+pub fn readKey() ?u8 {
+    var saved: abi.Termios = undefined;
+    if (tcgetattr(0, &saved) != 0) return null;
+    var raw = saved;
+    raw.lflag &= ~@as(u32, abi.TERMIOS.ICANON | abi.TERMIOS.ECHO);
+    _ = tcsetattr(0, &raw);
+    defer _ = tcsetattr(0, &saved);
+    var c: [1]u8 = undefined;
+    return if (read(0, &c) == 1) c[0] else null;
 }
 
 /// Start the program at `path` and wait for it to exit. Returns its exit
