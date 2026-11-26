@@ -161,7 +161,7 @@ run_scenario() {
             elif [[ "$scenario" == tests_kvm ]]; then
                 expect_line 'extended state: (XSAVE|FXSAVE), [0-9]+ bytes' # whatever the host has
             else
-                expect_line 'extended state: XSAVE, 832 bytes, AVX on$'
+                expect_line 'extended state: XSAVE, 832 bytes, AVX on, AVX-512 not supported$' # QEMU's emulated CPU has no AVX-512
             fi
             if [[ "$scenario" == tests_smp || "$scenario" == tests_kvm ]]; then
                 expect_line 'info\(smp\): 4 of 4 CPUs online$'

@@ -1077,6 +1077,38 @@ fn dotnetSelfContained() TestError!void {
     try expectFootprint(memory); // code heaps, mapped assemblies, threads: all gone
 }
 
+/// The C, Rust and Go programs built the way a developer builds them, with
+/// no flags: `gcc hello.c`, `cargo build --release`, `go build`. The first
+/// two are linked against glibc; this build machine's toolchain marks the
+/// C one as needing an x86-64-v4 CPU (AVX-512), so where the CPU has none
+/// glibc's loader refuses it, as it would on Linux, and that is checked
+/// instead.
+fn plainBuilds() TestError!void {
+    if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
+        root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
+        return;
+    }
+    _ = helpers.runProgram("/fixtures/rust-hello-cargo"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    helpers.traceUnknownSyscalls(true);
+    defer helpers.traceUnknownSyscalls(false);
+    const args = [_][]const u8{ "hello", "built", "plainly" };
+    for ([_][]const u8{ "/fixtures/rust-hello-cargo", "/fixtures/go-hello-plain" }) |path| {
+        const code = helpers.runProgramArgs(path, &args, &.{}) orelse return error.Failed;
+        if (code != 3) report("plain build exit status", code);
+        try check(code == 3);
+    }
+    const c = helpers.runProgramArgs("/fixtures/c-hello-gcc", &args, &.{}) orelse return error.Failed;
+    if (helpers.cpuHasX86_64V4()) {
+        if (c != 3) report("gcc build exit status", c);
+        try check(c == 3);
+    } else {
+        root.print("  this CPU is not x86-64-v4: the gcc build is refused, as on Linux\n", .{});
+        try check(c == 127); // what glibc's loader exits with
+    }
+    try expectFootprint(memory);
+}
+
 /// Threads and futexes through the raw calls: a lock made of a futex,
 /// each thread's own FS base, join through the exit announcement, wake
 /// counts, timeouts, requeue; and the ways a threaded process ends.
@@ -1860,6 +1892,7 @@ fn runCases() noreturn {
         .{ .name = "position-independent programs built for Linux run, at a random address", .func = positionIndependent },
         .{ .name = "a program's ELF interpreter is loaded and started in its place", .func = elfInterpreter },
         .{ .name = "a dynamically linked C program runs with its loader and C library from files", .func = dynamicHello },
+        .{ .name = "C, Rust and Go built with plain gcc, cargo build, go build run", .func = plainBuilds },
         .{ .name = "a .NET program published ahead of time for linux-x64 (glibc, dynamic) runs", .func = dotnetAot },
         .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },

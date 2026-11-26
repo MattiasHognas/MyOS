@@ -179,6 +179,14 @@ pub fn spawnFailsCleanly(image: []const u8) bool {
     return false;
 }
 
+/// Whether this CPU, with what the kernel has enabled, is x86-64-v4: AVX-512
+/// F, BW, CD, DQ and VL, and their state saved.
+pub fn cpuHasX86_64V4() bool {
+    const ebx = cpu.cpuid(7, 0).ebx;
+    const want: u32 = (1 << 16) | (1 << 17) | (1 << 28) | (1 << 30) | (1 << 31); // F DQ CD BW VL
+    return fpu.avx512Enabled() and ebx & want == want;
+}
+
 /// Blocks the filesystem at `/tmp` holds.
 pub fn tmpBlocksUsed() usize {
     return kernel_root.kernel.fs.tmpfs.blocksUsed();
@@ -1201,9 +1209,11 @@ pub fn extendedStateSetup(want_xsave: bool) u32 {
     if (want_xsave) {
         const cpu_avx = leaf1.ecx & (1 << 28) != 0;
         if (fpu.avxEnabled() != cpu_avx) return 7;
-        if (fpu.enabledFeatures() != @as(u64, if (cpu_avx) 7 else 3)) return 8;
+        const cpu_avx512 = cpu_avx and cpu.cpuid(7, 0).ebx & (1 << 16) != 0 and cpu.cpuid(0xD, 0).eax & 0xE0 == 0xE0;
+        if (fpu.avx512Enabled() != cpu_avx512) return 14;
+        if (fpu.enabledFeatures() != @as(u64, if (cpu_avx512) 0xE7 else if (cpu_avx) 7 else 3)) return 8;
         if (fpu.areaSize() != cpu.cpuid(0xD, 0).ebx) return 9;
-        if (cpu_avx and fpu.areaSize() != 832) return 10;
+        if (cpu_avx and !cpu_avx512 and fpu.areaSize() != fpu.AVX_AREA_SIZE) return 10;
     } else {
         if (fpu.avxEnabled() or fpu.areaSize() != 512) return 11;
     }

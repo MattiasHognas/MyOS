@@ -20,6 +20,10 @@
 #                       against glibc (Zig's stand-in for glibc 2.36 at
 #                       link time; the real one comes from
 #                       scripts/fetch-sysroot.sh when it runs)
+#   c-hello-gcc, rust-hello-cargo, go-hello-plain
+#                       the C, Rust and Go programs built the ordinary way
+#                       on this machine, with no flags: gcc, cargo build,
+#                       go build
 #   go-hello-static     Go (no cgo): goroutines, a channel, the garbage
 #                       collector
 #   rust-hello-static   Rust with its standard library, statically linked
@@ -110,5 +114,22 @@ for f in "$work/out"/*; do
         cp "$f" bin/dotnet-hello-app/
     fi
 done
+
+# The same three programs built as a developer on this machine builds
+# them, with nothing added: `gcc hello.c`, `cargo build --release`,
+# `go build`. They are linked against this machine's C library; a
+# distribution built for newer CPUs marks them as needing one too.
+gcc -O2 -o bin/c-hello-gcc src/hello.c
+cargo_dir="$work/cargo"
+mkdir -p "$cargo_dir/src"
+printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n' >"$cargo_dir/Cargo.toml"
+cp src/hello.rs "$cargo_dir/src/main.rs"
+(cd "$cargo_dir" && cargo build -q --release)
+cp "$cargo_dir/target/release/hello" bin/rust-hello-cargo
+go_dir="$work/go"
+mkdir -p "$go_dir"
+printf 'module hello\n\ngo 1.22\n' >"$go_dir/go.mod"
+cp src/hello.go "$go_dir/"
+(cd "$go_dir" && go build -o "$OLDPWD/bin/go-hello-plain" .)
 
 ls -l bin bin/dotnet-hello-app
