@@ -174,6 +174,12 @@ pub fn elfProbePath(path: []const u8, addr: u64, out: []u8) ?ElfProbe {
 /// Return true if `process.spawn` rejects `image` and leaves
 /// Physical memory and the heap exactly as they were (full rollback).
 pub fn spawnFailsCleanly(image: []const u8) bool {
+    // Once first: the heap keeps slabs and pages it grows by, and the
+    // first attempt may be what makes it grow.
+    if (process.spawn("bad", image, .{})) |p| {
+        _ = process.wait(p);
+        return false;
+    } else |_| {}
     const pages = pmm.free_pages;
     const in_use = heap.stats().bytes_in_use;
     const p = process.spawn("bad", image, .{}) catch
@@ -461,17 +467,28 @@ pub fn vmmMapTranslate() bool {
 /// Check that the heap usage counters track an allocation,
 /// A shrink and a free, and return to their starting value.
 pub fn heapStats() bool {
+    // A small block: counted at its size class, resized in place only
+    // within it.
+    const small = heap.allocator.alloc(u8, 100) catch return false;
+    const t1 = heap.stats();
+    const same_class = heap.allocator.resize(small, 120);
+    const other_class = heap.allocator.resize(small.ptr[0..120], 20);
+    const t2 = heap.stats();
+    heap.allocator.free(small.ptr[0..120]);
+    if (!same_class or other_class or t2.bytes_in_use != t1.bytes_in_use) return false;
+
+    // A large one: counted as rounded, shrunk in place.
     const s0 = heap.stats();
-    const mem = heap.allocator.alloc(u8, 100) catch return false;
+    const mem = heap.allocator.alloc(u8, 10000) catch return false;
     const s1 = heap.stats();
-    const shrunk = heap.allocator.resize(mem, 20);
+    const shrunk = heap.allocator.resize(mem, 5000);
     const s2 = heap.stats();
-    heap.allocator.free(mem[0..20]);
+    heap.allocator.free(mem[0..5000]);
     const s3 = heap.stats();
     return s1.allocs == s0.allocs + 1 and
-        s1.bytes_in_use == s0.bytes_in_use + 112 and // 100 rounded up to 16
+        s1.bytes_in_use == s0.bytes_in_use + 10000 and // a multiple of 16 already
         s1.peak_bytes >= s1.bytes_in_use and
-        shrunk and s2.bytes_in_use == s0.bytes_in_use + 32 and
+        shrunk and s2.bytes_in_use == s0.bytes_in_use + 5008 and // 5000 rounded up to 16
         s3.frees == s0.frees + 1 and
         s3.bytes_in_use == s0.bytes_in_use and
         s3.bytes_mapped >= s3.bytes_in_use;
@@ -2856,6 +2873,19 @@ fn stressWorker() void {
         const block = heap.allocator.alloc(u8, size) catch null;
         if (block) |b| @memset(b, @truncate(stamp));
 
+        // Heap across CPUs: a block goes to a mailbox, and what was there
+        // (another thread's, maybe from another CPU) is checked and freed
+        // here. Small and large ones, every size class.
+        {
+            const len = if (round % 5 == 0) 2100 + (round * 53 + tag * 7) % 6000 else 16 + (round * 29 + tag * 13) % 2032;
+            if (heap.allocator.alloc(u8, len)) |b| {
+                std.mem.writeInt(u64, b[0..8], len, .little);
+                @memset(b[8..], @truncate(stamp >> 3));
+                const old = stress_mailbox[(tag * 7 + round) % stress_mailbox.len].swap(@intFromPtr(b.ptr), .acq_rel);
+                if (old != 0) takeMail(old);
+            } else |_| {}
+        }
+
         // Spinlock: a read, a pause and a write lose no update.
         {
             const held = stress_spin.acquire();
@@ -2936,7 +2966,26 @@ fn stressWorker() void {
 /// running threads) the kernel stacks that were freed were flushed from
 /// the other CPUs' TLBs by request. Must be called with interrupts on.
 /// Returns 0, or the number of the first failing check.
+/// Blocks left for another stress worker to free.
+var stress_mailbox: [16]Atomic(usize) = @splat(.init(0));
+
+/// Check a block from the mailbox (its length, then one byte throughout)
+/// and free it.
+fn takeMail(addr: usize) void {
+    const p: [*]u8 = @ptrFromInt(addr);
+    const len = std.mem.readInt(u64, p[0..8], .little);
+    if (len < 16 or len > 8200) return stressError();
+    for (p[8..len]) |b| {
+        if (b != p[8]) return stressError();
+    }
+    heap.allocator.free(p[0..len]);
+}
+
 pub fn kernelStress() u32 {
+    for (&stress_mailbox) |*m| {
+        const old = m.swap(0, .acq_rel);
+        if (old != 0) takeMail(old);
+    }
     const before = footprint();
     const timers_before = timer.pending();
     const requests_before = ipi.requestsSent();
@@ -2951,6 +3000,10 @@ pub fn kernelStress() u32 {
     seen_cpus.store(0, .monotonic);
     for (0..STRESS_WORKERS) |_| _ = thread.spawn(stressWorker, null) catch return 1;
     waitForDone(&stress_done, STRESS_WORKERS, &done_queue);
+    for (&stress_mailbox) |*m| {
+        const old = m.swap(0, .acq_rel);
+        if (old != 0) takeMail(old);
+    }
 
     const total = STRESS_WORKERS * STRESS_ROUNDS;
     if (stress_errors.load(.monotonic) != 0) return 2;

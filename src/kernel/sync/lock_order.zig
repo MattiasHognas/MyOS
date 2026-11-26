@@ -25,6 +25,8 @@ pub const Rank = enum(u8) {
     timer,
     /// The ready queue and every thread's scheduling state.
     scheduler,
+    /// One CPU's cache of free heap blocks (`heap.zig`). Never two at once.
+    heap_cache,
     /// A region of kernel address space and its page tables: the heap, the
     /// kernel stacks, the device window. Never two of them at once.
     kernel_region,

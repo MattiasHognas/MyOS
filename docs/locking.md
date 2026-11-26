@@ -58,6 +58,7 @@ belongs to this CPU.
 | Heap lock | `kernel_region` | The kernel heap, and the page tables of the heap's region | `heap.zig` |
 | Kernel-stack lock | `kernel_region` | The stack slots, and the page tables of the stack region | `kstack.zig` |
 | Device-window lock | `kernel_region` | Where the next device mapping goes, and the page tables of the device window | `vmm.zig` |
+| Heap-cache lock | `heap_cache` | One CPU's free heap blocks; taken by that CPU, and by another only when memory runs out | `heap.zig` |
 | Page-cache lock | `page_cache` | One CPU's cache of free pages; taken by that CPU, and by another only when memory runs out elsewhere | `pmm.zig` |
 | Page-allocator lock | `page_allocator` | The page bitmaps | `pmm.zig` |
 | Random-generator lock | `random` | The generator's state | `random.zig` |
@@ -89,11 +90,12 @@ above it.
 3. A condition's lock (including a mutex's internal lock)
 4. Timer lock
 5. Scheduler lock
-6. Heap lock, kernel-stack lock or device-window lock (never two of them)
-7. A CPU's page-cache lock (never two of them)
-8. Page-allocator lock
-9. Random-generator lock
-10. Console lock
+6. A CPU's heap-cache lock (never two of them)
+7. Heap lock, kernel-stack lock or device-window lock (never two of them)
+8. A CPU's page-cache lock (never two of them)
+9. Page-allocator lock
+10. Random-generator lock
+11. Console lock
 
 Two locks of the same rank are never held together either: not two
 conditions' locks, not two regions' locks.

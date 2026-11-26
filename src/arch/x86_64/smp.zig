@@ -31,6 +31,7 @@ const std = @import("std");
 const limine = @import("../../boot/limine.zig");
 const hpet = @import("../../drivers/hpet.zig");
 const heap = @import("../../kernel/heap.zig");
+const pmm = @import("../../kernel/pmm.zig");
 const kstack = @import("../../kernel/kstack.zig");
 const thread = @import("../../kernel/thread.zig");
 const timer = @import("../../kernel/timer.zig");
@@ -194,6 +195,8 @@ fn apMain() callconv(.c) noreturn {
     apic.timerStart(timer.HZ);
     c.runs_threads = true;
     percpu.register(c); // online: the boot CPU goes on to the next one
+    pmm.initCpu(); // its caches of free pages and heap blocks
+    heap.initCpu();
     log.debug("CPU {d} (APIC ID {d}) is up", .{ c.id, c.apic_id });
 
     // This context has nothing left to do: the CPU takes threads from the

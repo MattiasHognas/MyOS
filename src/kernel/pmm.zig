@@ -263,6 +263,15 @@ fn ownCache() ?*Cache {
     return c;
 }
 
+/// Make the running CPU's cache now, when it comes up, rather than at its
+/// first allocation (which would look like a page gone to whoever is
+/// counting then).
+pub fn initCpu() void {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    _ = ownCache();
+}
+
 /// Allocate one physical page filled with zeroes, or null if memory is
 /// exhausted. Every page that is mapped into a user address space, and
 /// every page table, comes from here.
