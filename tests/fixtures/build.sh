@@ -132,4 +132,7 @@ printf 'module hello\n\ngo 1.22\n' >"$go_dir/go.mod"
 cp src/hello.go "$go_dir/"
 (cd "$go_dir" && go build -o "$OLDPWD/bin/go-hello-plain" .)
 
+# Their notices: what the toolchains copied into them.
+./notices.sh
+
 ls -l bin bin/dotnet-hello-app

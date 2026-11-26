@@ -47,6 +47,8 @@ cp zig-out/bin/hello.elf "$initrd/bin/hello"
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
 # Programs built for Linux by other toolchains (tests/fixtures), to run by hand.
 find tests/fixtures/bin -maxdepth 1 -type f -exec cp {} "$initrd/bin/" \;
+# With the notices of the code their toolchains put into them.
+cp tests/fixtures/THIRD_PARTY_NOTICES.txt "$initrd/bin/"
 # The C library dynamically linked Linux programs expect on the system:
 # the loader and shared libraries of scripts/fetch-sysroot.sh, fetched the
 # first time (and checked against pinned checksums) so that a program
@@ -72,6 +74,7 @@ if [[ "$mode" == --package-test ]]; then
     # Programs built for Linux by other toolchains (tests/fixtures): /fixtures/<name>
     mkdir -p "$initrd/fixtures"
     cp -r tests/fixtures/bin/* "$initrd/fixtures/"
+    cp tests/fixtures/THIRD_PARTY_NOTICES.txt "$initrd/fixtures/"
     # The .NET program published as a folder is complete with the runtime's
     # native libraries, which every such folder has the same copy of
     # (scripts/fetch-dotnet-runtime.sh). Without them it is left out, and
