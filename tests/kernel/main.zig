@@ -733,7 +733,10 @@ fn elfSpawnRollback() TestError!void {
     // for the addresses the program itself is at.
     try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .interp = "/lib/ld-does-not-exist.so.1" })));
     try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .interp = "/etc/motd" })));
-    try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .interp = "/fixtures/musl-hello-static", .vaddr = 0x100_0000, .entry = 0x100_0000 })));
+    // (A real program as the interpreter, if the image has the fixtures.)
+    if (helpers.fileExists("/fixtures/musl-hello-static")) {
+        try check(helpers.spawnFailsCleanly(buildElf(.{ .phnum = 2, .interp = "/fixtures/musl-hello-static", .vaddr = 0x100_0000, .entry = 0x100_0000 })));
+    }
 
     // An image within the limit that needs more pages than are free is
     // refused before anything is allocated (skipped on a machine with more
@@ -951,6 +954,7 @@ fn userMemory() TestError!void {
 /// through its own `printf`, and exits with its number of arguments. The
 /// host script checks what it printed.
 fn muslHello() TestError!void {
+    if (!helpers.haveFixtures(&.{"musl-hello-static"})) return;
     const memory = helpers.footprint();
     const code = helpers.runProgramArgs(
         "/fixtures/musl-hello-static",
@@ -968,13 +972,16 @@ fn muslHello() TestError!void {
 /// Rust program, each a static PIE that relocates itself), at an address
 /// that is different every time unless the layout is fixed.
 fn positionIndependent() TestError!void {
+    if (!helpers.haveFixtures(&.{"musl-hello-static-pie"})) return;
     const memory = helpers.footprint();
     const c = helpers.runProgramArgs("/fixtures/musl-hello-static-pie", &.{ "musl-hello-pie", "one", "two words" }, &.{"GREETING=hi pie"}) orelse return error.Failed;
     if (c != 3) report("musl static-pie exit status", c);
     try check(c == 3);
-    const r = helpers.runProgramArgs("/fixtures/rust-hello-static-pie", &.{ "rust-hello-pie", "from", "MyOS" }, &.{"GREETING=hi rust pie"}) orelse return error.Failed;
-    if (r != 3) report("rust static-pie exit status", r);
-    try check(r == 3);
+    if (helpers.haveFixtures(&.{"rust-hello-static-pie"})) {
+        const r = helpers.runProgramArgs("/fixtures/rust-hello-static-pie", &.{ "rust-hello-pie", "from", "MyOS" }, &.{"GREETING=hi rust pie"}) orelse return error.Failed;
+        if (r != 3) report("rust static-pie exit status", r);
+        try check(r == 3);
+    }
 
     // Where it is put: the same place with the layout fixed, another one
     // each time otherwise, always on a page boundary within the range.
@@ -999,6 +1006,7 @@ fn positionIndependent() TestError!void {
 /// the program that names it is never run, but its headers are mapped, as
 /// a real program's are: a C library reads them (`AT_PHDR`).
 fn elfInterpreter() TestError!void {
+    if (!helpers.haveFixtures(&.{ "musl-hello-static", "musl-hello-static-pie" })) return;
     _ = helpers.runImage(buildElf(.{ .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static-pie" })); // warm up
     const memory = helpers.footprint();
     try check(helpers.runImage(buildElf(.{ .offset = 0, .filesz = 0x1000, .phnum = 2, .interp = "/fixtures/musl-hello-static-pie" })) == 1);
@@ -1014,6 +1022,7 @@ fn elfInterpreter() TestError!void {
 /// (`scripts/fetch-sysroot.sh`); an image built without them has nothing
 /// to load the program with, and the test says so.
 fn dynamicHello() TestError!void {
+    if (!helpers.haveFixtures(&.{"glibc-hello-dynamic"})) return;
     const path = "/fixtures/glibc-hello-dynamic";
     if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
         root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
@@ -1035,6 +1044,7 @@ fn dynamicHello() TestError!void {
 /// linked against glibc, position independent. Nothing of MyOS went into
 /// building it.
 fn dotnetAot() TestError!void {
+    if (!helpers.haveFixtures(&.{"dotnet-hello-aot"})) return;
     const path = "/fixtures/dotnet-hello-aot";
     if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
         root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
@@ -1061,9 +1071,10 @@ fn dotnetAot() TestError!void {
 /// with `libclrjit.so` into memory it then runs, and collects garbage
 /// with eight managed threads running.
 fn dotnetSelfContained() TestError!void {
+    if (!helpers.haveFixtures(&.{"dotnet-hello-app/hello"})) return;
     const path = "/fixtures/dotnet-hello-app/hello";
-    if (!helpers.fileExists("/fixtures/dotnet-hello-app/libcoreclr.so") or !helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
-        root.print("  skipped: the image has no .NET runtime (scripts/fetch-dotnet-runtime.sh) or no C library (scripts/fetch-sysroot.sh)\n", .{});
+    if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
+        root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
         return;
     }
     _ = helpers.runProgramArgs(path, &.{path}, &.{}); // warm up: the heap may grow
@@ -1084,6 +1095,7 @@ fn dotnetSelfContained() TestError!void {
 /// glibc's loader refuses it, as it would on Linux, and that is checked
 /// instead.
 fn plainBuilds() TestError!void {
+    if (!helpers.haveFixtures(&.{ "c-hello-gcc", "go-hello-plain", "rust-hello-cargo" })) return;
     if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
         root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
         return;
@@ -1200,6 +1212,7 @@ fn programHeap() TestError!void {
 /// storage, a timed wait and joins. It checks its own numbers and says
 /// so; the host script checks what it printed.
 fn muslThreads() TestError!void {
+    if (!helpers.haveFixtures(&.{"musl-threads-static"})) return;
     _ = helpers.runProgram("/fixtures/musl-threads-static"); // warm up: the heap may grow
     const memory = helpers.footprint();
     const code = helpers.runProgram("/fixtures/musl-threads-static") orelse return error.Failed;
@@ -1213,6 +1226,7 @@ fn muslThreads() TestError!void {
 /// library: arguments, the environment, heap allocation, formatted
 /// output. The host script checks what it printed.
 fn rustHello() TestError!void {
+    if (!helpers.haveFixtures(&.{"rust-hello-static"})) return;
     _ = helpers.runProgram("/fixtures/rust-hello-static"); // warm up: the heap may grow
     const memory = helpers.footprint();
     const code = helpers.runProgramArgs(
@@ -1230,6 +1244,7 @@ fn rustHello() TestError!void {
 /// reservation and its signal setup, then goroutines, a channel and a
 /// garbage collection. The host script checks what it printed.
 fn goHello() TestError!void {
+    if (!helpers.haveFixtures(&.{"go-hello-static"})) return;
     _ = helpers.runProgram("/fixtures/go-hello-static"); // warm up: the heap may grow
     const memory = helpers.footprint();
     helpers.traceUnknownSyscalls(true); // anything it asks for that is missing shows in the log
@@ -1246,6 +1261,7 @@ fn goHello() TestError!void {
 /// allocate, the garbage collector stops them and collects. The host
 /// script checks what it printed.
 fn dotnetHello() TestError!void {
+    if (!helpers.haveFixtures(&.{"dotnet-hello-static"})) return;
     _ = helpers.runProgramArgs("/fixtures/dotnet-hello-static", &.{"dotnet-hello"}, &.{}); // warm up: the heap may grow
     const memory = helpers.footprint();
     helpers.traceUnknownSyscalls(true);

@@ -52,16 +52,15 @@ The console font is not in the repository. Put it in place once:
 ```bash
 scripts/fetch-font.sh
 scripts/fetch-sysroot.sh   # done by scripts/build.sh when needed: the C library for dynamically linked programs
-scripts/fetch-dotnet-runtime.sh   # optional: completes the self-contained .NET test program
 ```
 
-`scripts/fetch-dotnet-runtime.sh` downloads Microsoft's .NET runtime
-package for linux-x64 (pinned by version and checksum) and unpacks its
-native libraries to `dotnet-runtime/`. Every self-contained .NET program
-carries the same copy of them; the test program's folder in
-`tests/fixtures/bin/dotnet-hello-app` is checked in without, and the test
-image gets them from there. Without it the kernel test for that program
-reports that it was skipped.
+The test programs for Linux (`tests/fixtures/src`: C, Rust, Go and .NET)
+are not stored as binaries. `scripts/build.sh --package-test` builds them
+with `tests/fixtures/build.sh`, using whatever of zig, gcc, rustc (with the
+`x86_64-unknown-linux-musl` target), cargo, go and the .NET SDK this
+machine has, and only when their sources or the toolchains changed. A
+program whose toolchain is missing is left out, and the kernel test for
+it says it was skipped.
 
 To run a program of your own, published elsewhere, put its folder under
 a directory and name that directory when building the image:

@@ -13,5 +13,6 @@ font.psf
 
 # The C library for dynamically linked programs (scripts/fetch-sysroot.sh)
 sysroot/
-# The native part of the .NET runtime (scripts/fetch-dotnet-runtime.sh)
-dotnet-runtime/
+
+# Built from tests/fixtures/src by tests/fixtures/build.sh
+tests/fixtures/bin/

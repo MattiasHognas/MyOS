@@ -76,15 +76,15 @@ for the time.
 
 | Program | Status |
 | --- | --- |
-| C, static, musl | Runs (`tests/fixtures/bin/musl-hello-static`) |
-| Rust with std, static, musl, fixed address | Runs (`tests/fixtures/bin/rust-hello-static`) |
-| C with pthreads, static, musl | Runs, its threads on several CPUs (`tests/fixtures/bin/musl-threads-static`) |
+| C, static, musl | Runs (`tests/fixtures/` builds `musl-hello-static`) |
+| Rust with std, static, musl, fixed address | Runs (`tests/fixtures/` builds `rust-hello-static`) |
+| C with pthreads, static, musl | Runs, its threads on several CPUs (`tests/fixtures/` builds `musl-threads-static`) |
 | C and Rust as static position-independent executables | Run, at a random address (`musl-hello-static-pie`, `rust-hello-static-pie`) |
-| Go, static | Runs: the runtime's threads, goroutines on every CPU, a channel, a garbage collection (`tests/fixtures/bin/go-hello-static`). No signal has to be delivered for that; the runtime sends itself some (to preempt goroutines that do not yield) and carries on when they do not arrive |
-| .NET Native AOT, static, musl, fixed address | Runs: the runtime, eight managed threads that allocate, a garbage collection that stops them (`tests/fixtures/bin/dotnet-hello-static`). No signal has to be delivered: the collector stops threads through `membarrier` and the checks compiled into managed code |
-| C, dynamically linked against glibc | Runs (`tests/fixtures/bin/glibc-hello-dynamic`): the kernel loads `ld-linux-x86-64.so.2`, which maps `libc.so.6` from its file. Loader and library are Debian 13's, unchanged (`scripts/fetch-sysroot.sh`). Beyond a static program it calls `newfstatat`, `access`, `mmap` of a file, `set_robust_list` and `rseq` (which it does without) |
-| .NET ahead of time as its tools build it (`dotnet publish -r linux-x64 -p:PublishAot=true`) | Runs (`tests/fixtures/bin/dotnet-hello-aot`): dynamically linked against glibc, position independent. glibc makes its threads with `clone3` |
-| .NET as its tools build it (`dotnet publish -r linux-x64 --self-contained`) | Runs (`tests/fixtures/bin/dotnet-hello-app`): the host program, `libhostfxr`, `libhostpolicy`, `libcoreclr` and the JIT compiler `libclrjit` from the program's folder, eight managed threads, a garbage collection. Trimmed in the fixture; the untrimmed 80 MB folder runs the same. No signal has to be delivered for this program |
+| Go, static | Runs: the runtime's threads, goroutines on every CPU, a channel, a garbage collection (`tests/fixtures/` builds `go-hello-static`). No signal has to be delivered for that; the runtime sends itself some (to preempt goroutines that do not yield) and carries on when they do not arrive |
+| .NET Native AOT, static, musl, fixed address | Runs: the runtime, eight managed threads that allocate, a garbage collection that stops them (`tests/fixtures/` builds `dotnet-hello-static`). No signal has to be delivered: the collector stops threads through `membarrier` and the checks compiled into managed code |
+| C, dynamically linked against glibc | Runs (`tests/fixtures/` builds `glibc-hello-dynamic`): the kernel loads `ld-linux-x86-64.so.2`, which maps `libc.so.6` from its file. Loader and library are Debian 13's, unchanged (`scripts/fetch-sysroot.sh`). Beyond a static program it calls `newfstatat`, `access`, `mmap` of a file, `set_robust_list` and `rseq` (which it does without) |
+| .NET ahead of time as its tools build it (`dotnet publish -r linux-x64 -p:PublishAot=true`) | Runs (`tests/fixtures/` builds `dotnet-hello-aot`): dynamically linked against glibc, position independent. glibc makes its threads with `clone3` |
+| .NET as its tools build it (`dotnet publish -r linux-x64 --self-contained`) | Runs (`tests/fixtures/` builds `dotnet-hello-app`): the host program, `libhostfxr`, `libhostpolicy`, `libcoreclr` and the JIT compiler `libclrjit` from the program's folder, eight managed threads, a garbage collection. Trimmed in the fixture; the untrimmed 80 MB folder runs the same. No signal has to be delivered for this program |
 
 ## What this means for the order of work
 

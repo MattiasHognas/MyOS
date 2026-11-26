@@ -192,6 +192,22 @@ pub fn tmpBlocksUsed() usize {
     return kernel_root.kernel.fs.tmpfs.blocksUsed();
 }
 
+/// Whether the image has the fixture programs `names` (in `/fixtures`).
+/// They are built from source by `tests/fixtures/build.sh`, with
+/// toolchains a machine may lack; a test that needs one that is missing
+/// says so and is skipped.
+pub fn haveFixtures(names: []const []const u8) bool {
+    var buf: [128]u8 = undefined;
+    for (names) |name| {
+        const path = std.fmt.bufPrint(&buf, "/fixtures/{s}", .{name}) catch return false;
+        if (!fileExists(path)) {
+            kernel_root.print("  skipped: the image has no {s} (tests/fixtures/build.sh)\n", .{path});
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Whether the filesystem has a file at `path`.
 pub fn fileExists(path: []const u8) bool {
     return vfs.lookup(path) != null;

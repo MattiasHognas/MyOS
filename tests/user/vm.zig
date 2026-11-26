@@ -219,9 +219,9 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.madvise, fm, PAGE, abi.MADV.DONTNEED) == 0 and bytes(fm, 1)[0] == 'W', 86);
     expect(lib.munmap(fm, PAGE) == 0, 87);
 
-    // A larger file, from an offset: one_page for one_page what `pread` gives,
+    // A larger file, from an offset: page for page what `pread` gives,
     // also after the mapping has been cut up.
-    const elf = lib.open("/fixtures/rust-hello-static"); // 400 KiB in every build
+    const elf = lib.open("/test/data"); // about 100 KiB of numbers, made by scripts/build.sh
     const file_span = 6 * PAGE;
     const file_at = 3 * PAGE;
     const bm = lib.syscall6(Sys.mmap, 0, file_span, PROT.READ, MAP.PRIVATE, elf, file_at);
@@ -238,9 +238,9 @@ pub fn main() noreturn {
     // put at a chosen address over part of the first mapping, as a
     // dynamic loader places a library's segments.
     const sm = lib.syscall6(Sys.mmap, 0, PAGE, PROT.READ, MAP.SHARED, elf, 0);
-    expect(!lib.isError(sm) and std.mem.eql(u8, @volatileCast(bytes(sm, 4)), "\x7fELF"), 93);
+    expect(!lib.isError(sm) and std.mem.eql(u8, @volatileCast(bytes(sm, 4)), "1\n2\n"), 93);
     expect(lib.syscall6(Sys.mmap, bm, PAGE, PROT.READ, MAP.PRIVATE | MAP.FIXED, elf, 0) == bm, 94);
-    expect(std.mem.eql(u8, @volatileCast(bytes(bm, 4)), "\x7fELF"), 95);
+    expect(std.mem.eql(u8, @volatileCast(bytes(bm, 4)), "1\n2\n"), 95);
     // What is refused.
     expect(lib.syscall6(Sys.mmap, 0, PAGE, RW, MAP.SHARED, elf, 0) == lib.err(.ACCES), 96); // files cannot be written
     expect(lib.syscall6(Sys.mmap, 0, PAGE, PROT.READ, MAP.PRIVATE, elf, 123) == lib.err(.INVAL), 97); // offset not a page

@@ -111,17 +111,33 @@ jobs:
       - name: Fetch sysroot
         run: scripts/fetch-sysroot.sh
 
-      # The native libraries of the .NET runtime, which complete the
-      # self-contained .NET test program (a pinned package from nuget.org,
-      # checked by checksum).
-      - name: Cache .NET runtime
+      # The test programs for Linux are built from tests/fixtures/src with
+      # the toolchains below, and kept until their sources or the script
+      # change (the script also rebuilds when a toolchain's version does).
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+          rustup default stable
+
+      - name: Cache fixtures
         uses: actions/cache@v6
         with:
-          path: dotnet-runtime
-          key: dotnet-runtime-${{ hashFiles('scripts/fetch-dotnet-runtime.sh') }}
+          path: tests/fixtures/bin
+          key: fixtures-${{ hashFiles('tests/fixtures/src/**', 'tests/fixtures/build.sh', 'tests/fixtures/zig-link') }}
 
-      - name: Fetch .NET runtime
-        run: scripts/fetch-dotnet-runtime.sh
+      - name: Build fixtures
+        run: tests/fixtures/build.sh
 
       - name: Build kernel and apps
         run: zig build -Doptimize=${{ matrix.optimize }}

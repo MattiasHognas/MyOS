@@ -197,48 +197,59 @@ run_scenario() {
             expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x8 SS=0x1b$'
             expect_line '^RIP=0x4[0-9a-f]{5} RSP=0x7ff[b-f][0-9a-f]{8} RFLAGS=0x[0-9a-f]+ CS=0x23 SS=0x10$'
             expect_line '^fuzz done$'
-            # A C program built for Linux against musl prints what it was started with.
-            expect_line '^hello from musl: 3 args$'
-            expect_line '^argv\[0\]=musl-hello$'
-            expect_line '^argv\[2\]=two words$'
-            expect_line '^env GREETING=hi$'
-            expect_line '^env EMPTY=$'
+            # Programs built for Linux (tests/fixtures), each checked if the
+            # image has it: they are built with whatever toolchains there are.
+            fixture() { [[ -e "zig-out/test/initrd/fixtures/$1" ]]; }
+            libc() { [[ -f zig-out/test/initrd/lib64/ld-linux-x86-64.so.2 ]]; }
             expect_line '^linux_abi: writev works$'
-            # A pthreads program built for Linux checks its own numbers.
-            expect_line '^threads: 8 threads, counter 160000 of 160000, baton passed 24 times, timed wait timed out, main.s own count 0$'
-            expect_line '^threads: all correct$'
-            if grep -q '^threads: WRONG' "$log"; then fail "the pthreads program found a wrong result"; fi
-            # A Go program built for Linux: goroutines on every CPU, a channel, a GC.
-            expect_line '^hello from go: 3 args$'
-            expect_line '^goroutines: 8 sum: 479976 cpus: [0-9]+$'
-            expect_line '^GREETING=hi go$'
             if grep -q '^syscall trace: ' "$log"; then fail "a fixture made a call the kernel does not know: $(grep -m3 '^syscall trace: ' "$log" | tr '\n' ' ')"; fi
-            # A .NET program compiled ahead of time for Linux: managed threads, a GC.
-            expect_line '^hello from dotnet: 2 args$'
-            expect_line '^threads: 8 sum: 12188000 cpus: [0-9]+ collected: True$'
-            expect_line '^GREETING=hi dotnet$'
-            # A Rust program built for Linux, with its standard library.
-            expect_line '^hello from rust: 3 args$'
-            expect_line '^argv\[2\]=MyOS$'
-            expect_line '^sum of squares below 100000: 333328333350000$'
-            expect_line '^GREETING=hi rust$'
-            # A dynamically linked C program, if the image has one.
-            if [[ -f zig-out/test/initrd/lib64/ld-linux-x86-64.so.2 ]]; then
+            # A C program against musl prints what it was started with.
+            if fixture musl-hello-static; then
+                expect_line '^hello from musl: 3 args$'
+                expect_line '^argv\[0\]=musl-hello$'
+                expect_line '^argv\[2\]=two words$'
+                expect_line '^env GREETING=hi$'
+                expect_line '^env EMPTY=$'
+            fi
+            # A pthreads program checks its own numbers.
+            if fixture musl-threads-static; then
+                expect_line '^threads: 8 threads, counter 160000 of 160000, baton passed 24 times, timed wait timed out, main.s own count 0$'
+                expect_line '^threads: all correct$'
+                if grep -q '^threads: WRONG' "$log"; then fail "the pthreads program found a wrong result"; fi
+            fi
+            # Go: goroutines on every CPU, a channel, a GC.
+            if fixture go-hello-static; then
+                expect_line '^hello from go: 3 args$'
+                expect_line '^goroutines: 8 sum: 479976 cpus: [0-9]+$'
+                expect_line '^GREETING=hi go$'
+            fi
+            # .NET compiled ahead of time: managed threads, a GC.
+            if fixture dotnet-hello-static; then
+                expect_line '^hello from dotnet: 2 args$'
+                expect_line '^threads: 8 sum: 12188000 cpus: [0-9]+ collected: True$'
+                expect_line '^GREETING=hi dotnet$'
+            fi
+            # Rust with its standard library.
+            if fixture rust-hello-static; then
+                expect_line '^hello from rust: 3 args$'
+                expect_line '^argv\[2\]=MyOS$'
+                expect_line '^sum of squares below 100000: 333328333350000$'
+                expect_line '^GREETING=hi rust$'
+            fi
+            # Dynamically linked against glibc.
+            if libc && fixture glibc-hello-dynamic; then
                 expect_line '^env GREETING=hi dynamic$'
                 expect_line '^argv\[2\]=at run time$'
             fi
-            # .NET published ahead of time the ordinary way: dynamic, glibc.
-            if [[ -f zig-out/test/initrd/lib64/ld-linux-x86-64.so.2 ]]; then
-                expect_line '^hello from dotnet: 2 args$'
+            if libc && fixture dotnet-hello-aot; then
                 expect_line '^GREETING=hi dotnet aot$'
             fi
-            # .NET published as a self-contained folder: the JIT runtime.
-            if [[ -f zig-out/test/initrd/fixtures/dotnet-hello-app/libcoreclr.so && -f zig-out/test/initrd/lib64/ld-linux-x86-64.so.2 ]]; then
+            if libc && fixture dotnet-hello-app/hello; then
                 expect_line '^GREETING=hi dotnet jit$'
             fi
             # The same C and Rust programs as position-independent executables.
-            expect_line '^env GREETING=hi pie$'
-            expect_line '^GREETING=hi rust pie$'
+            if fixture musl-hello-static-pie; then expect_line '^env GREETING=hi pie$'; fi
+            if fixture rust-hello-static-pie; then expect_line '^GREETING=hi rust pie$'; fi
             # A program past its memory limit is told so, and killed like any fault.
             expect_line '^\*\*\* thread [0-9]+ \(/test/vm\): no memory for the page it touched'
             expect_line '^\*\*\* thread [0-9]+ \(/test/vm\): Page fault in user mode \(vector 14, error 0x[0-9a-f]+\), killed$'

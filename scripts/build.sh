@@ -45,10 +45,6 @@ mkdir -p "$iso_root/boot/limine" "$iso_root/EFI/BOOT" "$initrd/bin" "$initrd/etc
 cp zig-out/bin/sh.elf "$initrd/bin/sh"
 cp zig-out/bin/hello.elf "$initrd/bin/hello"
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
-# Programs built for Linux by other toolchains (tests/fixtures), to run by hand.
-find tests/fixtures/bin -maxdepth 1 -type f -exec cp {} "$initrd/bin/" \;
-# With the notices of the code their toolchains put into them.
-cp tests/fixtures/THIRD_PARTY_NOTICES.txt "$initrd/bin/"
 # The C library dynamically linked Linux programs expect on the system:
 # the loader and shared libraries of scripts/fetch-sysroot.sh, fetched the
 # first time (and checked against pinned checksums) so that a program
@@ -67,24 +63,21 @@ fi
 if [[ "$mode" == --package-test ]]; then
     # User-mode test programs: zig-out/bin/test-<name>.elf -> /test/<name>
     mkdir -p "$initrd/test"
+    # A file of about 100 KiB with known contents, for tests that map or
+    # read something larger than a page: "1\n2\n3\n...".
+    seq 1 20000 >"$initrd/test/data"
     for f in zig-out/bin/test-*.elf; do
         name="$(basename "$f" .elf)"
         cp "$f" "$initrd/test/${name#test-}"
     done
-    # Programs built for Linux by other toolchains (tests/fixtures): /fixtures/<name>
+    # Programs for Linux built from tests/fixtures/src with other
+    # toolchains (tests/fixtures/build.sh, which builds what this machine
+    # has toolchains for, and only when something changed): /fixtures/<name>.
+    # Only in test images: they are not MyOS's to hand out.
+    bash tests/fixtures/build.sh >/dev/null
     mkdir -p "$initrd/fixtures"
-    cp -r tests/fixtures/bin/* "$initrd/fixtures/"
-    cp tests/fixtures/THIRD_PARTY_NOTICES.txt "$initrd/fixtures/"
-    # The .NET program published as a folder is complete with the runtime's
-    # native libraries, which every such folder has the same copy of
-    # (scripts/fetch-dotnet-runtime.sh). Without them it is left out, and
-    # the kernel test for it says so.
-    if [[ -f dotnet-runtime/.complete ]]; then
-        cp dotnet-runtime/* "$initrd/fixtures/dotnet-hello-app/"
-    else
-        rm -rf "$initrd/fixtures/dotnet-hello-app"
-        echo "note: no dotnet-runtime/ (scripts/fetch-dotnet-runtime.sh): the self-contained .NET program is left out" >&2
-    fi
+    cp -r tests/fixtures/bin/. "$initrd/fixtures/"
+    rm -f "$initrd/fixtures/.stamp"
 fi
 # Anything else the image is to hold: the tree under MYOS_INITRD_EXTRA is
 # copied over the root, so <dir>/app/hello becomes /app/hello. This is how
