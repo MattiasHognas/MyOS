@@ -480,6 +480,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
   - Done: `fcntl` (`F_DUPFD`, `F_GETFL`, `F_SETFL`, `F_GETFD`), `readlink`, `pread64`, `ioctl` answering `ENOTTY`. `readv` and `pwrite64` since `/tmp`. Open: a terminal's `ioctl`s (with the terminal).
 - [x] Add `epoll` and `eventfd` on top of `poll`: `epoll.zig`; Go's timers sit on them. Readiness is polled each tick, and `EPOLLET` is treated as level-triggered; descriptors waking waiters themselves would remove both limits.
+- [ ] Let descriptors wake their waiters (pipes, the terminal, eventfds, and sockets later): `poll` and `epoll_wait` then sleep until something happens instead of looking again every tick (10 ms of delay at worst today), and `EPOLLET` can be edge-triggered as on Linux (it is reported as level-triggered now). Watch the open file, not the descriptor number, as Linux does. Network servers (12.3) need this.
 - [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents (the list from 4.2 says which).
   - Done: `/dev/null`, `/dev/urandom`, `/dev/random`, `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/meminfo` (`procfs.zig`: text made when the file is opened). Open: `/proc/cpuinfo`, `/proc/stat`, `/proc/self/mountinfo` and `cgroup`, `/sys/devices/system/cpu/*`, which the .NET runtime looks for and does without.
 - [x] Test EOF, partial I/O, invalid descriptors, and cleanup. Done: `/test/syscalls`, `/test/pipes` and `/test/files` from ring 3, with the kernel test checking that nothing stays allocated.
@@ -502,6 +503,8 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [ ] Assign stable PIDs and track parent-child relationships.
 - [ ] Define generalized process waiting and exit-code handling (`wait4`).
 - [x] Support Ctrl+C termination of foreground jobs. A program the shell runs is the foreground while the shell waits for it (`process.giveForeground`: only from whoever has the terminal, or from nobody); Ctrl+C ends it with status 130 through `process.terminate`, which any thread can now ask of a process.
+- [ ] Job control: process groups and sessions (`setpgid`, `getpgid`, `setsid`, a terminal foreground group with `TIOCSPGRP`), and `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU` stopping a process and `SIGCONT` continuing it (Ctrl+Z, `fg`, `bg`). Today the stop signals and `SIGCONT` are ignored, and `TIOCSPGRP` is accepted and changes nothing.
+- [ ] Signals between processes: `kill` to another process (and to a group, `-pgid`), with permission rules once there are users; `SIGCHLD` to a parent when a child ends. Today `kill` reaches only the calling process (`ESRCH` otherwise). Comes with `fork` and `wait4` above.
 - [ ] Add monotonic timekeeping and a sleep syscall (`clock_gettime`, `nanosleep`), on a calibrated TSC clock where the TSC is invariant and HPET otherwise: runtimes read the clock constantly. `nanosleep` sits on the kernel timers of 2.8, whose resolution is one tick (10 ms): decide whether that is enough or sleeps need a one-shot timer.
 - [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 11.5 need it).
 - [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.
@@ -551,6 +554,8 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [x] Run a statically linked Go or Rust program (threads, futexes and signals in earnest).
   - Both run already, without signals: Rust since 4.2, and a Go program with goroutines on every CPU, a channel and a garbage collection since 7 (`tests/fixtures/src/hello.go`). Go sends itself signals to preempt goroutines that do not yield and carries on when they are not delivered. What this item still asks for is the same programs with signals delivered: a Go program whose goroutine spins without yielding and is preempted, and one that recovers from a nil dereference.
 
+- [ ] Queue real-time signals (`SIGRTMIN` to `SIGRTMAX`): each one sent is delivered, with its `sigqueue` value (`rt_sigqueueinfo`, `rt_tgsigqueueinfo`), instead of a second one being lost while the first is pending, as the standard signals are. Add `rt_sigtimedwait` and `signalfd` with it.
+
 **Milestone 8 done when:** A statically linked Go program built on Linux runs unmodified.
 
 ---
@@ -577,6 +582,7 @@ These are dynamically linked against glibc, so MyOS loads the dynamic loader, ma
 - [x] Run a .NET Native AOT hello-world built the ordinary way (`dotnet publish -r linux-x64 -p:PublishAot=true`): `tests/fixtures/` builds `dotnet-hello-aot`, position independent and dynamically linked against glibc, with managed threads and a collection, on one and four CPUs. It added `clone3` and `time` to what the kernel knows.
   - The fixture is linked against a plain glibc, not the build machine's: a distribution built for newer CPUs only marks every program linked on it as needing one (`x86-64-v4` here, which also needs AVX-512 state the kernel does not save yet: 9.2).
 - [x] Run one that allocates enough to exercise the GC, then a multi-threaded one. The fixture does both: eight managed threads each allocate a megabyte in small arrays, then a collection is forced and counted.
+- [ ] Test that the .NET garbage collector stops a thread spinning in a tight loop: the runtime interrupts such a thread with a signal (it cannot wait for it to reach a safe point). A thread loops without calls or allocation while the main thread forces collections; the program must end. The fixtures' threads only allocate, so the collector never needed the signal there.
 - [x] Add them to the fixture binaries (4.3) and run them as QEMU tests on several CPUs. Four .NET fixtures: static ahead-of-time, ahead-of-time against glibc, the self-contained folder with the JIT, each on one and four CPUs and under KVM.
 
 ### 9.2 Fast and multicore
