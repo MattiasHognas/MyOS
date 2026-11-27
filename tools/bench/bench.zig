@@ -14,8 +14,13 @@
 //!
 //!     bench,<name>,<copies>,<median ns>,<min ns>,<max ns>
 //!
+//! Then it runs the .NET workload of `tools/bench/dotnet` if the image has
+//! it (`/dotnet-bench` or `/usr/bin/dotnet-bench`), which prints lines of
+//! the same form.
+//!
 //! Run as process 1 (the Linux guest's `/init`), it mounts `devtmpfs` for
-//! a console first and powers the machine off at the end.
+//! a console, and `/proc`, `/sys` and `/tmp`, first, and powers the
+//! machine off at the end.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -273,10 +278,17 @@ fn cpuCount() usize {
     return @max(n, 1);
 }
 
-/// As process 1 there is no console yet: mount devtmpfs and open one.
+/// As process 1 there is no console yet: mount devtmpfs and open one; and
+/// /proc and /sys, which MyOS has and the .NET runtime reads.
 fn becomeConsole() void {
     _ = linux.mkdir("/dev", 0o755);
     _ = linux.mount("devtmpfs", "/dev", "devtmpfs", 0, 0);
+    _ = linux.mkdir("/proc", 0o555);
+    _ = linux.mount("proc", "/proc", "proc", 0, 0);
+    _ = linux.mkdir("/sys", 0o555);
+    _ = linux.mount("sysfs", "/sys", "sysfs", 0, 0);
+    _ = linux.mkdir("/tmp", 0o1777);
+    _ = linux.mount("tmpfs", "/tmp", "tmpfs", 0, 0);
     const fd = linux.open("/dev/console", .{ .ACCMODE = .RDWR }, 0);
     if (linux.errno(fd) != .SUCCESS) return;
     for ([_]i32{ 0, 1, 2 }) |want| _ = linux.dup2(@intCast(fd), want);
@@ -307,6 +319,27 @@ pub fn main() void {
         benchCopies("page_fault", opPageFault, copies);
         benchCopies("mmap_churn", opMmapChurn, copies);
     }
+    runDotnet();
     print("BENCH_DONE\n", .{});
     exit(0);
+}
+
+/// The .NET workload (`tools/bench/dotnet`), where the image has it: it
+/// prints its own lines.
+fn runDotnet() void {
+    for ([_][*:0]const u8{ "/dotnet-bench", "/usr/bin/dotnet-bench" }) |path| {
+        if (linux.errno(linux.access(path, 1)) != .SUCCESS) continue;
+        const pid = linux.fork();
+        if (linux.errno(pid) != .SUCCESS) return;
+        if (pid == 0) {
+            const argv = [_:null]?[*:0]const u8{path};
+            const envp = [_:null]?[*:0]const u8{ "HOME=/", "TMPDIR=/tmp" };
+            _ = linux.execve(path, &argv, &envp);
+            linux.exit_group(127);
+        }
+        var status: i32 = 0;
+        _ = linux.wait4(@intCast(pid), &status, 0, null);
+        if (status != 0) print("bench,error,dotnet-bench status {d}\n", .{status});
+        return;
+    }
 }

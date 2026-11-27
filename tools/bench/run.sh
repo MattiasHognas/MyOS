@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the benchmark (tools/bench/bench.zig) in a Linux guest and a MyOS
+# Run the benchmark (tools/bench/bench.zig, and the .NET workload of
+# tools/bench/dotnet when there is a .NET SDK) in a Linux guest and a MyOS
 # guest under the same QEMU and KVM, with the same CPUs and memory, and
 # print the two side by side. The same static program runs on both.
 #
@@ -35,10 +36,27 @@ memory=1G
 out=zig-out/bench
 mkdir -p "$out"
 
-# --- Build: the program, MyOS's kernel and its test image.
+# --- Build: the programs, MyOS's kernel and its test image.
 zig build -Doptimize=ReleaseSafe
 zig build test-kernel -Doptimize=ReleaseSafe
-bash scripts/build.sh --package-test >/dev/null
+# The .NET workload, ahead of time and static (as the fixture
+# dotnet-hello-static is built), if there is a .NET SDK.
+extra="$out/extra"
+rm -rf "$extra"
+mkdir -p "$extra/usr/bin"
+if command -v dotnet >/dev/null; then
+    work="$out/dotnet"
+    rm -rf "$work"
+    mkdir -p "$work"
+    cp tools/bench/dotnet/bench.csproj tools/bench/dotnet/Program.cs "$work/"
+    ZIG_LINK_TARGET=x86_64-linux-musl dotnet publish "$work/bench.csproj" -c Release -r linux-musl-x64 \
+        -p:PublishAot=true -p:StaticExecutable=true -p:PositionIndependentExecutable=false \
+        -p:CppCompilerAndLinker="$PWD/tests/fixtures/zig-link" -p:LinkerFlavor=lld -o "$work/out" >/dev/null
+    cp "$work/out/dotnet-bench" "$extra/usr/bin/dotnet-bench"
+else
+    echo "bench: no dotnet: the .NET workload is left out" >&2
+fi
+MYOS_INITRD_EXTRA="$extra" bash scripts/build.sh --package-test >/dev/null
 
 # --- Linux: the host's kernel, the benchmark as /init.
 kernel="${BENCH_LINUX_KERNEL:-/usr/lib/modules/$(uname -r)/vmlinuz}"
@@ -47,6 +65,7 @@ cpio_dir="$out/linux-initramfs"
 rm -rf "$cpio_dir"
 mkdir -p "$cpio_dir"
 cp zig-out/bin/bin-bench "$cpio_dir/init"
+[[ -f "$extra/usr/bin/dotnet-bench" ]] && cp "$extra/usr/bin/dotnet-bench" "$cpio_dir/dotnet-bench"
 (cd "$cpio_dir" && find . | cpio -o -H newc --quiet) >"$out/linux-initramfs.cpio"
 
 qemu_common=(-machine q35 -enable-kvm -cpu host,+invtsc -smp "$cpus" -m "$memory"
