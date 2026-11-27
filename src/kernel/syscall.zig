@@ -694,13 +694,22 @@ fn sysIoctl(fd: u64, request: u64, arg: u64) u64 {
             if (arg != 1) tty.flushInput();
             return 0;
         },
-        // There are no process groups yet: every process is its own, and
-        // the terminal's foreground is the one the shell runs.
+        // The foreground process group: the one Ctrl+C goes to. Until a
+        // shell sets one, the caller's own group stands in.
         abi.TIOC.TIOCGPGRP => {
+            const fg = proc.foregroundGroup();
             const p = thread.current().process.?;
-            return if (toUser(arg, @as(i32, @intCast(p.pid)))) 0 else err(.FAULT);
+            const g = if (fg != 0) fg else proc.groupOf(0, .group) orelse p.pid;
+            return if (toUser(arg, @as(i32, @intCast(g)))) 0 else err(.FAULT);
         },
-        abi.TIOC.TIOCSPGRP => return 0,
+        abi.TIOC.TIOCSPGRP => {
+            const g = fromUser(i32, arg) orelse return err(.FAULT);
+            if (g <= 0) return err(.INVAL);
+            return switch (proc.setForegroundGroup(@intCast(g))) {
+                .ok => 0,
+                .no_such => err(.PERM),
+            };
+        },
         else => return err(.INVAL),
     }
 }
@@ -1162,24 +1171,39 @@ fn fileStat(node: vfs.Node) abi.Stat {
 /// itself with an empty path and `AT_EMPTY_PATH`. `ENOENT`, `EINVAL`
 /// for unknown flags, `EFAULT`.
 fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
-    if (flags & ~@as(u64, abi.AT_EMPTY_PATH | abi.AT_SYMLINK_NOFOLLOW | 0x800) != 0) return err(.INVAL); // 0x800: AT_NO_AUTOMOUNT
+    return switch (statAt(dirfd, path_ptr, flags)) {
+        .stat => |st| if (toUser(stat_ptr, st)) 0 else err(.FAULT),
+        .fail => |e| e,
+    };
+}
+
+const StatResult = union(enum) { stat: abi.Stat, fail: u64 };
+
+/// What `newfstatat` says about `path_ptr` from `dirfd` with `flags`
+/// (`AT_EMPTY_PATH`, `AT_SYMLINK_NOFOLLOW`, `AT_NO_AUTOMOUNT`).
+fn statAt(dirfd: u64, path_ptr: u64, flags: u64) StatResult {
+    if (flags & ~@as(u64, abi.AT_EMPTY_PATH | abi.AT_SYMLINK_NOFOLLOW | 0x800) != 0) return .{ .fail = err(.INVAL) }; // 0x800: AT_NO_AUTOMOUNT
     if (flags & abi.AT_EMPTY_PATH != 0) {
-        const first = fromUser(u8, path_ptr) orelse return err(.FAULT);
-        if (first == 0) return sysFstat(dirfd, stat_ptr);
+        const first = fromUser(u8, path_ptr) orelse return .{ .fail = err(.FAULT) };
+        if (first == 0) return statFd(dirfd);
     }
+    return statPath(dirfd, path_ptr, flags);
+}
+
+fn statPath(dirfd: u64, path_ptr: u64, flags: u64) StatResult {
     var given = switch ((if (flags & abi.AT_SYMLINK_NOFOLLOW != 0) Path.fromNoFollow(dirfd, path_ptr) else Path.from(dirfd, path_ptr))) {
         .path => |p| p,
-        .fail => |e| return e,
+        .fail => |e| return .{ .fail = e },
     };
     defer given.deinit();
     const path = given.text;
     const what = named(path);
-    if (given.directory_wanted and what != .directory and what != .none) return err(.NOTDIR);
+    if (given.directory_wanted and what != .directory and what != .none) return .{ .fail = err(.NOTDIR) };
     const st = switch (what) {
-        .none => return err(.NOENT),
+        .none => return .{ .fail = err(.NOENT) },
         .directory => directoryStat(),
         .file => blk: {
-            const node = fileAt(path) orelse return err(.NOENT);
+            const node = fileAt(path) orelse return .{ .fail = err(.NOENT) };
             defer vfs.release(&node);
             break :blk fileStat(node);
         },
@@ -1203,12 +1227,12 @@ fn sysNewfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) u64 {
                 link.ino = 3;
                 break :blk link;
             }
-            const node = fileAt(path) orelse return err(.NOENT);
+            const node = fileAt(path) orelse return .{ .fail = err(.NOENT) };
             defer vfs.release(&node);
             break :blk fileStat(node);
         },
     };
-    return if (toUser(stat_ptr, st)) 0 else err(.FAULT);
+    return .{ .stat = st };
 }
 
 /// `mknodat`: devices and FIFOs cannot be made anywhere: `EROFS` where
@@ -1439,8 +1463,16 @@ fn sysSetRobustList(head: u64, size: u64) u64 {
 }
 
 fn sysFstat(fd: u64, ptr: u64) u64 {
+    return switch (statFd(fd)) {
+        .stat => |st| if (toUser(ptr, st)) 0 else err(.FAULT),
+        .fail => |e| e,
+    };
+}
+
+/// What `fstat` says about descriptor `fd`.
+fn statFd(fd: u64) StatResult {
     var st: abi.Stat = .{};
-    const of = getFile(fd) orelse return err(.BADF);
+    const of = getFile(fd) orelse return .{ .fail = err(.BADF) };
     defer putFile(of);
     switch (of.kind) {
         .console => {
@@ -1458,7 +1490,68 @@ fn sysFstat(fd: u64, ptr: u64) u64 {
         .eventfd, .epoll => st.mode = 0o600,
         .file => st = fileStat(of.node),
     }
-    return if (toUser(ptr, st)) 0 else err(.FAULT);
+    return .{ .stat = st };
+}
+
+/// `statx`: `newfstatat` in Linux's newer structure, which the Zig
+/// standard library uses. Every field `mask` may ask for is given
+/// (`STATX_BASIC_STATS`); there are no birth times. `AT_STATX_*` sync
+/// flags are accepted: nothing is cached elsewhere.
+fn sysStatx(dirfd: u64, path_ptr: u64, flags: u64, mask: u64, buf: u64) u64 {
+    _ = mask;
+    const sync_bits: u64 = 0x6000; // AT_STATX_FORCE_SYNC, AT_STATX_DONT_SYNC
+    const st = switch (statAt(dirfd, path_ptr, flags & ~sync_bits)) {
+        .stat => |st| st,
+        .fail => |e| return e,
+    };
+    const ts = struct {
+        fn of(t: abi.TimeSpec) abi.StatxTimestamp {
+            return .{ .sec = t.sec, .nsec = @intCast(t.nsec) };
+        }
+    }.of;
+    const x: abi.Statx = .{
+        .mask = 0x7FF, // STATX_BASIC_STATS
+        .blksize = @intCast(st.blksize),
+        .nlink = @intCast(st.nlink),
+        .uid = st.uid,
+        .gid = st.gid,
+        .mode = @intCast(st.mode & 0xFFFF),
+        .ino = st.ino,
+        .size = @bitCast(st.size),
+        .blocks = @bitCast(st.blocks),
+        .atime = ts(st.atime),
+        .ctime = ts(st.ctime),
+        .mtime = ts(st.mtime),
+        .rdev_major = @intCast((st.rdev >> 8) & 0xFFF),
+        .rdev_minor = @intCast(st.rdev & 0xFF),
+        .dev_major = @intCast((st.dev >> 8) & 0xFFF),
+        .dev_minor = @intCast(st.dev & 0xFF),
+    };
+    return if (toUser(buf, x)) 0 else err(.FAULT);
+}
+
+/// `preadv` and `pwritev` (and their `2` forms with `flags` 0): `pread64`
+/// and `pwrite64` over the buffers of an `iovec` array, one after the
+/// other from `offset`. `ESPIPE` for what is not a file, as `pread64`.
+fn sysPreadv(fd: u64, iov: u64, count: u64, offset: u64, write: bool) u64 {
+    if (count > abi.IOV_MAX) return err(.INVAL);
+    if (offset > std.math.maxInt(i64)) return err(.INVAL);
+    var total: u64 = 0;
+    for (0..count) |i| {
+        const v = readIoVec(iov, i) orelse return err(.FAULT);
+        total = std.math.add(u64, total, v.len) catch return err(.INVAL);
+        if (total > abi.MAX_RW_COUNT) return err(.INVAL);
+    }
+    var done: u64 = 0;
+    for (0..count) |i| {
+        const v = readIoVec(iov, i) orelse break;
+        if (v.len == 0) continue;
+        const n = if (write) sysPwrite(fd, v.base, v.len, offset + done) else sysPread(fd, v.base, v.len, offset + done);
+        if (abi.isError(n)) return if (done == 0) n else done;
+        done += n;
+        if (n < v.len) break;
+    }
+    return done;
 }
 
 /// `fcntl`: the descriptor and status flags can be read; setting them is
@@ -2044,8 +2137,7 @@ fn sysWait4(pid_arg: u64, status_ptr: u64, options: u64, rusage_ptr: u64) u64 {
     if (options & ~@as(u64, abi.WNOHANG | abi.WUNTRACED | abi.WCONTINUED) != 0) return err(.INVAL);
     if (thread.current().process == null) return err(.CHILD);
     const pid: i64 = @as(i32, @truncate(@as(i64, @bitCast(pid_arg))));
-    if (pid < -1) {} // a process group: there is one, so it is everyone
-    return switch (proc.waitChild(if (pid < -1) -1 else pid, options & abi.WNOHANG != 0)) {
+    return switch (proc.waitChild(pid, options & abi.WNOHANG != 0)) {
         .exited => |x| blk: {
             if (status_ptr != 0 and !toUser(status_ptr, @as(i32, @bitCast(x.status)))) break :blk err(.FAULT);
             if (rusage_ptr != 0 and !toUser(rusage_ptr, std.mem.zeroes([18]u64))) break :blk err(.FAULT);
@@ -2108,8 +2200,20 @@ fn sysSchedPriorityRange(policy: u64) u64 {
 /// `getsid`: every process is a session of its own, since there is no
 /// terminal to share. `ESRCH` for another process.
 fn sysGetsid(pid: u64) u64 {
-    const p = thread.current().process orelse return err(.NOSYS);
-    return if (pid == 0 or pid == p.pid) p.pid else err(.SRCH);
+    if (thread.current().process == null) return err(.NOSYS);
+    return proc.groupOf(pid, .session) orelse err(.SRCH);
+}
+
+/// `setpgid`, `getpgid`, `getpgrp`, `setsid` (`proc.setGroup` and the
+/// rest say how).
+fn sysSetpgid(pid: u64, pgid: u64) u64 {
+    if (@as(i64, @bitCast(pgid)) < 0) return err(.INVAL);
+    proc.setGroup(pid, pgid) catch |e| return switch (e) {
+        error.NoSuchProcess => err(.SRCH),
+        error.NotPermitted => err(.PERM),
+        error.Invalid => err(.INVAL),
+    };
+    return 0;
 }
 
 /// `sched_getaffinity`: the CPUs the thread may run on, which is all that
@@ -2178,10 +2282,12 @@ fn sysKill(pid_arg: u64, sig: u64) u64 {
         if (sig != 0) proc.signalProcess(p, @intCast(sig));
         return if (n == 0 and sig != 0) 0 else 0;
     }
-    // Process groups are not there yet: a group means the caller's, which
-    // is the caller (0, or its own ID negated).
-    const target: u64 = if (pid == 0 or -pid == @as(i64, @intCast(p.pid))) p.pid else if (pid < 0) return err(.SRCH) else @intCast(pid);
-    return switch (proc.signalPid(target, @intCast(sig))) {
+    // A process group: the caller's for 0.
+    if (pid <= 0) {
+        const g: u64 = if (pid == 0) proc.groupOf(0, .group).? else @intCast(-pid);
+        return if (proc.signalGroup(g, @intCast(sig)) == 0) err(.SRCH) else 0;
+    }
+    return switch (proc.signalPid(@intCast(pid), @intCast(sig))) {
         .sent, .zombie => 0,
         .no_such => err(.SRCH),
     };
@@ -2376,6 +2482,11 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.fchmod => sysFchmod(f.rdi),
         Sys.pwrite64 => sysPwrite(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.readv => sysReadv(f.rdi, f.rsi, f.rdx),
+        Sys.preadv => sysPreadv(f.rdi, f.rsi, f.rdx, f.r10, false),
+        Sys.pwritev => sysPreadv(f.rdi, f.rsi, f.rdx, f.r10, true),
+        Sys.preadv2 => if (f.r9 != 0) err(.OPNOTSUPP) else if (f.r10 == std.math.maxInt(u64)) sysReadv(f.rdi, f.rsi, f.rdx) else sysPreadv(f.rdi, f.rsi, f.rdx, f.r10, false),
+        Sys.pwritev2 => if (f.r9 != 0) err(.OPNOTSUPP) else if (f.r10 == std.math.maxInt(u64)) sysWritev(f.rdi, f.rsi, f.rdx) else sysPreadv(f.rdi, f.rsi, f.rdx, f.r10, true),
+        Sys.statx => sysStatx(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
         Sys.truncate => sysTruncate(f.rdi, f.rsi),
         // Nothing is ever waiting to be written.
         Sys.fsync, Sys.fdatasync => if (isOpen(f.rdi)) 0 else err(.BADF),
@@ -2440,6 +2551,10 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.sched_setparam => sysSchedPolicy(.set_param, f),
         Sys.sched_get_priority_max, Sys.sched_get_priority_min => sysSchedPriorityRange(f.rdi),
         Sys.getsid => sysGetsid(f.rdi),
+        Sys.setpgid => if (thread.current().process == null) err(.NOSYS) else sysSetpgid(f.rdi, f.rsi),
+        Sys.getpgid => if (thread.current().process == null) err(.NOSYS) else proc.groupOf(f.rdi, .group) orelse err(.SRCH),
+        Sys.getpgrp => if (thread.current().process == null) err(.NOSYS) else proc.groupOf(0, .group).?,
+        Sys.setsid => if (thread.current().process == null) err(.NOSYS) else proc.newSession() catch err(.PERM),
         Sys.time => sysTime(f.rdi),
         Sys.futex => sysFutex(f),
         Sys.sched_getaffinity => sysSchedGetAffinity(f.rsi, f.rdx),

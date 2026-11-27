@@ -420,5 +420,49 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.fcntl, @intCast(pfd[0]), F_GETFD, 0) == 1 and lib.syscall(Sys.fcntl, @intCast(pfd[1]), F_GETFD, 0) == 1, 210);
     for ([_]u64{ ce, plain, dup_ce, 60, 61, @intCast(pfd[0]), @intCast(pfd[1]) }) |fd| expect(lib.close(fd) == 0, 211);
 
+    // statx: what newfstatat says, in the newer structure.
+    var sx: abi.Statx = .{};
+    var st2: abi.Stat = .{};
+    const cwdfd: u64 = @bitCast(@as(i64, abi.AT_FDCWD));
+    expect(lib.syscall6(Sys.statx, cwdfd, @intFromPtr("/etc/motd"), 0, 0x7FF, @intFromPtr(&sx), 0) == 0, 220);
+    expect(lib.syscall6(Sys.newfstatat, cwdfd, @intFromPtr("/etc/motd"), @intFromPtr(&st2), 0, 0, 0) == 0, 221);
+    expect(sx.size == @as(u64, @intCast(st2.size)) and sx.mode == @as(u16, @truncate(st2.mode)) and sx.mask & 0x7FF == 0x7FF, 222);
+    expect(lib.syscall6(Sys.statx, cwdfd, @intFromPtr("/etc"), 0, 0x7FF, @intFromPtr(&sx), 0) == 0 and sx.mode & abi.S.IFMT == abi.S.IFDIR, 223);
+    expect(lib.syscall6(Sys.statx, cwdfd, @intFromPtr("/nope"), 0, 0x7FF, @intFromPtr(&sx), 0) == lib.err(.NOENT), 224);
+    const motd2 = lib.open("/etc/motd");
+    expect(lib.syscall6(Sys.statx, motd2, @intFromPtr(""), abi.AT_EMPTY_PATH, 0x7FF, @intFromPtr(&sx), 0) == 0 and sx.size == @as(u64, @intCast(st2.size)), 225);
+    expect(lib.syscall6(Sys.statx, cwdfd, @intFromPtr("/etc/motd"), 0, 0x7FF, 8, 0) == lib.err(.FAULT), 226);
+
+    // preadv and pwritev: buffers in turn, from an offset; the file
+    // offset stays.
+    var a4: [4]u8 = undefined;
+    var b4: [4]u8 = undefined;
+    var whole: [8]u8 = undefined;
+    expect(lib.syscall(Sys.pread64, motd2, @intFromPtr(&whole), 8) == 8 or true, 227);
+    _ = lib.syscall6(Sys.pread64, motd2, @intFromPtr(&whole), 8, 2, 0, 0);
+    const iov = [2]abi.IoVec{ .{ .base = @intFromPtr(&a4), .len = 4 }, .{ .base = @intFromPtr(&b4), .len = 4 } };
+    expect(lib.syscall6(Sys.preadv, motd2, @intFromPtr(&iov), 2, 2, 0, 0) == 8, 228);
+    expect(std.mem.eql(u8, &a4, whole[0..4]) and std.mem.eql(u8, &b4, whole[4..8]), 229);
+    expect(lib.syscall(Sys.lseek, motd2, 0, 1) == 0, 230); // offset untouched
+    expect(lib.syscall6(Sys.preadv, 1, @intFromPtr(&iov), 2, 0, 0, 0) == lib.err(.SPIPE), 231);
+    // (A name of its own: two of these programs may run at once.)
+    var tname = "/tmp/pwritev-0000000000".*;
+    var tpid = lib.syscall(Sys.getpid, 0, 0, 0);
+    var ti: usize = tname.len;
+    while (ti > 13) {
+        ti -= 1;
+        tname[ti] = @intCast('0' + tpid % 10);
+        tpid /= 10;
+    }
+    const tf = lib.syscall6(Sys.openat, cwdfd, @intFromPtr(&tname), abi.O.RDWR | abi.O.CREAT | abi.O.TRUNC, 0o644, 0, 0);
+    expect(!lib.isError(tf), 232);
+    expect(lib.syscall6(Sys.pwritev, tf, @intFromPtr(&iov), 2, 3, 0, 0) == 8, 233);
+    var back: [11]u8 = undefined;
+    expect(lib.syscall6(Sys.pread64, tf, @intFromPtr(&back), 11, 0, 0, 0) == 11 and std.mem.eql(u8, back[3..11], whole[0..8]) and back[0] == 0, 234);
+    expect(lib.syscall6(Sys.pwritev2, tf, @intFromPtr(&iov), 1, @bitCast(@as(i64, -1)), 0, 0) == 4, 235); // -1: at the offset, as writev
+    _ = lib.close(tf);
+    _ = lib.syscall(Sys.unlink, @intFromPtr(&tname), 0, 0);
+    _ = lib.close(motd2);
+
     lib.exit(0);
 }

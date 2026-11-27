@@ -88,7 +88,7 @@ Linux calls, with Linux's numbers:
 | 13 | `rt_sigaction(sig, act, oldact, size)` | What a signal does: default, ignore, or a handler with `SA_SIGINFO`, `SA_ONSTACK`, `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND` and `sa_mask`. A handler needs `SA_RESTORER` (C libraries always set it); without, delivering to it kills the program, as on Linux. `EINVAL` for `SIGKILL` and `SIGSTOP`. |
 | 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals; `SIGKILL` and `SIGSTOP` cannot be blocked. A signal unblocked here is delivered as the call returns. |
 | 15 | `rt_sigreturn()` | Back from a handler: registers, signal mask, alternate stack and FP state as the frame says, with what the handler changed in it. Selectors are user mode's whatever it says, flags only user-settable ones, the return address checked like any; an FP image cannot make the kernel fault. A frame that cannot be read kills the program. |
-| 16 | `ioctl(fd, request, arg)` | The terminal: `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` (line editing, echo, Ctrl+C, CR to newline; other settings are ignored), `TIOCGWINSZ` (80 by 25), `FIONREAD`, `TCFLSH`, `TIOCGPGRP` (the caller) and `TIOCSPGRP` (accepted). `EINVAL` for other requests; `ENOTTY` for every descriptor that is not the terminal (how a C library finds out that its output is not one), `EBADF` otherwise. |
+| 16 | `ioctl(fd, request, arg)` | The terminal: `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` (line editing, echo, Ctrl+C, CR to newline; other settings are ignored), `TIOCGWINSZ` (80 by 25), `FIONREAD`, `TCFLSH`, `TIOCSPGRP` and `TIOCGPGRP` (the foreground process group, which Ctrl+C sends `SIGINT` to; until one is set, the caller's group). `EINVAL` for other requests; `ENOTTY` for every descriptor that is not the terminal (how a C library finds out that its output is not one), `EBADF` otherwise. |
 | 17 | `pread64(fd, buf, count, offset)` | |
 | 18 | `pwrite64(fd, buf, count, offset)` | `write` to a file at an offset; the descriptor's own stays. |
 | 19 | `readv(fd, iov, iovcnt)` | `read` into up to 1024 buffers. |
@@ -109,8 +109,8 @@ Linux calls, with Linux's numbers:
 | 58 | `vfork()` | `fork` that holds the caller until the child calls `execve` or ends. |
 | 59 | `execve(path, argv, envp)` | Replaces the program of the calling process. The new one is loaded first: on an error the old one goes on as it was. Then the process's other threads end; it keeps its ID, parent, children, descriptors (but those marked close-on-exec), working directory, signal mask, pending signals and limits. Signal handlers go back to the default (ignored signals stay ignored); the alternate stack, FS and GS base and extended state are cleared; a parent waiting in `vfork` goes on. A file that starts with `#!` runs its interpreter with the file as an argument (one level, as on Linux). `ENOENT`, `ENOEXEC`, `E2BIG`, `EFAULT`, `ENOMEM`, `EINTR` (another thread replaced or ended the process first). |
 | 60 | `exit(status)` | Ends the calling thread. The last thread's status is the process's: the parent sees `status & 0xff`. |
-| 61 | `wait4(pid, status, options, rusage)` | Collects a child that has ended, any (`pid` -1, or 0 and below: no process groups yet) or the one given, and writes its status as Linux does (`code << 8`, or the signal that ended it; a fault the kernel killed it for counts as that fault's signal). An ended child is a zombie until then, or until its parent ends. `WNOHANG` returns 0 if none has ended; `WUNTRACED` and `WCONTINUED` change nothing yet. `rusage` is zeroes. `ECHILD`, `EINTR`, `EINVAL`, `EFAULT`. |
-| 62 | `kill(pid, sig)` | Any process by its ID; `-1`: every process but `init` and the caller, then the caller; `0` and `-pid` of the caller: the caller (no process groups yet). Any of the process's threads that does not block the signal takes it. Signal 0 checks. An ended process not yet collected takes nothing, without an error. `ESRCH`, `EINVAL`. |
+| 61 | `wait4(pid, status, options, rusage)` | Collects a child that has ended, any (`pid` -1), the one given, any in the caller's process group (0) or in the group `-pid`, and writes its status as Linux does (`code << 8`, or the signal that ended it; a fault the kernel killed it for counts as that fault's signal). An ended child is a zombie until then, or until its parent ends. `WNOHANG` returns 0 if none has ended; `WUNTRACED` and `WCONTINUED` change nothing yet. `rusage` is zeroes. `ECHILD`, `EINTR`, `EINVAL`, `EFAULT`. |
+| 62 | `kill(pid, sig)` | Any process by its ID; `-1`: every process but `init` and the caller, then the caller; `0`: the caller's process group; `-pgid`: that group. Any of the process's threads that does not block the signal takes it. Signal 0 checks. An ended process not yet collected takes nothing, without an error. `ESRCH`, `EINVAL`. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
 | 74 | `fsync(fd)` | Nothing is ever waiting to be written: 0. |
@@ -128,8 +128,12 @@ Linux calls, with Linux's numbers:
 | 91 | `fchmod(fd, mode)` | No permissions exist: accepted for a file that can be written, `EROFS` otherwise. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
+| 109 | `setpgid(pid, pgid)` | Puts the caller or one of its children (`pid` 0: the caller) in the group `pgid` (0: its own ID), which must be its own ID or a group of the same session. A session leader stays in its group. `EPERM`, `ESRCH`, `EINVAL`. |
 | 110 | `getppid()` | The parent's process ID; an orphan's new parent's; 0 for none. |
-| 124 | `getsid(pid)` | Every process is its own session. |
+| 111 | `getpgrp()` | The caller's process group. |
+| 112 | `setsid()` | A new session and group, led by the caller; `EPERM` for a group leader. There is one terminal, which stays where it is. |
+| 121 | `getpgid(pid)` | A process's group (0: the caller's); `ESRCH`. |
+| 124 | `getsid(pid)` | A process's session (0: the caller's); `ESRCH`. A process starts in its parent's group and session, or in its own if the kernel started it. |
 | 127 | `rt_sigpending(set, size)` | The signals waiting that the thread blocks. |
 | 130 | `rt_sigsuspend(mask, size)` | Waits with `mask` blocked instead until a signal is handled; the old mask is back after the handler. `EINTR`. |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, used by handlers with `SA_ONSTACK`; reported as `SS_ONSTACK` while in use. |
@@ -174,12 +178,17 @@ Linux calls, with Linux's numbers:
 | 291 | `epoll_create1(flags)` | A new instance; `epoll_create(size)` (213) the same. |
 | 292 | `dup3(old, new, flags)` | `dup2`, with `EINVAL` if `old` is `new`. |
 | 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
+| 295 | `preadv(fd, iov, count, offset)` | `pread64` into each buffer in turn, from `offset`; the file offset stays. `ESPIPE` for what is not a file. |
+| 296 | `pwritev(fd, iov, count, offset)` | The same for `pwrite64`. |
 | 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | As `rename`; no flags (`EINVAL`). |
 | 318 | `getrandom(buf, len, flags)` | Never blocks. |
 | 319 | `memfd_create(name, flags)` | Not offered yet: `ENOSYS`, on purpose. |
 | 322 | `execveat(dirfd, path, argv, envp, flags)` | `execve` with `path` relative to `dirfd`; `flags` must be 0. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
+| 327 | `preadv2(fd, iov, count, offset, flags)` | `preadv`, or `readv` with offset -1; `flags` must be 0 (`EOPNOTSUPP`). |
+| 328 | `pwritev2(fd, iov, count, offset, flags)` | The same for writing. |
+| 332 | `statx(dirfd, path, flags, mask, buf)` | What `newfstatat` says, in `struct statx`, every basic field filled whatever `mask` asks (no birth time). The Zig standard library uses it. |
 | 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
 | 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules (threads, and processes with `exit_signal`). Fields past the first version of the structure must be zero. |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`. |

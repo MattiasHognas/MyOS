@@ -84,6 +84,18 @@ pub const Sys = struct {
     pub const wait4 = 61;
     /// `getppid() -> pid` of the parent.
     pub const getppid = 110;
+    /// Process groups and sessions.
+    pub const setpgid = 109;
+    pub const getpgrp = 111;
+    pub const setsid = 112;
+    pub const getpgid = 121;
+    /// `preadv(fd, iov, count, offset)`, `pwritev`, and their `2` forms
+    /// with flags; `statx(dirfd, path, flags, mask, buf)`.
+    pub const preadv = 295;
+    pub const pwritev = 296;
+    pub const preadv2 = 327;
+    pub const pwritev2 = 328;
+    pub const statx = 332;
     /// `execveat(dirfd, path, argv, envp, flags)`.
     pub const execveat = 322;
     /// `kill(pid, signal)`.
@@ -313,6 +325,8 @@ pub const E = enum(u16) {
     /// Broken pipe: nobody is left to read what is written.
     PIPE = 32,
     /// The time ran out.
+    /// Operation not supported (`EOPNOTSUPP`).
+    OPNOTSUPP = 95,
     TIMEDOUT = 110,
 };
 
@@ -789,3 +803,39 @@ pub const HWCAP2 = struct {
 pub const WNOHANG = 1;
 pub const WUNTRACED = 2;
 pub const WCONTINUED = 8;
+
+/// `struct statx_timestamp`.
+pub const StatxTimestamp = extern struct {
+    sec: i64 = 0,
+    nsec: u32 = 0,
+    _reserved: i32 = 0,
+};
+
+/// `struct statx`: 256 bytes.
+pub const Statx = extern struct {
+    mask: u32 = 0,
+    blksize: u32 = 0,
+    attributes: u64 = 0,
+    nlink: u32 = 0,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    mode: u16 = 0,
+    _spare0: u16 = 0,
+    ino: u64 = 0,
+    size: u64 = 0,
+    blocks: u64 = 0,
+    attributes_mask: u64 = 0,
+    atime: StatxTimestamp = .{},
+    btime: StatxTimestamp = .{},
+    ctime: StatxTimestamp = .{},
+    mtime: StatxTimestamp = .{},
+    rdev_major: u32 = 0,
+    rdev_minor: u32 = 0,
+    dev_major: u32 = 0,
+    dev_minor: u32 = 0,
+    _spare: [14]u64 = @splat(0),
+};
+
+comptime {
+    if (@sizeOf(Statx) != 256) @compileError("struct statx is 256 bytes");
+}

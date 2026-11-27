@@ -146,6 +146,40 @@ pub fn main() noreturn {
     expect(seen == 0x3F, 20);
     expect(wait4(-1, &status, 0) == lib.err(.CHILD), 21);
 
+    // --- Process groups and sessions. Started by the kernel, this program
+    // leads a session and a group of its own.
+    expect(lib.syscall(Sys.getpgrp, 0, 0, 0) == me and lib.syscall(Sys.getpgid, 0, 0, 0) == me, 30);
+    expect(lib.syscall(Sys.getsid, 0, 0, 0) == me, 31);
+    expect(lib.syscall(Sys.setsid, 0, 0, 0) == lib.err(.PERM), 32); // leads a group already
+    expect(lib.syscall(Sys.setpgid, 0, 0, 0) == lib.err(.PERM), 33); // a session leader stays where it is
+    // A child moved into a group of its own, and ended through it.
+    const g = lib.syscall(Sys.fork, 0, 0, 0);
+    if (g == 0) {
+        _ = lib.read(@intCast(pfd[0]), &buf); // waits for ever
+        lib.exit(1);
+    }
+    expect(lib.syscall(Sys.getpgid, g, 0, 0) == me, 34); // inherited
+    expect(lib.syscall(Sys.setpgid, g, 0, 0) == 0 and lib.syscall(Sys.getpgid, g, 0, 0) == g, 35);
+    expect(lib.syscall(Sys.getsid, g, 0, 0) == me, 36); // the same session
+    expect(lib.syscall(Sys.setpgid, g, 99999, 0) == lib.err(.PERM), 37); // no such group
+    expect(lib.syscall(Sys.setpgid, 99999, 0, 0) == lib.err(.SRCH), 38); // not a child
+    expect(wait4(0, &status, abi.WNOHANG) == lib.err(.CHILD), 39); // none in this group now
+    expect(lib.syscall(Sys.kill, @bitCast(-@as(i64, @intCast(g))), 15, 0) == 0, 40);
+    expect(wait4(-@as(i64, @intCast(g)), &status, 0) == g and signaled(status) == 15, 41);
+    expect(lib.syscall(Sys.kill, @bitCast(-@as(i64, @intCast(g))), 15, 0) == lib.err(.SRCH), 42); // the group is gone
+    // A child that starts a session of its own.
+    const s1 = lib.syscall(Sys.fork, 0, 0, 0);
+    if (s1 == 0) {
+        const mine = lib.syscall(Sys.getpid, 0, 0, 0);
+        if (lib.syscall(Sys.setsid, 0, 0, 0) != mine) lib.exit(50);
+        if (lib.syscall(Sys.getsid, 0, 0, 0) != mine or lib.syscall(Sys.getpgrp, 0, 0, 0) != mine) lib.exit(51);
+        lib.exit(52);
+    }
+    expect(wait4(@intCast(s1), &status, 0) == s1 and exited(status) == 52, 43);
+    // The terminal's foreground group: this program's, as nobody set one.
+    var fg: i32 = 0;
+    expect(lib.syscall(Sys.ioctl, 0, 0x540F, @intFromPtr(&fg)) == 0 and fg == @as(i32, @intCast(me)), 44); // TIOCGPGRP
+
     _ = lib.close(@intCast(pfd[0]));
     _ = lib.close(@intCast(pfd[1]));
     lib.exit(0);

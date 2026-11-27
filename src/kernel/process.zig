@@ -259,6 +259,11 @@ pub const Process = struct {
     /// The signal that ended the process, 0 if it ended by itself or by
     /// the kernel without one: what `wait4` reports.
     term_signal: std.atomic.Value(u32) = .init(0),
+    /// Its process group and session (`setpgid`, `setsid`): a process
+    /// starts in its parent's, or in its own if it has no parent. Under the
+    /// tree lock.
+    pgid: u64 = 0,
+    sid: u64 = 0,
     /// The thread that is replacing the program (`execve`), while it makes
     /// the others end.
     exec_thread: std.atomic.Value(?*thread.Thread) = .init(null),
@@ -613,10 +618,115 @@ pub fn terminateForeground(code: u64) bool {
     _ = code;
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
+    // SIGINT, which ends them unless they handle or ignore it: to the
+    // terminal's foreground process group, if a shell has set one; else to
+    // the program the private `myos_run` started.
+    if (foreground_group != 0) return signalGroupLocked(foreground_group, signal.SIG.INT) != 0;
     const p = foreground orelse return false;
-    // SIGINT, which ends it unless it handles or ignores it.
-    @import("signal.zig").sendProcessLocked(p, @import("signal.zig").SIG.INT);
+    signal.sendProcessLocked(p, signal.SIG.INT);
     return true;
+}
+
+/// The terminal's foreground process group (`TIOCSPGRP`), 0 for none.
+/// Under the tree lock.
+var foreground_group: u64 = 0;
+
+pub fn setForegroundGroup(pgid: u64) enum { ok, no_such } {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    if (pgid != 0 and !groupExistsLocked(pgid)) return .no_such;
+    foreground_group = pgid;
+    return .ok;
+}
+
+pub fn foregroundGroup() u64 {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    return foreground_group;
+}
+
+fn groupExistsLocked(pgid: u64) bool {
+    var q = all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (p.pgid == pgid and p.exit_code == null) return true;
+    }
+    return false;
+}
+
+/// Send `sig` to every live process of the group `pgid`; how many got it.
+/// The tree lock must be held.
+fn signalGroupLocked(pgid: u64, sig: u32) usize {
+    var n: usize = 0;
+    var q = all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (p.pgid != pgid or p.exit_code != null) continue;
+        if (sig != 0) signal.sendProcessLocked(p, sig);
+        n += 1;
+    }
+    return n;
+}
+
+/// `kill(-pgid)`: `sig` to the group; how many got it.
+pub fn signalGroup(pgid: u64, sig: u32) usize {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    return signalGroupLocked(pgid, sig);
+}
+
+pub const GroupError = error{ NoSuchProcess, NotPermitted, Invalid };
+
+/// `setpgid(pid, pgid)`: put the process `pid` (the caller or one of its
+/// children; 0 for the caller) in the group `pgid` (0: its own ID), which
+/// must be its own ID or a group of the caller's session. A session
+/// leader cannot change its group.
+pub fn setGroup(pid: u64, pgid: u64) GroupError!void {
+    const me = thread.current().process.?;
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    const target = if (pid == 0 or pid == me.pid) me else blk: {
+        var c = me.first_child;
+        while (c) |child| : (c = child.next_sibling) {
+            if (child.pid == pid and child.exit_code == null) break :blk child;
+        }
+        return error.NoSuchProcess;
+    };
+    if (target.sid != me.sid) return error.NotPermitted;
+    if (target.pid == target.sid) return error.NotPermitted; // a session leader
+    const want = if (pgid == 0) target.pid else pgid;
+    if (want != target.pid) {
+        // An existing group of the same session.
+        var found = false;
+        var q = all_processes;
+        while (q) |p| : (q = p.all_next) {
+            if (p.pgid == want and p.sid == me.sid and p.exit_code == null) found = true;
+        }
+        if (!found) return error.NotPermitted;
+    }
+    target.pgid = want;
+}
+
+/// `setsid`: the caller starts a new session and group of its own, with no
+/// terminal. `EPERM` (`NotPermitted`) for a group leader.
+pub fn newSession() GroupError!u64 {
+    const me = thread.current().process.?;
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    if (me.pgid == me.pid) return error.NotPermitted;
+    me.pgid = me.pid;
+    me.sid = me.pid;
+    return me.pid;
+}
+
+/// The group or session of the process `pid` (0 for the caller).
+pub fn groupOf(pid: u64, which: enum { group, session }) ?u64 {
+    const me = thread.current().process.?;
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var q: ?*Process = if (pid == 0) me else all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (pid == 0 or p.pid == pid) return if (which == .group) p.pgid else p.sid;
+    }
+    return null;
 }
 
 /// Send `sig` to the process `p` (`signal.sendProcessLocked`, with the
@@ -843,8 +953,8 @@ pub const WaitResult = union(enum) {
 };
 
 /// `wait4`: wait for a child of the calling process to end and collect
-/// it. `pid` -1 (or 0: there are no process groups yet, so the caller's
-/// group is everyone) means any child; a positive one, that child. With
+/// it. `pid` -1 means any child; a positive one, that child; 0, any in the
+/// caller's process group; below -1, any in the group `-pid`. With
 /// `nohang`, report `none_yet` instead of waiting.
 pub fn waitChild(pid: i64, nohang: bool) WaitResult {
     const me = thread.current().process.?;
@@ -853,9 +963,11 @@ pub fn waitChild(pid: i64, nohang: bool) WaitResult {
         defer tree_lock.release(held);
         while (true) {
             var any = false;
+            const group: ?u64 = if (pid == 0) me.pgid else if (pid < -1) @intCast(-pid) else null;
             var c = me.first_child;
             while (c) |child| : (c = child.next_sibling) {
                 if (pid > 0 and child.pid != @as(u64, @intCast(pid))) continue;
+                if (group) |g| if (child.pgid != g) continue;
                 any = true;
                 if (child.exit_code != null) {
                     unlinkChild(child);
@@ -964,6 +1076,8 @@ pub fn forkProcess(frame: *const arch_syscall.Frame, args: CloneArgs, exit_signa
         registerLocked(child);
         live += 1;
         child.pid = tid;
+        child.pgid = parent.pgid;
+        child.sid = parent.sid;
         child.thread_list = t;
         child.thread_count = 1;
         files_given = true;
@@ -1609,7 +1723,6 @@ const Image = struct {
 /// it names one. `name` is the path it is started under. On error nothing
 /// is left. Not inlined: its frame stays out of its callers'.
 noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOptions, limits: Limits) !Image {
-
     const root = try vmm.createAddressSpace();
     errdefer vmm.destroyAddressSpace(root);
 
@@ -1673,7 +1786,6 @@ noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOption
         .brk = loaded.end,
         .pages = pages,
     };
-
 }
 
 /// Create a process named `name` that runs the ELF executable `image`.
@@ -1759,6 +1871,8 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     registerLocked(p);
     live += 1;
     p.pid = thread.assignId(t);
+    p.pgid = if (options.parent) |parent| parent.pgid else p.pid;
+    p.sid = if (options.parent) |parent| parent.sid else p.pid;
     p.thread_list = t;
     p.thread_count = 1;
     thread.start(t);
