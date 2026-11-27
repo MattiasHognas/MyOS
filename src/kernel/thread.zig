@@ -101,6 +101,7 @@
 
 const std = @import("std");
 const stats = @import("stats.zig");
+const clock = @import("clock.zig");
 const root = @import("root");
 const abi = @import("abi");
 
@@ -351,14 +352,60 @@ pub fn block() void {
 fn idleOnce() void {
     const c = percpu.current();
     assert.check(.thread, ready_head == null or !c.runs_threads, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
-    c.halts += 1;
     c.idle = true;
     vmm.enterLazy(); // not to be woken for flushes of the address space it has loaded
     lock.drop();
-    asm volatile ("sti; hlt; cli");
+    if (!pollForWork(c)) {
+        c.halts += 1;
+        asm volatile ("sti; hlt; cli");
+    }
     vmm.leaveLazy();
     lock.take();
     c.idle = false;
+}
+
+/// How long a CPU with nothing to run spins before it halts: work that
+/// comes meanwhile is taken without the halt, and without the interrupt
+/// that would end it, which for a virtual CPU means leaving the guest
+/// twice (Linux's guest halt polling, which waits up to 200 µs).
+const POLL_NS: u64 = 50_000;
+
+/// Spin, with interrupts off and the scheduler lock released, until there
+/// may be work for this CPU (another CPU took it off the idle list to give
+/// it a thread, woke the thread it idles in, or a thread is ready) or
+/// `POLL_NS` have passed. True if there may be work: the caller does not
+/// halt. While spinning the CPU says so (`PerCpu.polling`), and wakers
+/// skip the interrupt; it stops saying so before it looks one last time,
+/// and a waker makes the work visible before it looks whether the CPU
+/// polls, so one of them sees the other and no wake-up is lost.
+fn pollForWork(c: *percpu.PerCpu) bool {
+    const me = current();
+    const hz = clock.tscHz();
+    if (hz == 0) return false; // no clock to poll by
+    const until = stats.rdtsc() + POLL_NS * hz / std.time.ns_per_s;
+    @atomicStore(bool, &c.polling, true, .seq_cst);
+    while (stats.rdtsc() < until) {
+        if (workMayBeThere(c, me)) break;
+        ipi.poll(); // a request for this CPU is not to wait either
+        std.atomic.spinLoopHint();
+    }
+    @atomicStore(bool, &c.polling, false, .seq_cst);
+    return workMayBeThere(c, me);
+}
+
+fn workMayBeThere(c: *percpu.PerCpu, me: *Thread) bool {
+    if (!@atomicLoad(bool, &c.idle, .seq_cst)) return true; // chosen to run a ready thread
+    if (@atomicLoad(State, &me.state, .seq_cst) != .blocked and me != @as(?*Thread, @ptrCast(@alignCast(c.idle_thread)))) return true;
+    if (@atomicLoad(bool, &c.preempt_requested, .seq_cst)) return true;
+    return c.runs_threads and @atomicLoad(?*Thread, &ready_head, .seq_cst) != null;
+}
+
+/// Have the halted (or polling) CPU `c` look for work: an interrupt,
+/// unless it is polling and will see it anyway (`pollForWork`). The work
+/// is to be visible already. Scheduler lock held.
+fn wakeCpu(c: *percpu.PerCpu) void {
+    if (@atomicLoad(bool, &c.polling, .seq_cst)) return;
+    ipi.wake(c);
 }
 
 /// A thread has just been put in the ready queue: if a CPU is halted with
@@ -370,8 +417,8 @@ fn kickIdleCpu() bool {
     for (0..percpu.count()) |i| {
         const c = percpu.get(i);
         if (c == me or !c.idle or !c.runs_threads) continue;
-        c.idle = false;
-        ipi.wake(c);
+        @atomicStore(bool, &c.idle, false, .seq_cst);
+        wakeCpu(c);
         return true;
     }
     return false;
@@ -434,9 +481,9 @@ pub fn wake(t: *Thread) void {
         // It is blocked but a CPU is still on its stack, idling in `block`
         // because nothing else was ready: it just carries on there. If that
         // is another CPU, it is halted and has to be told.
-        t.state = .running;
+        @atomicStore(State, &t.state, .running, .seq_cst);
         const c = t.cpu.?;
-        if (c != percpu.current()) ipi.wake(c);
+        if (c != percpu.current()) wakeCpu(c);
     } else {
         t.state = .ready;
         enqueue(t);

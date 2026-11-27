@@ -124,6 +124,10 @@ pub const PerCpu = extern struct {
     /// wakes (`vmm.enterLazy`, `vmm.leaveLazy`). Both atomic.
     tlb_lazy: bool = false,
     tlb_stale: bool = false,
+    /// Spinning for a moment before it halts with nothing to run
+    /// (`thread.idleOnce`): whoever gives it something to do need not send
+    /// it an interrupt (`thread.wakeCpu`). Atomic.
+    polling: bool = false,
     /// Where the timer found this CPU, in kernels that sample
     /// (`profile.zig`; a `*profile.Ring`).
     profile_ring: ?*anyopaque = null,
