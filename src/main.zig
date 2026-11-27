@@ -216,6 +216,28 @@ pub fn seizeConsole() void {
     kernel.sync.spinlock.stopChecking();
 }
 
+/// The stack a crash report is printed on: after `seizeConsole` only one
+/// CPU reports, so one stack is enough, and the CPU may be on a small
+/// emergency stack (`gdt.IST_STACK_SIZE`) or a broken one. Formatting and
+/// symbolizing take about 4 KiB in a Debug build.
+var crash_stack: [8 * 1024]u8 align(16) = undefined;
+var crash_job: *const fn () noreturn = undefined;
+
+/// After `seizeConsole`: carry on with `job` on the crash stack. Whatever
+/// it needs from the stack it leaves is to be copied out first.
+pub fn onCrashStack(job: *const fn () noreturn) noreturn {
+    crash_job = job;
+    arch.x86_64.context.runOnStack(@intFromPtr(&crash_stack) + crash_stack.len, &crashEntry);
+}
+
+fn crashEntry() callconv(.c) noreturn {
+    crash_job();
+}
+
+var panic_msg: []const u8 = "";
+var panic_ret: usize = 0;
+var panic_rbp: usize = 0;
+
 /// Panic handler behind `panic`: print the message and a symbolized
 /// backtrace, then halt. In the test kernel, report failure and exit QEMU.
 fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
@@ -226,8 +248,15 @@ fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
         halt();
     }
     panicking = true;
-    print("PANIC: {s}\n", .{msg});
-    backtrace.print(.{ .return_address = ret_addr orelse @returnAddress() }, @frameAddress());
+    panic_msg = msg;
+    panic_ret = ret_addr orelse @returnAddress();
+    panic_rbp = @frameAddress();
+    onCrashStack(&panicReport);
+}
+
+fn panicReport() noreturn {
+    print("PANIC: {s}\n", .{panic_msg});
+    backtrace.print(.{ .return_address = panic_ret }, panic_rbp);
     if (comptime build_options.is_test) serial.puts("MYOS_TEST_FAIL\n");
     halt();
 }
@@ -237,8 +266,35 @@ fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
 /// than 512 bytes is replaced by `<print overflow>`. Other modules call this
 /// as `root.print`.
 pub fn print(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    write(std.fmt.bufPrint(&buf, fmt, args) catch "<print overflow>\n");
+    // Formatted a little at a time, under the console lock so the message
+    // comes out whole: a crash report prints on an emergency stack, and a
+    // buffer for the whole line took a good part of it.
+    var buf: [96]u8 = undefined;
+    var w: std.Io.Writer = .{ .vtable = &.{ .drain = drainToConsole }, .buffer = &buf };
+    if (console_seized) {
+        w.print(fmt, args) catch {};
+        w.flush() catch {};
+        return;
+    }
+    const held = console_lock.acquire();
+    defer console_lock.release(held);
+    w.print(fmt, args) catch {};
+    w.flush() catch {};
+}
+
+/// Where `print`'s writer sends what it formats: the console lock is held
+/// (or the console seized).
+fn drainToConsole(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    writeUnlocked(w.buffered());
+    w.end = 0;
+    var n: usize = 0;
+    for (data[0 .. data.len - 1]) |d| {
+        writeUnlocked(d);
+        n += d.len;
+    }
+    const last = data[data.len - 1];
+    for (0..splat) |_| writeUnlocked(last);
+    return n + last.len * splat;
 }
 
 fn serialIrq(_: *idt.Frame) void {

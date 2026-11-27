@@ -39,13 +39,14 @@ const gdt_template = [_]u64{
     0, // 0x30 TSS high
 };
 
-/// Size of each emergency stack. What runs on them is a crash report
-/// that ends in a halt, or, for a debug trap from a program, the end of
-/// that process. Measured (`istPeak`, printed by the tests and by every
-/// crash report of a measured build): at most 4.4 KiB in a Debug build,
-/// 2.8 KiB in an optimized one. Linux has 4 KiB, which it can do because
-/// its handlers move to the thread's own stack before they do any work.
-pub const IST_STACK_SIZE = 8 * 1024;
+/// Size of each emergency stack, as Linux's. Little runs on them: an
+/// exception from ring 3 moves to the thread's own kernel stack before
+/// anything else (`isr_paranoid`, as Linux does), and a crash report moves
+/// to the one crash stack before it prints (`main.onCrashStack`). What is
+/// left is the handler up to that point. Measured (`istPeak`, printed by
+/// the tests and by every crash report of a measured build): about 1 KiB
+/// in a Debug build.
+pub const IST_STACK_SIZE = 4 * 1024;
 
 /// IST index (1-7, as used in IDT gates) of the double-fault stack.
 pub const IST_DOUBLE_FAULT = 1;

@@ -96,7 +96,7 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
 - [x] Verify stack overflow triggers a page fault rather than heap corruption (QEMU scenario `stack_overflow`: the fault on the guard page arrives as a double fault on the emergency stack and is reported as a kernel stack overflow).
 - [x] The guard is a single page, so a stack frame larger than 4 KiB could step over it into the neighbouring stack. No kernel function may have one: `scripts/check-frames.sh` (`zig build check-frames`, part of `zig build test` and CI in all three build modes) fails on a frame over 4088 bytes and warns over 2 KiB, the same limit Linux warns at. The largest frame is about 1 KiB.
   - Panic messages are formatted in a 256-byte buffer (`kernel/debug/panic.zig`) instead of the standard library's 4 KiB one.
-  - Not covered: a function reached only through a pointer stored in a data table, and assembly that moves RSP by a computed amount. Stack probes (`stack_check`) are the fallback if a function ever needs a larger frame.
+  - What the check cannot see is a task in 13 (Performance and observability).
 - [x] Kernel stacks stay at 16 KiB, the same as Linux (decided; not larger, and going smaller is not a goal). The high-water mark of every stack is measured in Debug builds and in the test kernel (`-Dstack-usage`): the kernel warns when a thread used more than 12 KiB, and the `tests` scenario reports the peak (`MYOS_STACK_PEAK`) and fails above that level. The suite peaks at about 5 KiB in Debug and under 4 KiB in release builds.
 
 **Done when:** A kernel stack overflow is caught and reported instead of corrupting memory, and no stack pages or slots leak when threads exit.
@@ -109,15 +109,15 @@ Tests for the kernel as it existed at milestone 1. Tests for unfinished function
   - The alignment must be zero or a power of two, and the address and file offset must agree modulo the alignment and modulo the page size, as on Linux.
   - A segment no longer has to start on a page boundary: the loader places its data at the right offset in the page and zeroes the rest. Linux toolchains produce such segments.
 - [x] Reject overlapping or conflicting load segments: two segments may not share a page (`error.Overlap`), since a page has one set of permissions.
-  - This closes the leak where a second segment (or the user stack) mapped over an existing page replaced it without freeing the old page. `vmm.map` itself still replaces silently (2.6).
+  - This closes the leak where a second segment (or the user stack) mapped over an existing page replaced it without freeing the old page. `vmm.map` itself refuses to replace a mapping since 2.6.
 - [x] Prevent mapping page zero and reserved user regions (`process.image_limits`).
   - [x] The last user page is never mapped (`vmm.USER_MAP_END`; see the `sysretq` item in 2.5).
   - The first 64 KiB are never mapped (`IMAGE_MIN`, the same as Linux's `mmap_min_addr`).
   - The 8 MiB below the top of the user stack are reserved for the stack (`STACK_RESERVE`, Linux's default stack limit; 16 KiB of it is mapped today), and a program may not be loaded there or above.
 - [x] Cap segment sizes (`memsz`) so one ELF cannot ask for all physical memory.
-  - The segments of one program may take 256 MiB together (`process.MAX_IMAGE_BYTES`), a stand-in until there are per-process limits (2.6).
+  - The segments of one program may take 256 MiB together (`process.MAX_IMAGE_BYTES`), which is also the default memory limit of 2.6; making it follow the machine is a task in 6.4.
   - The loader refuses an image that needs more pages than are free, with some left over for page tables, before it allocates anything.
-  - Not covered: memory that runs out for another reason while page tables are being allocated still panics (`vmm.allocTable`, 2.6).
+  - Memory that runs out while page tables are being allocated is an error since 2.6 (`vmm.allocTable`), not a panic.
 - [x] Verify the entry point is inside an executable loaded segment (`error.BadEntry`).
 - [x] Enforce readable/writable/executable permissions and avoid unintended writable-executable pages (a JIT later needs pages that go from writable to executable with `mprotect`, never both at once; see 9.3).
   - A segment that is both writable and executable is refused (`error.WritableExecutable`), and so is one with no permissions at all.
@@ -138,7 +138,7 @@ The ABI a program sees is described in `docs/syscalls.md`.
 - [x] Move the existing syscalls to Linux's numbers and argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`): `read` 0, `write` 1, `open` 2, `close` 3, and also `sched_yield` 24, `exit` 60 and `gettid` 186. `getchar` and `run` have no Linux equivalent and sit at `0x4D5900` and `0x4D5901` until 6 replaces them.
   - The numbers, error values and flags are in `src/abi/linux.zig`, which the kernel and `app/lib.zig` both import, so there is nothing to keep in sync by hand. A host test compares them with Zig's own table of Linux's values.
   - The calls take Linux's arguments too: `write` takes a descriptor (1 and 2 are the console), paths are NUL-terminated (`uaccess.copyStringFromUser`), `open` takes flags and returns descriptors from 3 up, and an exit status is 8 bits.
-  - Not done here, on purpose: reading descriptor 0 (still `myos_getchar`) and descriptors that can be inherited or duplicated. Both are 6.
+  - Left for 6, on purpose: reading descriptor 0 (done with the terminal, 6.2) and descriptors that can be inherited or duplicated (duplicated: 6.2; inherited: the 6.2 task on inheritance rules and 6.4).
 - [x] Return Linux's negative errno values from every syscall instead of the single `ERR` value; mirror them in `app/lib.zig` (shared, see above).
   - `read` and `write` return a short count when the buffer turns bad partway, as Linux does, instead of failing after a partial transfer.
 - [x] Introduce the per-CPU structure reached through GS, with `swapgs` on every entry from and exit to ring 3, while there is still one CPU (moved from the SMP milestone, so the entry assembly is audited once, in its final shape).
@@ -149,7 +149,7 @@ The ABI a program sees is described in `docs/syscalls.md`.
 - [x] Enable SSE (CR0/CR4) and save and restore the extended CPU state per thread on context switch: XSAVE with the area sized from CPUID, AVX enabled where supported, FXSAVE as the fallback. Build user programs with SSE; the kernel stays soft-float.
   - `src/arch/x86_64/fpu.zig`. The state is switched eagerly, and only between user threads: the kernel never touches these registers, so syscalls, interrupts and kernel threads cost nothing. A user thread's save area is 832 bytes with AVX (512 with FXSAVE), allocated with the thread.
   - AVX-512 is enabled since 9.3, where the CPU has it; AMX stays disabled in XCR0.
-  - Not done: the faster save instructions (XSAVEOPT, XSAVES/compacted format). Measure first (9.2).
+  - The faster save instructions (XSAVEOPT, XSAVES/compacted format) are in the list of known slow paths in 9.2, to measure first.
 - [x] Audit `syscall` entry and exit assembly for register preservation and ABI stack alignment. The audit is written down at the top of `src/arch/x86_64/syscall.zig`. What it changed:
   - The frame now ends in a complete `iretq` frame (12 words, so the stack is 16-byte aligned at the call; checked at compile time and by an assertion on every syscall).
   - SFMASK now also clears NT and IOPL on entry. A program can set NT, and an `iretq` in ring 0 with NT set faults.
@@ -192,7 +192,7 @@ The ABI a program sees is described in `docs/syscalls.md`.
 - [x] Test from ring 3 that a program spawning itself recursively until memory runs out gets an error from `run` and the kernel survives with no leak (`/test/recurse`, with all but 4 MiB of memory taken first so the chain is dozens of processes, not thousands).
 - [x] Add per-process resource limits (memory, descendants, open files) so one program cannot starve the rest (`process.Limits`, inherited by child processes).
   - Memory: every page of physical memory the process takes: its program, its stack, the page tables of its address space and its thread's kernel stack. A program that does not fit is not started (`ENOMEM`). The limit is 256 MiB by default. The test compares the charge with what really left the allocator, and checks the limit is exact (that many pages are enough, one less is not).
-  - Processes cannot ask for more memory yet, so the limit is checked once, at start. Charging later requests is a task in 5.
+  - At first the limit was checked once, at start; since 5 every page a process gets later is charged too.
   - Descendants: processes alive below a process, 1024 by default. Starting one more fails with `EAGAIN`.
   - Open files: 16 descriptors by default, which is also the size of the table (`EMFILE`).
   - What this does and does not give: one program and everything it starts are bounded, and the kernel survives memory running out. The default limits add up to far more than the machine has, so a program can still use up memory and make other programs' requests fail (as on Linux by default). Reading and lowering limits, and a default that follows the machine's memory, are tasks in 6.4; dividing memory between unrelated programs needs accounting per user or group, which is not planned yet.
@@ -214,7 +214,7 @@ The ABI a program sees is described in `docs/syscalls.md`.
 - [x] Handle children that exit before the parent begins waiting. The exit status is kept in the `Process` structure for as long as anyone holds a reference, so `wait` returns at once however late it is called. Before, the status was written into the waiting thread, which had to be blocked already.
 - [x] Handle parents that exit before their children: the children are handed to the parent's own parent (or to nobody), so `Process.parent` always points at a process that has not exited and the descendant counts (2.6) stay right.
   - No syscall can cause this yet, since `myos_run` waits for its child. The kernel test builds the situation directly.
-  - Not done: reparenting to an init process that collects orphans' exit statuses. Nobody can ask for an orphan's status, so nothing is kept; revisit with `fork`/`wait4` (6.4).
+  - Reparenting to an `init` process that collects orphans' exit statuses is the `init` task in 6.4, tested from ring 3 by the orphan task there.
 - [x] Reap each exited thread/process exactly once (checked by assertions on the thread's queue and state, on tearing a process down, and on the reference count; the tests compare threads created with threads reaped).
 - [x] Close open descriptors and free all resources on process exit and failed spawn. Files are now closed at exit instead of when the thread is reaped, which will matter once closing has effects others see (pipes). Failed spawns are covered by the 2.6 allocation-failure sweep.
 - [x] Stress-test repeated spawn/exit, wait, wakeup, orphaning, and failure paths (`helpers.lifecycleStress`: 40 rounds of processes waited for at once, late and in reverse order, never waited for, killed by a fault, starting children, cut off by a limit, and failing to start; afterwards no process, thread, stack, page or heap byte is left).
@@ -224,14 +224,14 @@ Pipes, blocking I/O, sleep and interrupt-driven drivers need these, and SMP (mil
 - [x] Add interrupt-aware spinlocks with interrupt-state restoration, as real atomic locks from the start (`sync/spinlock.zig` on the atomic `sync/raw_spinlock.zig`).
   - The atomic part is tested on the host with four real threads, the only place it can meet true parallelism before milestone 3.
   - A lock that stays held absurdly long (taken twice, or never released) is a panic rather than a silent hang.
-  - The physical allocator, the heap and the kernel stack allocator use them now. Still protected by turning interrupts off only, for 3.1 and 3.4: the scheduler's queues, process bookkeeping, the page tables, and the drivers.
+  - The physical allocator, the heap and the kernel stack allocator used them first; the scheduler's queues, process bookkeeping and the page tables got theirs in 3.1. The one driver without a lock (NVMe) has a task in 11.2.
 - [x] Add wait queues and replace the single-`waiter` pointers (keyboard, process wait) with them (`sync/wait_queue.zig`: any number of waiters, woken in arrival order, one or all, with an optional timeout).
   - Several programs can now wait for a key; each key goes to the one that has waited longest.
   - On one CPU the rule "check the condition and wait with interrupts off" is enough to never lose a wake-up. With several, the check and the wait must be under a lock the waker also takes (3.1).
-- [x] Add mutexes for code that may block while holding a lock (`sync/mutex.zig`). `unlock` hands the mutex to the longest waiter, which owns it before it runs, so nobody starves. Nothing in the kernel uses one yet; the first users are expected in 6 (pipes, the terminal).
+- [x] Add mutexes for code that may block while holding a lock (`sync/mutex.zig`). `unlock` hands the mutex to the longest waiter, which owns it before it runs, so nobody starves. The first user is `/tmp` (6.1).
 - [x] Add kernel timers: a timeout queue driven by the timer tick, for sleep, driver timeouts and later TCP (`timer.zig` with the ordering in `sync/timer_queue.zig`; `sleepTicks`, `sleepMs`, and `WaitQueue.waitTimeout`).
   - Resolution is one tick (10 ms). The queue is a sorted list: fine for a handful of timers, to be replaced by a heap or a timer wheel when there are many (12, TCP).
-  - No syscall uses it yet (`nanosleep`, `clock_gettime`: 6.4).
+  - `nanosleep`, `clock_nanosleep`, `poll` and the futex timeouts use it.
 - [x] Test several waiters on one queue, wake-before-block, timer ordering and expiry, and mutex hand-off under preemption.
   - Host: the timer queue against a model (100 000 random operations), the spinlock under contention.
   - In the kernel: spinlock interrupt state and nesting; wait queue order, rechecked conditions, wake-ups with nobody waiting, timeouts, and being woken and timing out on the same tick; timers firing on their exact tick, cancellation, sleep length against the HPET; a mutex whose holder is preempted, yields and sleeps; keyboard readers.
@@ -241,13 +241,13 @@ From the code review before 2.2. None of these fix a known hole; they shrink wha
 - [x] Enable UMIP when CPU-supported, so ring 3 cannot read kernel table addresses with `sgdt`/`sidt` (`usercopy.init`; tested by `/test/umip`).
 - [x] Add a kernel random-number generator: a CSPRNG seeded from RDSEED/RDRAND where present, plus timing jitter (`src/kernel/random.zig`; the deterministic part, ChaCha with fast key erasure, is `random_core.zig` and tested on the host). Address randomization draws from it; `AT_RANDOM` (4.1) and `getrandom` (6.4) will.
   - It is reseeded from the hardware source after every megabyte of output.
-  - On a CPU with neither instruction the seed rests on timer jitter alone, which is weak; boot says so in the log. Interrupt timing is not mixed in yet (`random.addEntropy` exists for it): do that with the input drivers of 6.2.
+  - On a CPU with neither instruction the seed rests on timer jitter alone, which is weak; boot says so in the log. Mixing in interrupt timing is a task in 6.2.
 - Stack protectors: moved to 13. The compiler cannot build them for the kernel yet (see there), so they are not part of this milestone.
 - [x] Add a speculation barrier after the user range check in the user-copy path, and audit other user-controlled indexes (syscall number, file descriptor) for Spectre v1 (`src/arch/x86_64/nospec.zig`).
   - `user_copy` starts with `lfence`, so it cannot begin copying before the range check on the user address is decided.
   - File descriptors index the descriptor table through `nospec.index`, which clamps without a branch.
   - The syscall number is not an index: the dispatcher is a `switch` over scattered numbers, compiled to comparisons. Check again if it becomes a table.
-  - Not done: the other Spectre variants (branch target injection and later ones) and their mitigations (retpolines, IBRS/IBPB, STIBP). See 13.
+  - The other Spectre variants (branch target injection and later ones) and their mitigations (retpolines, IBRS/IBPB, STIBP) are a task in 13.
 - [x] Decide on kernel page-table isolation: detect CPUs that need it (Meltdown) and either implement it or refuse to run untrusted code on them. Decided: not implemented. The kernel checks the CPU at boot (`src/arch/x86_64/meltdown.zig`, rule tested on the host) and refuses to boot on an affected one, since any program could read all memory there; `-Dallow-meltdown` turns that into a warning. Processors made since about 2019, and all AMD ones, are not affected.
 - [x] Randomize the kernel's load address and the user stack (KASLR/ASLR).
   - The kernel is a position-independent executable, and `kaslr: yes` in `limine.conf` has the bootloader load it at a random address in the top 2 GiB. Backtraces take the offset into account and print it. `MYOS_KASLR=no scripts/build.sh` turns it off for debuggers.
@@ -329,12 +329,12 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
 - [x] Initialize separate GDT/TSS, emergency (IST) stacks and guarded stacks for each CPU (`gdt.Tables`). A CPU that is started gets its four emergency stacks and its kernel stack from `kstack`, each with a guard page. The boot CPU's emergency stacks stay in `.bss`, unguarded: they are needed before there is memory management.
 - [x] Add a speculation barrier (`lfence`) after the conditional `swapgs` in `isr_common` and `isr_paranoid`, where the two paths meet, so it covers both. Checked against Linux's entry code (`FENCE_SWAPGS_KERNEL_ENTRY` at the join in `error_entry` and `paranoid_entry`; nothing on the way out). Linux enables it only where SMAP does not hold during speculation or programs can set the GS base themselves; MyOS always has it.
 - [x] Test per-CPU state and `swapgs` transitions (syscalls, interrupts from ring 0 and ring 3) with one and several CPUs: the existing entry and exit tests run in both the one-CPU and the four-CPU scenario, and the CPU test checks every CPU's structure, tables, stacks, GS base and timer interrupts (from ring 0).
-  - Left for 3.4: syscalls and interrupts from ring 3 on a CPU other than the boot CPU. No program runs there until those CPUs take threads.
+  - Syscalls and interrupts from ring 3 on the other CPUs came with 3.4, when those CPUs began taking threads; the four-CPU runs cover them.
 
 ### 3.3 Bring up application processors
 - [x] Request SMP information through Limine (the MP request; x2APIC is not asked for).
 - [x] Start APs and initialize CPU-local structures (`arch/x86_64/smp.zig`): one at a time, each onto the kernel's page tables, its own GDT, TSS, GS base and kernel stack, as a thread of its own.
-  - A started CPU handles its interrupts and halts in between; it does not take threads from the ready queue yet (`PerCpu.runs_threads`). That waits for 3.4: an address space must not be freed while another CPU has it loaded, and a kernel stack must not be unmapped while another CPU's TLB still maps it.
+  - A started CPU handles its interrupts and halts in between; at first it did not take threads from the ready queue (`PerCpu.runs_threads`); that came with 3.4, once an address space must not be freed while another CPU has it loaded, and a kernel stack must not be unmapped while another CPU's TLB still maps it.
 - [x] Apply the per-CPU control-register settings on every AP: SMEP, SMAP, UMIP, CR0.WP, the `syscall` MSRs and the extended-state setup from 2.5, and the Meltdown check. Each CPU reads back what it set, and the kernel panics if it differs from the boot CPU's.
 - [x] Configure local APIC/timer and interrupts per CPU. Every CPU's timer runs at the rate measured on the boot CPU. Time is kept by the boot CPU alone: its tick advances the clock and runs the timers; the others' ticks drive only their own scheduling. Device interrupts all go to the boot CPU.
 - [x] Print and test online CPU counts (`N of M CPUs online`; QEMU scenario `tests_smp` with four CPUs, next to the one-CPU runs, in CI).
@@ -350,7 +350,7 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
   - A CPU that reports a panic or a kernel fault halts the others first, with a non-maskable interrupt, so the report comes out whole (QEMU scenario `panic_smp`).
 - [ ] Add CPU affinity/load balancing if needed. Not needed with one queue; comes back with per-CPU queues.
 - [x] Synchronize PMM, heap, page tables, and drivers: each has its lock (3.1), and all are used from every CPU at once by the stress test below.
-  - Still for one user at a time: the NVMe driver, which polls and has no lock. It is used by its test only; it gets one with the block layer (11).
+  - The NVMe driver, which polls and has no lock, is used by its test only; its lock is a task in 11.2.
 - [x] Implement cross-CPU TLB shootdowns.
   - `vmm.unmap` clears the entries, has every CPU concerned flush, and only then frees page tables and hands back the page. A kernel stack is unmapped with one flush for all its pages (`vmm.unmapRange`).
   - An address space is taken away from every CPU that has it loaded before it is freed (`vmm.unloadRoot`).
@@ -359,24 +359,22 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
   - Decided: per-CPU caches of free pages in front of the bitmap, as Linux's per-CPU page lists (`pmm.zig`). Each CPU keeps up to 64 pages under a lock of its own and moves 32 at a time to and from the bitmap; a third bitmap marks cached pages, so double frees are still caught. When the bitmap is empty the other CPUs' caches are emptied before an allocation fails. LLFree stays the candidate for when 2 MiB frames are needed (9.2): it is a change to the bitmap behind the caches, not to them.
 - [x] Give the kernel heap size classes with a per-CPU cache of free objects, replacing the first-fit list under one lock (`docs/research.md`: magazines, snmalloc).
   - `heap.zig`: 14 size classes up to 2 KiB, cut from 32 KiB slabs aligned to their size; each CPU keeps up to 16 free blocks per class under a lock of its own and moves 8 at a time to and from the slabs. A slab whose blocks are all free goes back to the first-fit list, which stays for larger blocks. When memory runs out, every CPU's blocks are given back first. Each CPU's caches (pages and blocks) are made as it comes up. The stress test frees blocks of every class on other CPUs than they came from.
-  - Not done: frees from another CPU go to the freeing CPU's cache, not back to the owner's (snmalloc's message passing). Measure first (9.2).
 - [x] Preempt on wake-up, or otherwise bound how long a woken thread waits: with every CPU busy it goes to the tail of the queue and waits for a running thread's slice to end, up to 50 ms. Futex-heavy programs depend on it (7).
   - `thread.preemptForWoken`: when a woken thread finds no idle CPU, the CPU whose thread has used most of its slice switches at once (an interrupt, `ipi.PREEMPT_VECTOR`; on the waking CPU itself, at the next tick, which for a timer wake-up comes right after). A thread that has not run a full tick is left alone, so two threads waking each other cannot keep a third from running. Test: a thread sleeping while every CPU spins runs again within a tick of its timer (it took up to two before, and up to a slice with more threads).
-  - Still a FIFO queue: with more ready threads than CPUs, the woken one waits behind them. Priorities or per-CPU queues come with 9.2's measurements.
 - [x] Stress-test simultaneous allocations, processes, interrupts, and I/O. Three tests run with every CPU taking threads:
   - programs: six threads each run seven programs (extended state, long syscalls, a crash, fresh memory), so processes start, are preempted, move between CPUs, die and are torn down everywhere at once, and memory is back afterwards;
   - the kernel: eight threads use the page allocator, the heap, kernel stacks, a spinlock, a mutex and a wait queue with timeouts that run out as the wake-up comes (the timer fires on the boot CPU, the waker runs anywhere);
   - the TLB: threads on every CPU read a kernel page until it is in their TLBs, then it is unmapped and replaced, and nobody may see the old page.
-  - Not covered: I/O, of which there is none to do in parallel yet.
+  - I/O, of which there is none to do in parallel yet, has a stress task in 11.1.
 - [x] Run the QEMU test scenarios with several CPUs (`-smp 4`) in CI from here on, next to the single-CPU run: `tests_smp` runs the whole suite on four CPUs, and `panic_smp` a crash.
   - All but seven of the in-kernel tests run with every CPU taking threads; the seven say why they cannot (`docs/testing.md`).
   - Getting there showed two things the kernel had wrong on several CPUs. A process's memory was freed only when its thread was, after its waiters had been woken, so a parent could find its last child's memory still taken: `process.exit` frees the address space first now. And two keyboard readers woken for two keys could take them in the wrong order: readers are served by number now.
-- [ ] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
+- [x] Add a test run under KVM where the machine supports it: QEMU's emulation hides races and timing bugs that real parallel execution shows.
   - `scripts/test-qemu.sh` has it as scenario `tests_kvm` (four CPUs, the host's own CPU), skipped where `/dev/kvm` cannot be used or the kernel refuses the host CPU. It passes on the development machine (AMD Zen 5), also run a hundred times over.
   - The four tests that failed under KVM at first were the tests' fault: one wrote a reserved bit of the x87 control word as 0, which a real CPU reads back as 1 (three tests used that program); one needed timer interrupts to land inside syscalls and gave up after a fixed number of runs, which a fast CPU finishes between two ticks.
-  - Open: CI does not run it. The hosted runners would need `/dev/kvm` opened up, and their CPUs differ from run to run.
+  - CI runs it: the hosted runners have `/dev/kvm`, and a udev rule opens it to the runner's user. It runs on whatever CPU the runner has; one the kernel refuses (Meltdown) is skipped, not failed.
 - [x] Measure what the emergency stacks really use, now that every CPU has four, and size them by that. Measured builds record the deepest use (`gdt.istPeak`); the test run prints it and fails past three quarters, and every crash report says how much it took. The most seen: 4.4 KiB for a double-fault report in a Debug build, 2.8 KiB optimized, 3.5 KiB for a debug trap that ends a process. They are 8 KiB now, down from 16, each with its own guard on the CPUs started after boot.
-  - [ ] Linux has 4 KiB. To get there: do as Linux does and move to the thread's own stack before doing any work when the trap came from a program, and make the crash report's frames smaller (the 512-byte print buffer and the formatting under it are most of a Debug report).
+  - [x] Linux has 4 KiB. To get there: do as Linux does and move to the thread's own stack before doing any work when the trap came from a program, and make the crash report's frames smaller (the 512-byte print buffer and the formatting under it are most of a Debug report). Done: a trap from ring 3 moves its frame to the thread's kernel stack first thing (`isr_paranoid`), a crash report moves to one crash stack (`main.onCrashStack`; only the CPU that stopped the others reports), and `print` formats through a 96-byte buffer instead of 512. The stacks are 4 KiB; the most seen is 1.4 KiB, for a double fault in a Debug build.
 
 **Milestone 3 done when:** Multiple cores safely execute user threads and syscalls concurrently, and CI runs the test suite on several CPUs.
 
@@ -432,7 +430,8 @@ Designed once, demand-paged from the start, instead of an eager `mmap` first and
 - [x] Define user virtual-memory regions: a per-process set of regions with their permissions and backing, which the page-fault handler consults. Tested on the host against a page-by-page model.
 - [x] Add demand paging and overcommit for anonymous memory: garbage collectors reserve huge virtual ranges and commit them piece by piece.
 - [x] Implement `mmap`: anonymous mappings, `MAP_FIXED`, `MAP_NORESERVE`, `PROT_NONE` reservations, and private file-backed mappings (needed by the dynamic loader in 9.3).
-  - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations; `mremap` that shrinks and grows in place. Private file-backed mappings since 9.3. Open: `mremap` that moves a mapping (`MREMAP_MAYMOVE` gets `ENOMEM` today, and allocators copy instead).
+  - Done: anonymous mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`, `PROT_NONE` reservations; `mremap` that shrinks and grows in place. Private file-backed mappings since 9.3. Moving a mapping with `mremap` is the next task.
+- [ ] `mremap` that moves a mapping (`MREMAP_MAYMOVE`): it gets `ENOMEM` today, and allocators copy instead. Move the pages and their page-table entries, with the charge (2.6) unchanged; test growing a mapping that has something right after it.
 - [x] Implement `mprotect`, `munmap` of partial ranges, `madvise(MADV_DONTNEED)` and `brk`, with resource reclamation.
 - [x] Charge every page a process gets after it has started against its memory limit (`process.Limits.max_pages`, 2.6): pages given on demand to `mmap`, `brk` and stack growth, and the page tables they need; give the charge back on `munmap`. Today the limit is only checked when the program is loaded, because nothing else can allocate. A request over the limit fails with `ENOMEM`; a page fault over it follows the out-of-memory policy below. Test that the charge always equals what left the allocator, as the 2.6 test does at start.
 - [x] Give processes a large, guarded user stack that grows on demand (the fixed 16 KiB stack is far too small for runtimes). The stack's region is 8 MiB, Linux's default limit; below it 1 MiB is kept free of mappings.
@@ -471,21 +470,22 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 ### 6.2 Descriptors and I/O
 - [x] Reserve FDs 0/1/2 for stdin/stdout/stderr: a process starts with the three open on the console, as one open file with three descriptors (`open_file.zig`). They are closed, duplicated and replaced like any other.
   - [x] The numbers are reserved since 2.5: `open` returns descriptors from 3 up, and `write` to 1 and 2 reaches the console.
-  - [ ] Still to do: they are not real descriptors. They cannot be closed, redirected or inherited, and `write` handles them as a special case.
+  - [x] They were not real descriptors at first (they could not be closed, redirected or inherited, and `write` handled them as a special case). They are now; inheriting them by new programs is the inheritance task below.
 - [x] Make `read` on descriptor 0 return keyboard input and remove the private `myos_getchar` syscall (`0x4D5900`). Today `read(0, ...)` returns `EBADF` and the shell reads keys with `myos_getchar`. Do it together with the terminal layer below, so blocking, line editing, echo and end of file are designed once; move `app/sh.zig` to `read` and update `docs/syscalls.md`. Done: the shell reads its lines with `read(0)`; `lib.readKey` waits for one key with line editing off.
 - [x] Route console I/O through descriptor-backed devices. The console is one open file behind descriptors 0, 1 and 2; reading it goes through the terminal (`tty.zig`).
 - [x] Add serial input (receive interrupt) as a second console input source; the scripted shell tests in 6.3 depend on it. IRQ 4 into the terminal, like a typed key.
 - [x] Add a terminal layer between the input drivers and FD 0: line editing, echo, backspace, and Ctrl+C/Ctrl+D handling. Keep it small; anything richer belongs in user space. `tty_core.zig` (the line discipline alone, host-tested, also against a model of random typing) and `tty.zig` (the lock, the readers in the order they asked, echo to the console, Ctrl+C ending the foreground program). `termios` through `ioctl`, and the size of the window.
 - [x] Support generic open/read/write/close plus `seek` where applicable (`openat`, `lseek`). Done: `open`, `openat`, `read`, `pread64`, `write`, `writev`, `close`, `lseek`, over files, pipes, the console and devices.
-- [ ] Define file-offset, ownership, and descriptor inheritance rules.
+- [ ] Define file-offset, ownership, and descriptor inheritance rules. For inheritance (with `fork`/`execve`, 6.4) the reference count of an open file has to stop relying on one process's lock.
 - [x] Add descriptor duplication and pipes (`dup`/`dup2`/`dup3`, `fcntl(F_DUPFD)`, `pipe`/`pipe2`): `pipe.zig`, a page of buffer, readers and writers that wait and are woken, end of file and `EPIPE` when the other end is closed, `O_NONBLOCK`. Tested from ring 3 (`/test/pipes`), with a thread on each end and with a process that ends while a thread sleeps in a pipe.
-  - Open: `SIGPIPE` (8); inheriting descriptors (with `fork`/`execve`, 6.4), for which the reference count of an open file has to stop relying on one process's lock.
-- [ ] Add `poll` to wait on several descriptors at once (needed by network servers in 12.3 and the compositor in 10.3).
-  - Done: `poll` reports the console, files and pipes and waits with a timeout. Open: it looks again every tick instead of being woken by the descriptor.
-- [ ] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
-  - Done: `fcntl` (`F_DUPFD`, `F_GETFL`, `F_SETFL`, `F_GETFD`), `readlink`, `pread64`, `ioctl` answering `ENOTTY`. `readv` and `pwrite64` since `/tmp`. Open: a terminal's `ioctl`s (with the terminal).
+  - `SIGPIPE` since 8. Inheriting descriptors: the task on inheritance rules above.
+- [x] Add `poll` to wait on several descriptors at once (needed by network servers in 12.3 and the compositor in 10.3).
+  - `poll` reports the console, files, pipes and eventfds and waits with a timeout. It looks again every tick instead of being woken by the descriptor: that is the task on descriptors waking their waiters below.
+- [x] Add the file syscalls runtimes expect: `fcntl`, a terminal subset of `ioctl`, `readlink`, `readv`, `pread`/`pwrite`.
+  - `fcntl` (`F_DUPFD`, `F_GETFL`, `F_SETFL`, `F_GETFD`), `readlink`, `pread64`, `ioctl` answering `ENOTTY` for what is not a terminal. `readv` and `pwrite64` since `/tmp`. The terminal's `ioctl`s came with the terminal: `TCGETS`, `TCSETS*`, `TIOCGWINSZ`, `FIONREAD` (`docs/syscalls.md`).
 - [x] Add `epoll` and `eventfd` on top of `poll`: `epoll.zig`; Go's timers sit on them. Readiness is polled each tick, and `EPOLLET` is treated as level-triggered; descriptors waking waiters themselves would remove both limits.
 - [ ] Let descriptors wake their waiters (pipes, the terminal, eventfds, and sockets later): `poll` and `epoll_wait` then sleep until something happens instead of looking again every tick (10 ms of delay at worst today), and `EPOLLET` can be edge-triggered as on Linux (it is reported as level-triggered now). Watch the open file, not the descriptor number, as Linux does. Network servers (12.3) need this.
+- [ ] Mix the timing of interrupts (keys, the serial line, later disks and the network) into the random generator (`random.addEntropy` exists for it, 2.9). On a CPU without RDSEED and RDRAND the seed rests on timer jitter alone today.
 - [ ] Provide the pseudo-files programs open at startup: `/dev/null`, `/dev/urandom`, `/proc/self/exe`, `/proc/self/maps`, `/proc/cpuinfo` or their minimal equivalents (the list from 4.2 says which).
   - Done: `/dev/null`, `/dev/urandom`, `/dev/random`, `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/meminfo` (`procfs.zig`: text made when the file is opened). Open: `/proc/cpuinfo`, `/proc/stat`, `/proc/self/mountinfo` and `cgroup`, `/sys/devices/system/cpu/*`, which the .NET runtime looks for and does without.
 - [x] Test EOF, partial I/O, invalid descriptors, and cleanup. Done: `/test/syscalls`, `/test/pipes` and `/test/files` from ring 3, with the kernel test checking that nothing stays allocated.
@@ -552,7 +552,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 
 - [x] Implement `rt_sigaction`, `rt_sigprocmask`, `sigaltstack` and `rt_sigreturn`, delivering signals on the return to user mode. `signal.zig`, with the frame laid out as Linux's (`signal_frame.zig`, tested on the host against its offsets). Also `rt_sigpending`, `rt_sigsuspend`, `pause`.
 - [x] Turn user faults into `SIGSEGV`, `SIGBUS`, `SIGFPE` and `SIGILL` with `siginfo` and a register context (including the extended state from 2.5), instead of always killing the process (2.2); runtimes use this for null checks and stack probes. For a program that handles the signal; one that does not is killed as before. `int3` and `into` became usable from user mode for it.
-- [x] Implement `kill`/`tgkill` and default actions; deliver Ctrl+C (6.4) as `SIGINT`. Within the calling process; job-control signals are ignored for now.
+- [x] Implement `kill`/`tgkill` and default actions; deliver Ctrl+C (6.4) as `SIGINT`. Within the calling process; signals to other processes and job control are tasks in 6.4.
 - [x] Interrupt blocking syscalls with `EINTR` or restart them. `thread.interrupted` ends killable waits; `SA_RESTART` restarts the calls Linux restarts; `myos_run` waits through signals, since its child is running already.
 - [x] Check the saved return address and flags that `rt_sigreturn` restores (the remaining `sysretq` item in 2.5): a handler can put anything there. Selectors forced, flags sanitized, RIP classified on the way out like any return; FP images sanitized so `XRSTOR` cannot fault.
 - [x] Test handlers that return, handlers that modify the saved context, nested and masked signals, the alternate stack, and signals sent to another thread on another CPU. `/test/signals` (with another thread sending, on another CPU in the four-CPU runs), the terminal's Ctrl+C reaching a handler, and the fixtures: .NET turning null dereferences and divisions by zero into exceptions, Go recovering from a nil pointer and preempting a spinning goroutine.
@@ -582,10 +582,10 @@ These are dynamically linked against glibc, so MyOS loads the dynamic loader, ma
 
 ### 9.1 .NET Native AOT
 - [ ] Implement what the list from 4.2 shows the .NET runtime still needs. Expected, to be confirmed by the trace: `/proc` and cgroup files for CPU and memory limits, `membarrier`, and thread suspension through signals.
-  - Done for the Native AOT runtime: `membarrier`, `mlock`, `sysinfo`, `statfs`, `get_mempolicy`, `mremap` in place, pipes and real standard descriptors. It runs without the `/proc` and cgroup files and without signals. Open: those files (it sizes its heap by them), and what the JIT runtime adds.
+  - Done for the Native AOT runtime: `membarrier`, `mlock`, `sysinfo`, `statfs`, `get_mempolicy`, `mremap` in place, pipes and real standard descriptors. It runs without the `/proc` and cgroup files and without signals. Those files (it sizes its heap by them) are the pseudo-file task of 6.2; what the JIT runtime adds is in 9.3.
 - [x] Run a .NET Native AOT hello-world built for linux-musl, statically linked, invariant globalization (`tests/fixtures/src/dotnet-hello`): the runtime starts, eight managed threads allocate, the collector runs, on one and four CPUs, two at once, with its memory back afterwards. A stepping stone and a test fixture, not something a developer is asked to build: it shows what the runtime's core needs before dynamic linking exists. (It is linked with `zig cc`, which brings musl; the build machine has none.)
 - [x] Run a .NET Native AOT hello-world built the ordinary way (`dotnet publish -r linux-x64 -p:PublishAot=true`): `tests/fixtures/` builds `dotnet-hello-aot`, position independent and dynamically linked against glibc, with managed threads and a collection, on one and four CPUs. It added `clone3` and `time` to what the kernel knows.
-  - The fixture is linked against a plain glibc, not the build machine's: a distribution built for newer CPUs only marks every program linked on it as needing one (`x86-64-v4` here, which also needs AVX-512 state the kernel does not save yet: 9.2).
+  - The fixture is linked against a plain glibc, not the build machine's: a distribution built for newer CPUs only marks every program linked on it as needing one (`x86-64-v4` here, which also needs AVX-512 state, saved since 9.3).
 - [x] Run one that allocates enough to exercise the GC, then a multi-threaded one. The fixture does both: eight managed threads each allocate a megabyte in small arrays, then a collection is forced and counted.
 - [ ] Test that the .NET garbage collector stops a thread spinning in a tight loop: the runtime interrupts such a thread with a signal (it cannot wait for it to reach a safe point). A thread loops without calls or allocation while the main thread forces collections; the program must end. The fixtures' threads only allocate, so the collector never needed the signal there.
 - [x] Add them to the fixture binaries (4.3) and run them as QEMU tests on several CPUs. Four .NET fixtures: static ahead-of-time, ahead-of-time against glibc, the self-contained folder with the JIT, each on one and four CPUs and under KVM.
@@ -600,8 +600,11 @@ These are dynamically linked against glibc, so MyOS loads the dynamic loader, ma
   - `read`/`write` bounce every 256 bytes through a kernel stack buffer, and `write` goes through the formatter as well.
   - Spawning a program copies the whole file to the heap and then into pages, although the initrd is already in memory (Debug builds: about 1.1 MiB per spawn, debug info included).
   - `print` keeps interrupts off while it writes to the polled serial port: about 22 ms for 256 bytes at 115200 baud, more than two timer ticks.
-  - The kernel heap is first-fit over an address-sorted list with interrupts off; allocation and free are linear in the number of free chunks.
-  - The page allocator scans its whole bitmap for a free page, with interrupts off (a word at a time since 2.10; a free list or per-CPU caches would not scan at all: 3.4).
+  - The kernel heap's blocks over 2 KiB, and its slabs, still come from a first-fit list, linear in the number of free chunks (3.4 put size classes in front for small blocks).
+  - A heap block freed on another CPU goes to that CPU's cache, not back to the one it came from (snmalloc returns them to their owner in batches).
+  - The page allocator scans its bitmap for a free page when a CPU's cache needs filling (a word at a time; 3.4 put per-CPU caches in front).
+  - One ready queue, first in first out: with more ready threads than CPUs, a woken thread waits behind them (3.4 bounds the wait only when there are as many CPUs as threads). Per-CPU queues or priorities.
+  - One lock for all futexes (7), and one lock per address space for faults and mapping changes (5): threads of one process that fault or wait at once meet on them. The research notes have the candidates for the address space.
   - Every switch between two processes reloads CR3 without PCID and flushes the user TLB entries (kernel entries are global and kernel threads do not reload it since 2.10).
   - Every switch between user threads saves and restores the whole x87/SSE/AVX state with plain XSAVE (2.5). XSAVEOPT or XSAVES would skip what has not changed.
   - AVX-512 is enabled where the CPU has it (decided by the programs, not by speed): a distribution built for x86-64-v4 marks everything linked on it as needing such a CPU, and glibc's loader refuses to start that unless the system has AVX-512's state enabled. The save area is 2432 bytes per thread on the development machine (AMD Zen 5), 832 without AVX-512.
@@ -616,13 +619,15 @@ Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
 - [x] File-backed `mmap` (5), private, with the permissions of each segment: a page is read from the file when it is first touched and is the program's own from then on (`user_memory.zig`, regions of kind `file`). Read-only shared mappings are the same thing; writable shared ones are refused, files being read-only.
   - Open: pages of a file that nobody has written are copied per process instead of shared. Sharing them (a page cache, copy-on-write) saves the memory of one C library per process; it is in 13.
 - [x] The calls a loader finds libraries with: `openat`, `fstat`, `newfstatat`, `pread64`, `readlink`, `access`/`faccessat`, `getcwd`; and `set_robust_list`, with `rseq` refused on purpose.
-  - Directories exist for `stat` and `access` since the JIT runtime needed them (it resolves its own path one part at a time). Open: opening and listing them (`getdents64`).
-- [x] Ship glibc's loader and libraries (`ld-linux-x86-64.so.2`, `libc.so.6`, `libm`, `libstdc++`, `libgcc_s`) in the image: `scripts/fetch-sysroot.sh` takes them from Debian 13, pinned by checksum, and `scripts/build.sh` packs them. Not in release images until the licence side of passing them on is decided.
+  - Directories exist for `stat` and `access` since the JIT runtime needed them (it resolves its own path one part at a time); opening and listing them (`getdents64`) came with 6.1.
+- [x] Ship glibc's loader and libraries (`ld-linux-x86-64.so.2`, `libc.so.6`, `libm`, `libstdc++`, `libgcc_s`) in the image: `scripts/fetch-sysroot.sh` takes them from Debian 13, pinned by checksum, and `scripts/build.sh` packs them into test images. Release images carry no C library (decided 2026-11-26): the task below.
 - [x] Run a dynamically linked hello-world built for Linux against glibc; test malformed `PT_INTERP` headers. (`tests/fixtures/` builds `glibc-hello-dynamic`, on one and four CPUs, two at once, memory back afterwards.)
 - [x] Run C, Rust and Go programs built the way a developer builds them, with no flags (`gcc hello.c`, `cargo build --release`, `go build`): `tests/fixtures/` builds `c-hello-gcc`, `rust-hello-cargo`, `go-hello-plain`. The `gcc` one is marked x86-64-v4 by this machine's toolchain and runs where the CPU has AVX-512 (under KVM here); elsewhere it is refused as Linux refuses it.
 - [x] Run the JIT-based runtime: a self-contained `dotnet publish -r linux-x64` hello-world (`dotnet-hello-app` of `tests/fixtures/build.sh`). The host program finds itself through `/proc/self/exe`, loads the runtime from its folder, and the runtime compiles and runs the program, with eight managed threads and a garbage collection, on one and four CPUs, two at once, its memory back afterwards. The untrimmed 80 MB folder runs too (tried by hand with `MYOS_INITRD_EXTRA`); the fixture is the trimmed one.
   - What it needed beyond the ahead-of-time build: directories that exist, `/proc/self/exe`, `/proc/self/maps` (glibc finds the main stack there; without it the runtime reports that it is out of memory), `stat`, more than 16 descriptors, the scheduling-policy calls and `sched_setaffinity`, `getsid`. No signal was delivered.
-  - Open, each tolerated by the runtime today: `memfd_create` with shared mappings (it wants its code mapped twice, writable in one place and executable in another; without that it uses memory that is both), sockets for its diagnostics, FIFOs in `/tmp`, `/proc/self/mountinfo` and cgroup files, `/sys/devices/system/cpu`.
+  - Tolerated by the runtime today, each a task: `memfd_create` with shared mappings and FIFOs in `/tmp` (below), sockets for its diagnostics (12.3), `/proc/self/mountinfo`, cgroup files and `/sys/devices/system/cpu` (6.2).
+- [ ] `memfd_create` and shared mappings of it: the JIT maps its code twice, writable in one place and executable in the other, and without that uses memory that is both (W^X broken for the JIT). Shared pages between two mappings of one object; test that a write through one is seen through the other and that the executable one is never writable.
+- [ ] FIFOs (`mknodat` with `S_IFIFO`, `mkfifo`) in `/tmp`: the .NET runtime makes them for its diagnostics and does without when refused. Opening one end waits for the other, as on Linux; reuse `pipe.zig`.
 - [x] The same published as a single file. Runs (`-p:PublishSingleFile=true -p:PublishTrimmed=true`, one file of 15 MB). Tried by hand with `MYOS_INITRD_EXTRA`; not a fixture, since it would be 15 MB in the repository for what the folder already tests.
 - [x] A way to put a published folder into the image, until there is a writable disk (11) or a network (12): `MYOS_INITRD_EXTRA=<dir> scripts/build.sh` copies the tree under `<dir>` over the image's root.
 - [ ] glibc for release images, without MyOS passing it on (decided 2026-11-26): release images carry no C library, and the user fetches Debian's. First a script run on the user's machine that adds the pinned packages to a downloaded release ISO; later an install command on a running MyOS, once there is a disk that keeps files (11) and a network (12).
@@ -676,9 +681,11 @@ Off the critical path (programs can ship in the initrd). It does not depend on m
 - [ ] Validate LBA ranges, buffer sizes, and alignment.
 - [ ] Add a small block cache with explicit flush (FAT32 writes in 11.5 rely on it for flush ordering).
 - [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, error propagation, and cache hits, eviction and flush.
+- [ ] Stress-test I/O from every CPU at once (several programs reading and writing files on the disk, and later sockets), as 3.4 stress-tests memory and processes.
 
 ### 11.2 NVMe
 - [ ] Implement NVMe write operations.
+- [ ] Give the NVMe driver a lock (or a queue per CPU): today it polls with no lock and is used by its own test only (3.4).
 - [ ] Support multi-page transfers with PRP lists or another valid DMA mechanism.
 - [ ] Add PCI MSI/MSI-X support and switch NVMe from polling to interrupt-driven completion (legacy PCI interrupt routing would need an ACPI AML interpreter; the network driver in 12.1 reuses this).
 - [ ] Validate namespace geometry and bounds.
@@ -748,6 +755,7 @@ Off the critical path (only network programs need it). It can be taken any time 
 
 ### 12.3 Sockets and programs
 - [ ] Define socket create/bind/listen/accept/connect/send/receive/close syscalls (Linux's numbers and layouts).
+- [ ] Unix domain sockets (`AF_UNIX`, stream and datagram): the .NET runtime opens one for its diagnostics (9.3) and many programs talk to local services through them. No network needed.
 - [ ] Implement `ping` and a small TCP client.
 - [ ] Implement a minimal HTTP client or server.
 - [ ] Add network integration tests with a host-side peer.
@@ -793,6 +801,7 @@ The native ABI is Linux's and there is one of it (see the primary goal). These a
 - [ ] CPU and memory usage statistics.
 - [ ] Scheduler tracing and kernel profiling.
 - [ ] Asynchronous I/O and a larger, smarter filesystem cache.
+- [ ] Cover what `check-frames` (2.3) cannot see: a function reached only through a pointer stored in a data table, and assembly that moves RSP by a computed amount. Or build with stack probes (`stack_check`), the fallback if a function ever needs a larger frame.
 
 ---
 

@@ -185,11 +185,43 @@ comptime {
         \\  add $16, %rsp
         \\  iretq
         \\
-        \\# Debug, NMI, double fault, machine check: decide by the GS base MSR
-        \\# (0xC0000101), not by the saved CS. EBX (callee-saved, so it
-        \\# survives the call) remembers whether GS was switched.
+        \\# Debug, NMI, double fault, machine check. From ring 3 the
+        \\# thread's kernel stack is unused, so, as Linux does, the frame
+        \\# moves there and the common path handles it like any interrupt
+        \\# from a program: the emergency stack holds seven words. From
+        \\# ring 0 they stay on it, and decide by the GS base MSR
+        \\# (0xC0000101), not by the saved CS: a #DB or NMI at the first
+        \\# instruction of `syscall_entry` is in ring 0 with the user's GS.
+        \\# EBX (callee-saved, so it survives the call) remembers whether GS
+        \\# was switched.
         \\.global isr_paranoid
         \\isr_paranoid:
+        \\  testb $3, 24(%rsp)
+        \\  jz 5f
+        \\  swapgs
+        \\  push %rax
+        \\  push %rbx
+        \\  mov %gs:8, %rax
+        \\  sub $56, %rax
+        \\  mov 16(%rsp), %rbx
+        \\  mov %rbx, 0(%rax)
+        \\  mov 24(%rsp), %rbx
+        \\  mov %rbx, 8(%rax)
+        \\  mov 32(%rsp), %rbx
+        \\  mov %rbx, 16(%rax)
+        \\  mov 40(%rsp), %rbx
+        \\  mov %rbx, 24(%rax)
+        \\  mov 48(%rsp), %rbx
+        \\  mov %rbx, 32(%rax)
+        \\  mov 56(%rsp), %rbx
+        \\  mov %rbx, 40(%rax)
+        \\  mov 64(%rsp), %rbx
+        \\  mov %rbx, 48(%rax)
+        \\  pop %rbx
+        \\  xchg (%rsp), %rax
+        \\  mov (%rsp), %rsp
+        \\  jmp isr_common_fence
+        \\5:
         \\  push %rax
         \\  push %rbx
         \\  push %rcx
@@ -343,14 +375,7 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
             return;
         }
     }
-    if (from_user and !kernel_fatal) { // kill the process, keep the kernel
-        const p = thread.current().process.?;
-        if (out_of_memory) root.print("\n*** thread {d} ({s}): no memory for the page it touched (its limit, or the machine's)\n", .{ thread.id(), p.name });
-        root.print("\n*** thread {d} ({s}): {s} in user mode (vector {d}, error 0x{x}), killed\n", .{ thread.id(), p.name, name, f.vector, f.error_code });
-        root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.rsp, f.rflags });
-        if (f.vector == VECTOR_PAGE_FAULT) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
-        process.exit(process.EXIT_KILLED); // the parent sees exit status 255 for a crash
-    }
+    if (from_user and !kernel_fatal) killForFault(f, name, out_of_memory); // kill the process, keep the kernel
     if (f.vector == VECTOR_DEBUG) {
         if (handlers[VECTOR_DEBUG]) |h| return h(f); // a test is watching ring 0 debug traps
     }
@@ -360,9 +385,48 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
             return;
         }
     }
+    reportKernelFault(f, name, from_user);
+    if (f.vector == VECTOR_BREAKPOINT) return; // breakpoint: resume after int3
+    root.halt();
+}
+
+/// The end of a process whose program faulted and does not handle it.
+/// Kept out of `interruptHandler`, as is the report below, so that the
+/// handler's own stack frame stays small: it runs on the emergency stacks.
+noinline fn killForFault(f: *const Frame, name: []const u8, out_of_memory: bool) noreturn {
+    const p = thread.current().process.?;
+    if (out_of_memory) root.print("\n*** thread {d} ({s}): no memory for the page it touched (its limit, or the machine's)\n", .{ thread.id(), p.name });
+    root.print("\n*** thread {d} ({s}): {s} in user mode (vector {d}, error 0x{x}), killed\n", .{ thread.id(), p.name, name, f.vector, f.error_code });
+    root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.rsp, f.rflags });
+    if (f.vector == VECTOR_PAGE_FAULT) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
+    process.exit(process.EXIT_KILLED); // the parent sees exit status 255 for a crash
+}
+
+var crash_frame: Frame = undefined;
+var crash_name: []const u8 = "";
+var crash_from_user = false;
+
+/// The report of a fault in the kernel.
+noinline fn reportKernelFault(f: *const Frame, name: []const u8, from_user: bool) void {
     // A kernel fault. Unless it is a breakpoint, this CPU halts after the
-    // report, and it may hold the console lock or any other: print regardless.
-    if (f.vector != VECTOR_BREAKPOINT) root.seizeConsole();
+    // report, and it may hold the console lock or any other: print
+    // regardless, on the crash stack.
+    if (f.vector != VECTOR_BREAKPOINT) {
+        root.seizeConsole();
+        crash_frame = f.*;
+        crash_name = name;
+        crash_from_user = from_user;
+        root.onCrashStack(&reportOnCrashStack);
+    }
+    printKernelFault(f, name, from_user);
+}
+
+fn reportOnCrashStack() noreturn {
+    printKernelFault(&crash_frame, crash_name, crash_from_user);
+    root.halt();
+}
+
+fn printKernelFault(f: *const Frame, name: []const u8, from_user: bool) void {
     root.print("\n*** {s} (vector {d}, error 0x{x})\n", .{ name, f.vector, f.error_code });
     root.print("RIP=0x{x} CS=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.cs, f.rflags });
     root.print("RSP=0x{x} RAX=0x{x} RBX=0x{x}\n", .{ f.rsp, f.rax, f.rbx });
@@ -376,12 +440,10 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
         else => {},
     }
     if (!from_user) backtrace.print(.{ .pc = f.rip }, f.rbp);
-    // Measured builds say how much of an emergency stack a report takes
-    // (this one, if it is on one): what their size is decided by.
+    // Measured builds say how much of an emergency stack the way here took
+    // (the report itself is on the crash stack): what their size is
+    // decided by.
     if (gdt.istPeak()) |peak| root.print("emergency stacks: deepest use {d} of {d} bytes\n", .{ peak, gdt.IST_STACK_SIZE });
-
-    if (f.vector == VECTOR_BREAKPOINT) return; // breakpoint: resume after int3
-    root.halt();
 }
 
 /// Extra diagnostics for a double fault: the CPU could not deliver an

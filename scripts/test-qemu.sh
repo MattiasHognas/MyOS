@@ -176,7 +176,7 @@ run_scenario() {
             expect_line '^MYOS_STACK_PEAK bytes=[1-9][0-9]* of=16384 limit=12288$'
             expect_line '^\[PASS\] kernel stack usage below the warning level$'
             # So is the deepest use of an emergency stack (a debug trap that ends a process).
-            expect_line '^MYOS_IST_PEAK bytes=[1-9][0-9]* of=8192$'
+            expect_line '^MYOS_IST_PEAK bytes=[1-9][0-9]* of=4096$'
             expect_line '^\[PASS\] emergency stack usage below the warning level$'
             if grep -q 'of its kernel stack' "$log"; then fail "a thread came close to filling its kernel stack: $(grep 'of its kernel stack' "$log" | tr '\n' ' ')"; fi
             # User-fault diagnostics: process, fault, vector, error code, then RIP/RSP, and CR2 for page faults.
