@@ -104,9 +104,12 @@ Linux calls, with Linux's numbers:
 | 35 | `nanosleep(req, rem)` | Resolution is one timer tick (10 ms), rounded up. `rem` is never written: nothing interrupts a sleep yet. |
 | 39 | `getpid()` | The ID of the process's first thread. |
 | 41 | `socket(domain, type, protocol)` | No networking yet: `EAFNOSUPPORT`. |
-| 56 | `clone(flags, stack, ptid, ctid, tls)` | New threads only: `flags` must include `CLONE_VM`, `CLONE_SIGHAND` and `CLONE_THREAD` (`EINVAL` otherwise; there is no `fork` yet). `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. |
+| 56 | `clone(flags, stack, ptid, ctid, tls)` | With `CLONE_THREAD` a new thread (it must come with `CLONE_VM` and `CLONE_SIGHAND`): `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. Without it, a new process as `fork` makes, the low byte of `flags` the signal its parent gets when it ends; `CLONE_VFORK` holds the caller until the child calls `execve` or ends. `CLONE_VM` without `CLONE_THREAD` gets a copy of the memory, not the same memory (Linux shares it; `vfork` and `posix_spawn` work either way, but what the child writes before `execve` stays its own). `EINVAL` for sharing the descriptor table or the signal actions between processes. |
+| 57 | `fork()` | A new process: a copy of the caller's memory (every page copied: no copy-on-write yet), the same open files (descriptors and their close-on-exec flags copied), working directory, signal actions, mask and alternate stack, and limits; one thread with the caller's registers, returning 0. The parent gets the child's ID, and `SIGCHLD` when it ends. `EAGAIN` past the descendant limit, `ENOMEM`. |
+| 58 | `vfork()` | `fork` that holds the caller until the child calls `execve` or ends. |
 | 60 | `exit(status)` | Ends the calling thread. The last thread's status is the process's: the parent sees `status & 0xff`. |
-| 62 | `kill(pid, sig)` | The calling process only (`ESRCH` otherwise): any of its threads that does not block the signal takes it. Signal 0 checks. |
+| 61 | `wait4(pid, status, options, rusage)` | Collects a child that has ended, any (`pid` -1, or 0 and below: no process groups yet) or the one given, and writes its status as Linux does (`code << 8`, or the signal that ended it; a fault the kernel killed it for counts as that fault's signal). An ended child is a zombie until then, or until its parent ends. `WNOHANG` returns 0 if none has ended; `WUNTRACED` and `WCONTINUED` change nothing yet. `rusage` is zeroes. `ECHILD`, `EINTR`, `EINVAL`, `EFAULT`. |
+| 62 | `kill(pid, sig)` | Any process by its ID; `-1`: every process but `init` and the caller, then the caller; `0` and `-pid` of the caller: the caller (no process groups yet). Any of the process's threads that does not block the signal takes it. Signal 0 checks. An ended process not yet collected takes nothing, without an error. `ESRCH`, `EINVAL`. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
 | 74 | `fsync(fd)` | Nothing is ever waiting to be written: 0. |
@@ -124,6 +127,7 @@ Linux calls, with Linux's numbers:
 | 91 | `fchmod(fd, mode)` | No permissions exist: accepted for a file that can be written, `EROFS` otherwise. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
+| 110 | `getppid()` | The parent's process ID; an orphan's new parent's; 0 for none. |
 | 124 | `getsid(pid)` | Every process is its own session. |
 | 127 | `rt_sigpending(set, size)` | The signals waiting that the thread blocks. |
 | 130 | `rt_sigsuspend(mask, size)` | Waits with `mask` blocked instead until a signal is handled; the old mask is back after the handler. `EINTR`. |
@@ -175,7 +179,7 @@ Linux calls, with Linux's numbers:
 | 319 | `memfd_create(name, flags)` | Not offered yet: `ENOSYS`, on purpose. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
 | 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
-| 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules: new threads only. Fields past the first version of the structure must be zero. |
+| 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules (threads, and processes with `exit_signal`). Fields past the first version of the structure must be zero. |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`. |
 | 441 | `epoll_pwait2(epfd, events, max, timeout_ts, sigmask, size)` | `epoll_pwait` with the timeout as a `timespec`. |
 

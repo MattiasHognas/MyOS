@@ -507,11 +507,11 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 
 ### 6.4 Process control and time
 - [ ] Decide how programs are started, and replace the private `run` syscall: either `clone(CLONE_VM|CLONE_VFORK)` plus `execve` (what musl's `posix_spawn` uses; no `fork` or copy-on-write needed), or one private spawn syscall kept outside Linux's numbers.
-- [ ] Assign stable PIDs and track parent-child relationships.
-- [ ] Define generalized process waiting and exit-code handling (`wait4`).
+- [x] Assign stable PIDs and track parent-child relationships. A process's ID is its first thread's, and stays until it is collected; `getppid`; every process can be found by its ID (`kill`).
+- [x] Define generalized process waiting and exit-code handling (`wait4`). `fork`, `vfork`, `clone` and `clone3` make processes (memory copied eagerly; copy-on-write is in 13); an ended child is a zombie in its parent's list until `wait4` collects it, with Linux's status encoding, the signal that ended it included; orphans go to `init` when there is one. Tested from ring 3 (`/test/fork`).
 - [x] Support Ctrl+C termination of foreground jobs. A program the shell runs is the foreground while the shell waits for it (`process.giveForeground`: only from whoever has the terminal, or from nobody); Ctrl+C ends it with status 130 through `process.terminate`, which any thread can now ask of a process.
 - [ ] Job control: process groups and sessions (`setpgid`, `getpgid`, `setsid`, a terminal foreground group with `TIOCSPGRP`), and `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU` stopping a process and `SIGCONT` continuing it (Ctrl+Z, `fg`, `bg`). Today the stop signals and `SIGCONT` are ignored, and `TIOCSPGRP` is accepted and changes nothing.
-- [ ] Signals between processes: `kill` to another process (and to a group, `-pgid`), with permission rules once there are users; `SIGCHLD` to a parent when a child ends. Today `kill` reaches only the calling process (`ESRCH` otherwise). Comes with `fork` and `wait4` above.
+- [x] Signals between processes: `kill` to another process (and `-1`, everyone), `SIGCHLD` (or the signal `clone` names) to a parent when a child ends. Sending to a process group (`-pgid`) is part of the job-control task above; permission rules wait for users (13).
 - [ ] Add monotonic timekeeping and a sleep syscall (`clock_gettime`, `nanosleep`), on a calibrated TSC clock where the TSC is invariant and HPET otherwise: runtimes read the clock constantly. `nanosleep` sits on the kernel timers of 2.8, whose resolution is one tick (10 ms): decide whether that is enough or sleeps need a one-shot timer.
 - [ ] Read wall-clock time from the RTC and expose it to userspace (FAT32 timestamps in 11.5 need it).
 - [ ] Add `getrandom`, `uname`, `getpid`/`gettid`, `sched_getaffinity`, `sched_yield`, `prlimit`/`getrlimit`.
