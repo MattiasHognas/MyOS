@@ -232,8 +232,9 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
                 \\MemAvailable:   {d: >8} kB
                 \\SwapTotal:             0 kB
                 \\SwapFree:              0 kB
+                \\AnonHugePages:  {d: >8} kB
                 \\
-            , .{ total, free, free });
+            , .{ total, free, free, @import("../arch/x86_64/vmm.zig").huge_mapped.load(.monotonic) * 2048 });
         },
     }
 }

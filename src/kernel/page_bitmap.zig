@@ -113,6 +113,47 @@ pub const PageBitmap = struct {
         return null;
     }
 
+    /// Take 512 free pages that start at a multiple of 512 (2 MiB of
+    /// memory, aligned as a large page must be) and return the first one's
+    /// number, or null if there is no such run. Each is given back on its
+    /// own with `free`. Looks at 8 words (512 pages) at a time, from the
+    /// start: large pages are few next to small ones.
+    pub fn allocAligned512(self: *PageBitmap) ?usize {
+        if (self.free_count < 512) return null;
+        const words = bytesFor(self.total) / 8;
+        var w: usize = 0;
+        while (w + 8 <= words) : (w += 8) {
+            var all_free = true;
+            for (w..w + 8) |i| {
+                if (self.usedWord(i) != 0) {
+                    all_free = false;
+                    break;
+                }
+            }
+            if (!all_free) continue;
+            @memset(self.used[w * 8 ..][0..64], 0xFF);
+            self.free_count -= 512;
+            return w * 64;
+        }
+        return null;
+    }
+
+    /// Give back the 512 pages from `first` (a multiple of 512) at once, as
+    /// `allocAligned512` took them. Refused, with nothing changed, unless
+    /// every one of them is managed and taken.
+    pub fn free512(self: *PageBitmap, first: usize) FreeError!void {
+        if (first % 512 != 0 or first + 512 > self.total) return error.OutOfRange;
+        const w = first / 64;
+        for (w..w + 8) |i| {
+            const managed = std.mem.readInt(u64, self.managed[i * 8 ..][0..8], .little);
+            if (managed != ~@as(u64, 0)) return error.NotManaged;
+            if (self.usedWord(i) != ~@as(u64, 0)) return error.NotAllocated;
+        }
+        @memset(self.used[w * 8 ..][0..64], 0);
+        self.free_count += 512;
+        if (first < self.hint) self.hint = first;
+    }
+
     /// Give `page` back. Nothing changes if it is refused.
     pub fn free(self: *PageBitmap, page: usize) FreeError!void {
         if (page >= self.total) return error.OutOfRange;

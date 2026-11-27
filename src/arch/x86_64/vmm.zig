@@ -156,6 +156,8 @@ fn freeTable(phys: u64, level: u6) void {
         if (e & PRESENT == 0) continue;
         if (level == 0) {
             if (e & SHARED == 0) pmm.free(e & ADDR_MASK);
+        } else if (level == 1 and e & HUGE != 0) {
+            freeHugePages(e & ADDR_MASK);
         } else freeTable(e & ADDR_MASK, level - 1);
     }
     pmm.free(phys);
@@ -385,6 +387,89 @@ pub fn moveUserPage(root: u64, from: u64, to: u64, tables_added: *usize) MapErro
     return true;
 }
 
+/// Map the 2 MiB page at `phys` (512 pages from `pmm.allocHugeZeroed`) at
+/// `virt`, both 2 MiB aligned, counting the page tables added. Fails with
+/// `error.AlreadyMapped` if anything is mapped in those 2 MiB, or a page
+/// table is there for them.
+pub fn mapHugeCounting(root: u64, virt: u64, phys: u64, flags: u64, tables_added: *usize) MapError!void {
+    const before = userTablePagesOnPath(root, virt);
+    try map(root, virt, phys, flags, true);
+    tables_added.* = userTablePagesOnPath(root, virt) - before;
+    _ = huge_mapped.fetchAdd(1, .monotonic);
+}
+
+/// 2 MiB user pages mapped now, in all address spaces (`AnonHugePages`
+/// of `/proc/meminfo`).
+pub var huge_mapped: std.atomic.Value(usize) = .init(0);
+
+/// Whether nothing is mapped in the 2 MiB at `virt` (aligned) under
+/// `root`, and no page table is there for them: where a 2 MiB page can go.
+pub fn blockEmpty(root: u64, virt: u64) bool {
+    var t = table(root);
+    var level: u6 = 3;
+    while (level > 1) : (level -= 1) {
+        const e = t[index(virt, level)];
+        if (e & PRESENT == 0) return true;
+        if (e & HUGE != 0) return false;
+        t = table(e & ADDR_MASK);
+    }
+    return t[index(virt, 1)] & PRESENT == 0;
+}
+
+/// Free the 512 pages of a 2 MiB page, one by one.
+fn freeHugePages(phys: u64) void {
+    freeWholeHuge(phys);
+}
+
+/// Give a 2 MiB page that is still whole back to the page allocator in
+/// one step, and count it gone.
+fn freeWholeHuge(phys: u64) void {
+    pmm.freeHuge(phys);
+    _ = huge_mapped.fetchSub(1, .monotonic);
+}
+
+/// If a 2 MiB page maps `virt` in `root`, put a page table of 512 small
+/// entries for the same memory, with the same permissions, in its place,
+/// so that part of it can be unmapped or protected. The translations do not
+/// change, so nothing needs flushing. Returns the page tables added (0 or
+/// 1); `error.OutOfMemory` if there is no page for the table, and then
+/// nothing has changed.
+pub fn splitHugeAt(root: u64, virt: u64) error{OutOfMemory}!usize {
+    var t = table(root);
+    var level: u6 = 3;
+    while (level > 1) : (level -= 1) {
+        const e = t[index(virt, level)];
+        if (e & PRESENT == 0 or e & HUGE != 0) return 0;
+        t = table(e & ADDR_MASK);
+    }
+    const pde = &t[index(virt, 1)];
+    const e = pde.*;
+    if (e & PRESENT == 0 or e & HUGE == 0) return 0;
+    const pt = try allocTable();
+    const flags = e & ~ADDR_MASK & ~HUGE;
+    const small = table(pt);
+    for (small, 0..) |*entry, k| entry.* = ((e & ADDR_MASK) + k * pmm.PAGE_SIZE) | flags;
+    @atomicStore(u64, pde, pt | PRESENT | WRITABLE | USER, .release);
+    _ = huge_mapped.fetchSub(1, .monotonic);
+    return 1;
+}
+
+/// Split the 2 MiB pages that `[start, end)` covers only partly (at most
+/// the two at its ends), so that an operation on the range need not split
+/// any (`walkUserRange`). With `all`, every 2 MiB page in it (for moving
+/// it page by page). Returns the page tables added.
+pub fn splitHugeIn(root: u64, start: u64, end: u64, all: bool) error{OutOfMemory}!usize {
+    var added: usize = 0;
+    if (all) {
+        var v = start & ~(MIB2 - 1);
+        while (v < end) : (v += MIB2) added += try splitHugeAt(root, v);
+        return added;
+    }
+    if (start % MIB2 != 0) added += try splitHugeAt(root, start);
+    if (end % MIB2 != 0 and end > start) added += try splitHugeAt(root, end - 1);
+    return added;
+}
+
 /// Copy every user page of the address space `from` into the empty address
 /// space `to`: a new page with the same contents and the same entry bits
 /// for each one (`fork`, without copy-on-write). Returns how many pages
@@ -418,6 +503,20 @@ fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapErro
             taken.* += 1 + tables;
         } else if (e & HUGE == 0) {
             try copyLevel(table(e & ADDR_MASK), to, level - 1, virt, taken);
+        } else if (level == 1) {
+            // A 2 MiB page, copied as 512 small ones: the copy need not find
+            // 2 MiB in one piece, and is the same memory to the program.
+            const flags = e & ~ADDR_MASK & ~PRESENT & ~HUGE;
+            for (0..512) |k| {
+                const page = pmm.alloc() orelse return error.OutOfMemory;
+                @memcpy(pmm.physToVirt(page)[0..pmm.PAGE_SIZE], pmm.physToVirt((e & ADDR_MASK) + k * pmm.PAGE_SIZE)[0..pmm.PAGE_SIZE]);
+                var tables: usize = 0;
+                mapCounting(to, virt + k * pmm.PAGE_SIZE, page, flags, &tables) catch |err| {
+                    pmm.free(page);
+                    return err;
+                };
+                taken.* += 1 + tables;
+            }
         }
     }
 }
@@ -481,7 +580,10 @@ const Gather = struct {
         if (g.n == 0 and !g.cleared) return;
         g.cleared = false;
         flushEverywhere(g.root, g.start, g.pages);
-        for (g.buf[0..g.n]) |phys| pmm.free(phys);
+        for (g.buf[0..g.n]) |entry| {
+            // Bit 0 (never set in a page's address) marks a 2 MiB page.
+            if (entry & 1 != 0) freeWholeHuge(entry & ~@as(u64, 1)) else pmm.free(entry);
+        }
         g.n = 0;
     }
 };
@@ -503,7 +605,24 @@ fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: 
         const entry_base = base + i * step;
         if (entry_base >= end) break;
         const e = t[i];
-        if (e & PRESENT == 0 or e & HUGE != 0) continue;
+        if (e & PRESENT == 0) continue;
+        if (e & HUGE != 0) {
+            // A 2 MiB page: wholly in the range, since the callers split the
+            // ones it only partly covers first (`splitHugeAt`).
+            if (level != 1 or entry_base < start or entry_base + step > end) continue;
+            switch (action) {
+                .unmap => |g| {
+                    t[i] = 0;
+                    g.add((e & ADDR_MASK) | 1); // freed whole, after the flush
+                    freed += 512;
+                },
+                .protect => |bits| {
+                    t[i] = (e & ~(USER | WRITABLE | NX)) | bits;
+                    freed += 512;
+                },
+            }
+            continue;
+        }
         if (level == 0) {
             switch (action) {
                 .unmap => |g| {

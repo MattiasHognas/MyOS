@@ -171,6 +171,7 @@ pub fn build(b: *std.Build) void {
         "pipes",      "files",       "alloc",      "tmp",            "terminal",
         "signals",    "epoll",       "fsgsbase",   "fork",           "exec",
         "clock",      "jobs",        "errors",     "sigqueue",       "flock",
+        "hugepages",
     }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, user_target, optimize);
         exe.root_module.addImport("lib", user_lib);

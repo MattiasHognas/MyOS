@@ -274,3 +274,31 @@ test "random allocations and frees agree with a model" {
     try expect(bm.consistent());
     try expectEqual(free_model, bm.countFree());
 }
+
+test "512 pages aligned to 512: taken whole, given back one by one" {
+    const total = 4096;
+    var used: [PageBitmap.bytesFor(total)]u8 = undefined;
+    var managed: [PageBitmap.bytesFor(total)]u8 = undefined;
+    var b = PageBitmap.init(&used, &managed, total);
+    b.addRegion(1, total - 1); // page 0 is never managed: the first run is taken
+    try std.testing.expectEqual(@as(?usize, 512), b.allocAligned512());
+    try std.testing.expectEqual(total - 1 - 512, b.free_count);
+    for (512..1024) |p| try std.testing.expect(b.isAllocated(p));
+    // One page not free in the next run: that run is skipped.
+    b.reserve(1030);
+    try std.testing.expectEqual(@as(?usize, 1536), b.allocAligned512());
+    // Given back page by page, the run can be had again.
+    for (512..1024) |p| try b.free(p);
+    try std.testing.expectEqual(@as(?usize, 512), b.allocAligned512());
+    // Or whole, at once; not twice, and not one with a page free in it.
+    try b.free512(512);
+    try std.testing.expectError(error.NotAllocated, b.free512(512));
+    try std.testing.expectEqual(@as(?usize, 512), b.allocAligned512());
+    try b.free(600);
+    try std.testing.expectError(error.NotAllocated, b.free512(512));
+    try std.testing.expectError(error.NotManaged, b.free512(1024)); // page 1030 was reserved
+    try std.testing.expect(b.consistent());
+    // Too little left in one piece.
+    while (b.allocAligned512()) |_| {}
+    try std.testing.expect(b.free_count > 0 and b.allocAligned512() == null);
+}

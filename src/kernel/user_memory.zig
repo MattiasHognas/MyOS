@@ -128,6 +128,7 @@ pub const Access = struct {
 /// and for faults on user addresses inside a user copy.
 pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
     if (addr >= vmm.USER_END) return error.BadAccess;
+    if (!access.present and tryHugePage(p, addr, access)) return;
     // A page that is not there yet is most likely wanted, zeroed: get it
     // before taking the lock, so that zeroing 4 KiB is not done while the
     // process's other threads wait for the lock (their faults, `mmap`).
@@ -202,11 +203,85 @@ pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
     p.pages += 1 + tables;
 }
 
+/// Where a mapping of `len` bytes with no address asked for goes: the
+/// highest free place below `mmap_top`; for anonymous memory of 2 MiB or
+/// more, one that starts on a 2 MiB boundary, so that its 2 MiB blocks can
+/// be 2 MiB pages (as Linux does since 6.7), unless there is no such place.
+fn placeFree(p: *Process, len: u64, anonymous: bool) ?u64 {
+    if (anonymous and huge_pages and len >= HUGE) {
+        if (p.mem.regions.findFree(len + HUGE - PAGE, MAP_MIN, p.mem.mmap_top)) |at| {
+            // The aligned start within it, as high as the room allows.
+            const top = at + len + HUGE - PAGE;
+            return std.mem.alignBackward(u64, top - len, HUGE);
+        }
+    }
+    return p.mem.regions.findFree(len, MAP_MIN, p.mem.mmap_top);
+}
+
+/// Whether to give 2 MiB pages to anonymous memory at all.
+pub var huge_pages = true;
+const HUGE = 2 * 1024 * 1024;
+
+/// Whether a fault at `addr` can be given a 2 MiB page: in anonymous
+/// memory whose region holds the whole 2 MiB around it, which allows the
+/// access, with nothing mapped there yet, within the memory limit. The
+/// lock must be held.
+fn hugeFits(p: *Process, addr: u64, access: Access) ?vm_regions.Region {
+    const region = p.mem.regions.find(addr) orelse return null;
+    if (region.kind != .anon) return null;
+    const block = addr & ~@as(u64, HUGE - 1);
+    if (block < region.start or block + HUGE > region.end) return null;
+    const allowed = if (access.exec) region.prot.exec else if (access.write) region.prot.write else region.prot.read;
+    if (!allowed) return null;
+    if (p.pages + 512 + 2 > p.limits.max_pages) return null; // and the tables it may take
+    if (!vmm.blockEmpty(p.root, block)) return null;
+    return region;
+}
+
+/// A fault in anonymous memory that can have a 2 MiB page gets one, as
+/// Linux's transparent large pages do: one fault where there would be
+/// 512, and one TLB entry where there would be 512. The page is found and
+/// zeroed (2 MiB, which takes a while) without the lock, then mapped under
+/// it if nothing changed meanwhile. False if this fault is for a small
+/// page (or 2 MiB were not to be had in one piece).
+fn tryHugePage(p: *Process, addr: u64, access: Access) bool {
+    if (!huge_pages) return false;
+    {
+        const held = p.mem.lock.acquire();
+        defer p.mem.lock.release(held);
+        _ = hugeFits(p, addr, access) orelse return false;
+    }
+    const big = pmm.allocHugeZeroed() orelse return false;
+    const held = p.mem.lock.acquire();
+    defer p.mem.lock.release(held);
+    const region = hugeFits(p, addr, access) orelse {
+        pmm.freeHuge(big);
+        return false; // changed meanwhile: the small path decides
+    };
+    var tables: usize = 0;
+    vmm.mapHugeCounting(p.root, addr & ~@as(u64, HUGE - 1), big, pteFlags(region.prot), &tables) catch {
+        pmm.freeHuge(big);
+        return false;
+    };
+    p.pages += 512 + tables;
+    return true;
+}
+
 /// Remove `[start, start + len)` from the regions of `p` and free what was
 /// mapped there. The lock must be held.
 fn unmapLocked(p: *Process, start: u64, len: u64) vm_regions.Error!void {
+    try splitFor(p, start, start + len, false);
     try p.mem.regions.remove(heap.allocator, start, len);
     releasePages(p, start, start + len);
+}
+
+/// Split the 2 MiB pages `[start, end)` covers only partly (all of them,
+/// with `all`), before anything else changes: an operation on part of one
+/// works on small pages. The page tables this takes count against the
+/// process. The lock must be held.
+fn splitFor(p: *Process, start: u64, end: u64, all: bool) error{OutOfMemory}!void {
+    const added = try vmm.splitHugeIn(p.root, start, end, all);
+    p.pages += added;
 }
 
 /// Free the pages mapped in `[start, end)` and give their count back. The
@@ -266,7 +341,7 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fil
         addr = if (wanted != 0 and mappable(wanted, len) and p.mem.regions.isFree(wanted, len))
             wanted
         else
-            p.mem.regions.findFree(len, MAP_MIN, p.mem.mmap_top) orelse return abi.err(.NOMEM);
+            placeFree(p, len, anonymous) orelse return abi.err(.NOMEM);
     }
     if (anonymous) {
         p.mem.regions.add(heap.allocator, addr, len, prot, .anon) catch |e| return mapError(e);
@@ -372,6 +447,11 @@ fn moveLocked(p: *Process, region: vm_regions.Region, addr: u64, old_len: u64, n
     // page tables at the new place), the moved ones go back, which needs
     // none: their old tables are still there.
     const moved = @min(old_len, new_len);
+    // Moved page by page: 2 MiB pages in the way become small ones first.
+    splitFor(p, addr, addr + moved, true) catch {
+        p.mem.regions.remove(heap.allocator, to, new_len) catch {};
+        return abi.err(.NOMEM);
+    };
     var off: u64 = 0;
     var added: usize = 0;
     while (off < moved) : (off += PAGE) {
@@ -493,6 +573,7 @@ pub fn mprotect(p: *Process, addr: u64, length: u64, prot_bits: u64) u64 {
             if ((r.kind == .vvar or r.kind == .vdso) and r.start < addr + len and addr < r.end) return abi.err(.ACCES);
         }
     }
+    splitFor(p, addr, addr + len, false) catch return abi.err(.NOMEM);
     p.mem.regions.protect(heap.allocator, addr, len, prot) catch |e| return mapError(e);
     vmm.protectUserRange(p.root, addr, addr + len, pteFlags(prot));
     return 0;
@@ -511,6 +592,7 @@ pub fn madvise(p: *Process, addr: u64, length: u64, advice: u64) u64 {
     if (!p.mem.regions.isCovered(addr, len)) return abi.err(.NOMEM);
     switch (advice) {
         abi.MADV.DONTNEED, abi.MADV.FREE => {
+            splitFor(p, addr, addr + len, false) catch return abi.err(.NOMEM);
             // Only anonymous memory can be given back and come back as
             // zeroes; the program's own segments keep their contents.
             var at = addr;

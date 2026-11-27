@@ -277,8 +277,59 @@ pub fn initCpu() void {
 /// every page table, comes from here.
 pub fn allocZeroed() ?u64 {
     const phys = alloc() orelse return null;
-    @memset(physToVirt(phys)[0..PAGE_SIZE], 0);
+    zero(physToVirt(phys), PAGE_SIZE);
     return phys;
+}
+
+/// Fill `len` bytes at `to` with zeroes with `rep stosb`, which CPUs with
+/// fast string operations (ERMS, every x86-64 CPU of the last decade) do
+/// a cache line at a time, as Linux's `clear_page_erms` does: several
+/// times faster than the loop `@memset` becomes in a kernel built without
+/// SSE.
+pub fn zero(to: [*]u8, len: usize) void {
+    var d = to;
+    var c = len;
+    asm volatile ("rep stosb"
+        : [d] "+{rdi}" (d),
+          [c] "+{rcx}" (c),
+        : [a] "{al}" (@as(u8, 0)),
+        : .{ .memory = true });
+}
+
+/// Allocate 512 contiguous physical pages starting at a 2 MiB boundary,
+/// zeroed, for a large page; null if no such run is free. Each page is
+/// freed on its own (`free`), so a large page that is split up gives its
+/// parts back as they go. Straight from the bitmap: the caches hold single
+/// pages.
+pub fn allocHugeZeroed() ?u64 {
+    const flags = cpu.saveAndDisableInterrupts();
+    const first = blk: {
+        lock.take();
+        defer lock.drop();
+        inCriticalSection();
+        const page = pages.allocAligned512() orelse break :blk null;
+        addFree(-512);
+        break :blk page;
+    };
+    cpu.restoreInterrupts(flags);
+    const phys = @as(u64, first orelse return null) * PAGE_SIZE;
+    zero(physToVirt(phys), 512 * PAGE_SIZE); // with interrupts on: 2 MiB takes a while
+    return phys;
+}
+
+/// Free a 2 MiB page from `allocHugeZeroed` whole: its 512 pages back to
+/// the bitmap in one step. Panics if they are not all taken, and none in
+/// a cache: the caller's bookkeeping is wrong.
+pub fn freeHuge(phys: u64) void {
+    const first: usize = @intCast(phys / PAGE_SIZE);
+    if (poison) @memset(physToVirt(phys)[0 .. 512 * PAGE_SIZE], POISON);
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    lock.take();
+    defer lock.drop();
+    inCriticalSection();
+    pages.free512(first) catch |e| panicFmt("PMM: bad free of the 2 MiB page at 0x{x}: {s}", .{ phys, @errorName(e) });
+    addFree(512);
 }
 
 /// Free the physical page at `phys`, or say why it cannot be freed. On an
