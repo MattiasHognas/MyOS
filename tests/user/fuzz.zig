@@ -11,7 +11,8 @@
 //!
 //! Left out on purpose: `exit` and `exit_group` (the run would end early),
 //! the calls that unmap or reprotect memory (the program would take its
-//! own code or stack away), closing or replacing the standard descriptors,
+//! own code or stack away), lowering its own limits, closing or replacing
+//! the standard descriptors,
 //! making pipes, waiting in `poll`, and reading the terminal
 //! (it would wait for a key forever). Console writes of readable memory are
 //! steered to a block of text, to keep the serial log printable.
@@ -154,6 +155,10 @@ pub fn main() noreturn {
         // Nor copied to where reads go (above).
         if ((nr == Sys.dup or nr == Sys.dup2 or nr == Sys.dup3 or nr == Sys.fcntl) and args[0] <= 2) continue;
         if (nr == Sys.pipe or nr == Sys.pipe2) continue;
+        // Lowering its own limits is a program's right too (a memory limit
+        // of nothing is its end): only read them.
+        if (nr == Sys.prlimit64) args[2] = 0;
+        if (nr == Sys.setrlimit) continue;
         if (nr == Sys.write and args[0] <= 2 and (second_readable or args[1] >= STACK_TOP - 8)) {
             const off = next(&rng) % (text.len - 64);
             args[1] = @intFromPtr(text) + off;

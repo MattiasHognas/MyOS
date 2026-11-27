@@ -236,6 +236,10 @@ pub const Sys = struct {
     pub const dup3 = 292;
     /// `prlimit64(pid, resource, new, old) -> 0`.
     pub const prlimit64 = 302;
+    /// `getrlimit(resource, old)` and `setrlimit(resource, new)`: `prlimit64`
+    /// for the caller.
+    pub const getrlimit = 97;
+    pub const setrlimit = 160;
     /// `getrandom(buf, length, flags) -> bytes written`.
     pub const getrandom = 318;
     /// `get_mempolicy(mode, nodemask, maxnode, addr, flags) -> 0`: there
@@ -621,8 +625,13 @@ pub const RLimit = extern struct {
 };
 pub const RLIM_INFINITY: u64 = ~@as(u64, 0);
 pub const RLIMIT = struct {
+    pub const DATA = 2;
     pub const STACK = 3;
+    pub const NPROC = 6;
     pub const NOFILE = 7;
+    pub const AS = 9;
+    /// The number of resources (`RLIM_NLIMITS`).
+    pub const COUNT = 16;
 };
 
 /// `membarrier` commands.

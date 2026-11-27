@@ -2283,22 +2283,30 @@ fn sysUname(ptr: u64) u64 {
     return if (toUser(ptr, u)) 0 else err(.FAULT);
 }
 
-/// `prlimit64`: read a resource limit of the calling process. The stack
-/// may grow to its reservation, a process has a fixed number of
-/// descriptors, and nothing else is limited through this call. Limits
-/// cannot be changed with it yet (`EPERM`).
-fn sysPrlimit(pid: u64, resource: u64, new: u64, old: u64) u64 {
+/// `prlimit64`, `getrlimit` and `setrlimit`: the caller's limits
+/// (`proc.Limits`). The memory limit is `RLIMIT_DATA` (in bytes, whole
+/// pages), the descriptor limit `RLIMIT_NOFILE`, the descendant limit
+/// `RLIMIT_NPROC`; the others are kept and reported as they are set, and
+/// not enforced. A limit may be set up to its ceiling, and the ceiling
+/// lowered and never raised (`EPERM`). `EINVAL` for an unknown resource,
+/// or a value above its ceiling; `ESRCH` for another process; `EFAULT`.
+fn sysPrlimit(pid: u64, resource_arg: u64, new: u64, old: u64) u64 {
     const p = thread.current().process orelse return err(.NOSYS);
     if (pid != 0 and pid != p.pid) return err(.SRCH);
-    if (new != 0) return err(.PERM);
-    if (old == 0) return 0;
-    const limit: abi.RLimit = switch (resource) {
-        abi.RLIMIT.STACK => .{ .cur = proc.STACK_RESERVE, .max = abi.RLIM_INFINITY },
-        abi.RLIMIT.NOFILE => .{ .cur = p.limits.max_files, .max = proc.MAX_FILES },
-        0...2, 4...6, 8...15 => .{ .cur = abi.RLIM_INFINITY, .max = abi.RLIM_INFINITY },
-        else => return err(.INVAL),
-    };
-    return if (toUser(old, limit)) 0 else err(.FAULT);
+    if (resource_arg >= abi.RLIMIT.COUNT) return err(.INVAL);
+    const resource: u32 = @intCast(resource_arg);
+    const enforced = p.limits.get(resource);
+    const now = enforced orelse p.other_limits[resource];
+    if (new != 0) {
+        const want = fromUser(abi.RLimit, new) orelse return err(.FAULT);
+        if (want.cur > want.max) return err(.INVAL);
+        if (want.max > now.max) return err(.PERM);
+        // The descriptor table holds no more than `MAX_FILES`.
+        if (resource == abi.RLIMIT.NOFILE and want.max > proc.MAX_FILES) return err(.PERM);
+        if (enforced != null) p.limits.set(resource, want) else p.other_limits[resource] = want;
+    }
+    if (old != 0 and !toUser(old, now)) return err(.FAULT);
+    return 0;
 }
 
 /// `kill`: send `sig` to the process `pid`, which must be the caller's
@@ -2593,6 +2601,8 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.getrandom => sysGetRandom(f.rdi, f.rsi),
         Sys.uname => sysUname(f.rdi),
         Sys.prlimit64 => sysPrlimit(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.getrlimit => sysPrlimit(0, f.rdi, 0, f.rsi),
+        Sys.setrlimit => sysPrlimit(0, f.rdi, f.rsi, 0),
         // No option exists here yet. Runtimes try a few (naming their
         // mappings, for one) and go on without them.
         Sys.prctl => err(.INVAL),

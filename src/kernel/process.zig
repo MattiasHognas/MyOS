@@ -137,17 +137,78 @@ pub const MAX_FILES = 1024;
 pub const FILES_INITIAL = 32;
 
 /// What one process may use. Inherited by the processes it starts.
+///
+/// Each limit has the value enforced (Linux's soft limit) and a ceiling
+/// (its hard limit): a process may change the first up to the second and
+/// lower the second, never raise it (`prlimit64`). There are no users to
+/// let one raise it.
 pub const Limits = struct {
     /// Most pages of physical memory the process may take: its program
     /// (code, data, `.bss`), its stack, the page tables of its address
-    /// space and its thread's kernel stack.
+    /// space and its thread's kernel stack. `RLIMIT_DATA` (in bytes).
     max_pages: u64 = MAX_IMAGE_BYTES / pmm.PAGE_SIZE,
+    max_pages_hard: u64 = UNLIMITED,
     /// Most processes that may be alive below this one at once: children,
-    /// their children, and so on. Starting one more fails.
-    max_descendants: u32 = 1024,
+    /// their children, and so on. Starting one more fails. `RLIMIT_NPROC`
+    /// (which Linux counts per user).
+    max_descendants: u64 = 1024,
+    max_descendants_hard: u64 = UNLIMITED,
     /// Most descriptors the process may have, the three standard streams
-    /// included; at most `MAX_FILES`.
+    /// included; at most `MAX_FILES`. `RLIMIT_NOFILE`.
     max_files: u32 = MAX_FILES,
+    max_files_hard: u32 = MAX_FILES,
+
+    pub const UNLIMITED = std.math.maxInt(u64);
+
+    /// The limits of a process nothing else started: a memory limit of
+    /// three quarters of the machine's memory, so that one program cannot
+    /// take everything on a small machine and is not held back on a large
+    /// one.
+    pub fn default() Limits {
+        return .{ .max_pages = pmm.totalPages() / 4 * 3 };
+    }
+
+    /// `resource` as `getrlimit` reports it; null for one this does not
+    /// enforce (`Process.other_limits` has those).
+    pub fn get(l: *const Limits, resource: u32) ?abi.RLimit {
+        return switch (resource) {
+            abi.RLIMIT.DATA => .{ .cur = bytes(l.max_pages), .max = bytes(l.max_pages_hard) },
+            abi.RLIMIT.NPROC => .{ .cur = count(l.max_descendants), .max = count(l.max_descendants_hard) },
+            abi.RLIMIT.NOFILE => .{ .cur = l.max_files, .max = l.max_files_hard },
+            else => null,
+        };
+    }
+
+    /// Set `resource`, one `get` answers for, to `want`, which the caller
+    /// has checked: `cur` not above `max`, and `max` not above what `get`
+    /// says now.
+    pub fn set(l: *Limits, resource: u32, want: abi.RLimit) void {
+        switch (resource) {
+            abi.RLIMIT.DATA => {
+                l.max_pages = pages(want.cur);
+                l.max_pages_hard = pages(want.max);
+            },
+            abi.RLIMIT.NPROC => {
+                l.max_descendants = want.cur;
+                l.max_descendants_hard = want.max;
+            },
+            abi.RLIMIT.NOFILE => {
+                l.max_files = @intCast(want.cur);
+                l.max_files_hard = @intCast(want.max);
+            },
+            else => unreachable,
+        }
+    }
+
+    fn bytes(n: u64) u64 {
+        return if (n == UNLIMITED) abi.RLIM_INFINITY else n *| pmm.PAGE_SIZE;
+    }
+    fn pages(b: u64) u64 {
+        return if (b == abi.RLIM_INFINITY) UNLIMITED else b / pmm.PAGE_SIZE;
+    }
+    fn count(n: u64) u64 {
+        return if (n == UNLIMITED) abi.RLIM_INFINITY else n;
+    }
 };
 
 /// Where a program image may be loaded and how large it may be under
@@ -288,6 +349,17 @@ pub const Process = struct {
     /// (`WCONTINUED`). Under the tree lock.
     stop_report: u32 = 0,
     continued_report: bool = false,
+    /// The limits not enforced (`RLIMIT_STACK`, `RLIMIT_CORE`,
+    /// `RLIMIT_CPU`, ...), by number: kept as the program sets them and
+    /// reported (`Limits` has those that are). Inherited like `limits`.
+    /// The stack is reserved at 8 MiB whatever `RLIMIT_STACK` says.
+    other_limits: [abi.RLIMIT.COUNT]abi.RLimit = default_other_limits,
+};
+
+const default_other_limits = blk: {
+    var all: [abi.RLIMIT.COUNT]abi.RLimit = @splat(.{ .cur = abi.RLIM_INFINITY, .max = abi.RLIM_INFINITY });
+    all[abi.RLIMIT.STACK].cur = STACK_RESERVE;
+    break :blk all;
 };
 
 /// The signal actions of a process structure that is not a real process
@@ -1277,6 +1349,7 @@ noinline fn initChild(child: *Process, parent: *Process, root: u64, name: []cons
         .entry_rsp = parent.entry_rsp,
         .name = name,
         .limits = parent.limits,
+        .other_limits = parent.other_limits,
         .pages = pages,
         .parent = parent,
         .refs = 2, // the thread's and the parent's list's
@@ -1968,7 +2041,7 @@ noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOption
 /// limit, `error.OutOfMemory`, or an error of the ELF loader. On error
 /// nothing is leaked and nothing is counted.
 pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Process {
-    const limits = options.limits orelse if (options.parent) |parent| parent.limits else Limits{};
+    const limits = options.limits orelse if (options.parent) |parent| parent.limits else Limits.default();
 
     const img = try buildImage(name, image, options, limits);
     errdefer img.destroy();

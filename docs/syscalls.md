@@ -180,7 +180,7 @@ Linux calls, with Linux's numbers:
 | 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
 | 295 | `preadv(fd, iov, count, offset)` | `pread64` into each buffer in turn, from `offset`; the file offset stays. `ESPIPE` for what is not a file. |
 | 296 | `pwritev(fd, iov, count, offset)` | The same for `pwrite64`. |
-| 302 | `prlimit64(pid, resource, new, old)` | Reads limits of the calling process (stack 8 MiB, descriptors 16, the rest unlimited). Setting is `EPERM`. |
+| 302 | `prlimit64(pid, resource, new, old)` | The calling process's limits: `RLIMIT_DATA` is its memory limit (in bytes, whole pages), `RLIMIT_NOFILE` its descriptors, `RLIMIT_NPROC` the processes alive below it (Linux counts per user); the others are kept and reported as set (`RLIMIT_STACK` 8 MiB, the rest unlimited), not enforced. A limit may be set up to its ceiling, and the ceiling lowered, never raised (`EPERM`). `EINVAL` for a resource above 15 or `cur` above `max`, `ESRCH` for another process. `getrlimit` (97) and `setrlimit` (160) are the same for the caller. |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | As `rename`; no flags (`EINVAL`). |
 | 318 | `getrandom(buf, len, flags)` | Never blocks. |
 | 319 | `memfd_create(name, flags)` | Not offered yet: `ENOSYS`, on purpose. |
@@ -250,10 +250,10 @@ Every other number returns `ENOSYS`.
   `/dev/null`, `/dev/urandom` and `/dev/random` are devices.
 - **Counts** above `0x7ffff000` are shortened to that, as on Linux.
 - **Limits.** Every process has limits, inherited from the process that
-  started it: 256 MiB of memory (its program, stack, page tables and kernel
-  stack), 16 descriptors,
-  and 1024 processes alive below it. There are no calls to read or change
-  them yet (`getrlimit`, `prlimit`).
+  started it: memory (its program, stack, page tables and kernel stack;
+  three quarters of the machine's for a process nothing else started),
+  1024 descriptors, and 1024 processes alive below it. A process reads and
+  lowers them with `prlimit64`, `getrlimit` and `setrlimit`.
 - **Arguments and environment** of a new program may take 8 KiB on its
   stack together, the auxiliary vector included, and be 256 strings (on
   Linux: a quarter of the stack limit, 2 MiB by default).

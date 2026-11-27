@@ -217,6 +217,62 @@ pub fn main() noreturn {
     var fg: i32 = 0;
     expect(lib.syscall(Sys.ioctl, 0, 0x540F, @intFromPtr(&fg)) == 0 and fg == @as(i32, @intCast(me)), 44); // TIOCGPGRP
 
+    // --- Limits (prlimit64, getrlimit, setrlimit), in a child so that
+    // this process keeps its own; the child's are inherited.
+    const RLIMIT_DATA = 2;
+    const RLIMIT_CORE = 4;
+    const RLIMIT_NOFILE = 7;
+    const INF = lib.abi.RLIM_INFINITY;
+    var mine: lib.abi.RLimit = undefined;
+    expect(lib.syscall(Sys.getrlimit, RLIMIT_DATA, @intFromPtr(&mine), 0) == 0, 60);
+    expect(mine.cur != 0 and mine.cur % 4096 == 0 and mine.cur <= mine.max, 61);
+    const lim = lib.syscall(Sys.fork, 0, 0, 0);
+    if (lim == 0) {
+        var r: lib.abi.RLimit = undefined;
+        // Inherited.
+        if (lib.syscall(Sys.getrlimit, RLIMIT_DATA, @intFromPtr(&r), 0) != 0 or r.cur != mine.cur) lib.exit(70);
+        // Descriptors: lowered, then up to the ceiling, never above it.
+        var nofile: lib.abi.RLimit = .{ .cur = 8, .max = 32 };
+        if (lib.syscall(Sys.setrlimit, RLIMIT_NOFILE, @intFromPtr(&nofile), 0) != 0) lib.exit(71);
+        var opened: u64 = 0;
+        while (opened < 20) : (opened += 1) {
+            if (lib.isError(lib.open("/etc/motd"))) break;
+        }
+        if (lib.open("/etc/motd") != lib.err(.MFILE) or opened >= 8) lib.exit(72); // at most 8 descriptors
+        nofile = .{ .cur = 32, .max = 32 };
+        if (lib.syscall(Sys.setrlimit, RLIMIT_NOFILE, @intFromPtr(&nofile), 0) != 0) lib.exit(73);
+        if (lib.isError(lib.open("/etc/motd"))) lib.exit(74);
+        nofile = .{ .cur = 32, .max = 64 };
+        if (lib.syscall(Sys.setrlimit, RLIMIT_NOFILE, @intFromPtr(&nofile), 0) != lib.err(.PERM)) lib.exit(75); // above the ceiling
+        nofile = .{ .cur = 33, .max = 32 };
+        if (lib.syscall(Sys.setrlimit, RLIMIT_NOFILE, @intFromPtr(&nofile), 0) != lib.err(.INVAL)) lib.exit(76);
+        // Old and new in one call.
+        var before: lib.abi.RLimit = undefined;
+        nofile = .{ .cur = 16, .max = 32 };
+        if (lib.syscall6(Sys.prlimit64, 0, RLIMIT_NOFILE, @intFromPtr(&nofile), @intFromPtr(&before), 0, 0) != 0 or before.cur != 32) lib.exit(77);
+        // A resource that is not enforced is kept as set.
+        var core: lib.abi.RLimit = .{ .cur = 0, .max = 0 };
+        if (lib.syscall(Sys.setrlimit, RLIMIT_CORE, @intFromPtr(&core), 0) != 0) lib.exit(78);
+        core = .{ .cur = 1, .max = 1 };
+        if (lib.syscall(Sys.getrlimit, RLIMIT_CORE, @intFromPtr(&core), 0) != 0 or core.cur != 0 or core.max != 0) lib.exit(79);
+        if (lib.syscall(Sys.getrlimit, 16, @intFromPtr(&core), 0) != lib.err(.INVAL)) lib.exit(80);
+        if (lib.syscall6(Sys.prlimit64, 99999, RLIMIT_CORE, 0, @intFromPtr(&core), 0, 0) != lib.err(.SRCH)) lib.exit(81);
+        // Memory: 4 MiB, and then a 16 MiB mapping touched page by page
+        // is this process's end.
+        var data: lib.abi.RLimit = .{ .cur = 4 << 20, .max = 4 << 20 };
+        if (lib.syscall(Sys.setrlimit, RLIMIT_DATA, @intFromPtr(&data), 0) != 0) lib.exit(82);
+        data = .{ .cur = INF, .max = INF };
+        if (lib.syscall(Sys.setrlimit, RLIMIT_DATA, @intFromPtr(&data), 0) != lib.err(.PERM)) lib.exit(83);
+        const big = lib.mmap(0, 16 << 20, lib.abi.PROT.READ | lib.abi.PROT.WRITE, lib.abi.MAP.PRIVATE | lib.abi.MAP.ANONYMOUS);
+        if (lib.isError(big)) lib.exit(84);
+        var at: u64 = 0;
+        while (at < 16 << 20) : (at += 4096) @as(*volatile u8, @ptrFromInt(big + at)).* = 1;
+        lib.exit(85); // not reached
+    }
+    expect(wait4(@intCast(lim), &status, 0) == lim and signaled(status) == 11, 62); // killed at its memory limit (a fault it cannot handle)
+    var after: lib.abi.RLimit = undefined;
+    expect(lib.syscall(Sys.getrlimit, RLIMIT_DATA, @intFromPtr(&after), 0) == 0 and after.cur == mine.cur, 63); // its own are as they were
+
     _ = lib.close(@intCast(pfd[0]));
     _ = lib.close(@intCast(pfd[1]));
     lib.exit(0);
