@@ -905,6 +905,17 @@ fn forkWait() TestError!void {
     try expectFootprint(memory);
 }
 
+/// The clocks: in the kernel, the monotonic clock against the HPET and in
+/// step on every CPU; from ring 3, sleeps and the wall clock.
+fn clocks() TestError!void {
+    const failed = helpers.clockChecks();
+    if (failed != 0) report("clock check", failed);
+    try check(failed == 0);
+    const code = helpers.runProgram("/test/clock") orelse return error.Failed;
+    if (code != 0) report("/test/clock failed check", code);
+    try check(code == 0);
+}
+
 /// `execve`: arguments, environment, descriptors and signal actions across
 /// it; failures that keep the program; `vfork` with it; scripts; a
 /// process with several threads. Nothing left behind.
@@ -1985,6 +1996,7 @@ fn runCases() noreturn {
         .{ .name = "FS and GS base set by the program itself (FSGSBASE)", .func = fsgsbase },
         .{ .name = "fork, vfork, clone of a process, wait4 (ring 3)", .func = forkWait },
         .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
+        .{ .name = "clocks: TSC or HPET, in step on every CPU; sleeps; the wall clock from the RTC", .func = clocks },
         .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },
         .{ .name = "x87/SSE/AVX registers survive process switches", .func = extendedStateSwitching },
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },

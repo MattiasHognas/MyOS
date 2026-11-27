@@ -101,7 +101,7 @@ Linux calls, with Linux's numbers:
 | 32 | `dup(fd)` | The lowest free descriptor, for the same open file: they share its offset. |
 | 33 | `dup2(old, new)` | Closes what `new` was. |
 | 34 | `pause()` | Waits for a signal to be handled; `EINTR`. |
-| 35 | `nanosleep(req, rem)` | Resolution is one timer tick (10 ms), rounded up. `rem` is never written: nothing interrupts a sleep yet. |
+| 35 | `nanosleep(req, rem)` | Whole timer ticks (10 ms) while more than a tick is left, so a sleep ends at most a tick late; under 2 ms left the CPU goes to others until the deadline, so short sleeps are short. A signal ends it with `EINTR`, and what was left is written at `rem`. |
 | 39 | `getpid()` | The ID of the process's first thread. |
 | 41 | `socket(domain, type, protocol)` | No networking yet: `EAFNOSUPPORT`. |
 | 56 | `clone(flags, stack, ptid, ctid, tls)` | With `CLONE_THREAD` a new thread (it must come with `CLONE_VM` and `CLONE_SIGHAND`): `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. Without it, a new process as `fork` makes, the low byte of `flags` the signal its parent gets when it ends; `CLONE_VFORK` holds the caller until the child calls `execve` or ends. `CLONE_VM` without `CLONE_THREAD` gets a copy of the memory, not the same memory (Linux shares it; `vfork` and `posix_spawn` work either way, but what the child writes before `execve` stays its own). `EINVAL` for sharing the descriptor table or the signal actions between processes. |
@@ -156,7 +156,7 @@ Linux calls, with Linux's numbers:
 | 204 | `sched_getaffinity(pid, size, mask)` | Every CPU that is up; 8 bytes. |
 | 217 | `getdents64(fd, buf, count)` | The next entries of a directory as `struct linux_dirent64`, "." and ".." first; 0 at the end. `EINVAL` if not one entry fits. |
 | 218 | `set_tid_address(ptr)` | Returns the thread ID. When the thread exits, zero is written to `ptr` and one futex waiter on it is woken. |
-| 228 | `clock_gettime(clock, ts)` | Monotonic clocks count from boot. The real-time clock is time since boot counted from 2026-01-01: there is no clock chip driver yet. CPU-time clocks return time since boot. |
+| 228 | `clock_gettime(clock, ts)` | `CLOCK_MONOTONIC` (and `_RAW`, `_COARSE`, `CLOCK_BOOTTIME`): time since boot, from the TSC where it is invariant and the HPET otherwise. `CLOCK_REALTIME` (and `_COARSE`): the RTC's date at boot plus that. The CPU-time clocks give time since boot, an upper bound: CPU time is not counted yet. `EINVAL` for other clocks. |
 | 230 | `clock_nanosleep(clock, flags, req, rem)` | With `TIMER_ABSTIME` too. |
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
 | 232 | `epoll_wait(epfd, events, max, timeout)` | The watched descriptors that are ready, waiting up to `timeout` ms (for ever if negative). Readiness is looked at again each timer tick. Edge-triggered watching (`EPOLLET`) is reported as level-triggered; `EPOLLONESHOT` works. A signal ends the wait with `EINTR`. |

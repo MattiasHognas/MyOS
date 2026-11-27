@@ -24,6 +24,7 @@ const ipi = @import("../arch/x86_64/ipi.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const kfutex = @import("futex.zig");
 const kpipe = @import("pipe.zig");
+const kclock = @import("clock.zig");
 const kepoll = @import("epoll.zig");
 const open_file = @import("open_file.zig");
 const procfs = @import("procfs.zig");
@@ -1845,17 +1846,13 @@ fn sysEpollWait(epfd: u64, events_ptr: u64, max: u64, timeout_ms: i64, sigmask_p
     }
 }
 
-/// Seconds between 1970 and the moment the wall clock is taken to have
-/// started at boot: 2026-01-01. There is no clock chip driver yet, so
-/// "real" time is time since boot from there.
-const BOOT_EPOCH_SECONDS: u64 = 1_767_225_600;
 const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// Nanoseconds on `clock`, or null if there is no such clock.
 fn clockNanos(clock: u64) ?u64 {
     return switch (clock) {
         abi.CLOCK.MONOTONIC, abi.CLOCK.MONOTONIC_RAW, abi.CLOCK.MONOTONIC_COARSE, abi.CLOCK.BOOTTIME => futex.monotonicNanos(),
-        abi.CLOCK.REALTIME, abi.CLOCK.REALTIME_COARSE => futex.monotonicNanos() + BOOT_EPOCH_SECONDS * NS_PER_SEC,
+        abi.CLOCK.REALTIME, abi.CLOCK.REALTIME_COARSE => kclock.wallNanos(),
         // CPU time used is not counted yet; time since boot is an upper bound.
         abi.CLOCK.PROCESS_CPUTIME_ID, abi.CLOCK.THREAD_CPUTIME_ID => futex.monotonicNanos(),
         else => null,
@@ -1898,29 +1895,51 @@ fn sysGetTimeOfDay(tv: u64) u64 {
     return if (toUser(tv, value)) 0 else err(.FAULT);
 }
 
-/// Sleep until `deadline` (nanoseconds since boot). Returns 0, or `EINTR`
-/// if the process is ending.
+/// Below this much time left, a sleep gives the CPU away with `yield`
+/// until its deadline instead of sleeping a timer tick (10 ms), which
+/// would overshoot by most of a tick: runtimes sleep for microseconds
+/// while they spin (Go's `usleep(20)`).
+const YIELD_BELOW_NS: u64 = 2_000_000;
+
+/// Sleep until `deadline` (nanoseconds since boot). Whole timer ticks
+/// while more than a tick is left, so the sleep ends at most a tick late;
+/// under `YIELD_BELOW_NS`, giving the CPU to others until the deadline.
+/// Returns 0, or `EINTR` if a signal or the process's end comes first.
 fn sleepUntil(deadline: u64) u64 {
     while (true) {
         const now = futex.monotonicNanos();
         if (now >= deadline) return 0;
-        // In ticks, rounded up; a tick more than needed is slept by `sleepTicks`.
-        const ticks = futex.nanosToTicks(deadline - now);
+        const left = deadline - now;
+        if (left < YIELD_BELOW_NS) {
+            if (thread.interrupted()) return err(.INTR);
+            thread.yield();
+            continue;
+        }
+        // `sleepTicks(n)` sleeps n to n + 1 ticks: n is the whole ticks left
+        // less one, so it ends before the deadline (or in the tick of it,
+        // for less than two ticks left).
+        const ticks = left / timer.NS_PER_TICK;
         if (!timer.sleepTicksKillable(ticks -| 1)) return err(.INTR);
     }
 }
 
 /// `nanosleep` and `clock_nanosleep`: sleep for the time at `request`, or
-/// with `absolute` until that time on `clock`. Nothing interrupts a sleep
-/// yet, so `remaining` is never written.
-fn sysSleep(clock: u64, absolute: bool, request: u64) u64 {
+/// with `absolute` until that time on `clock`. A signal ends it with
+/// `EINTR`, and a relative sleep then writes what was left at `remaining`
+/// (if not null), as Linux does.
+fn sysSleep(clock: u64, absolute: bool, request: u64, remaining: u64) u64 {
     const now = clockNanos(clock) orelse return err(.INVAL);
     const ns = switch (userNanos(request)) {
         .ns => |n| n,
         .fail => |e| return e,
     };
     const wait_ns = if (absolute) ns -| now else ns;
-    return sleepUntil(futex.monotonicNanos() +| wait_ns);
+    const deadline = futex.monotonicNanos() +| wait_ns;
+    const rc = sleepUntil(deadline);
+    if (rc == err(.INTR) and !absolute and remaining != 0) {
+        if (!toUser(remaining, timeSpec(deadline -| futex.monotonicNanos()))) return err(.FAULT);
+    }
+    return rc;
 }
 
 /// `futex`: wait on, wake, or move the waiters of the 32-bit word at
@@ -2460,8 +2479,8 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.dup => sysDup(f.rdi, 0, false),
         Sys.dup2 => sysDup2(f.rdi, f.rsi, false, false),
         Sys.dup3 => if (f.rdx & ~@as(u64, abi.O.CLOEXEC) != 0) err(.INVAL) else sysDup2(f.rdi, f.rsi, true, f.rdx & abi.O.CLOEXEC != 0),
-        Sys.nanosleep => sysSleep(abi.CLOCK.MONOTONIC, false, f.rdi),
-        Sys.clock_nanosleep => sysSleep(f.rdi, f.rsi & 1 != 0, f.rdx),
+        Sys.nanosleep => sysSleep(abi.CLOCK.MONOTONIC, false, f.rdi, f.rsi),
+        Sys.clock_nanosleep => sysSleep(f.rdi, f.rsi & 1 != 0, f.rdx, f.r10),
         Sys.clock_gettime => sysClockGetTime(f.rdi, f.rsi),
         Sys.gettimeofday => sysGetTimeOfDay(f.rdi),
         Sys.getpid => if (thread.current().process) |p| p.pid else err(.NOSYS),

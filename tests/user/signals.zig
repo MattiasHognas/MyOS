@@ -469,9 +469,11 @@ pub fn main() noreturn {
     // A sleep is cut short whatever the flags.
     start(interrupter, 0);
     const long: abi.TimeSpec = .{ .sec = 5, .nsec = 0 };
-    expect(lib.syscall(Sys.nanosleep, @intFromPtr(&long), 0, 0) == lib.err(.INTR), 55);
+    var left: abi.TimeSpec = .{ .sec = 0, .nsec = 0 };
+    expect(lib.syscall(Sys.nanosleep, @intFromPtr(&long), @intFromPtr(&left), 0) == lib.err(.INTR), 55);
     join();
     expect(noop_count == 3, 56); // and the handler ran
+    expect(left.sec >= 3 and left.sec < 5, 57); // and what was left of it was said
 
     // --- rt_sigsuspend: wait with another mask until one is handled.
     _ = procmask(abi.SIG.BLOCK, bitOf(SIGUSR1));

@@ -69,7 +69,7 @@ boot() {
     local told="${4:-$scenario}"
     local session="${5:-}"
     local accel=()
-    [[ "$cpu" == host ]] && accel=(-enable-kvm)
+    [[ "$cpu" == host* ]] && accel=(-enable-kvm)
     local dir="$out/$scenario"
     mkdir -p "$dir"
     local raw="$dir/serial.log"
@@ -177,7 +177,8 @@ run_scenario() {
         return
     fi
     case "$scenario" in
-        tests_kvm) boot "$scenario" host 4 tests_smp ;;
+        # With the host's invariant TSC passed through: the clock's TSC path.
+        tests_kvm) boot "$scenario" host,+invtsc 4 tests_smp ;;
         # Without XSAVE there is no AVX either (and nothing that builds on it).
         tests_fxsave) boot "$scenario" max,xsave=off ;;
         tests_smp | panic_smp) boot "$scenario" max 4 ;;
@@ -202,6 +203,14 @@ run_scenario() {
                 expect_line 'extended state: (XSAVE|FXSAVE), [0-9]+ bytes' # whatever the host has
             else
                 expect_line 'extended state: XSAVE, 832 bytes, AVX on, AVX-512 not supported$' # QEMU's emulated CPU has no AVX-512
+            fi
+            # The wall clock comes from the RTC, which QEMU sets from the
+            # host's clock: within a day of it (time zones, a slow run).
+            rt="$(grep -aoE '^MYOS_REALTIME [0-9]+' "$log" | head -1 | cut -d' ' -f2)"
+            if [[ -z "$rt" ]]; then
+                fail "no MYOS_REALTIME line"
+            elif ((rt < $(date +%s) - 86400 || rt > $(date +%s) + 86400)); then
+                fail "the wall clock says $rt, the host $(date +%s)"
             fi
             if [[ "$scenario" == tests_smp || "$scenario" == tests_kvm ]]; then
                 expect_line 'info\(smp\): 4 of 4 CPUs online$'

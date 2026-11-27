@@ -161,6 +161,28 @@ pub fn main() noreturn {
     expect(seen == 0x3F, 20);
     expect(wait4(-1, &status, 0) == lib.err(.CHILD), 21);
 
+    // --- An orphan: a child that ends before its own child goes to this
+    // process (there is no init in the kernel's tests), which collects it.
+    var opfd: [2]i32 = undefined;
+    expect(lib.syscall(Sys.pipe2, @intFromPtr(&opfd), 0, 0) == 0, 26);
+    const middle = lib.syscall(Sys.fork, 0, 0, 0);
+    if (middle == 0) {
+        const grandchild = lib.syscall(Sys.fork, 0, 0, 0);
+        if (grandchild == 0) {
+            _ = lib.close(@intCast(opfd[1]));
+            var b: [1]u8 = undefined;
+            _ = lib.read(@intCast(opfd[0]), &b); // until the grandparent says
+            // Adopted by now: its parent is the grandparent.
+            lib.exit(if (lib.syscall(Sys.getppid, 0, 0, 0) == me) 60 else 61);
+        }
+        lib.exit(if (lib.isError(grandchild)) 1 else 0);
+    }
+    expect(wait4(@intCast(middle), &status, 0) == middle and exited(status) == 0, 27);
+    _ = lib.syscall(Sys.write, @intCast(opfd[1]), @intFromPtr("x"), 1);
+    _ = lib.close(@intCast(opfd[1]));
+    _ = lib.close(@intCast(opfd[0]));
+    expect(wait4(-1, &status, 0) != lib.err(.CHILD) and exited(status) == 60, 28); // the orphan, collected here
+
     // --- Process groups and sessions. Started by the kernel, this program
     // leads a session and a group of its own.
     expect(lib.syscall(Sys.getpgrp, 0, 0, 0) == me and lib.syscall(Sys.getpgid, 0, 0, 0) == me, 30);

@@ -44,6 +44,7 @@ pub const boot = struct {
 /// Hardware device drivers.
 pub const drivers = struct {
     pub const hpet = @import("drivers/hpet.zig");
+    pub const rtc = @import("drivers/rtc.zig");
     pub const nvme = @import("drivers/nvme.zig");
     pub const pci = @import("drivers/pci.zig");
     pub const ps2_keyboard = @import("drivers/ps2_keyboard.zig");
@@ -58,6 +59,8 @@ pub const firmware = struct {
 /// Architecture-independent kernel core: memory, threads, processes, syscalls and files.
 pub const kernel = struct {
     pub const tty = @import("kernel/tty.zig");
+    pub const clock = @import("kernel/clock.zig");
+    pub const calendar = @import("kernel/calendar.zig");
     pub const console = @import("kernel/console.zig");
     pub const elf = @import("kernel/elf.zig");
     pub const elf_image = @import("kernel/elf_image.zig");
@@ -388,6 +391,7 @@ fn kmainOnStack() callconv(.c) noreturn {
     acpi.init(response(&rsdp_request).address, hhdm);
     apic.init();
     hpet.init();
+    kernel.clock.init(); // the TSC calibrated against the HPET, the wall clock from the RTC
 
     pci.scan();
     if (pci.find(0x01, 0x08, 0x02)) |dev| {

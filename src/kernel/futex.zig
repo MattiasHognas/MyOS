@@ -241,7 +241,7 @@ pub fn waiting(p: *const Process) usize {
 
 /// Nanoseconds since boot, for timeouts and the clock calls.
 pub fn monotonicNanos() u64 {
-    return hpet.nanos();
+    return @import("clock.zig").nanos();
 }
 
 /// Timer ticks that cover `ns` nanoseconds, rounded up.

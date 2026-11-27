@@ -31,6 +31,7 @@ const std = @import("std");
 const limine = @import("../../boot/limine.zig");
 const hpet = @import("../../drivers/hpet.zig");
 const heap = @import("../../kernel/heap.zig");
+const clock = @import("../../kernel/clock.zig");
 const pmm = @import("../../kernel/pmm.zig");
 const kstack = @import("../../kernel/kstack.zig");
 const thread = @import("../../kernel/thread.zig");
@@ -149,12 +150,49 @@ fn start(info: *limine.MpInfo) !void {
 
     const deadline = hpet.nanos() + START_TIMEOUT_NS;
     while (percpu.count() == before) {
+        answerTscCheck();
         if (hpet.nanos() > deadline) {
             log.err("CPU with APIC ID {d} did not come up within {d} ms", .{ info.lapic_id, START_TIMEOUT_NS / 1_000_000 });
             return;
         }
         std.atomic.spinLoopHint();
     }
+}
+
+// The check that a starting CPU's TSC runs with the boot CPU's, done while
+// the boot CPU waits for it to come up. 1: the new CPU asks; 2: the boot
+// CPU has put its TSC in `tsc_boot`, and the new CPU's, read after, must
+// not be smaller; 3: the new CPU has put its own in `tsc_new`, and the
+// boot CPU's, read after, must not be smaller; 0: done.
+var tsc_step = std.atomic.Value(u32).init(0);
+var tsc_boot: u64 = 0;
+var tsc_new: u64 = 0;
+
+/// The boot CPU's half, called while it waits.
+fn answerTscCheck() void {
+    switch (tsc_step.load(.acquire)) {
+        1 => {
+            tsc_boot = clock.rdtsc();
+            tsc_step.store(2, .release);
+        },
+        3 => {
+            const mine = clock.rdtsc();
+            if (mine < tsc_new) clock.disableTsc("a CPU's TSC is ahead of the boot CPU's");
+            tsc_step.store(0, .release);
+        },
+        else => {},
+    }
+}
+
+/// The new CPU's half.
+fn checkTsc() void {
+    if (!clock.usingTsc()) return;
+    tsc_step.store(1, .release);
+    while (tsc_step.load(.acquire) != 2) std.atomic.spinLoopHint();
+    clock.checkCpu(tsc_boot);
+    tsc_new = clock.rdtsc();
+    tsc_step.store(3, .release);
+    while (tsc_step.load(.acquire) != 0) std.atomic.spinLoopHint();
 }
 
 /// First kernel code of a CPU other than the boot CPU, jumped to by the
@@ -192,6 +230,7 @@ fn apMain() callconv(.c) noreturn {
         });
     }
 
+    checkTsc();
     apic.timerStart(timer.HZ);
     c.runs_threads = true;
     percpu.register(c); // online: the boot CPU goes on to the next one

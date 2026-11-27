@@ -4064,3 +4064,46 @@ pub fn processCount() usize {
     quiesce();
     return process.liveCount();
 }
+
+// ---------------------------------------------------------------------------
+// Clocks (roadmap 6.4)
+
+var clock_latest: Atomic(u64) = .init(0);
+var clock_backwards: Atomic(u64) = .init(0);
+var clock_done: usize = 0;
+
+/// Read the clock again and again, each reading after one that another
+/// thread published: none may be earlier than what it saw published.
+fn clockWorker() void {
+    for (0..20000) |i| {
+        const seen = clock_latest.load(.acquire);
+        const t = kernel_root.kernel.clock.nanos();
+        if (t < seen) _ = clock_backwards.fetchAdd(1, .monotonic);
+        _ = clock_latest.fetchMax(t, .acq_rel);
+        if (i % 500 == 0) thread.yield(); // and on another CPU, maybe
+    }
+    signalDone(&clock_done, &done_queue);
+}
+
+/// The monotonic clock: it keeps time with the HPET (within 0.5% over
+/// 100 ms), and threads on every CPU never see it go back. Returns 0, or
+/// the number of the first failing check.
+pub fn clockChecks() u32 {
+    const clock = kernel_root.kernel.clock;
+    const c0 = clock.nanos();
+    const h0 = hpet.nanos();
+    timer.sleepMs(100);
+    const dc = clock.nanos() - c0;
+    const dh = hpet.nanos() - h0;
+    if (dc * 200 < dh * 199 or dc * 200 > dh * 201) return 1;
+    clock_latest.store(0, .monotonic);
+    clock_backwards.store(0, .monotonic);
+    clock_done = 0;
+    const n = @max(schedulingCpus(), 2);
+    for (0..n) |_| _ = thread.spawn(clockWorker, null) catch return 2;
+    waitForDone(&clock_done, n, &done_queue);
+    if (clock_backwards.load(.monotonic) != 0) return 3;
+    // The wall clock is a date after this code was written.
+    if (clock.wallNanos() / 1_000_000_000 < 1_767_225_600) return 4;
+    return 0;
+}
