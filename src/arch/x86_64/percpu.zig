@@ -118,6 +118,15 @@ pub const PerCpu = extern struct {
     syscall_stats: ?*anyopaque = null,
     lock_contended: [16]u64 = @splat(0),
     lock_wait_cycles: [16]u64 = @splat(0),
+    /// Halted with nothing to run, and so not interrupted for a flush of
+    /// the user addresses it has loaded (Linux's lazy TLB): whoever would
+    /// have sets `tlb_stale` instead, and the CPU flushes them all when it
+    /// wakes (`vmm.enterLazy`, `vmm.leaveLazy`). Both atomic.
+    tlb_lazy: bool = false,
+    tlb_stale: bool = false,
+    /// Where the timer found this CPU, in kernels that sample
+    /// (`profile.zig`; a `*profile.Ring`).
+    profile_ring: ?*anyopaque = null,
 };
 
 comptime {

@@ -33,8 +33,9 @@
 //!
 //! A process's regions, `brk` and page tables are protected by its
 //! address-space lock (`docs/locking.md`). The page-fault handler takes it
-//! too. Pages are allocated under it; the list of regions may allocate
-//! from the heap under it. Both rank after it.
+//! too, after zeroing the page it will most likely need without it. Pages
+//! are allocated under it; the list of regions may allocate from the heap
+//! under it. Both rank after it.
 
 const std = @import("std");
 
@@ -126,6 +127,12 @@ pub const Access = struct {
 /// and for faults on user addresses inside a user copy.
 pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
     if (addr >= vmm.USER_END) return error.BadAccess;
+    // A page that is not there yet is most likely wanted, zeroed: get it
+    // before taking the lock, so that zeroing 4 KiB is not done while the
+    // process's other threads wait for the lock (their faults, `mmap`).
+    // Given back if it is not used.
+    var fresh: ?u64 = if (access.present) null else pmm.allocZeroed();
+    defer if (fresh) |f| pmm.free(f);
     const held = p.mem.lock.acquire();
     defer p.mem.lock.release(held);
 
@@ -158,7 +165,13 @@ pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
         file_offset = region.fileOffset(page);
         if (file_offset >= node.size) return error.BadAccess;
     }
-    const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
+    const phys = blk: {
+        if (fresh) |f| {
+            fresh = null; // used: not freed on the way out
+            break :blk f;
+        }
+        break :blk pmm.allocZeroed() orelse return error.OutOfMemory;
+    };
     if (region.kind == .file) {
         // (The file is in memory, so reading it cannot wait; a file on a
         // disk will have to be read before this lock is taken.)

@@ -61,6 +61,11 @@ pub fn build(b: *std.Build) void {
             "stack-usage",
             "Measure how much of each kernel stack is used (default: true in Debug builds, false otherwise; always on in the test kernel)",
         ) orelse (optimize == .debug),
+        .bench = b.option(
+            bool,
+            "bench",
+            "Build the test kernel as a release kernel is built, without the poisoning and stack measuring it otherwise always has: for tools/bench, so that MyOS is measured as it ships (default: false)",
+        ) orelse false,
         .version = b.option(
             []const u8,
             "version",
@@ -368,6 +373,7 @@ const KernelOptions = struct {
     alloc_debug: bool,
     stack_usage: bool,
     poison: bool,
+    bench: bool,
     allow_meltdown: bool,
     version: []const u8,
 };
@@ -406,9 +412,13 @@ fn kernelArtifact(
     options.addOption(std.log.Level, "log_level", kopts.log_level);
     options.addOption(bool, "assertions", kopts.assertions);
     options.addOption(bool, "alloc_debug", kopts.alloc_debug);
-    // The test kernel always measures, so the tests cover it in every build mode.
-    options.addOption(bool, "stack_usage", kopts.stack_usage or is_test);
-    options.addOption(bool, "poison", kopts.poison or is_test);
+    // The test kernel always measures, so the tests cover it in every build
+    // mode; unless it is built to be benchmarked (`-Dbench`).
+    const test_extras = is_test and !kopts.bench;
+    options.addOption(bool, "stack_usage", kopts.stack_usage or test_extras);
+    options.addOption(bool, "poison", kopts.poison or test_extras);
+    // Benchmarked kernels sample where the time goes (`profile.zig`).
+    options.addOption(bool, "profile", kopts.bench);
     options.addOption(bool, "allow_meltdown", kopts.allow_meltdown);
     options.addOption([]const u8, "version", kopts.version);
     kernel.root_module.addOptions("build_options", options);

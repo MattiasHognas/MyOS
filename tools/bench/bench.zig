@@ -92,7 +92,17 @@ fn report(name: []const u8, copies: usize, samples: []f64) void {
     print("bench,{s},{d},{d:.1},{d:.1},{d:.1}\n", .{ name, copies, samples[samples.len / 2], samples[0], samples[samples.len - 1] });
 }
 
+/// Only the benchmarks whose name contains this, if it is set: the first
+/// argument (`run.sh --only`), to profile one alone.
+var only: ?[]const u8 = null;
+
+fn selected(name: []const u8) bool {
+    const want = only orelse return true;
+    return std.mem.indexOf(u8, name, want) != null;
+}
+
 fn bench(name: []const u8, op: Op) void {
+    if (!selected(name)) return;
     _ = timeRun(op); // warm up
     var samples: [RUNS]f64 = undefined;
     for (&samples) |*s| s.* = timeRun(op);
@@ -102,6 +112,7 @@ fn bench(name: []const u8, op: Op) void {
 /// `op` on `copies` threads at once, each for about `RUN_NS`; the time
 /// per operation of one copy.
 fn benchCopies(name: []const u8, op: Op, copies: usize) void {
+    if (!selected(name)) return;
     var samples: [RUNS]f64 = undefined;
     for (0..RUNS + 1) |r| {
         var results: [MAX_COPIES]f64 = undefined;
@@ -294,8 +305,10 @@ fn becomeConsole() void {
     for ([_]i32{ 0, 1, 2 }) |want| _ = linux.dup2(@intCast(fd), want);
 }
 
-pub fn main() void {
+pub fn main(init: std.process.Init.Minimal) void {
     if (linux.getpid() == 1) becomeConsole();
+    const args = init.args.vector;
+    if (args.len > 1 and std.mem.span(args[1]).len > 0) only = std.mem.span(args[1]);
     var uts: linux.utsname = undefined;
     _ = linux.uname(&uts);
     const cpus = cpuCount();
@@ -319,11 +332,12 @@ pub fn main() void {
         benchCopies("page_fault", opPageFault, copies);
         benchCopies("mmap_churn", opMmapChurn, copies);
     }
-    runDotnet();
+    if (selected("dotnet")) runDotnet();
     // MyOS's counters, where there are any (Linux has no such files): where
     // the time of this run went.
     dumpFile("/proc/lockstat");
     dumpFile("/proc/syscalls");
+    dumpFile("/proc/profile");
     print("BENCH_DONE\n", .{});
     exit(0);
 }

@@ -4,13 +4,18 @@
 # guest under the same QEMU and KVM, with the same CPUs and memory, and
 # print the two side by side. The same static program runs on both.
 #
-#   tools/bench/run.sh [--cpus N] [--save]
+#   tools/bench/run.sh [--cpus N] [--save] [--only NAME] [--myos-only]
+#
+# --only runs the benchmarks whose name contains NAME (to profile one
+# alone: MyOS's kernel then samples where its time goes, in
+# zig-out/bench/myos-profile.txt); --myos-only leaves Linux out.
 #
 # The Linux guest boots the host's own kernel image (/usr/lib/modules/
 # $(uname -r)/vmlinuz, or $BENCH_LINUX_KERNEL) with the benchmark as its
 # /init, twice: with its default mitigations and with mitigations=off.
 # MyOS runs the benchmark from its test image (scenario "bench"), built
-# ReleaseSafe: optimized, with its safety checks on, as it ships.
+# ReleaseSafe with -Dbench: optimized, with its safety checks and
+# assertions on, without the test kernel's poisoning: as it ships.
 #
 # Results go to zig-out/bench/; with --save also to
 # tools/bench/results/<commit>.csv, the record kept per commit.
@@ -24,11 +29,15 @@ cd "$(dirname "$0")/../.."  # the repository root
 
 cpus=4
 save=false
+only=""
+linux=true
 while (($#)); do
     case "$1" in
         --cpus) cpus="$2"; shift 2 ;;
         --save) save=true; shift ;;
-        *) echo "Usage: $0 [--cpus N] [--save]" >&2; exit 2 ;;
+        --only) only="$2"; shift 2 ;;
+        --myos-only) linux=false; shift ;;
+        *) echo "Usage: $0 [--cpus N] [--save] [--only NAME] [--myos-only]" >&2; exit 2 ;;
     esac
 done
 [[ -w /dev/kvm ]] || { echo "bench: needs KVM (/dev/kvm)" >&2; exit 1; }
@@ -38,7 +47,9 @@ mkdir -p "$out"
 
 # --- Build: the programs, MyOS's kernel and its test image.
 zig build -Doptimize=ReleaseSafe
-zig build test-kernel -Doptimize=ReleaseSafe
+# The test kernel only for its "bench" scenario: built as a release kernel
+# is (no poisoning, no stack measuring), so MyOS is measured as it ships.
+zig build test-kernel -Doptimize=ReleaseSafe -Dbench=true
 # The .NET workload, ahead of time and static (as the fixture
 # dotnet-hello-static is built), if there is a .NET SDK.
 extra="$out/extra"
@@ -74,7 +85,7 @@ qemu_common=(-machine q35 -enable-kvm -cpu host,+invtsc -smp "$cpus" -m "$memory
 run_linux() { # $1: extra kernel arguments; $2: the output file
     timeout 600 qemu-system-x86_64 "${qemu_common[@]}" \
         -kernel "$kernel" -initrd "$out/linux-initramfs.cpio" \
-        -append "console=ttyS0 rdinit=/init quiet loglevel=0 $1" \
+        -append "console=ttyS0 rdinit=/init quiet loglevel=0 $1 -- $only" \
         </dev/null | tr -d '\r' >"$2" || true
 }
 
@@ -82,16 +93,24 @@ run_myos() { # $1: the output file
     timeout 600 qemu-system-x86_64 "${qemu_common[@]}" \
         -cdrom zig-out/test/os.iso -boot d \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        -fw_cfg name=opt/myos/scenario,string=bench \
+        -fw_cfg name=opt/myos/scenario,string="bench${only:+:$only}" \
         </dev/null | tr -d '\r' >"$1" || true
 }
 
-echo "bench: Linux ($(basename "$(dirname "$kernel")")), default mitigations" >&2
-run_linux "" "$out/linux.log"
-echo "bench: Linux, mitigations=off" >&2
-run_linux "mitigations=off" "$out/linux-nomit.log"
+if $linux; then
+    echo "bench: Linux ($(basename "$(dirname "$kernel")")), default mitigations" >&2
+    run_linux "" "$out/linux.log"
+    echo "bench: Linux, mitigations=off" >&2
+    run_linux "mitigations=off" "$out/linux-nomit.log"
+fi
 echo "bench: MyOS" >&2
 run_myos "$out/myos.log"
+if ! $linux; then
+    grep '^bench,' "$out/myos.log" | grep -v '^bench,kernel' | column -t -s,
+    grep '^counters,/proc/profile,' "$out/myos.log" | cut -d, -f3- >"$out/myos-profile.txt" || true
+    echo "bench: where MyOS's time went in $out/myos-profile.txt" >&2
+    exit 0
+fi
 
 for f in linux linux-nomit myos; do
     grep -q '^BENCH_DONE' "$out/$f.log" || { echo "bench: the $f run did not finish; see $out/$f.log" >&2; exit 1; }
@@ -114,7 +133,8 @@ column -t -s, <"$out/compare.csv"
 # Where MyOS's time went during its run (its always-on counters).
 grep '^counters,/proc/lockstat,' "$out/myos.log" | cut -d, -f3- >"$out/myos-lockstat.txt" || true
 grep '^counters,/proc/syscalls,' "$out/myos.log" | cut -d, -f3- >"$out/myos-syscalls.txt" || true
-echo "bench: MyOS's lock contention in $out/myos-lockstat.txt, system calls in $out/myos-syscalls.txt" >&2
+grep '^counters,/proc/profile,' "$out/myos.log" | cut -d, -f3- >"$out/myos-profile.txt" || true
+echo "bench: MyOS's lock contention in $out/myos-lockstat.txt, system calls in $out/myos-syscalls.txt, where its time went in $out/myos-profile.txt" >&2
 if $save; then
     mkdir -p tools/bench/results
     cp "$out/compare.csv" "tools/bench/results/$commit.csv"

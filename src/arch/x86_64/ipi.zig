@@ -119,6 +119,19 @@ pub fn poll() void {
 /// CPU there is nothing to do. May be called with interrupts on or off and
 /// with any locks held. The caller does its own part itself.
 pub fn broadcast(r: Request) void {
+    send(r, null);
+}
+
+/// `broadcast` to the CPUs that have the address space `root` loaded, for
+/// work only those can have (a flush of its user addresses, letting go of
+/// it). The caller has made the change the work is for before calling, so
+/// that a CPU that loads `root` after this looked has the change already
+/// (`vmm.loadRoot`).
+pub fn broadcastTo(r: Request, root: u64) void {
+    send(r, root);
+}
+
+fn send(r: Request, only_root: ?u64) void {
     if (percpu.count() < 2) return;
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
@@ -132,15 +145,33 @@ pub fn broadcast(r: Request) void {
     _ = requests_sent.fetchAdd(1, .monotonic);
     const me = percpu.current();
     const n = percpu.count();
+    // The change the request is for is made; read where `root` is loaded
+    // only after every CPU can see it (a store, then a load: x86 may
+    // reorder those without a fence).
+    if (only_root != null) asm volatile ("mfence" ::: .{ .memory = true });
+    var asked: [percpu.MAX_CPUS / 64]u64 = @splat(0);
     for (0..n) |i| {
         const c = percpu.get(i);
         if (c == me) continue;
+        if (only_root) |root| {
+            if (@atomicLoad(u64, &c.loaded_root, .seq_cst) != root) continue;
+            // A flush of user addresses passes a halted CPU by: it is
+            // marked stale (first, see `vmm.leaveLazy`) and flushes when
+            // it wakes. Waking a halted CPU, a virtual one above all, costs
+            // far more. An address space being let go of is another matter:
+            // nothing may keep it loaded.
+            if (r == .flush_user) {
+                @atomicStore(bool, &c.tlb_stale, true, .seq_cst);
+                if (@atomicLoad(bool, &c.tlb_lazy, .seq_cst)) continue;
+            }
+        }
+        asked[i / 64] |= @as(u64, 1) << @intCast(i % 64);
         @atomicStore(bool, &c.ipi_pending, true, .release);
         apic.sendIpi(c.apic_id, CALL_VECTOR);
     }
     for (0..n) |i| {
         const c = percpu.get(i);
-        if (c == me) continue;
+        if (asked[i / 64] & (@as(u64, 1) << @intCast(i % 64)) == 0) continue;
         while (@atomicLoad(bool, &c.ipi_pending, .acquire)) {
             if (stopper.load(.acquire) >= 0) haltIfStopped(); // it may never answer
             std.atomic.spinLoopHint();

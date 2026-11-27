@@ -237,6 +237,7 @@ fn apMain() callconv(.c) noreturn {
     pmm.initCpu(); // its caches of free pages and heap blocks
     heap.initCpu();
     @import("../../kernel/stats.zig").initCpu(); // its counters
+    @import("../../kernel/profile.zig").initCpu();
     log.debug("CPU {d} (APIC ID {d}) is up", .{ c.id, c.apic_id });
 
     // This context has nothing left to do: the CPU takes threads from the

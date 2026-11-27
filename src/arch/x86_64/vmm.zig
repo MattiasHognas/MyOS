@@ -304,7 +304,10 @@ fn flushEverywhere(root: u64, start: u64, pages: u64) void {
         ipi.broadcast(.{ .flush_kernel = .{ .start = start, .pages = pages } });
     } else {
         if (loadedRoot() == root) flushLocal(start, pages);
-        ipi.broadcast(.{ .flush_user = .{ .root = root, .start = start, .pages = pages } });
+        // Only the CPUs that have `root` loaded can hold its translations
+        // (see `loadRoot` for why reading that is enough): a process's
+        // `munmap` interrupts none but the CPUs its threads ran on.
+        ipi.broadcastTo(.{ .flush_user = .{ .root = root, .start = start, .pages = pages } }, root);
     }
 }
 
@@ -620,13 +623,42 @@ pub fn createAddressSpace() error{OutOfMemory}!u64 {
 /// `root` by loading CR3. This flushes the TLB entries of user addresses;
 /// the kernel's are global and stay. Interrupts must be off.
 pub fn loadRoot(root: u64) void {
+    const c = percpu.current();
+    // Said before it is done: a CPU that changes a mapping of `root` and
+    // then reads this (`flushEverywhere`) either sees it and asks this one
+    // to flush, or wrote the mapping before this CPU loads CR3, which it
+    // then walks afresh. Loading CR3 is serializing: the store is visible
+    // to every CPU before any translation through the new tables is made.
+    @atomicStore(u64, &c.loaded_root, root, .seq_cst);
     asm volatile ("mov %[r], %%cr3"
         :
         : [r] "r" (root),
         : .{ .memory = true });
-    const c = percpu.current();
-    c.loaded_root = root;
     c.root_loads += 1;
+}
+
+/// This CPU is about to halt with nothing to run: from now on a flush of
+/// the user addresses it has loaded need not interrupt it (`ipi.send`
+/// marks it stale instead). Interrupts are off.
+pub fn enterLazy() void {
+    @atomicStore(bool, &percpu.current().tlb_lazy, true, .seq_cst);
+}
+
+/// This CPU has woken: if a flush passed it by while it halted, forget
+/// every user translation now, before anything can use one. Against a
+/// sender: it marks the CPU stale before it looks whether the CPU is lazy,
+/// and the CPU says it is not before it looks whether it is stale, so one
+/// of them sees the other. Interrupts are off.
+pub fn leaveLazy() void {
+    const c = percpu.current();
+    @atomicStore(bool, &c.tlb_lazy, false, .seq_cst);
+    if (@atomicRmw(bool, &c.tlb_stale, .Xchg, false, .seq_cst)) {
+        // Reloading CR3 drops every user translation; the kernel's are global.
+        asm volatile ("mov %[r], %%cr3"
+            :
+            : [r] "r" (c.loaded_root),
+            : .{ .memory = true });
+    }
 }
 
 /// The PML4 that is loaded on this CPU now.
@@ -654,7 +686,7 @@ pub fn unloadRoot(root: u64) void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     if (percpu.current().loaded_root == root) loadRoot(kernel_root);
-    ipi.broadcast(.{ .unload_root = root });
+    ipi.broadcastTo(.{ .unload_root = root }, root);
 }
 
 /// Count the page tables under the table at `phys`, itself included.

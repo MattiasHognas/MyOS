@@ -58,6 +58,7 @@ pub const File = enum {
     meminfo,
     syscalls,
     lockstat,
+    profile,
     cpuinfo,
     cpus_online,
     cg_controllers,
@@ -74,7 +75,7 @@ pub fn find(name: []const u8, per_process: bool) ?File {
     const table = if (per_process)
         &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm }, .{ "mountinfo", .mountinfo }, .{ "cgroup", .cgroup }, .{ "schedstat", .schedstat } }
     else
-        &[_]struct { []const u8, File }{ .{ "meminfo", .meminfo }, .{ "cpuinfo", .cpuinfo }, .{ "syscalls", .syscalls }, .{ "lockstat", .lockstat } };
+        &[_]struct { []const u8, File }{ .{ "meminfo", .meminfo }, .{ "cpuinfo", .cpuinfo }, .{ "syscalls", .syscalls }, .{ "lockstat", .lockstat }, .{ "profile", .profile } };
     for (table) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return entry[1];
     }
@@ -201,6 +202,7 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
         },
         .syscalls => return stats.syscallReport(heap.allocator),
         .lockstat => return stats.lockReport(heap.allocator),
+        .profile => return @import("profile.zig").report(heap.allocator),
         .cg_controllers => return heap.allocator.dupe(u8, "cpuset cpu memory\n"),
         .cg_cpu_max => return heap.allocator.dupe(u8, "max 100000\n"),
         .cg_memory_max => {

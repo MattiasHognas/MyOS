@@ -353,8 +353,10 @@ fn idleOnce() void {
     assert.check(.thread, ready_head == null or !c.runs_threads, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
     c.halts += 1;
     c.idle = true;
+    vmm.enterLazy(); // not to be woken for flushes of the address space it has loaded
     lock.drop();
     asm volatile ("sti; hlt; cli");
+    vmm.leaveLazy();
     lock.take();
     c.idle = false;
 }
@@ -651,6 +653,10 @@ pub fn yield() void {
 /// one hands it over again.
 fn switchToNext() bool {
     spinlock.assertHeld(1, "switching threads");
+    // Switched to from an interrupt taken while halting (preemption by the
+    // tick): no longer lazy, and flushed if a flush passed this CPU by,
+    // before a thread of the address space it has loaded runs.
+    vmm.leaveLazy();
     const c = percpu.current();
     const prev = current();
     const next: *Thread = (if (c.runs_threads) dequeue() else null) orelse blk: {

@@ -71,6 +71,7 @@ pub const kernel = struct {
     pub const random = @import("kernel/random.zig");
     pub const flock = @import("kernel/flock.zig");
     pub const stats = @import("kernel/stats.zig");
+    pub const profile = @import("kernel/profile.zig");
     pub const random_core = @import("kernel/random_core.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
@@ -178,7 +179,8 @@ fn findModule(name: []const u8) ?[]const u8 {
 /// Timer interrupt handler, on every CPU: the boot CPU advances time and
 /// runs the timers that are due, and each CPU lets the scheduler preempt
 /// its current thread when the time slice is used up.
-fn onTick(_: *idt.Frame) void {
+fn onTick(f: *idt.Frame) void {
+    kernel.profile.sample(f.rip, f.cs & 3 == 3);
     if (arch.x86_64.percpu.current().id == 0) kernel.timer.tick(); // first: a thread a timer wakes can run right away
     thread.tick();
 }
@@ -395,6 +397,7 @@ fn kmainOnStack() callconv(.c) noreturn {
     hpet.init();
     kernel.clock.init(); // the TSC calibrated against the HPET, the wall clock from the RTC
     kernel.stats.initCpu(); // the boot CPU's counters (the others make theirs as they come up)
+    kernel.profile.initCpu();
 
     pci.scan();
     if (pci.find(0x01, 0x08, 0x02)) |dev| {

@@ -1806,10 +1806,11 @@ fn scenarioShell() noreturn {
 
 /// Scenario "bench" (`tools/bench/run.sh`): run `/usr/bin/bench` with every
 /// CPU taking threads, as a program a user starts, and end the run. Not a
-/// test: the numbers are for the host to compare with Linux's.
-fn scenarioBench() noreturn {
+/// test: the numbers are for the host to compare with Linux's. `only`
+/// limits it to the benchmarks whose name has it in.
+fn scenarioBench(only: []const u8) noreturn {
     _ = helpers.setOthersParked(false);
-    const p = process.spawnPath("/usr/bin/bench", .{ .argv = &.{"bench"} }) catch |e|
+    const p = process.spawnPath("/usr/bin/bench", .{ .argv = &.{ "bench", only } }) catch |e|
         panicFmt("bench scenario: cannot start /usr/bin/bench: {s}", .{@errorName(e)});
     const code = process.wait(p);
     var line: [64]u8 = undefined;
@@ -1924,7 +1925,9 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "lock_order")) scenarioLockOrder();
     if (std.mem.eql(u8, scenario, "sleep_with_lock")) scenarioSleepWithLock();
     if (std.mem.eql(u8, scenario, "shell")) scenarioShell();
-    if (std.mem.eql(u8, scenario, "bench")) scenarioBench();
+    // "bench", or "bench:<name>" for only the benchmarks named so.
+    if (std.mem.eql(u8, scenario, "bench")) scenarioBench("");
+    if (std.mem.startsWith(u8, scenario, "bench:")) scenarioBench(scenario["bench:".len..]);
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
     const smp_run = std.mem.eql(u8, scenario, "tests_smp");
     expect_cpus = if (smp_run) 4 else 1; // as `scripts/test-qemu.sh` starts QEMU
@@ -2086,7 +2089,9 @@ fn runCases() noreturn {
         .{ .name = "a new process sees only zeroes (ring 3)", .func = userMemoryIsZeroed },
         .{ .name = "speculation guards (index clamp, user address clamp in user copies)", .func = speculationGuards },
         .{ .name = "Meltdown: CPU checked at boot", .func = meltdownDecision },
-        .{ .name = "user stack address randomization", .func = stackRandomization },
+        // Alone: it reads each process's page tables before the process runs,
+        // which another CPU taking threads would not wait for.
+        .{ .name = "user stack address randomization", .func = stackRandomization, .alone = true },
         .{ .name = "kernel runs at a randomized address", .func = kernelRelocation },
         .{ .name = "spinlocks (interrupt state, nesting, exclusion under preemption)", .func = spinlocks },
         // Alone: checks the order in which woken threads run.
