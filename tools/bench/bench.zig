@@ -320,8 +320,30 @@ pub fn main() void {
         benchCopies("mmap_churn", opMmapChurn, copies);
     }
     runDotnet();
+    // MyOS's counters, where there are any (Linux has no such files): where
+    // the time of this run went.
+    dumpFile("/proc/lockstat");
+    dumpFile("/proc/syscalls");
     print("BENCH_DONE\n", .{});
     exit(0);
+}
+
+/// Each line of `path`, prefixed with `counters,<path>,`.
+fn dumpFile(path: [*:0]const u8) void {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [16384]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = linux.read(@intCast(fd), buf[len..].ptr, buf.len - len);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        len += n;
+    }
+    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
+    while (lines.next()) |line| {
+        if (line.len != 0) print("counters,{s},{s}\n", .{ std.mem.span(path), line });
+    }
 }
 
 /// The .NET workload (`tools/bench/dotnet`), where the image has it: it

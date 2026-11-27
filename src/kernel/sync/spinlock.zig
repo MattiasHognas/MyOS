@@ -28,6 +28,7 @@
 //! keeping its lock across a context switch.
 
 const std = @import("std");
+const stats = @import("../stats.zig");
 
 const cpu = @import("../../arch/x86_64/cpu.zig");
 const ipi = @import("../../arch/x86_64/ipi.zig");
@@ -104,6 +105,10 @@ pub const SpinLock = struct {
     pub fn take(self: *SpinLock) void {
         assert.check(.spinlock, cpu.readFlags() & (1 << 9) == 0, "taking a {t} lock with interrupts on", .{self.rank});
         self.noteTaken();
+        if (self.raw.tryLock()) return;
+        // It has to wait: counted, with how long (`stats.zig`).
+        const waited_from = stats.rdtsc();
+        defer stats.contended(self.rank, stats.rdtsc() - waited_from);
         var spins: usize = 0;
         while (!self.raw.tryLock()) {
             // Only read the flag while waiting, so the cache line is not

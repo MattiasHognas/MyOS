@@ -29,6 +29,7 @@ const readiness = @import("readiness.zig");
 const kepoll = @import("epoll.zig");
 const open_file = @import("open_file.zig");
 const procfs = @import("procfs.zig");
+const kstats = @import("stats.zig");
 const kflock = @import("flock.zig");
 const OpenFile = open_file.OpenFile;
 const pmm = @import("pmm.zig");
@@ -1389,7 +1390,7 @@ fn extraEntries(dir: []const u8) []const ListEntry {
         .{ .name = "urandom", .type = abi.DT.CHR },
         .{ .name = "random", .type = abi.DT.CHR },
     };
-    if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG }, .{ .name = "cpuinfo", .type = REG } };
+    if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG }, .{ .name = "cpuinfo", .type = REG }, .{ .name = "syscalls", .type = REG }, .{ .name = "lockstat", .type = REG } };
     if (named(dir) == .directory and std.mem.startsWith(u8, dir, "/proc/")) {
         const own = std.mem.eql(u8, dir, "/proc/self") or blk: {
             var id_buf: [24]u8 = undefined;
@@ -1402,10 +1403,11 @@ fn extraEntries(dir: []const u8) []const ListEntry {
             .{ .name = "comm", .type = REG },
             .{ .name = "mountinfo", .type = REG },
             .{ .name = "cgroup", .type = REG },
+            .{ .name = "schedstat", .type = REG },
             .{ .name = "exe", .type = abi.DT.LNK },
             .{ .name = "maps", .type = REG },
         };
-        return if (own) all else all[0..5];
+        return if (own) all else all[0..6];
     }
     return &.{};
 }
@@ -2687,7 +2689,10 @@ pub fn dispatch(f: *arch.Frame) void {
         root.print("syscall: thread {d} call {d} = 0x{x}\n", .{ thread.id(), number, f.rax });
         return;
     }
+    const number = f.rax;
+    const start = kstats.rdtsc();
     dispatchCall(f);
+    kstats.syscall(number, kstats.rdtsc() - start); // a call that waits counts its wait
 }
 
 /// Log every system call of every program, with its first three arguments

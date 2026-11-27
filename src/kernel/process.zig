@@ -430,6 +430,26 @@ pub fn describe(p: *Process) struct { state: u8, ppid: u64, pgid: u64, sid: u64,
     };
 }
 
+/// What `/proc/<pid>/schedstat` says of `p`: time running and ready but
+/// waiting, in TSC cycles, and time slices, over all its threads alive
+/// now.
+pub fn schedTotals(p: *Process) struct { run: u64, wait: u64, slices: u64 } {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var r: @TypeOf(schedTotals(p)) = .{ .run = 0, .wait = 0, .slices = 0 };
+    const now = @import("stats.zig").rdtsc();
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        r.run += @atomicLoad(u64, &one.run_cycles, .monotonic);
+        // A thread on a CPU now: its slice so far counts too, as on Linux.
+        const since = @atomicLoad(u64, &one.run_since, .monotonic);
+        if (@atomicLoad(bool, &one.on_cpu, .monotonic) and since != 0) r.run += now -% since;
+        r.wait += @atomicLoad(u64, &one.wait_cycles, .monotonic);
+        r.slices += @atomicLoad(u64, &one.slices, .monotonic);
+    }
+    return r;
+}
+
 /// The process with ID `pid`, with a reference the caller gives up with
 /// `release`; null if there is none.
 pub fn findRetained(pid: u64) ?*Process {

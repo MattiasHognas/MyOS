@@ -1,0 +1,14 @@
+# class contended wait_ns
+process_tree 144216 168646282
+address_space 3191396 9491743362
+descriptor_table 0 0
+condition 13541 68308181
+readiness 0 0
+timer 0 0
+scheduler 2317740 1278701326
+heap_cache 0 0
+kernel_region 467 2546859
+page_cache 0 0
+page_allocator 6 4939
+random 0 0
+console 0 0

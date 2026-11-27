@@ -70,6 +70,7 @@ pub const kernel = struct {
     pub const process = @import("kernel/process.zig");
     pub const random = @import("kernel/random.zig");
     pub const flock = @import("kernel/flock.zig");
+    pub const stats = @import("kernel/stats.zig");
     pub const random_core = @import("kernel/random_core.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
@@ -393,6 +394,7 @@ fn kmainOnStack() callconv(.c) noreturn {
     apic.init();
     hpet.init();
     kernel.clock.init(); // the TSC calibrated against the HPET, the wall clock from the RTC
+    kernel.stats.initCpu(); // the boot CPU's counters (the others make theirs as they come up)
 
     pci.scan();
     if (pci.find(0x01, 0x08, 0x02)) |dev| {

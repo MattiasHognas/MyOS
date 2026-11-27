@@ -100,6 +100,7 @@
 //! to themselves; it is also the first half of taking a CPU offline.
 
 const std = @import("std");
+const stats = @import("stats.zig");
 const root = @import("root");
 const abi = @import("abi");
 
@@ -151,6 +152,7 @@ fn enqueue(t: *Thread) void {
     assert.check(.thread, t.link == .none, "thread {d} is already queued ({t})", .{ t.id, t.link });
     t.link = .ready_queue;
     t.next = null;
+    t.ready_since = stats.rdtsc();
     if (ready_tail) |tail| tail.next = t else ready_head = t;
     ready_tail = t;
 }
@@ -219,6 +221,14 @@ pub const Link = enum { none, ready_queue, zombie_list };
 /// A kernel thread: a stack, saved registers and scheduling state. A thread
 /// either belongs to a user process or is a pure kernel thread (`process == null`).
 pub const Thread = struct {
+    /// Its time (TSC cycles, `stats.zig`): running, ready but waiting for
+    /// a CPU, and the time slices it got; and when it last became ready
+    /// and last started running. Under the scheduler lock.
+    run_cycles: u64 = 0,
+    wait_cycles: u64 = 0,
+    slices: u64 = 0,
+    ready_since: u64 = 0,
+    run_since: u64 = 0,
     id: usize,
     /// Saved stack pointer while the thread is not running.
     rsp: usize = 0,
@@ -664,6 +674,12 @@ fn switchToNext() bool {
         enqueue(prev);
         _ = kickIdleCpu(); // it need not wait for this CPU to come back to it
     }
+    const now = stats.rdtsc();
+    if (prev.run_since != 0) prev.run_cycles += now -% prev.run_since;
+    if (next.ready_since != 0) next.wait_cycles += now -% next.ready_since;
+    next.ready_since = 0;
+    next.run_since = now;
+    next.slices += 1;
     next.state = .running;
     next.on_cpu = true;
     next.cpu = c;

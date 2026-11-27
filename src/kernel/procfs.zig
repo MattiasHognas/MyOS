@@ -13,6 +13,8 @@
 //!   /proc/<pid>/comm     its name, as `stat` gives it
 //!   /proc/meminfo        memory in the machine and how much is free
 //!   /proc/cpuinfo        each CPU, with its features (`cpuinfo.zig`)
+//!   /proc/syscalls, /proc/lockstat, /proc/<pid>/schedstat
+//!                        the always-on counters (`stats.zig`)
 //!
 //!   /proc/<pid>/mountinfo  the filesystems, as Linux lists them
 //!   /proc/<pid>/cgroup     "0::/": the one control group, at the root
@@ -40,6 +42,7 @@ const pmm = @import("pmm.zig");
 const proc = @import("process.zig");
 const user_memory = @import("user_memory.zig");
 const cpuinfo = @import("cpuinfo.zig");
+const stats = @import("stats.zig");
 const clock = @import("clock.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
@@ -51,7 +54,10 @@ pub const File = enum {
     comm,
     mountinfo,
     cgroup,
+    schedstat,
     meminfo,
+    syscalls,
+    lockstat,
     cpuinfo,
     cpus_online,
     cg_controllers,
@@ -66,9 +72,9 @@ pub const File = enum {
 /// if `per_process`, or below `/proc`.
 pub fn find(name: []const u8, per_process: bool) ?File {
     const table = if (per_process)
-        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm }, .{ "mountinfo", .mountinfo }, .{ "cgroup", .cgroup } }
+        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm }, .{ "mountinfo", .mountinfo }, .{ "cgroup", .cgroup }, .{ "schedstat", .schedstat } }
     else
-        &[_]struct { []const u8, File }{ .{ "meminfo", .meminfo }, .{ "cpuinfo", .cpuinfo } };
+        &[_]struct { []const u8, File }{ .{ "meminfo", .meminfo }, .{ "cpuinfo", .cpuinfo }, .{ "syscalls", .syscalls }, .{ "lockstat", .lockstat } };
     for (table) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return entry[1];
     }
@@ -189,6 +195,12 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
             \\
         ),
         .cgroup => return heap.allocator.dupe(u8, "0::/\n"),
+        .schedstat => {
+            const t = proc.schedTotals(p);
+            return std.fmt.allocPrint(heap.allocator, "{d} {d} {d}\n", .{ stats.toNs(t.run), stats.toNs(t.wait), t.slices });
+        },
+        .syscalls => return stats.syscallReport(heap.allocator),
+        .lockstat => return stats.lockReport(heap.allocator),
         .cg_controllers => return heap.allocator.dupe(u8, "cpuset cpu memory\n"),
         .cg_cpu_max => return heap.allocator.dupe(u8, "max 100000\n"),
         .cg_memory_max => {

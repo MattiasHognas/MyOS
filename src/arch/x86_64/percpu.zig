@@ -111,6 +111,13 @@ pub const PerCpu = extern struct {
     /// (`random.interruptTiming`). Touched only with interrupts off.
     entropy: [4]u64 = @splat(0),
     entropy_count: u32 = 0,
+
+    /// This CPU's counters (`stats.zig`): per system call (a
+    /// `*stats.SyscallTable`, made the first time it is needed), and per
+    /// lock class the acquisitions that waited and the cycles they waited.
+    syscall_stats: ?*anyopaque = null,
+    lock_contended: [16]u64 = @splat(0),
+    lock_wait_cycles: [16]u64 = @splat(0),
 };
 
 comptime {

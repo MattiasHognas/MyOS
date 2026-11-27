@@ -158,7 +158,7 @@ pub fn main() noreturn {
     expect(std.mem.eql(u8, listing(dev_dir), ". .. null urandom random"), 128);
     _ = lib.close(dev_dir);
     const self_dir = lib.open("/proc/self/");
-    expect(std.mem.eql(u8, listing(self_dir), ". .. stat cmdline comm mountinfo cgroup exe maps"), 129);
+    expect(std.mem.eql(u8, listing(self_dir), ". .. stat cmdline comm mountinfo cgroup schedstat exe maps"), 129);
     _ = lib.close(self_dir);
     // Every process has a directory by its ID, this one included; another
     // process's has no `exe` or `maps`.
@@ -365,17 +365,29 @@ pub fn main() noreturn {
     const max_text = std.mem.trimEnd(u8, slurp("/sys/fs/cgroup/memory.max"), "\n");
     expect((std.fmt.parseInt(u64, max_text, 10) catch 0) == data_limit.cur, 149);
     const current = std.fmt.parseInt(u64, std.mem.trimEnd(u8, slurp("/sys/fs/cgroup/memory.current"), "\n"), 10) catch 0;
-    expect(current > 0 and current < data_limit.cur, 300);
-    expect(std.mem.eql(u8, slurp("/sys/fs/cgroup/cpu.max"), "max 100000\n"), 301);
-    expect(std.mem.startsWith(u8, slurp("/sys/fs/cgroup/memory.stat"), "anon "), 302);
+    expect(current > 0 and current < data_limit.cur, 12);
+    expect(std.mem.eql(u8, slurp("/sys/fs/cgroup/cpu.max"), "max 100000\n"), 13);
+    expect(std.mem.startsWith(u8, slurp("/sys/fs/cgroup/memory.stat"), "anon "), 14);
     var fs: abi.StatFs = undefined;
-    expect(lib.syscall(Sys.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs), 0) == 0 and fs.type == 0x63677270, 303); // CGROUP2_SUPER_MAGIC
-    expect(lib.syscall(Sys.statfs, @intFromPtr("/proc/self"), @intFromPtr(&fs), 0) == 0 and fs.type == 0x9fa0, 304);
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs), 0) == 0 and fs.type == 0x63677270, 15); // CGROUP2_SUPER_MAGIC
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/proc/self"), @intFromPtr(&fs), 0) == 0 and fs.type == 0x9fa0, 16);
     const cg_dir = lib.open("/sys/fs/cgroup");
-    expect(std.mem.eql(u8, listing(cg_dir), ". .. cgroup.controllers cpu.max cpuset.cpus.effective memory.current memory.max memory.stat"), 305);
+    expect(std.mem.eql(u8, listing(cg_dir), ". .. cgroup.controllers cpu.max cpuset.cpus.effective memory.current memory.max memory.stat"), 17);
     _ = lib.close(cg_dir);
+    // The always-on counters: this program's calls are among them, its
+    // threads have run, and the lock classes are listed.
+    const calls = slurp("/proc/syscalls");
+    expect(std.mem.startsWith(u8, calls, "# number name calls ") and std.mem.indexOf(u8, calls, "\n39 getpid ") != null, 19);
+    const sched = std.mem.trimEnd(u8, slurp("/proc/self/schedstat"), "\n");
+    var fields = std.mem.splitScalar(u8, sched, ' ');
+    const run_ns = std.fmt.parseInt(u64, fields.next() orelse "", 10) catch 0;
+    _ = std.fmt.parseInt(u64, fields.next() orelse "x", 10) catch expect(false, 33);
+    const slices = std.fmt.parseInt(u64, fields.next() orelse "", 10) catch 0;
+    expect(run_ns > 0 and slices > 0 and fields.next() == null, 34);
+    const locks = slurp("/proc/lockstat");
+    expect(std.mem.startsWith(u8, locks, "# class contended wait_ns\n") and std.mem.indexOf(u8, locks, "\nscheduler ") != null, 35);
     const sys_dir = lib.open("/sys");
-    expect(std.mem.eql(u8, listing(sys_dir), ". .. devices fs"), 306);
+    expect(std.mem.eql(u8, listing(sys_dir), ". .. devices fs"), 18);
     _ = lib.close(sys_dir);
 
     // --- /dev/null and /dev/urandom.

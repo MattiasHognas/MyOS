@@ -111,6 +111,10 @@ commit=$(git rev-parse --short HEAD)
         sort -t, -k1,1 -k2,2n
 } >"$out/compare.csv"
 column -t -s, <"$out/compare.csv"
+# Where MyOS's time went during its run (its always-on counters).
+grep '^counters,/proc/lockstat,' "$out/myos.log" | cut -d, -f3- >"$out/myos-lockstat.txt" || true
+grep '^counters,/proc/syscalls,' "$out/myos.log" | cut -d, -f3- >"$out/myos-syscalls.txt" || true
+echo "bench: MyOS's lock contention in $out/myos-lockstat.txt, system calls in $out/myos-syscalls.txt" >&2
 if $save; then
     mkdir -p tools/bench/results
     cp "$out/compare.csv" "tools/bench/results/$commit.csv"
