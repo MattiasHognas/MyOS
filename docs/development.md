@@ -107,6 +107,7 @@ scripts/run-qemu.sh   # boots into the shell; type "hello", or "exit"
 | `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (listed in [testing](testing.md#qemu-integration-test-scenarios)). |
 | `zig build test` | Host tests, the model checks, the stack frame and syscall dispatch checks and QEMU scenarios. |
 | `zig build coverage` | Host tests under kcov; report in `zig-out/coverage/`. |
+| `tools/bench/run.sh [--cpus N] [--save]` | The benchmark (`tools/bench/bench.zig`) in a Linux guest (the host's kernel, with and without mitigations) and a MyOS guest under the same QEMU and KVM; prints the medians side by side. `--save` keeps them in `tools/bench/results/<commit>.csv`. Needs KVM. |
 
 Build options (they apply to the test commands too):
 

@@ -1804,6 +1804,19 @@ fn scenarioShell() noreturn {
     qemu_exit.exit(if (code == 0) 0 else 1);
 }
 
+/// Scenario "bench" (`tools/bench/run.sh`): run `/usr/bin/bench` with every
+/// CPU taking threads, as a program a user starts, and end the run. Not a
+/// test: the numbers are for the host to compare with Linux's.
+fn scenarioBench() noreturn {
+    _ = helpers.setOthersParked(false);
+    const p = process.spawnPath("/usr/bin/bench", .{ .argv = &.{"bench"} }) catch |e|
+        panicFmt("bench scenario: cannot start /usr/bin/bench: {s}", .{@errorName(e)});
+    const code = process.wait(p);
+    var line: [64]u8 = undefined;
+    serial.puts(std.fmt.bufPrint(&line, "MYOS_BENCH_DONE status={d}\n", .{code}) catch unreachable);
+    qemu_exit.exit(if (code == 0) 0 else 1);
+}
+
 /// Integration-test scenario "panic": fail a subsystem assertion two calls
 /// deep, so the panic output must contain a symbolized backtrace through
 /// these functions.
@@ -1911,6 +1924,7 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "lock_order")) scenarioLockOrder();
     if (std.mem.eql(u8, scenario, "sleep_with_lock")) scenarioSleepWithLock();
     if (std.mem.eql(u8, scenario, "shell")) scenarioShell();
+    if (std.mem.eql(u8, scenario, "bench")) scenarioBench();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
     const smp_run = std.mem.eql(u8, scenario, "tests_smp");
     expect_cpus = if (smp_run) 4 else 1; // as `scripts/test-qemu.sh` starts QEMU

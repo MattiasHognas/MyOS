@@ -1,0 +1,17 @@
+# 2026-11-27T21:39Z commit 96acc89, 4 CPUs under KVM (AMD Ryzen 9 9950X3D 16-Core Processor)
+name,copies,linux_ns,linux_nomit_ns,myos_ns,myos_vs_linux
+clock_gettime,1,15.6,15.6,55.0,3.53
+clock_gettime_syscall,1,54.9,55.0,55.0,1.00
+fork_wait,1,37543.9,40093.1,95093.9,2.53
+futex_pingpong,1,6961.0,4825.0,11737.0,1.69
+getppid,1,31.7,32.6,48.5,1.53
+getppid,2,30.4,30.9,57.5,1.89
+getppid,4,31.2,31.1,77.0,2.47
+mmap_churn,1,1242.1,1242.2,27788.9,22.37
+mmap_churn,2,21938.1,22462.1,54193.8,2.47
+mmap_churn,4,33066.9,30544.9,94530.7,2.86
+page_fault,1,36.4,36.6,474.7,13.04
+page_fault,2,62.7,63.2,801.2,12.78
+page_fault,4,98.0,92.9,2128.6,21.72
+pipe_pingpong,1,9262.9,9264.4,20023.5,2.16
+thread_create,1,50790.7,51413.3,113542.5,2.24

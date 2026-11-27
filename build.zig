@@ -120,6 +120,18 @@ pub fn build(b: *std.Build) void {
         exe.root_module.addImport("sh_words", sh_words);
         b.installArtifact(exe); // scripts/build.sh puts zig-out/bin/bin-<name> at /usr/bin/<name>
     }
+    // The benchmark of tools/bench, as /usr/bin/bench: always optimized,
+    // since its numbers are compared with Linux's.
+    const bench_exe = b.addExecutable(.{
+        .name = "bin-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench/bench.zig"),
+            .target = linux_target,
+            .optimize = .ReleaseFast,
+            .strip = true,
+        }),
+    });
+    b.installArtifact(bench_exe);
     // A few utilities in plain C, built as any Linux toolchain builds them
     // (Zig's clang and musl, statically linked), packaged next to them.
     const musl_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
