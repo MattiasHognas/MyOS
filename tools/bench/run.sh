@@ -77,6 +77,10 @@ rm -rf "$cpio_dir"
 mkdir -p "$cpio_dir"
 cp zig-out/bin/bin-bench "$cpio_dir/init"
 [[ -f "$extra/usr/bin/dotnet-bench" ]] && cp "$extra/usr/bin/dotnet-bench" "$cpio_dir/dotnet-bench"
+# Halt polling, which a distribution's Linux guest has and MyOS does too:
+# a module of the host's kernel, loaded by the benchmark as /init.
+haltpoll="$(dirname "$kernel")/kernel/drivers/cpuidle/cpuidle-haltpoll.ko.zst"
+[[ -r "$haltpoll" ]] && cp "$haltpoll" "$cpio_dir/" || echo "bench: no cpuidle-haltpoll module at $haltpoll: Linux will halt without polling" >&2
 (cd "$cpio_dir" && find . | cpio -o -H newc --quiet) >"$out/linux-initramfs.cpio"
 
 qemu_common=(-machine q35 -enable-kvm -cpu host,+invtsc -smp "$cpus" -m "$memory"
@@ -112,9 +116,10 @@ if ! $linux; then
     exit 0
 fi
 
+grep -h '^bench,note,' "$out/linux.log" | cut -d, -f3- | sed 's/^/bench: Linux: /' >&2 || true
 for f in linux linux-nomit myos; do
     grep -q '^BENCH_DONE' "$out/$f.log" || { echo "bench: the $f run did not finish; see $out/$f.log" >&2; exit 1; }
-    grep '^bench,' "$out/$f.log" | grep -v '^bench,kernel' >"$out/$f.csv"
+    grep '^bench,' "$out/$f.log" | grep -v '^bench,kernel\|^bench,note' >"$out/$f.csv"
 done
 
 # --- Side by side: the median ns per operation, and MyOS against Linux.

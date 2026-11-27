@@ -300,9 +300,35 @@ fn becomeConsole() void {
     _ = linux.mount("sysfs", "/sys", "sysfs", 0, 0);
     _ = linux.mkdir("/tmp", 0o1777);
     _ = linux.mount("tmpfs", "/tmp", "tmpfs", 0, 0);
-    const fd = linux.open("/dev/console", .{ .ACCMODE = .RDWR }, 0);
-    if (linux.errno(fd) != .SUCCESS) return;
-    for ([_]i32{ 0, 1, 2 }) |want| _ = linux.dup2(@intCast(fd), want);
+    const console = linux.open("/dev/console", .{ .ACCMODE = .RDWR }, 0);
+    if (linux.errno(console) == .SUCCESS) {
+        for ([_]i32{ 0, 1, 2 }) |want| _ = linux.dup2(@intCast(console), want);
+    }
+    loadHaltpoll();
+}
+
+/// A Linux guest of a distribution polls before it halts an idle CPU
+/// (`cpuidle-haltpoll`, a module); MyOS does too. Load it, if `run.sh`
+/// put it in the image, so that the two are compared alike. Said in the
+/// output either way.
+fn loadHaltpoll() void {
+    const path = "/cpuidle-haltpoll.ko.zst";
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) {
+        print("bench,note,no cpuidle-haltpoll module: Linux halts its idle CPUs without polling\n", .{});
+        return;
+    }
+    defer _ = linux.close(@intCast(fd));
+    const MODULE_INIT_COMPRESSED_FILE = 4;
+    // force=1: without it the driver loads only where the host says the
+    // CPUs are dedicated to the guest (KVM_HINTS_REALTIME), which QEMU
+    // does not say by default.
+    const rc = linux.syscall3(.finit_module, fd, @intFromPtr("force=1"), MODULE_INIT_COMPRESSED_FILE);
+    if (linux.errno(rc) == .SUCCESS) {
+        print("bench,note,cpuidle-haltpoll loaded: Linux polls before halting, as MyOS does\n", .{});
+    } else {
+        print("bench,note,cpuidle-haltpoll not loaded (errno {d})\n", .{@intFromEnum(linux.errno(rc))});
+    }
 }
 
 pub fn main(init: std.process.Init.Minimal) void {
