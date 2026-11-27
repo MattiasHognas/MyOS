@@ -317,6 +317,9 @@ pub const Process = struct {
     /// Its regions of memory, `brk` heap and the lock for them and its
     /// page tables (`user_memory.zig`).
     mem: user_memory.UserMemory = .{},
+    /// The parent's process ID (0 for none), kept with `parent` by
+    /// `setParentLocked`: what `getppid` reads, without the tree lock.
+    parent_pid: std.atomic.Value(u64) = .init(0),
     /// This process's children, and its link in its parent's list. A
     /// child that has exited stays in the list, a zombie, until its
     /// parent collects its status (`waitChild`) or exits itself; the
@@ -638,12 +641,12 @@ fn reparentChildren(p: *Process) ?*Process {
         p.first_child = child.next_sibling;
         child.next_sibling = null;
         if (child.exit_code != null or adopter == null) {
-            child.parent = null;
+            setParentLocked(child, null);
             child.next_sibling = gone;
             gone = child;
             continue;
         }
-        child.parent = adopter;
+        setParentLocked(child, adopter);
         linkChild(child);
         // Adopted by init: it collects them (`waitChild`); an orphan that
         // ended already is news for it.
@@ -1205,7 +1208,7 @@ pub fn reap(child: *Process) void {
         if (child.exit_code == null) break :blk false;
         if (child.parent == null) break :blk false;
         unlinkChild(child);
-        child.parent = null;
+        setParentLocked(child, null);
         break :blk true;
     };
     if (drop) release(child);
@@ -1254,7 +1257,7 @@ pub fn waitChild(pid: i64, how: WaitFor) WaitResult {
                 any = true;
                 if (child.exit_code != null) {
                     unlinkChild(child);
-                    child.parent = null;
+                    setParentLocked(child, null);
                     break :blk child;
                 }
                 if (how.stopped and child.stop_report != 0) {
@@ -1281,9 +1284,14 @@ pub fn waitChild(pid: i64, how: WaitFor) WaitResult {
 
 /// The parent's process ID, or 0 for a process with none.
 pub fn parentPid(p: *Process) usize {
-    const held = tree_lock.acquire();
-    defer tree_lock.release(held);
-    return if (p.parent) |parent| parent.pid else 0;
+    return p.parent_pid.load(.acquire); // no lock: `getppid` is called often
+}
+
+/// Make `parent` the parent of `child` (null: none), and its ID what
+/// `getppid` says. Tree lock held.
+fn setParentLocked(child: *Process, parent: ?*Process) void {
+    child.parent = parent;
+    child.parent_pid.store(if (parent) |q| q.pid else 0, .release);
 }
 
 /// Make a new process that is a copy of the calling one (`fork`, and
@@ -1413,6 +1421,7 @@ noinline fn initChild(child: *Process, parent: *Process, root: u64, name: []cons
         .other_limits = parent.other_limits,
         .pages = pages,
         .parent = parent,
+        .parent_pid = .init(parent.pid),
         .refs = 2, // the thread's and the parent's list's
         .start_ticks = timer.now(),
         .exit_signal = exit_signal,
@@ -2139,6 +2148,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         .limits = limits,
         .pages = pages,
         .parent = options.parent,
+        .parent_pid = .init(if (options.parent) |q| q.pid else 0),
         .refs = if (options.parent != null) 3 else 2, // the thread's, the caller's, and the parent's list's
         .mem = .{
             .regions = regions,

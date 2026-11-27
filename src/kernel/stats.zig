@@ -4,17 +4,19 @@
 //! looking, not guessing.
 //!
 //!   /proc/syscalls   per system call, machine-wide: calls, total time,
-//!                    and how long they took, in powers of two
+//!                    and how long they took, in powers of two (every call
+//!                    counted, one in `TIME_EVERY` timed)
 //!   /proc/lockstat   per lock class (`lock_order.Rank`): acquisitions that
 //!                    had to wait, and how long they waited
 //!   /proc/<pid>/schedstat  as Linux's: time running, time ready but not
 //!                    running, and time slices, summed over its threads
 //!
 //! Each CPU counts into its own table (`PerCpu.syscall_stats`, made when
-//! it comes up; `PerCpu.lock_contended`), with interrupts off
-//! for the few instructions of an update, so no two CPUs write one line
-//! and nothing is lost when a thread moves. Reading adds the CPUs up; a
-//! read while counting goes on may be a count behind.
+//! it comes up; `PerCpu.lock_contended`), so no two CPUs write one line,
+//! except that a thread moved at the instant it counts a system call may
+//! add it to the CPU it left, racing that CPU: a count lost now and then.
+//! Reading adds the CPUs up; a read while counting goes on may be a count
+//! behind.
 //!
 //! Times are TSC cycles, shown in nanoseconds (`clock.tscHz`); without an
 //! invariant TSC they are shown as cycles.
@@ -36,10 +38,18 @@ pub const BUCKETS = 16;
 const BUCKET0 = 6;
 
 pub const SyscallStat = struct {
+    /// Every call.
     count: u64 = 0,
+    /// The calls timed (one in `TIME_EVERY`), their cycles and latencies.
+    timed: u64 = 0,
     cycles: u64 = 0,
     buckets: [BUCKETS]u32 = @splat(0),
 };
+
+/// One call in this many is timed: reading the TSC twice costs more than
+/// a cheap system call does (under KVM above all), so every call is
+/// counted and a sample of them timed.
+pub const TIME_EVERY = 64;
 
 pub const SyscallTable = [SYSCALLS]SyscallStat;
 
@@ -71,15 +81,28 @@ pub fn initCpu() void {
     c.syscall_stats = t;
 }
 
-/// A system call `number` took `cycles`: count it on this CPU.
-pub fn syscall(number: u64, cycles: u64) void {
-    if (number >= SYSCALLS) return;
-    const flags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(flags);
+/// A system call `number` is about to be made: count it on this CPU, and
+/// return the TSC if it is one of those timed (to give to `syscallEnd`).
+/// Interrupts stay on: turning them off and on again costs more than the
+/// counting. A thread moved to another CPU between finding the table and
+/// adding to it may lose a count to the other CPU's own: statistics.
+pub inline fn syscallStart(number: u64) ?u64 {
+    if (number >= SYSCALLS) return null;
+    const c = percpu.currentIfReady() orelse return null;
+    const table: *SyscallTable = @ptrCast(@alignCast(c.syscall_stats orelse return null));
+    const s = &table[@intCast(number)];
+    s.count += 1;
+    if (s.count % TIME_EVERY != 0) return null;
+    return rdtsc();
+}
+
+/// The timed call `number`, started at `start`, has returned.
+pub fn syscallEnd(number: u64, start: u64) void {
+    const cycles = rdtsc() -% start;
     const c = percpu.currentIfReady() orelse return;
     const table: *SyscallTable = @ptrCast(@alignCast(c.syscall_stats orelse return));
     const s = &table[@intCast(number)];
-    s.count += 1;
+    s.timed += 1;
     s.cycles += cycles;
     s.buckets[bucketOf(cycles)] += 1;
 }
@@ -122,7 +145,7 @@ fn syscallName(n: usize) ?[]const u8 {
 pub fn syscallReport(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "# number name calls total_ns avg_ns buckets(<128 cycles, then x2 each)\n");
+    try out.appendSlice(allocator, "# number name calls total_ns avg_ns buckets(<128 cycles, then x2 each; of the calls timed, one in 64)\n");
     const sums = try allocator.create(SyscallTable);
     defer allocator.destroy(sums);
     sums.* = @splat(.{});
@@ -130,13 +153,16 @@ pub fn syscallReport(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
         const table: *const SyscallTable = @ptrCast(@alignCast(percpu.get(i).syscall_stats orelse continue));
         for (table, sums) |s, *sum| {
             sum.count += s.count;
+            sum.timed += s.timed;
             sum.cycles += s.cycles;
             for (s.buckets, &sum.buckets) |b, *sb| sb.* += b;
         }
     }
     for (sums, 0..) |s, n| {
         if (s.count == 0) continue;
-        try out.print(allocator, "{d} {s} {d} {d} {d}", .{ n, syscallName(n) orelse "?", s.count, toNs(s.cycles), toNs(s.cycles / s.count) });
+        // The total from the calls timed, as if every call took their average.
+        const avg = if (s.timed == 0) 0 else s.cycles / s.timed;
+        try out.print(allocator, "{d} {s} {d} {d} {d}", .{ n, syscallName(n) orelse "?", s.count, toNs(avg * s.count), toNs(avg) });
         for (s.buckets) |b| try out.print(allocator, " {d}", .{b});
         try out.append(allocator, '\n');
     }

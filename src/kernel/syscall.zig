@@ -2690,9 +2690,9 @@ pub fn dispatch(f: *arch.Frame) void {
         return;
     }
     const number = f.rax;
-    const start = kstats.rdtsc();
+    const start = kstats.syscallStart(number);
     dispatchCall(f);
-    kstats.syscall(number, kstats.rdtsc() - start); // a call that waits counts its wait
+    if (start) |t| kstats.syscallEnd(number, t); // a call that waits counts its wait
 }
 
 /// Log every system call of every program, with its first three arguments

@@ -99,5 +99,35 @@ pub fn report(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
         const name = @as([*]const u8, @ptrFromInt(e.name.ptr))[0..e.name.len];
         try out.print(allocator, "{d} {d:.1} {s}\n", .{ e.count, @as(f64, @floatFromInt(e.count * 100)) / @as(f64, @floatFromInt(@max(total, 1))), name });
     }
+
+    // And the addresses most sampled, for what in a function is hot.
+    var rips: std.ArrayList(u64) = .empty;
+    defer rips.deinit(allocator);
+    for (0..percpu.count()) |cpu_index| {
+        const r: *const Ring = @ptrCast(@alignCast(percpu.get(cpu_index).profile_ring orelse continue));
+        for (r.rips[0..@min(r.next, RING)]) |rip| if (rip != 0) try rips.append(allocator, rip);
+    }
+    std.mem.sort(u64, rips.items, {}, std.sort.asc(u64));
+    const Hot = struct { rip: u64, count: usize };
+    var hot: std.ArrayList(Hot) = .empty;
+    defer hot.deinit(allocator);
+    var k: usize = 0;
+    while (k < rips.items.len) {
+        var m = k;
+        while (m < rips.items.len and rips.items[m] == rips.items[k]) m += 1;
+        try hot.append(allocator, .{ .rip = rips.items[k], .count = m - k });
+        k = m;
+    }
+    std.mem.sort(Hot, hot.items, {}, struct {
+        fn more(_: void, a: Hot, b: Hot) bool {
+            return a.count > b.count;
+        }
+    }.more);
+    try out.appendSlice(allocator, "# count address\n");
+    for (hot.items[0..@min(hot.items.len, 30)]) |h| {
+        if (backtrace.symbolize(h.rip)) |sym| {
+            try out.print(allocator, "{d} {s}+0x{x}\n", .{ h.count, sym.name, sym.offset });
+        } else try out.print(allocator, "{d} 0x{x}\n", .{ h.count, h.rip });
+    }
     return out.toOwnedSlice(allocator);
 }
