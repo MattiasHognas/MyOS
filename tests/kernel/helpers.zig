@@ -741,6 +741,7 @@ fn kernelMapped(addr: u64) bool {
 /// thread included) runs on such a stack. Returns 0, or the number of the
 /// first failing check.
 pub fn kernelStacks() u32 {
+    kstack.trim(); // stacks kept for reuse would come first, already mapped
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
 
@@ -780,8 +781,16 @@ pub fn kernelStacks() u32 {
     @memset(b, 0x5A);
     if (a[0] != 0xA5 or a[a.len - 1] != 0xA5 or b[0] != 0x5A) return 15;
 
-    // Freeing unmaps everything and gives pages and slot back.
+    // A freed stack is kept, still mapped, and the next alloc gets it back
+    // without mapping anything; it is no thread's in the meantime.
     kstack.free(a);
+    if (kstack.inUse() != in_use + 1 or kstack.cachedPages() != kstack.STACK_PAGES) return 16;
+    if (!kernelMapped(a_low) or kernelMapped(a_low - 1)) return 16; // its guard still unmapped
+    const kept = kstack.alloc() orelse return 16;
+    if (@intFromPtr(kept.ptr) != a_low or kstack.cachedPages() != 0 or pmm.free_pages != pages - 2 * kstack.STACK_PAGES) return 16;
+    kstack.free(kept);
+    // Given back for good (`trim`): unmapped, pages and slot free.
+    kstack.trim();
     if (kernelMapped(a_low) or kernelMapped(a_low + a.len - 1)) return 16;
     if (kstack.inUse() != in_use + 1 or pmm.free_pages != pages - kstack.STACK_PAGES) return 17;
     const again = kstack.alloc() orelse return 18;
@@ -789,6 +798,7 @@ pub fn kernelStacks() u32 {
     again[0] = 1; // and its new pages are reachable (no stale TLB entry)
     kstack.free(again);
     kstack.free(b);
+    kstack.trim();
     if (kstack.inUse() != in_use or pmm.free_pages != pages) return 20;
 
     // This thread runs on a kernel stack from the allocator.
@@ -1451,7 +1461,7 @@ pub fn footprint() Footprint {
         // Free pages, plus what the heap holds and the page tables the
         // kernel has added to map its own memory: the heap grows on demand
         // and keeps what it got, tables included, so neither is a leak.
-        .pages = pmm.free_pages + h.bytes_mapped / pmm.PAGE_SIZE + vmm.kernelTablePages(),
+        .pages = pmm.free_pages + h.bytes_mapped / pmm.PAGE_SIZE + vmm.kernelTablePages() + kstack.cachedPages(),
         .heap_bytes = h.bytes_in_use,
         .stacks = kstack.inUse(),
     };
@@ -1629,6 +1639,7 @@ fn neverRuns() void {}
 /// cannot be created and leave nothing behind. Returns 0, or the number of
 /// the first failing check.
 pub fn memoryExhaustion() u32 {
+    kstack.trim(); // all memory there is, to be used up
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const before = footprint();
@@ -1711,6 +1722,7 @@ pub fn memoryExhaustion() u32 {
 /// or the number of the first failing check; `failures.*` is the number of
 /// allocation points that were made to fail.
 pub fn spawnAllocationFailures(failures: *usize) u32 {
+    kstack.trim(); // every allocation a spawn makes, a kernel stack's included
     failures.* = 0;
     // Stands in for a parent process, to see what is counted against it.
     // A static: a process structure is too large for a kernel stack frame.
@@ -1747,6 +1759,7 @@ pub fn spawnAllocationFailures(failures: *usize) u32 {
 /// turn: a failed attempt must give back the pages it had taken. Returns 0,
 /// or the number of the first failing check.
 pub fn kstackAllocationFailures() u32 {
+    kstack.trim(); // a kept stack would be handed out without an allocation to fail
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const before = footprint();

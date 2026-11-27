@@ -63,6 +63,19 @@ const REGION_END = REGION_START + MAX_STACKS * SLOT_SIZE;
 // One bit per slot; a set bit is a free slot. Guarded by `lock`.
 var free_slots: [MAX_STACKS / 64]u64 = @splat(~@as(u64, 0));
 
+/// Full-size stacks that were freed and kept, still mapped, for the next
+/// `alloc`: a thread that exits and one that starts then cost no mapping
+/// and no unmapping, which would flush every CPU's TLB (Linux keeps two
+/// per CPU for the same reason). At most `cacheLimit`. Guarded by `lock`;
+/// their slots stay taken.
+var cached: [CACHE_MAX][*]u8 = undefined;
+var cached_len: usize = 0;
+const CACHE_MAX = 16;
+
+fn cacheLimit() usize {
+    return @min(CACHE_MAX, 2 * @import("../arch/x86_64/percpu.zig").count());
+}
+
 comptime {
     std.debug.assert(MAX_STACKS % 64 == 0);
 }
@@ -109,6 +122,12 @@ pub fn allocSized(pages: usize) ?[]u8 {
     assert.check(.kstack, pages >= 1 and pages <= STACK_PAGES, "a kernel stack of {d} pages", .{pages});
     const held = lock.acquire();
     defer lock.release(held);
+    if (pages == STACK_PAGES and cached_len > 0) {
+        cached_len -= 1;
+        const stack = cached[cached_len][0..STACK_SIZE];
+        markUnused(stack);
+        return stack;
+    }
 
     const slot = firstFreeSlot() orelse return null;
     const low = REGION_START + (slot + 1) * SLOT_SIZE - pages * pmm.PAGE_SIZE;
@@ -177,8 +196,37 @@ pub fn free(stack: []u8) void {
     const held = lock.acquire();
     defer lock.release(held);
     assert.check(.kstack, !slotFree(slot), "double free of kernel stack 0x{x}", .{low});
+    for (cached[0..cached_len]) |c| assert.check(.kstack, c != stack.ptr, "double free of kernel stack 0x{x} (kept for reuse)", .{low});
+    if (stack.len == STACK_SIZE and cached_len < cacheLimit()) {
+        cached[cached_len] = stack.ptr; // kept, mapped, for the next thread
+        cached_len += 1;
+        return;
+    }
     unmapPages(low, stack.len / pmm.PAGE_SIZE);
     setSlotFree(slot, true);
+}
+
+/// Give every kept stack back (unmapped, its pages and slot free): for
+/// code that has to see stacks come and go exactly (tests), or wants their
+/// memory. Interrupts on or off.
+pub fn trim() void {
+    while (true) {
+        const held = lock.acquire();
+        defer lock.release(held);
+        if (cached_len == 0) return;
+        cached_len -= 1;
+        const low = @intFromPtr(cached[cached_len]);
+        unmapPages(low, STACK_PAGES);
+        setSlotFree((low - REGION_START) / SLOT_SIZE, true);
+    }
+}
+
+/// Pages the kept stacks hold: the kernel's, not a thread's (for the
+/// tests' accounting of memory).
+pub fn cachedPages() usize {
+    const held = lock.acquire();
+    defer lock.release(held);
+    return cached_len * STACK_PAGES;
 }
 
 /// True if `addr` is in the guard page of a stack slot. A kernel fault on
@@ -204,5 +252,5 @@ pub fn inUse() usize {
     defer lock.release(held);
     var free_count: usize = 0;
     for (free_slots) |word| free_count += @popCount(word);
-    return MAX_STACKS - free_count;
+    return MAX_STACKS - free_count - cached_len; // the kept ones are no thread's
 }
