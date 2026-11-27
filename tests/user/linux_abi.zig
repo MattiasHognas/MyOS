@@ -220,7 +220,9 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.statfs, @intFromPtr("/etc/motd"), @intFromPtr(&fs), 0) == 0, 109);
     expect(fs.type == abi.TMPFS_MAGIC and fs.bsize == 4096 and fs.flags & 1 == 1, 110);
     expect(lib.syscall(Sys.statfs, @intFromPtr("/"), @intFromPtr(&fs), 0) == 0, 111);
-    expect(lib.syscall(Sys.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs), 0) == lib.err(.NOENT), 112);
+    // The control groups' root (cgroup v2), which runtimes size themselves by.
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs), 0) == 0 and fs.type == 0x63677270, 112);
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/nonexistent"), @intFromPtr(&fs), 0) == lib.err(.NOENT), 161);
     expect(lib.syscall(Sys.statfs, @intFromPtr("/etc/motd"), 8, 0) == lib.err(.FAULT), 113);
     expect(lib.syscall(Sys.statfs, 8, @intFromPtr(&fs), 0) == lib.err(.FAULT), 114);
 

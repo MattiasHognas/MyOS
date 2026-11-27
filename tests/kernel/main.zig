@@ -906,6 +906,18 @@ fn forkWait() TestError!void {
     try expectFootprint(memory);
 }
 
+/// Advisory file locks from ring 3, two copies at once; none left behind.
+fn fileLocks() TestError!void {
+    _ = helpers.runProgram("/test/flock"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/flock") orelse return error.Failed;
+    if (code != 0) report("/test/flock failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/flock"));
+    try check(root.kernel.flock.count() == 0);
+    try expectFootprint(memory);
+}
+
 /// Real-time signals queued with their values, `rt_sigtimedwait`,
 /// `signalfd`, from ring 3; nothing left behind.
 fn queuedSignals() TestError!void {
@@ -2033,6 +2045,7 @@ fn runCases() noreturn {
         .{ .name = "job control: stop, continue, the terminal's background (ring 3)", .func = jobControl },
         .{ .name = "every system call's documented errors (ring 3)", .func = documentedErrors },
         .{ .name = "real-time signals, rt_sigtimedwait, signalfd (ring 3)", .func = queuedSignals },
+        .{ .name = "flock: shared, exclusive, waiting, given up on close (ring 3)", .func = fileLocks },
         .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
         .{ .name = "clocks: TSC or HPET, in step on every CPU; sleeps; the wall clock from the RTC", .func = clocks },
         .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },

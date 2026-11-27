@@ -158,7 +158,7 @@ pub fn main() noreturn {
     expect(std.mem.eql(u8, listing(dev_dir), ". .. null urandom random"), 128);
     _ = lib.close(dev_dir);
     const self_dir = lib.open("/proc/self/");
-    expect(std.mem.eql(u8, listing(self_dir), ". .. stat cmdline comm exe maps"), 129);
+    expect(std.mem.eql(u8, listing(self_dir), ". .. stat cmdline comm mountinfo cgroup exe maps"), 129);
     _ = lib.close(self_dir);
     // Every process has a directory by its ID, this one included; another
     // process's has no `exe` or `maps`.
@@ -356,6 +356,27 @@ pub fn main() noreturn {
     const cpu_dir = lib.open("/sys/devices/system/cpu");
     expect(std.mem.eql(u8, listing(cpu_dir), ". .. online possible present"), 145);
     _ = lib.close(cpu_dir);
+    // The control-group files, which say what this process may use: the
+    // memory limit is its RLIMIT_DATA.
+    expect(std.mem.eql(u8, slurp("/proc/self/cgroup"), "0::/\n"), 146);
+    expect(std.mem.indexOf(u8, slurp("/proc/self/mountinfo"), " / /sys/fs/cgroup ro,relatime - cgroup2 cgroup2 ro\n") != null, 147);
+    var data_limit: abi.RLimit = undefined;
+    expect(lib.syscall(Sys.getrlimit, abi.RLIMIT.DATA, @intFromPtr(&data_limit), 0) == 0, 148);
+    const max_text = std.mem.trimEnd(u8, slurp("/sys/fs/cgroup/memory.max"), "\n");
+    expect((std.fmt.parseInt(u64, max_text, 10) catch 0) == data_limit.cur, 149);
+    const current = std.fmt.parseInt(u64, std.mem.trimEnd(u8, slurp("/sys/fs/cgroup/memory.current"), "\n"), 10) catch 0;
+    expect(current > 0 and current < data_limit.cur, 300);
+    expect(std.mem.eql(u8, slurp("/sys/fs/cgroup/cpu.max"), "max 100000\n"), 301);
+    expect(std.mem.startsWith(u8, slurp("/sys/fs/cgroup/memory.stat"), "anon "), 302);
+    var fs: abi.StatFs = undefined;
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs), 0) == 0 and fs.type == 0x63677270, 303); // CGROUP2_SUPER_MAGIC
+    expect(lib.syscall(Sys.statfs, @intFromPtr("/proc/self"), @intFromPtr(&fs), 0) == 0 and fs.type == 0x9fa0, 304);
+    const cg_dir = lib.open("/sys/fs/cgroup");
+    expect(std.mem.eql(u8, listing(cg_dir), ". .. cgroup.controllers cpu.max cpuset.cpus.effective memory.current memory.max memory.stat"), 305);
+    _ = lib.close(cg_dir);
+    const sys_dir = lib.open("/sys");
+    expect(std.mem.eql(u8, listing(sys_dir), ". .. devices fs"), 306);
+    _ = lib.close(sys_dir);
 
     // --- /dev/null and /dev/urandom.
     const null_fd = openFlags("/dev/null", abi.O.RDWR);

@@ -25,6 +25,34 @@ foreach (var t in threads) t.Join();
 GC.Collect();
 
 Console.WriteLine($"threads: {threads.Length} sum: {sum} cpus: {Environment.ProcessorCount} collected: {GC.CollectionCount(0) > 0}");
+
+// A thread that spins without calls or allocation: the collector cannot
+// wait for it to reach a safe point, and stops it with a signal instead.
+// If it could not, the collections below would wait for ever.
+int stop = 0;
+long spins = 0;
+var spinner = new Thread(() =>
+{
+    long n = 0;
+    while (Volatile.Read(ref stop) == 0) n++;
+    spins = n;
+});
+spinner.Start();
+while (Volatile.Read(ref spins) == 0 && spinner.ThreadState == ThreadState.Unstarted) Thread.Yield();
+Thread.Sleep(20); // spinning by now
+int before = GC.CollectionCount(2);
+for (int i = 0; i < 3; i++) GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+Volatile.Write(ref stop, 1);
+spinner.Join();
+Console.WriteLine($"collected around a spinning thread: {GC.CollectionCount(2) - before >= 3}");
+
+// The collector sizes itself by the control group's memory limit where
+// there is one (in a container on Linux; on MyOS, the process's own).
+const string limitFile = "/sys/fs/cgroup/memory.max";
+bool honored = true;
+if (System.IO.File.Exists(limitFile) && long.TryParse(System.IO.File.ReadAllText(limitFile).Trim(), out long limit))
+    honored = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes <= limit;
+Console.WriteLine($"memory limit honored: {honored}");
 Console.WriteLine($"GREETING={Environment.GetEnvironmentVariable("GREETING")}");
 
 // Faults that the runtime turns into exceptions (through signals: a null

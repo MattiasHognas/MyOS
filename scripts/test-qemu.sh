@@ -281,6 +281,10 @@ run_scenario() {
             if fixture dotnet-hello-static || fixture dotnet-hello-aot || fixture dotnet-hello-app/hello; then
                 expect_line '^caught: NullReferenceException$'
                 expect_line '^caught: DivideByZeroException$'
+                # The collector stops a thread that spins without a safe point.
+                expect_line '^collected around a spinning thread: True$'
+                # Its collector takes the memory limit from the control group.
+                expect_line '^memory limit honored: True$'
                 if grep -q 'Unhandled exception' "$log"; then fail "a .NET program had an unhandled exception: $(grep -m1 -A3 'Unhandled exception' "$log" | tr '\n' ' ')"; fi
             fi
             # .NET compiled ahead of time: managed threads, a GC.

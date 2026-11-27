@@ -14,9 +14,21 @@
 //!   /proc/meminfo        memory in the machine and how much is free
 //!   /proc/cpuinfo        each CPU, with its features (`cpuinfo.zig`)
 //!
-//! And the files of `/sys` that tell how many CPUs there are:
+//!   /proc/<pid>/mountinfo  the filesystems, as Linux lists them
+//!   /proc/<pid>/cgroup     "0::/": the one control group, at the root
+//!
+//! And the files of `/sys` that tell how many CPUs there are and what a
+//! process may use:
 //!
 //!   /sys/devices/system/cpu/online, possible, present    "0-3"
+//!   /sys/fs/cgroup/memory.max, memory.current, memory.stat, cpu.max,
+//!       cpuset.cpus.effective, cgroup.controllers
+//!
+//! There are no control groups; the files at `/sys/fs/cgroup` say what
+//! the reader's own limits are in the form of the one at the root of a
+//! control-group (v2) hierarchy, which is what runtimes read to size
+//! themselves (.NET's collector its heap, Go its threads): `memory.max`
+//! is the reader's memory limit, `memory.current` what it uses.
 //!
 //! `/proc/self` is the calling process's directory, and there is one for
 //! every process by its ID; only the caller's own has `exe` and `maps`.
@@ -32,13 +44,29 @@ const clock = @import("clock.zig");
 const cpu = @import("../arch/x86_64/cpu.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 
-pub const File = enum { maps, stat, cmdline, comm, meminfo, cpuinfo, cpus_online };
+pub const File = enum {
+    maps,
+    stat,
+    cmdline,
+    comm,
+    mountinfo,
+    cgroup,
+    meminfo,
+    cpuinfo,
+    cpus_online,
+    cg_controllers,
+    cg_memory_max,
+    cg_memory_current,
+    cg_memory_stat,
+    cg_cpu_max,
+    cg_cpuset,
+};
 
 /// The generated file `name` names below `/proc/self` (or `/proc/<pid>`),
 /// if `per_process`, or below `/proc`.
 pub fn find(name: []const u8, per_process: bool) ?File {
     const table = if (per_process)
-        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm } }
+        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm }, .{ "mountinfo", .mountinfo }, .{ "cgroup", .cgroup } }
     else
         &[_]struct { []const u8, File }{ .{ "meminfo", .meminfo }, .{ "cpuinfo", .cpuinfo } };
     for (table) |entry| {
@@ -47,27 +75,51 @@ pub fn find(name: []const u8, per_process: bool) ?File {
     return null;
 }
 
-/// The directory that holds the CPU lists, and the lists in it.
-pub const SYS_CPU_DIR = "/sys/devices/system/cpu";
-pub const sys_cpu_files = [_][]const u8{ "online", "possible", "present" };
-/// The directories above it, which list only the way down.
-pub const sys_dirs = [_]struct { []const u8, []const u8 }{
-    .{ "/sys", "devices" },
-    .{ "/sys/devices", "system" },
-    .{ "/sys/devices/system", "cpu" },
+/// Everything there is below `/sys`: directories, and the generated
+/// files in them. A directory lists the entries whose parent it is.
+pub const SysEntry = struct { path: []const u8, file: ?File = null };
+pub const sys_tree = [_]SysEntry{
+    .{ .path = "/sys" },
+    .{ .path = "/sys/devices" },
+    .{ .path = "/sys/devices/system" },
+    .{ .path = "/sys/devices/system/cpu" },
+    .{ .path = "/sys/devices/system/cpu/online", .file = .cpus_online },
+    .{ .path = "/sys/devices/system/cpu/possible", .file = .cpus_online },
+    .{ .path = "/sys/devices/system/cpu/present", .file = .cpus_online },
+    .{ .path = "/sys/fs" },
+    .{ .path = "/sys/fs/cgroup" },
+    .{ .path = "/sys/fs/cgroup/cgroup.controllers", .file = .cg_controllers },
+    .{ .path = "/sys/fs/cgroup/cpu.max", .file = .cg_cpu_max },
+    .{ .path = "/sys/fs/cgroup/cpuset.cpus.effective", .file = .cg_cpuset },
+    .{ .path = "/sys/fs/cgroup/memory.current", .file = .cg_memory_current },
+    .{ .path = "/sys/fs/cgroup/memory.max", .file = .cg_memory_max },
+    .{ .path = "/sys/fs/cgroup/memory.stat", .file = .cg_memory_stat },
 };
 
 /// What the absolute `path` names below `/sys`: a directory, one of the
-/// CPU lists, or nothing (null) if it is not below `/sys` at all.
+/// generated files, or nothing (null) if it is not below `/sys` at all.
 pub fn findSys(path: []const u8) ?union(enum) { none, directory, file: File } {
     if (!std.mem.eql(u8, path, "/sys") and !std.mem.startsWith(u8, path, "/sys/")) return null;
-    if (std.mem.eql(u8, path, SYS_CPU_DIR)) return .directory;
-    for (sys_dirs) |d| if (std.mem.eql(u8, path, d[0])) return .directory;
-    if (std.mem.startsWith(u8, path, SYS_CPU_DIR ++ "/")) {
-        const name = path[SYS_CPU_DIR.len + 1 ..];
-        for (sys_cpu_files) |f| if (std.mem.eql(u8, name, f)) return .{ .file = .cpus_online };
+    for (sys_tree) |e| {
+        if (!std.mem.eql(u8, path, e.path)) continue;
+        return if (e.file) |f| .{ .file = f } else .directory;
     }
     return .none;
+}
+
+/// The filesystem `statfs` reports `path` (absolute) to be on, by its
+/// magic number: Linux's for `/proc`, `/sys` and the control groups; the
+/// one in memory for everything else.
+pub fn fsMagic(path: []const u8) i64 {
+    const under = struct {
+        fn f(p: []const u8, dir: []const u8) bool {
+            return std.mem.eql(u8, p, dir) or (std.mem.startsWith(u8, p, dir) and p.len > dir.len and p[dir.len] == '/');
+        }
+    }.f;
+    if (under(path, "/sys/fs/cgroup")) return 0x63677270; // CGROUP2_SUPER_MAGIC
+    if (under(path, "/sys")) return 0x62656572; // SYSFS_MAGIC
+    if (under(path, "/proc")) return 0x9fa0; // PROC_SUPER_MAGIC
+    return 0x01021994; // TMPFS_MAGIC
 }
 
 /// The text of `file` for the process `p`, in memory the caller frees with
@@ -123,10 +175,40 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
             for (cpus, 0..) |*c, i| c.* = .{ .number = @intCast(i), .apic_id = percpu.get(i).apic_id };
             return cpuinfo.format(heap.allocator, leaves, cpus, clock.tscHz());
         },
-        .cpus_online => {
+        .cpus_online, .cg_cpuset => {
             var buf: [24]u8 = undefined;
             return heap.allocator.dupe(u8, cpuinfo.rangeList(&buf, percpu.count()));
         },
+        .mountinfo => return heap.allocator.dupe(u8,
+            \\1 0 0:1 / / ro,relatime - tarfs initrd ro
+            \\2 1 0:2 / /tmp rw,relatime - tmpfs tmpfs rw
+            \\3 1 0:3 / /proc rw,relatime - proc proc rw
+            \\4 1 0:4 / /sys ro,relatime - sysfs sysfs ro
+            \\5 4 0:5 / /sys/fs/cgroup ro,relatime - cgroup2 cgroup2 ro
+            \\6 1 0:6 / /dev rw,relatime - devtmpfs devtmpfs rw
+            \\
+        ),
+        .cgroup => return heap.allocator.dupe(u8, "0::/\n"),
+        .cg_controllers => return heap.allocator.dupe(u8, "cpuset cpu memory\n"),
+        .cg_cpu_max => return heap.allocator.dupe(u8, "max 100000\n"),
+        .cg_memory_max => {
+            const limit = p.limits.max_pages;
+            if (limit == proc.Limits.UNLIMITED) return heap.allocator.dupe(u8, "max\n");
+            return std.fmt.allocPrint(heap.allocator, "{d}\n", .{limit *| pmm.PAGE_SIZE});
+        },
+        .cg_memory_current => return std.fmt.allocPrint(heap.allocator, "{d}\n", .{p.pages * pmm.PAGE_SIZE}),
+        .cg_memory_stat => return std.fmt.allocPrint(heap.allocator,
+            \\anon {d}
+            \\file 0
+            \\kernel 0
+            \\shmem 0
+            \\file_mapped 0
+            \\active_anon {d}
+            \\inactive_anon 0
+            \\active_file 0
+            \\inactive_file 0
+            \\
+        , .{ p.pages * pmm.PAGE_SIZE, p.pages * pmm.PAGE_SIZE }),
         .meminfo => {
             const total = pmm.totalPages() * pmm.PAGE_SIZE / 1024;
             const free = pmm.free_pages * pmm.PAGE_SIZE / 1024;

@@ -260,6 +260,16 @@ pub fn main() noreturn {
         row(Sys.getrandom, .{ b, 8, 1 }, .{ .is = 8 }), // GRND_NONBLOCK
         row(Sys.socket, .{ 2, 1, 0 }, .{ .e = .AFNOSUPPORT }),
         row(Sys.memfd_create, .{ @intFromPtr("x"), 0 }, .{ .e = .NOSYS }),
+        row(Sys.flock, .{ BAD_FD, abi.LOCK.SH }, .{ .e = .BADF }),
+        row(Sys.flock, .{ file, 0 }, .{ .e = .INVAL }),
+        row(Sys.rt_sigtimedwait, .{ @intFromPtr(&zero_mask), 0, 0, 4 }, .{ .e = .INVAL }),
+        row(Sys.rt_sigtimedwait, .{ KERNEL, 0, 0, abi.SIGSET_SIZE }, .{ .e = .FAULT }),
+        row(Sys.rt_sigqueueinfo, .{ me, 99, b }, .{ .e = .INVAL }),
+        row(Sys.rt_sigqueueinfo, .{ me, 10, KERNEL }, .{ .e = .FAULT }),
+        row(Sys.rt_tgsigqueueinfo, .{ me, me, 99, b }, .{ .e = .INVAL }),
+        row(Sys.signalfd4, .{ NEG1, @intFromPtr(&zero_mask), 4, 0 }, .{ .e = .INVAL }),
+        row(Sys.signalfd4, .{ NEG1, @intFromPtr(&zero_mask), abi.SIGSET_SIZE, 0x40 }, .{ .e = .INVAL }),
+        row(Sys.signalfd, .{ BAD_FD, @intFromPtr(&zero_mask), abi.SIGSET_SIZE }, .{ .e = .BADF }),
     };
 
     var first_failed: u64 = 0;

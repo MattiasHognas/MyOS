@@ -29,6 +29,7 @@ const readiness = @import("readiness.zig");
 const kepoll = @import("epoll.zig");
 const open_file = @import("open_file.zig");
 const procfs = @import("procfs.zig");
+const kflock = @import("flock.zig");
 const OpenFile = open_file.OpenFile;
 const pmm = @import("pmm.zig");
 const futex = kfutex; // its clock helpers read better by this name
@@ -1360,20 +1361,29 @@ const ListEntry = struct { name: []const u8, type: u8 };
 /// The filesystem layer's own positions follow, moved up by `LIST_BASE`.
 const LIST_BASE = 16;
 
+/// The entries of the directory `dir` of `procfs.sys_tree`.
+fn sysChildren(comptime dir: []const u8) []const ListEntry {
+    comptime {
+        @setEvalBranchQuota(20_000);
+        var list: []const ListEntry = &.{};
+        for (procfs.sys_tree) |c| {
+            const slash = std.mem.lastIndexOfScalar(u8, c.path, '/').?;
+            if (!std.mem.eql(u8, c.path[0..slash], dir)) continue;
+            list = list ++ &[_]ListEntry{.{ .name = c.path[slash + 1 ..], .type = if (c.file == null) abi.DT.DIR else abi.DT.REG }};
+        }
+        const final = list[0..list.len].*;
+        return &final;
+    }
+}
+
 /// The entries of `/proc`, `/dev` and `/` that no filesystem holds.
 fn extraEntries(dir: []const u8) []const ListEntry {
     const DIR = abi.DT.DIR;
     const REG = abi.DT.REG;
     if (std.mem.eql(u8, dir, "/")) return &.{ .{ .name = "proc", .type = DIR }, .{ .name = "dev", .type = DIR }, .{ .name = "sys", .type = DIR } };
-    inline for (procfs.sys_dirs) |d| {
-        if (std.mem.eql(u8, dir, d[0])) return &.{.{ .name = d[1], .type = DIR }};
+    inline for (procfs.sys_tree) |e| {
+        if (e.file == null and std.mem.eql(u8, dir, e.path)) return comptime sysChildren(e.path);
     }
-    if (std.mem.eql(u8, dir, procfs.SYS_CPU_DIR)) return comptime blk: {
-        var list: [procfs.sys_cpu_files.len]ListEntry = undefined;
-        for (procfs.sys_cpu_files, 0..) |f, i| list[i] = .{ .name = f, .type = REG };
-        const final = list;
-        break :blk &final;
-    };
     if (std.mem.eql(u8, dir, "/dev")) return &.{
         .{ .name = "null", .type = abi.DT.CHR },
         .{ .name = "urandom", .type = abi.DT.CHR },
@@ -1390,10 +1400,12 @@ fn extraEntries(dir: []const u8) []const ListEntry {
             .{ .name = "stat", .type = REG },
             .{ .name = "cmdline", .type = REG },
             .{ .name = "comm", .type = REG },
+            .{ .name = "mountinfo", .type = REG },
+            .{ .name = "cgroup", .type = REG },
             .{ .name = "exe", .type = abi.DT.LNK },
             .{ .name = "maps", .type = REG },
         };
-        return if (own) all else all[0..3];
+        return if (own) all else all[0..5];
     }
     return &.{};
 }
@@ -1757,6 +1769,35 @@ fn pollState(of: *OpenFile, events: i16) i16 {
             return if (pending != 0) events & abi.POLL.IN else 0;
         },
     }
+}
+
+/// `flock`: an advisory lock on the whole file `fd` is open on, held by
+/// its open file (`flock.zig`). `LOCK_SH`, `LOCK_EX`, `LOCK_UN`, with
+/// `LOCK_NB` not to wait: then `EWOULDBLOCK` for a lock in the way.
+/// What is not a file of a filesystem (a pipe, the terminal) is locked
+/// by its open file alone. `EINVAL` for another operation, `EBADF`,
+/// `EINTR`, `ENOLCK`.
+fn sysFlock(fd: u64, op: u64) u64 {
+    const what = op & ~@as(u64, abi.LOCK.NB);
+    if (what != abi.LOCK.SH and what != abi.LOCK.EX and what != abi.LOCK.UN) return err(.INVAL);
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    const owner = open_file.id(of);
+    const key: kflock.Key = if (of.kind == .file)
+        .{ .a = @intFromPtr(of.node.ops), .b = of.node.ctx }
+    else
+        .{ .a = 0, .b = owner };
+    if (what == abi.LOCK.UN) {
+        kflock.release(key, owner);
+        return 0;
+    }
+    @atomicStore(bool, &of.locked, true, .release);
+    kflock.acquire(key, owner, what == abi.LOCK.EX, op & abi.LOCK.NB != 0) catch |e| return switch (e) {
+        error.WouldBlock => err(.AGAIN),
+        error.Interrupted => err(.INTR),
+        error.NoLocks => err(.NOLCK),
+    };
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2567,9 +2608,10 @@ fn sysSysinfo(ptr: u64) u64 {
     return if (toUser(ptr, info)) 0 else err(.FAULT);
 }
 
-/// `statfs`: the only filesystem is the read-only one in memory.
-/// `ENOENT` for a path that does not exist, which is how a program finds
-/// that there are no control groups here.
+/// `statfs`: the filesystems are in memory; `/proc`, `/sys` and
+/// `/sys/fs/cgroup` say they are what Linux's are (`procfs.fsMagic`),
+/// which is how a runtime finds control groups (v2) to read its limits
+/// from. `ENOENT` for a path that does not exist.
 fn sysStatfs(path_ptr: u64, ptr: u64) u64 {
     var given = switch (Path.from(CWD, path_ptr)) {
         .path => |p| p,
@@ -2578,7 +2620,7 @@ fn sysStatfs(path_ptr: u64, ptr: u64) u64 {
     defer given.deinit();
     const path = given.text;
     if (named(path) == .none) return missing(path);
-    const st: abi.StatFs = .{ .type = abi.TMPFS_MAGIC };
+    const st: abi.StatFs = .{ .type = procfs.fsMagic(path) };
     return if (toUser(ptr, st)) 0 else err(.FAULT);
 }
 
@@ -2724,6 +2766,7 @@ fn dispatchCall(f: *arch.Frame) void {
         // and does without.
         Sys.rseq => err(.NOSYS),
         Sys.eventfd => sysEventFd(f.rdi, 0),
+        Sys.flock => sysFlock(f.rdi, f.rsi),
         Sys.rt_sigqueueinfo => sysSigQueueInfo(f.rdi, null, f.rsi, f.rdx),
         Sys.rt_tgsigqueueinfo => sysSigQueueInfo(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.rt_sigtimedwait => sysSigTimedWait(f.rdi, f.rsi, f.rdx, f.r10),

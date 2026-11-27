@@ -113,6 +113,7 @@ Linux calls, with Linux's numbers:
 | 62 | `kill(pid, sig)` | Any process by its ID; `-1`: every process but `init` and the caller, then the caller; `0`: the caller's process group; `-pgid`: that group. Any of the process's threads that does not block the signal takes it. Signal 0 checks. An ended process not yet collected takes nothing, without an error. `ESRCH`, `EINVAL`. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
+| 73 | `flock(fd, operation)` | An advisory lock on the whole file, held by the open file (shared by duplicates and across `fork`): `LOCK_SH`, `LOCK_EX`, `LOCK_UN`; it waits for a lock in the way unless `LOCK_NB` (`EWOULDBLOCK`). Given up when the open file's last descriptor closes; changing its kind gives up the old one first, as on Linux. |
 | 74 | `fsync(fd)` | Nothing is ever waiting to be written: 0. |
 | 75 | `fdatasync(fd)` | The same. |
 | 76 | `truncate(path, length)` | `ftruncate` by path. |
@@ -249,9 +250,13 @@ Every other number returns `ENOSYS`.
   itself and the machine as files, in Linux's format: `/proc/self/exe` (a
   link to its program), `/proc/self/maps` (its mappings; a C library finds
   the main thread's stack there), `/proc/self/stat`, `/proc/meminfo`,
-  `/proc/cpuinfo`, and `/sys/devices/system/cpu/online` (`possible`,
-  `present`: "0-3"); `self` may be its own process ID, and every process
-  has a directory by its ID (`stat`, `cmdline`, `comm`).
+  `/proc/cpuinfo`, `/proc/self/mountinfo`, `/proc/self/cgroup`, and
+  `/sys/devices/system/cpu/online` (`possible`, `present`: "0-3"); `self`
+  may be its own process ID, and every process has a directory by its ID
+  (`stat`, `cmdline`, `comm`). There are no control groups, but
+  `/sys/fs/cgroup` is laid out as the root of a cgroup v2 hierarchy whose
+  `memory.max` is the reader's memory limit and `memory.current` its use,
+  for runtimes that size themselves by them.
   `/dev/null`, `/dev/urandom` and `/dev/random` are devices.
 - **Counts** above `0x7ffff000` are shortened to that, as on Linux.
 - **Limits.** Every process has limits, inherited from the process that

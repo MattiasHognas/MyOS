@@ -246,6 +246,8 @@ pub const Sys = struct {
     pub const pipe2 = 293;
     /// `dup3(old, new, flags) -> new`.
     pub const dup3 = 292;
+    /// `flock(fd, operation) -> 0`: an advisory lock on the whole file.
+    pub const flock = 73;
     /// `prlimit64(pid, resource, new, old) -> 0`.
     pub const prlimit64 = 302;
     /// `getrlimit(resource, old)` and `setrlimit(resource, new)`: `prlimit64`
@@ -330,6 +332,8 @@ pub const E = enum(u16) {
     ROFS = 30,
     /// File name too long.
     NAMETOOLONG = 36,
+    /// No locks available (`flock`).
+    NOLCK = 37,
     /// Function not implemented: unknown syscall number.
     NOSYS = 38,
     /// Illegal seek: the descriptor has no position.
@@ -807,6 +811,13 @@ pub const EPOLL = struct {
     pub const CTL_DEL = 2;
     pub const CTL_MOD = 3;
     pub const CLOEXEC = 0o2000000;
+};
+
+pub const LOCK = struct {
+    pub const SH = 1;
+    pub const EX = 2;
+    pub const NB = 4;
+    pub const UN = 8;
 };
 
 pub const SFD = struct {

@@ -26,6 +26,7 @@
 const std = @import("std");
 const heap = @import("heap.zig");
 const epoll = @import("epoll.zig");
+const flock = @import("flock.zig");
 const pipe = @import("pipe.zig");
 const vfs = @import("vfs.zig");
 
@@ -74,6 +75,9 @@ pub const OpenFile = struct {
     /// first time it is asked for (`id`). 0 until then. Not the address:
     /// a new open file may be put where a closed one was.
     serial: u64 = 0,
+    /// Set once `flock` has been asked for on it: its locks are given up
+    /// when it goes (`destroy`).
+    locked: bool = false,
 };
 
 var next_serial: std.atomic.Value(u64) = .init(1);
@@ -132,6 +136,7 @@ fn readMemory(node: *const vfs.Node, offset: u64, buf: []u8) usize {
 /// Free an open file whose last reference is gone, and tell what it was
 /// open on.
 pub fn destroy(of: *OpenFile) void {
+    if (@atomicLoad(bool, &of.locked, .acquire)) flock.releaseAll(id(of));
     switch (of.kind) {
         .pipe_read => pipe.closeEnd(of.pipe, .read),
         .pipe_write => pipe.closeEnd(of.pipe, .write),

@@ -69,6 +69,7 @@ pub const kernel = struct {
     pub const pmm = @import("kernel/pmm.zig");
     pub const process = @import("kernel/process.zig");
     pub const random = @import("kernel/random.zig");
+    pub const flock = @import("kernel/flock.zig");
     pub const random_core = @import("kernel/random_core.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");

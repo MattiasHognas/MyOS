@@ -14,6 +14,18 @@ A dependency-ordered roadmap for building a small x86-64 operating system in Zig
 - **Minimal core:** when a feature is only needed off the critical path, prefer leaving it out or keeping it in user space over growing the kernel.
 - **Order:** SMP comes before the feature work, so everything after it is written and tested on several cores; a foreign hello-world comes right after, so Linux compatibility is tested from then on rather than discovered at the end.
 
+## Order of work from here
+
+Decided 2026-11-27, after milestone 8 and most of 6:
+
+1. Finish 9.1.
+2. Research: what MyOS could do better than Linux, given what it has and what is planned. The aim is not to build Linux again. Includes the ABI the .NET runtime needs, from its sources and documentation rather than from traces alone.
+3. Finish 9.2, and the open task of 3.4 (CPU affinity and load balancing, which comes with per-CPU run queues).
+4. Finish 9.3.
+5. Networking (12).
+6. Persistent storage (11).
+7. A second long research session before any work on graphics (10): whose programs run there (unmodified Linux programs through Wayland, MyOS's own, or both), what a terminal is (pseudo-terminals; foot, then Ghostty, as goals to weigh), and what drives the screen.
+
 ## Current foundation
 
 Already implemented: Limine BIOS/UEFI boot, serial/framebuffer console, GDT/IDT/TSS, physical and virtual memory management, kernel heap, APIC timer, preemptive threading, ring 3, syscalls (Linux's x86-64 ABI), SSE/AVX state per thread, ELF64 loading, basic processes, read-only tarfs/VFS, PCI, basic NVMe reads, PS/2 keyboard, and a userspace shell.
@@ -531,7 +543,7 @@ Every syscall added here takes Linux's number, signature and struct layout (`sta
 - [x] Test PID and parent tracking, waiting on exited children, sleep accuracy, Ctrl+C termination, wall-clock time, and the shell being restarted after `exit`. `/test/fork` (IDs, parents, `wait4`), `/test/clock` (sleeps; the wall clock, which the script compares with the host's), the kernel's clock checks (against the HPET, in step on every CPU), and the `shell` scenario (Ctrl+C, the shell started again after `exit`). The KVM scenario passes the host's invariant TSC, so the TSC path runs on real CPUs.
 - [x] Test from ring 3 that a parent can exit before its child and the child is adopted. 2.7 handles this in the kernel, but no syscall could cause it then, so it is only tested from inside the kernel. `/test/fork`: a child ends before its own child, which goes to the grandparent and is collected there (in a system with `init`, to `init`).
 - [x] Test each syscall from ring 3 against Linux's documented results and error codes, including the struct layouts.
-  - `/test/errors`: a table of every implemented call with arguments whose result Linux's manual pages document (174 rows: a bad descriptor, a bad address, an unknown flag, a missing file, or the value of a call that works), and `pause`. It found and fixed: `ENOENT` for a path through a file (now `ENOTDIR`), `mmap` with an offset not page-aligned, `mlock` of memory not mapped, `faccessat2` and `getrandom` with unknown flags, `sched_getaffinity` of a thread that does not exist. The structs (`stat`, `statx`, `sigaction`, `stack_t`, `sysinfo`, `statfs`, `termios`, `epoll_event`, `clone_args`, ...) are checked field by field against Linux's x86-64 offsets on the host (`abi_test.zig`); the signal frame was already (`signal_frame_test.zig`).
+  - `/test/errors`: a table of every implemented call with arguments whose result Linux's manual pages document (184 rows: a bad descriptor, a bad address, an unknown flag, a missing file, or the value of a call that works), and `pause`. It found and fixed: `ENOENT` for a path through a file (now `ENOTDIR`), `mmap` with an offset not page-aligned, `mlock` of memory not mapped, `faccessat2` and `getrandom` with unknown flags, `sched_getaffinity` of a thread that does not exist. The structs (`stat`, `statx`, `sigaction`, `stack_t`, `sysinfo`, `statfs`, `termios`, `epoll_event`, `clone_args`, ...) are checked field by field against Linux's x86-64 offsets on the host (`abi_test.zig`); the signal frame was already (`signal_frame_test.zig`).
 
 **Milestone 6 done when:** Commands such as `ls /bin`, `cat /etc/motd`, and `echo hello` work, alone and in pipelines, from MyOS's own programs and from C programs built on Linux.
 
@@ -593,13 +605,17 @@ What is supported is what a .NET developer builds with nothing but `dotnet`:
 These are dynamically linked against glibc, so MyOS loads the dynamic loader, maps shared libraries from files and ships glibc's libraries in its image, as a Linux distribution does. No build step of MyOS's own is asked of the developer, and there is no MyOS target in .NET: Linux's target is MyOS's.
 
 ### 9.1 .NET Native AOT
-- [ ] Implement what the list from 4.2 shows the .NET runtime still needs. Expected, to be confirmed by the trace: `/proc` and cgroup files for CPU and memory limits, `membarrier`, and thread suspension through signals.
+- [x] Implement what the list from 4.2 shows the .NET runtime still needs. Expected, to be confirmed by the trace: `/proc` and cgroup files for CPU and memory limits, `membarrier`, and thread suspension through signals.
   - Done for the Native AOT runtime: `membarrier`, `mlock`, `sysinfo`, `statfs`, `get_mempolicy`, `mremap` in place, pipes and real standard descriptors. It runs without the `/proc` and cgroup files and without signals. Those files (it sizes its heap by them) are the pseudo-file task of 6.2; what the JIT runtime adds is in 9.3.
+  - The control-group (v2) and mount files: `/proc/self/mountinfo` and `/proc/self/cgroup`, and `/sys/fs/cgroup` with `memory.max` (the process's memory limit), `memory.current`, `memory.stat`, `cpu.max`, `cpuset.cpus.effective`; `statfs` gives Linux's magic numbers for `/proc`, `/sys` and the cgroup root, which is how the runtime finds them. There are no control groups: the files say what the reader's own limits are. The fixture checks that the collector sizes itself by `memory.max` (it reports less memory than the machine has).
+  - `flock` (`flock.zig`): advisory whole-file locks held by open files, which the runtime takes on every file it opens. Found when the fixture first read a file.
+  - Signals: the runtime turns faults into exceptions, and stops threads for the collector with a real-time signal (next task).
 - [x] Run a .NET Native AOT hello-world built for linux-musl, statically linked, invariant globalization (`tests/fixtures/src/dotnet-hello`): the runtime starts, eight managed threads allocate, the collector runs, on one and four CPUs, two at once, with its memory back afterwards. A stepping stone and a test fixture, not something a developer is asked to build: it shows what the runtime's core needs before dynamic linking exists. (It is linked with `zig cc`, which brings musl; the build machine has none.)
 - [x] Run a .NET Native AOT hello-world built the ordinary way (`dotnet publish -r linux-x64 -p:PublishAot=true`): `tests/fixtures/` builds `dotnet-hello-aot`, position independent and dynamically linked against glibc, with managed threads and a collection, on one and four CPUs. It added `clone3` and `time` to what the kernel knows.
   - The fixture is linked against a plain glibc, not the build machine's: a distribution built for newer CPUs only marks every program linked on it as needing one (`x86-64-v4` here, which also needs AVX-512 state, saved since 9.3).
 - [x] Run one that allocates enough to exercise the GC, then a multi-threaded one. The fixture does both: eight managed threads each allocate a megabyte in small arrays, then a collection is forced and counted.
-- [ ] Test that the .NET garbage collector stops a thread spinning in a tight loop: the runtime interrupts such a thread with a signal (it cannot wait for it to reach a safe point). A thread loops without calls or allocation while the main thread forces collections; the program must end. The fixtures' threads only allocate, so the collector never needed the signal there.
+- [x] Test that the .NET garbage collector stops a thread spinning in a tight loop: the runtime interrupts such a thread with a signal (it cannot wait for it to reach a safe point). A thread loops without calls or allocation while the main thread forces collections; the program must end. The fixtures' threads only allocate, so the collector never needed the signal there.
+  - The fixture (`tests/fixtures/src/dotnet-hello`) starts a thread that loops on a volatile read and forces three full collections meanwhile; they finish, on one and four CPUs and under KVM, for the ahead-of-time and JIT builds.
 - [x] Add them to the fixture binaries (4.3) and run them as QEMU tests on several CPUs. Four .NET fixtures: static ahead-of-time, ahead-of-time against glibc, the self-contained folder with the JIT, each on one and four CPUs and under KVM.
 
 ### 9.2 Fast and multicore
