@@ -407,6 +407,30 @@ fn kernelArtifact(
     kernel.pie = true;
     kernel.entry = .{ .symbol_name = "kmain" };
     kernel.setLinkerScript(b.path("linker.ld"));
+    // The vDSO (src/vdso): position independent, in one segment, with the
+    // symbol versions and both hash tables glibc and Go look for; linked by
+    // hand with Zig's lld for the options a library step does not offer.
+    const vdso_obj = b.addObject(.{
+        .name = "vdso",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vdso/vdso.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+            .pic = true,
+            .stack_check = false,
+            .stack_protector = false,
+            .strip = true,
+        }),
+    });
+    const vdso_link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared", "--hash-style=both", "--eh-frame-hdr", "-soname", "linux-vdso.so.1", "-z", "max-page-size=4096", "--no-undefined", "--build-id=none", "-T" });
+    vdso_link.addFileArg(b.path("src/vdso/vdso.lds"));
+    vdso_link.addArg("--version-script");
+    vdso_link.addFileArg(b.path("src/vdso/vdso.map"));
+    vdso_link.addArg("-o");
+    const vdso_so = vdso_link.addOutputFileArg("vdso.so");
+    vdso_link.addArtifactArg(vdso_obj);
+    kernel.root_module.addAnonymousImport("vdso.so", .{ .root_source_file = vdso_so });
+
     const options = b.addOptions();
     options.addOption(bool, "is_test", is_test);
     options.addOption(std.log.Level, "log_level", kopts.log_level);

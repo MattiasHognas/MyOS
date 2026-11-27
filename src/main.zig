@@ -72,6 +72,7 @@ pub const kernel = struct {
     pub const flock = @import("kernel/flock.zig");
     pub const stats = @import("kernel/stats.zig");
     pub const profile = @import("kernel/profile.zig");
+    pub const vdso = @import("kernel/vdso.zig");
     pub const random_core = @import("kernel/random_core.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
@@ -396,6 +397,7 @@ fn kmainOnStack() callconv(.c) noreturn {
     apic.init();
     hpet.init();
     kernel.clock.init(); // the TSC calibrated against the HPET, the wall clock from the RTC
+    kernel.vdso.init(); // the clock for programs, after the clock itself
     kernel.stats.initCpu(); // the boot CPU's counters (the others make theirs as they come up)
     kernel.profile.initCpu();
 

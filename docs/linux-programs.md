@@ -168,7 +168,7 @@ the initial stack, laid out as Linux does. From the auxiliary vector they
 use `AT_PHDR`, `AT_PHNUM` and `AT_PHENT` (to find their thread-local data),
 `AT_PAGESZ`, `AT_RANDOM` (stack protector and hash seeds) and `AT_HWCAP`.
 None needs a vDSO: without `AT_SYSINFO_EHDR` they make real system calls
-for the time.
+for the time. MyOS has one since 9.2 (glibc and Go use it for the clock).
 
 ## What runs
 

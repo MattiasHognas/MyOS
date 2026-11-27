@@ -355,9 +355,16 @@ A program started without arguments gets the path it was started under as
 | `AT_SECURE` (23) | 0 |
 | `AT_RANDOM` (25) | address of 16 random bytes, new for every process |
 | `AT_EXECFN` (31) | address of the path the program was started under |
+| `AT_SYSINFO_EHDR` (33) | address of the vDSO |
 
-There is no vDSO (`AT_SYSINFO_EHDR`): a program that looks for one makes
-real system calls instead.
+The vDSO is an ELF image (`linux-vdso.so.1`, symbols of version
+`LINUX_2.6`) with `__vdso_clock_gettime`, `__vdso_gettimeofday` and
+`__vdso_time` (and the names without the prefix): they read the clock from
+the page below the image (`[vvar]` in `/proc/self/maps`) without a system
+call, for the realtime, monotonic and boot-time clocks and their coarse
+forms, and make the system call for the others or where the TSC is not
+the clock. Both pages are shared by every process and cannot be made
+writable (`mprotect`: `EACCES`). `getcpu` is not in it yet.
 
 A program that sets up thread-local storage does so itself, from its
 `PT_TLS` program header, and tells the kernel where with

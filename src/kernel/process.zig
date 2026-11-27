@@ -100,6 +100,7 @@ const user_memory = @import("user_memory.zig");
 const vm_regions = @import("vm_regions.zig");
 const timer = @import("timer.zig");
 const signal = @import("signal.zig");
+const vdso = @import("vdso.zig");
 const abi = @import("abi");
 
 /// Highest address a user stack can end at. Each process's stack ends at
@@ -1709,6 +1710,7 @@ noinline fn writeStartupData(
     options: SpawnOptions,
     loaded: *const elf.Loaded,
     interp_base: u64,
+    vdso_base: u64,
     stack_pages: *const [STACK_PAGES]u64,
     stack_top: u64,
     data_top: u64,
@@ -1728,6 +1730,7 @@ noinline fn writeStartupData(
         .hwcap = cpu.cpuid(1, 0).edx,
         .hwcap2 = if (@import("../arch/x86_64/percpu.zig").fsgsbase) abi.HWCAP2.FSGSBASE else 0,
         .clktck = timer.HZ,
+        .sysinfo_ehdr = vdso_base,
     };
     const start_size = startup_stack.size(start_args) catch return error.ArgumentsTooLong;
     if (start_size > abi.ARG_MAX) return error.ArgumentsTooLong;
@@ -2068,7 +2071,17 @@ noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOption
     // A program that names an interpreter (the dynamic loader) is not
     // started itself: the interpreter is loaded beside it and started,
     // and finds the program through the auxiliary vector.
-    const mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE;
+    var mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE;
+    // The vDSO, at the top of where mappings go: its clock page, then the
+    // image, shared by every process and faulted in when first touched.
+    var vdso_base: u64 = 0;
+    if (vdso.present()) {
+        const vvar_at = mmap_top - vdso.PAGES * pmm.PAGE_SIZE;
+        try regions.add(heap.allocator, vvar_at, pmm.PAGE_SIZE, .{ .read = true }, .vvar);
+        try regions.add(heap.allocator, vvar_at + pmm.PAGE_SIZE, vdso.TEXT_PAGES * pmm.PAGE_SIZE, .{ .read = true, .exec = true }, .vdso);
+        vdso_base = vvar_at + pmm.PAGE_SIZE;
+        mmap_top = vvar_at - pmm.PAGE_SIZE; // a page apart from the first mapping
+    }
     var interp_limits = image_limits_now;
     interp_limits.max_bytes -|= loaded.pages * pmm.PAGE_SIZE;
     var first_entry = loaded.entry;
@@ -2081,7 +2094,7 @@ noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOption
         interp_pages = interp.pages;
     }
 
-    const entry_rsp = try writeStartupData(name, options, loaded, interp_base, &stack_pages, stack_top, data_top);
+    const entry_rsp = try writeStartupData(name, options, loaded, interp_base, vdso_base, &stack_pages, stack_top, data_top);
 
     // Everything the program takes, now that its page tables exist (the
     // thread's kernel stack comes on top).

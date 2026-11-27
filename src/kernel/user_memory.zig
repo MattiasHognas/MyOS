@@ -48,6 +48,7 @@ const Process = proc.Process;
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const vm_regions = @import("vm_regions.zig");
 const vfs = @import("vfs.zig");
+const vdso = @import("vdso.zig");
 const Prot = vm_regions.Prot;
 
 const PAGE = pmm.PAGE_SIZE;
@@ -153,6 +154,19 @@ pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
         return error.BadAccess;
     }
     if (vmm.leafEntry(p.root, page) != null) return; // given meanwhile
+
+    // The vDSO's pages: the ones every process shares, not a page of its
+    // own; not counted against its limit.
+    if (region.kind == .vvar or region.kind == .vdso) {
+        const index = (page - region.start) / PAGE + @as(u64, if (region.kind == .vdso) 1 else 0);
+        var tables: usize = 0;
+        vmm.mapCounting(p.root, page, vdso.page(@intCast(index)), pteFlags(region.prot) | vmm.SHARED, &tables) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.AlreadyMapped => {},
+        };
+        p.pages += tables;
+        return;
+    }
 
     if (p.pages + 1 > p.limits.max_pages) return error.OutOfMemory;
     // A page of a file is filled from it, and what is past the file's end
@@ -419,6 +433,8 @@ pub fn describe(p: *Process) error{OutOfMemory}![]u8 {
                     switch (r.kind) {
                         .stack => "                         [stack]",
                         .heap => "                         [heap]",
+                        .vvar => "                         [vvar]",
+                        .vdso => "                         [vdso]",
                         .image, .anon, .file => "",
                     },
                 }) catch break :blk false;
@@ -471,6 +487,12 @@ pub fn mprotect(p: *Process, addr: u64, length: u64, prot_bits: u64) u64 {
     if (!mappable(addr, len)) return abi.err(.NOMEM);
     const held = p.mem.lock.acquire();
     defer p.mem.lock.release(held);
+    // The vDSO's pages are every process's: never writable (Linux: EACCES).
+    if (prot.write) {
+        for (p.mem.regions.items()) |r| {
+            if ((r.kind == .vvar or r.kind == .vdso) and r.start < addr + len and addr < r.end) return abi.err(.ACCES);
+        }
+    }
     p.mem.regions.protect(heap.allocator, addr, len, prot) catch |e| return mapError(e);
     vmm.protectUserRange(p.root, addr, addr + len, pteFlags(prot));
     return 0;

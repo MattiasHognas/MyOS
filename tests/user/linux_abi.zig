@@ -85,7 +85,10 @@ pub fn main() noreturn {
     expect(eql(execfn, "/test/linux_abi"), 13);
     const platform: [*:0]const u8 = @ptrFromInt(lib.auxValue(AT.PLATFORM) orelse lib.exit(14));
     expect(eql(platform, "x86_64"), 14);
-    expect(lib.auxValue(33) == null, 15); // no vDSO
+    // The vDSO: an ELF image the auxiliary vector points at, whose clock
+    // agrees with the system call's (checked further down).
+    const vdso_base = lib.auxValue(AT.SYSINFO_EHDR) orelse lib.exit(15);
+    expect(std.mem.eql(u8, @as(*const [4]u8, @ptrFromInt(vdso_base)), "\x7fELF"), 15);
 
     // set_tid_address returns the thread's ID.
     const tid = lib.gettid();
@@ -215,6 +218,39 @@ pub fn main() noreturn {
     expect(info.procs >= 1 and info.totalswap == 0, 107);
     expect(lib.syscall(Sys.sysinfo, 8, 0, 0) == lib.err(.FAULT), 108);
 
+    // --- The vDSO's clock, as glibc and Go call it, against the system call.
+    const vdso_clock = vdsoSymbol(vdso_base, "__vdso_clock_gettime") orelse lib.exit(162);
+    const clock_fn: *const fn (i32, *abi.TimeSpec) callconv(.c) i32 = @ptrFromInt(vdso_clock);
+    for ([_]i32{ abi.CLOCK.MONOTONIC, abi.CLOCK.REALTIME, abi.CLOCK.BOOTTIME, abi.CLOCK.MONOTONIC_COARSE }) |clk| {
+        var t0: abi.TimeSpec = undefined;
+        var t1: abi.TimeSpec = undefined;
+        var t2: abi.TimeSpec = undefined;
+        expect(lib.syscall(Sys.clock_gettime, @intCast(clk), @intFromPtr(&t0), 0) == 0, 163);
+        expect(clock_fn(clk, &t1) == 0, 164);
+        expect(lib.syscall(Sys.clock_gettime, @intCast(clk), @intFromPtr(&t2), 0) == 0, 165);
+        const ns = struct {
+            fn f(t: abi.TimeSpec) i128 {
+                return @as(i128, t.sec) * 1_000_000_000 + t.nsec;
+            }
+        }.f;
+        // In order, and within the tick the coarse clocks may lag by.
+        expect(ns(t0) <= ns(t1) + 20_000_000 and ns(t1) <= ns(t2) + 20_000_000 and t1.nsec >= 0 and t1.nsec < 1_000_000_000, 166);
+    }
+    // A clock it does not know (the CPU time ones) through the system call.
+    var cpu_ts: abi.TimeSpec = undefined;
+    expect(clock_fn(abi.CLOCK.PROCESS_CPUTIME_ID, &cpu_ts) == @as(i32, @truncate(@as(i64, @bitCast(lib.syscall(Sys.clock_gettime, abi.CLOCK.PROCESS_CPUTIME_ID, @intFromPtr(&cpu_ts), 0))))), 167);
+    // Nobody may write the vDSO or its clock page, not even after asking.
+    expect(lib.syscall(Sys.mprotect, vdso_base - 4096, 4096, abi.PROT.READ | abi.PROT.WRITE) == lib.err(.ACCES), 168);
+    expect(lib.syscall(Sys.mprotect, vdso_base, 4096, abi.PROT.READ | abi.PROT.WRITE | abi.PROT.EXEC) == lib.err(.ACCES), 169);
+    // A child made by fork has it too.
+    const vchild = lib.syscall(Sys.fork, 0, 0, 0);
+    if (vchild == 0) {
+        var t: abi.TimeSpec = undefined;
+        lib.exit(if (clock_fn(abi.CLOCK.MONOTONIC, &t) == 0 and t.sec >= 0) 0 else 1);
+    }
+    var vstatus: i32 = 0;
+    expect(lib.syscall6(Sys.wait4, vchild, @intFromPtr(&vstatus), 0, 0, 0, 0) == vchild and vstatus == 0, 170);
+
     // statfs: the filesystem is in memory and read-only; a missing path is missing.
     var fs: abi.StatFs = undefined;
     expect(lib.syscall(Sys.statfs, @intFromPtr("/etc/motd"), @intFromPtr(&fs), 0) == 0, 109);
@@ -290,4 +326,45 @@ pub fn main() noreturn {
 
     _ = lib.syscall(Sys.exit_group, 0, 0, 0);
     lib.exit(99); // exit_group returned
+}
+
+/// The address of `name` among the vDSO's dynamic symbols: through its
+/// program headers to the dynamic section, then the symbol table, whose
+/// size the hash table gives (the way Go's runtime reads it). The ELF
+/// fields are read at their offsets in the 64-bit format.
+fn vdsoSymbol(base: usize, name: []const u8) ?usize {
+    const Phdr = extern struct { p_type: u32, p_flags: u32, p_offset: u64, p_vaddr: u64, p_paddr: u64, p_filesz: u64, p_memsz: u64, p_align: u64 };
+    const Dyn = extern struct { tag: i64, val: u64 };
+    const Sym = extern struct { name: u32, info: u8, other: u8, shndx: u16, value: u64, size: u64 };
+    const phoff = @as(*align(1) const u64, @ptrFromInt(base + 32)).*;
+    const phentsize = @as(*align(1) const u16, @ptrFromInt(base + 54)).*;
+    const phnum = @as(*align(1) const u16, @ptrFromInt(base + 56)).*;
+    var dynamic: ?[*]const Dyn = null;
+    var bias: usize = base;
+    for (0..phnum) |k| {
+        const ph: *const Phdr = @ptrFromInt(base + phoff + k * phentsize);
+        if (ph.p_type == 1) bias = base + ph.p_offset - ph.p_vaddr; // PT_LOAD
+        if (ph.p_type == 2) dynamic = @ptrFromInt(base + ph.p_offset); // PT_DYNAMIC
+    }
+    const dyn = dynamic orelse return null;
+    var symtab: usize = 0;
+    var strtab: usize = 0;
+    var hash: usize = 0;
+    var i: usize = 0;
+    while (dyn[i].tag != 0) : (i += 1) {
+        switch (dyn[i].tag) {
+            6 => symtab = bias + dyn[i].val, // DT_SYMTAB
+            5 => strtab = bias + dyn[i].val, // DT_STRTAB
+            4 => hash = bias + dyn[i].val, // DT_HASH
+            else => {},
+        }
+    }
+    if (symtab == 0 or strtab == 0 or hash == 0) return null;
+    const nchain = @as([*]const u32, @ptrFromInt(hash))[1];
+    const syms: [*]const Sym = @ptrFromInt(symtab);
+    for (0..nchain) |k| {
+        const sym_name: [*:0]const u8 = @ptrFromInt(strtab + syms[k].name);
+        if (std.mem.eql(u8, std.mem.span(sym_name), name)) return bias + syms[k].value;
+    }
+    return null;
 }

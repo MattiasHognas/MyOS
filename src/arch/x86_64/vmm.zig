@@ -60,6 +60,10 @@ pub const HUGE: u64 = 1 << 7;
 /// so its TLB entry survives a CR3 load (requires CR4.PGE). `map` sets it
 /// on every kernel address and on no user address.
 pub const GLOBAL: u64 = 1 << 8;
+/// A user page that is not the address space's own but shared by all of
+/// them (the vDSO's, `kernel/vdso.zig`): never freed with a mapping, never
+/// copied by `fork`, never made writable. A bit the CPU leaves to software.
+pub const SHARED: u64 = 1 << 9;
 /// Page table entry flag: instruction fetches are not allowed (requires EFER.NXE).
 pub const NX: u64 = 1 << 63;
 /// Page table entry flag: write-through caching.
@@ -150,7 +154,9 @@ fn isEmpty(t: *const [512]u64) bool {
 fn freeTable(phys: u64, level: u6) void {
     for (table(phys)) |e| {
         if (e & PRESENT == 0) continue;
-        if (level == 0) pmm.free(e & ADDR_MASK) else freeTable(e & ADDR_MASK, level - 1);
+        if (level == 0) {
+            if (e & SHARED == 0) pmm.free(e & ADDR_MASK);
+        } else freeTable(e & ADDR_MASK, level - 1);
     }
     pmm.free(phys);
 }
@@ -396,7 +402,12 @@ fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapErro
     for (t[0..n], 0..) |e, i| {
         if (e & PRESENT == 0) continue;
         const virt = base + i * span(level);
-        if (level == 0) {
+        if (level == 0 and e & SHARED != 0) {
+            // A page all address spaces share: the same page, not a copy.
+            var tables: usize = 0;
+            try mapCounting(to, virt, e & ADDR_MASK, e & ~ADDR_MASK & ~PRESENT, &tables);
+            taken.* += tables;
+        } else if (level == 0) {
             const page = pmm.alloc() orelse return error.OutOfMemory;
             @memcpy(pmm.physToVirt(page)[0..pmm.PAGE_SIZE], pmm.physToVirt(e & ADDR_MASK)[0..pmm.PAGE_SIZE]);
             var tables: usize = 0;
@@ -456,6 +467,9 @@ const Gather = struct {
     pages: u64,
     buf: []u64,
     n: usize = 0,
+    /// Entries were cleared that free nothing (`SHARED` pages): the range
+    /// is flushed all the same.
+    cleared: bool = false,
 
     fn add(g: *Gather, phys: u64) void {
         if (g.n == g.buf.len) g.flush();
@@ -464,7 +478,8 @@ const Gather = struct {
     }
 
     fn flush(g: *Gather) void {
-        if (g.n == 0) return;
+        if (g.n == 0 and !g.cleared) return;
+        g.cleared = false;
         flushEverywhere(g.root, g.start, g.pages);
         for (g.buf[0..g.n]) |phys| pmm.free(phys);
         g.n = 0;
@@ -493,11 +508,16 @@ fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: 
             switch (action) {
                 .unmap => |g| {
                     t[i] = 0;
-                    g.add(e & ADDR_MASK);
-                    freed += 1;
+                    if (e & SHARED != 0) {
+                        g.cleared = true; // not the address space's: not freed or counted
+                    } else {
+                        g.add(e & ADDR_MASK);
+                        freed += 1;
+                    }
                 },
                 .protect => |bits| {
-                    t[i] = (e & ~(USER | WRITABLE | NX)) | bits;
+                    // A shared page is never made writable.
+                    t[i] = (e & ~(USER | WRITABLE | NX)) | (if (e & SHARED != 0) bits & ~WRITABLE else bits);
                     freed += 1; // counted, though nothing is freed: see the callers
                 },
             }

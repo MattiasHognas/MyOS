@@ -131,4 +131,18 @@ pub fn checkCpu(boot_tsc: u64) void {
 pub fn disableTsc(why: []const u8) void {
     if (!use_tsc.swap(false, .acq_rel)) return;
     log.warn("TSC: {s}; the monotonic clock is the HPET", .{why});
+    @import("vdso.zig").update(); // programs make the system call from now on
+}
+
+/// What the vDSO computes the time from (`vdso.zig`): the TSC's base and
+/// rate as `nanos` uses them, and the wall clock's offset.
+pub fn vdsoState() struct { tsc: bool, tsc_base: u64, ns_base: u64, mult: u64, shift: u32, realtime_offset: i64 } {
+    return .{
+        .tsc = use_tsc.load(.acquire),
+        .tsc_base = base_tsc,
+        .ns_base = base_ns,
+        .mult = mult,
+        .shift = SHIFT,
+        .realtime_offset = @intCast(wall_offset_ns),
+    };
 }

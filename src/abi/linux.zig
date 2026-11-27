@@ -460,6 +460,10 @@ pub const AT = struct {
     pub const RANDOM = 25;
     /// Address of the path the program was started with.
     pub const EXECFN = 31;
+    /// Where the vDSO is: its ELF header.
+    pub const SYSINFO_EHDR = 33;
+    /// A pair to be passed over.
+    pub const IGNORE = 1;
 };
 
 /// Most bytes the arguments, environment and auxiliary vector of a new

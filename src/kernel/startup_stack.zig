@@ -46,6 +46,9 @@ pub const Args = struct {
     hwcap2: u64 = 0,
     /// Timer ticks per second.
     clktck: u64,
+    /// Where the vDSO is mapped (`AT_SYSINFO_EHDR`); 0 for none, and the
+    /// pair is then `AT_IGNORE`.
+    sysinfo_ehdr: u64 = 0,
 };
 
 pub const Error = error{
@@ -58,7 +61,7 @@ const platform = "x86_64";
 const PAGE_SIZE = 4096;
 
 /// Number of (key, value) pairs `build` writes, `AT_NULL` included.
-const AUX_PAIRS = 19;
+const AUX_PAIRS = 20;
 
 /// Number of 8-byte words in the vectors: argc, the two pointer arrays
 /// with their terminators, and the auxiliary vector.
@@ -140,6 +143,7 @@ pub fn build(mem: []u8, top: u64, a: Args) Error!u64 {
         .{ AT.RANDOM, random },
         .{ AT.EXECFN, execfn },
         .{ AT.PLATFORM, platform_addr },
+        if (a.sysinfo_ehdr != 0) .{ AT.SYSINFO_EHDR, a.sysinfo_ehdr } else .{ AT.IGNORE, 0 },
         .{ AT.NULL, 0 },
     };
     for (aux) |pair| {

@@ -61,6 +61,11 @@ pub const Kind = enum(u8) {
     /// A private mapping of a file: a page is filled from the file when
     /// it is first touched, and is the program's own from then on.
     file,
+    /// The kernel's page with the clock for the vDSO (`[vvar]`), and the
+    /// vDSO itself (`[vdso]`): pages shared by every process, mapped on
+    /// first touch and never the process's own (`kernel/vdso.zig`).
+    vvar,
+    vdso,
 };
 
 /// Where a file-backed region reads its pages from.
