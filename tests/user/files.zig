@@ -158,8 +158,25 @@ pub fn main() noreturn {
     expect(std.mem.eql(u8, listing(dev_dir), ". .. null urandom random"), 128);
     _ = lib.close(dev_dir);
     const self_dir = lib.open("/proc/self/");
-    expect(std.mem.eql(u8, listing(self_dir), ". .. exe maps stat"), 129);
+    expect(std.mem.eql(u8, listing(self_dir), ". .. stat cmdline comm exe maps"), 129);
     _ = lib.close(self_dir);
+    // Every process has a directory by its ID, this one included; another
+    // process's has no `exe` or `maps`.
+    const proc_dir = lib.open("/proc");
+    var pid_text: [24]u8 = undefined;
+    const my_pid = lib.syscall(Sys.getpid, 0, 0, 0);
+    const pid_name = std.fmt.bufPrint(&pid_text, " {d}", .{my_pid}) catch unreachable;
+    const proc_list = listing(proc_dir);
+    expect(std.mem.startsWith(u8, proc_list, ". .. self meminfo ") and std.mem.indexOf(u8, proc_list, pid_name) != null, 135);
+    _ = lib.close(proc_dir);
+    const comm_fd = lib.open("/proc/self/comm");
+    expect(!lib.isError(comm_fd) and lib.read(comm_fd, buf[0..6]) == 6 and std.mem.eql(u8, buf[0..6], "files\n"), 136);
+    _ = lib.close(comm_fd);
+    const cmd_fd = lib.open("/proc/self/cmdline");
+    const cmd_len = lib.read(cmd_fd, buf[0..64]);
+    expect(!lib.isError(cmd_len) and cmd_len > 0 and buf[cmd_len - 1] == 0, 137);
+    _ = lib.close(cmd_fd);
+    expect(lib.open("/proc/999999/stat") == lib.err(.NOENT), 138);
     // What is in the directory, by a path that starts at its descriptor.
     const rel = lib.syscall(Sys.openat, etc, @intFromPtr("motd"), 0);
     expect(!lib.isError(rel) and lib.read(rel, buf[0..7]) == 7 and std.mem.eql(u8, buf[0..7], "Welcome"), 130);

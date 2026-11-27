@@ -840,7 +840,12 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
             if (directory_wanted) return err(.NOTDIR);
             if (what == .generated) {
                 if (access != abi.O.RDONLY) return err(.ROFS);
-                const text = procfs.generate(what.generated, p) catch return err(.NOMEM);
+                const g = what.generated;
+                const text = if (g.pid == 0 or g.pid == p.pid) procfs.generate(g.file, p) catch return err(.NOMEM) else blk: {
+                    const other = proc.findRetained(g.pid) orelse return err(.NOENT);
+                    defer proc.release(other);
+                    break :blk procfs.generate(g.file, other) catch return err(.NOMEM);
+                };
                 opened.generated = text;
                 opened.node = open_file.memoryNode(text);
             } else {
@@ -1066,8 +1071,9 @@ const Named = union(enum) {
     /// A symbolic link of a filesystem, not followed (the path came from
     /// `Path.fromNoFollow`): what it points to is `vfs.readLink`'s.
     symlink,
-    /// A text file made when it is opened (`procfs.zig`).
-    generated: procfs.File,
+    /// A text file made when it is opened (`procfs.zig`), about the
+    /// process with the ID `pid` (0: none, the machine).
+    generated: struct { file: procfs.File, pid: u64 },
     /// `/dev/null`, `/dev/urandom`, `/dev/random`.
     device: open_file.Kind,
 };
@@ -1100,15 +1106,20 @@ fn procEntry(path: []const u8) ?Named {
     // "/proc/<name>", or "/proc/<self or the caller's ID>[/<name>]".
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const first = rest[0 .. slash orelse rest.len];
-    var id_buf: [20]u8 = undefined;
-    const own_id = std.fmt.bufPrint(&id_buf, "{d}", .{p.pid}) catch unreachable;
-    if (!std.mem.eql(u8, first, "self") and !std.mem.eql(u8, first, own_id)) {
-        if (slash == null) if (procfs.find(first, false)) |file| return .{ .generated = file };
+    const pid: u64 = if (std.mem.eql(u8, first, "self")) p.pid else std.fmt.parseInt(u64, first, 10) catch {
+        if (slash == null) if (procfs.find(first, false)) |file| return .{ .generated = .{ .file = file, .pid = 0 } };
         return .none;
+    };
+    if (pid != p.pid) {
+        const other = proc.findRetained(pid) orelse return .none;
+        proc.release(other);
     }
     const name = rest[(slash orelse return .directory) + 1 ..];
-    if (std.mem.eql(u8, name, "exe")) return .exe_link;
-    return if (procfs.find(name, true)) |file| .{ .generated = file } else .none;
+    // Only a process's own directory has `exe` and `maps`.
+    if (std.mem.eql(u8, name, "exe")) return if (pid == p.pid) .exe_link else .none;
+    const file = procfs.find(name, true) orelse return .none;
+    if (file == .maps and pid != p.pid) return .none;
+    return .{ .generated = .{ .file = file, .pid = pid } };
 }
 
 /// The file `path` names, following the link if it is one. Null if it
@@ -1416,11 +1427,21 @@ fn extraEntries(dir: []const u8) []const ListEntry {
         .{ .name = "random", .type = abi.DT.CHR },
     };
     if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG } };
-    if (named(dir) == .directory and std.mem.startsWith(u8, dir, "/proc/")) return &.{
-        .{ .name = "exe", .type = abi.DT.LNK },
-        .{ .name = "maps", .type = REG },
-        .{ .name = "stat", .type = REG },
-    };
+    if (named(dir) == .directory and std.mem.startsWith(u8, dir, "/proc/")) {
+        const own = std.mem.eql(u8, dir, "/proc/self") or blk: {
+            var id_buf: [24]u8 = undefined;
+            const me = thread.current().process orelse break :blk false;
+            break :blk std.mem.eql(u8, dir, std.fmt.bufPrint(&id_buf, "/proc/{d}", .{me.pid}) catch break :blk false);
+        };
+        const all = &[_]ListEntry{
+            .{ .name = "stat", .type = REG },
+            .{ .name = "cmdline", .type = REG },
+            .{ .name = "comm", .type = REG },
+            .{ .name = "exe", .type = abi.DT.LNK },
+            .{ .name = "maps", .type = REG },
+        };
+        return if (own) all else all[0..3];
+    }
     return &.{};
 }
 
@@ -1435,6 +1456,15 @@ fn nextEntry(dir: []const u8, position: *u64, name_buf: []u8) ?ListEntry {
         if (index == 1) return .{ .name = "..", .type = abi.DT.DIR };
         if (index - 2 < extra.len) return extra[index - 2];
         position.* = LIST_BASE;
+    }
+    if (std.mem.eql(u8, dir, "/proc")) {
+        // Then a directory for each process, lowest ID first: the position
+        // is LIST_BASE + the last ID listed, so processes that come and go
+        // meanwhile move nothing.
+        const next = proc.pidAfter(position.* - LIST_BASE) orelse return null;
+        position.* = LIST_BASE + next;
+        const name = std.fmt.bufPrint(name_buf, "{d}", .{next}) catch return null;
+        return .{ .name = name, .type = abi.DT.DIR };
     }
     var cookie = position.* - LIST_BASE;
     defer position.* = cookie + LIST_BASE;

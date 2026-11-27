@@ -6,13 +6,15 @@
 //! to need are here (`docs/linux-programs.md`), in Linux's format, with
 //! the fields nobody reads left at zero.
 //!
-//!   /proc/self/maps   the mappings of the address space, one a line: a C
-//!                     library finds the main thread's stack in it
-//!   /proc/self/stat   one line about the process; its start time is read
-//!   /proc/meminfo     memory in the machine and how much is free
+//!   /proc/<pid>/maps     the mappings of the address space, one a line:
+//!                        a C library finds the main thread's stack in it
+//!   /proc/<pid>/stat     one line about the process (`ps` reads it)
+//!   /proc/<pid>/cmdline  its arguments, each ending in a NUL
+//!   /proc/<pid>/comm     its name, as `stat` gives it
+//!   /proc/meminfo        memory in the machine and how much is free
 //!
-//! `self` can also be the process's own ID. Other processes' entries do
-//! not exist.
+//! `/proc/self` is the calling process's directory, and there is one for
+//! every process by its ID; only the caller's own has `exe` and `maps`.
 
 const std = @import("std");
 
@@ -21,13 +23,13 @@ const pmm = @import("pmm.zig");
 const proc = @import("process.zig");
 const user_memory = @import("user_memory.zig");
 
-pub const File = enum { maps, stat, meminfo };
+pub const File = enum { maps, stat, cmdline, comm, meminfo };
 
 /// The generated file `name` names below `/proc/self` (or `/proc/<pid>`),
 /// if `per_process`, or below `/proc`.
 pub fn find(name: []const u8, per_process: bool) ?File {
     const table = if (per_process)
-        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat } }
+        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm } }
     else
         &[_]struct { []const u8, File }{.{ "meminfo", .meminfo }};
     for (table) |entry| {
@@ -44,18 +46,26 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
         .stat => {
             // pid (comm) state ppid pgrp session tty tpgid flags, four
             // fault counts, utime stime cutime cstime, priority nice
-            // threads 0, starttime in clock ticks, then sizes nobody reads.
-            const base = if (std.mem.lastIndexOfScalar(u8, p.name, '/')) |i| p.name[i + 1 ..] else p.name;
-            const comm = base[0..@min(base.len, 15)];
-            return std.fmt.allocPrint(heap.allocator, "{d} ({s}) R 0 {d} {d} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {d} 0 {d} 0 0\n", .{
+            // threads 0, starttime in clock ticks, vsize, rss in pages.
+            const info = proc.describe(p);
+            return std.fmt.allocPrint(heap.allocator, "{d} ({s}) {c} {d} {d} {d} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {d} 0 {d} 0 {d}\n", .{
                 p.pid,
-                comm,
-                p.pid,
-                p.pid,
-                p.thread_count,
+                comm(p),
+                info.state,
+                info.ppid,
+                info.pgid,
+                info.sid,
+                info.threads,
                 p.start_ticks,
+                p.pages,
             });
         },
+        .cmdline => {
+            const held = p.files_lock.acquire();
+            defer p.files_lock.release(held);
+            return heap.allocator.dupe(u8, p.cmdline);
+        },
+        .comm => return std.fmt.allocPrint(heap.allocator, "{s}\n", .{comm(p)}),
         .meminfo => {
             const total = pmm.totalPages() * pmm.PAGE_SIZE / 1024;
             const free = pmm.free_pages * pmm.PAGE_SIZE / 1024;
@@ -69,4 +79,11 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
             , .{ total, free, free });
         },
     }
+}
+
+/// The name `stat` and `comm` give: the program file's name, at most 15
+/// characters, as Linux keeps it.
+fn comm(p: *const proc.Process) []const u8 {
+    const base = if (std.mem.lastIndexOfScalar(u8, p.name, '/')) |i| p.name[i + 1 ..] else p.name;
+    return base[0..@min(base.len, 15)];
 }

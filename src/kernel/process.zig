@@ -184,6 +184,10 @@ pub const Process = struct {
     entry_rsp: u64 = STACK_TOP_MAX,
     /// Heap-allocated copy of the name the process was spawned with.
     name: []const u8,
+    /// Its arguments as `/proc/<pid>/cmdline` gives them, each ending in a
+    /// NUL; on the heap (empty for a structure that never ran). Replaced by
+    /// `execve` under `files_lock`.
+    cmdline: []u8 = &.{},
     /// File descriptor table, indexed by fd. A process starts with 0, 1
     /// and 2 open on the console. Several descriptors can refer to one
     /// open file (`dup`), which is counted (`OpenFile.refs`).
@@ -308,6 +312,71 @@ fn unregisterLocked(p: *Process) void {
             return;
         }
     }
+}
+
+/// What `/proc/<pid>/stat` says of `p`.
+pub fn describe(p: *Process) struct { state: u8, ppid: u64, pgid: u64, sid: u64, threads: u32 } {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    // R: a thread of it runs or is ready to; S: all of them wait; Z:
+    // ended, not collected. (The states are read without the scheduler's
+    // lock: what `ps` shows may be a moment old.)
+    var running = false;
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        const st = @atomicLoad(@TypeOf(one.state), &one.state, .monotonic);
+        if (st == .running or st == .ready) running = true;
+    }
+    return .{
+        .state = if (p.exit_code != null) 'Z' else if (running) 'R' else 'S',
+        .ppid = if (p.parent) |parent| parent.pid else 0,
+        .pgid = p.pgid,
+        .sid = p.sid,
+        .threads = p.thread_count,
+    };
+}
+
+/// The process with ID `pid`, with a reference the caller gives up with
+/// `release`; null if there is none.
+pub fn findRetained(pid: u64) ?*Process {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var q = all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (p.pid == pid) {
+            p.refs += 1;
+            return p;
+        }
+    }
+    return null;
+}
+
+/// The lowest process ID above `prev`, or null: for listing `/proc`.
+pub fn pidAfter(prev: u64) ?u64 {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var best: ?u64 = null;
+    var q = all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (p.pid > prev and (best == null or p.pid < best.?)) best = p.pid;
+    }
+    return best;
+}
+
+/// The arguments as `/proc/<pid>/cmdline` gives them: each followed by a
+/// NUL, on the heap.
+fn joinArgs(argv: []const []const u8, name: []const u8) error{OutOfMemory}![]u8 {
+    const list: []const []const u8 = if (argv.len != 0) argv else &.{name};
+    var len: usize = 0;
+    for (list) |a| len += a.len + 1;
+    const out = try heap.allocator.alloc(u8, len);
+    var at: usize = 0;
+    for (list) |a| {
+        @memcpy(out[at..][0..a.len], a);
+        out[at + a.len] = 0;
+        at += a.len + 1;
+    }
+    return out;
 }
 
 /// Send `sig` to the process with ID `pid` (`kill`); 0 checks only. False
@@ -1044,6 +1113,8 @@ pub fn forkProcess(frame: *const arch_syscall.Frame, args: CloneArgs, exit_signa
     child.cwd = cwd;
     child.signal_actions = try newActions(null);
     errdefer heap.allocator.destroy(child.signal_actions);
+    child.cmdline = try heap.allocator.dupe(u8, parent.cmdline);
+    errdefer heap.allocator.free(child.cmdline);
     {
         const held = parent.signal_lock.acquire();
         defer parent.signal_lock.release(held);
@@ -1287,6 +1358,7 @@ pub fn release(p: *Process) void {
     }
     // Nobody else has a reference, so nobody else can reach it.
     if (p.signal_actions != &none_set) heap.allocator.destroy(p.signal_actions);
+    heap.allocator.free(p.cmdline);
     heap.allocator.free(p.name);
     heap.allocator.destroy(p);
 }
@@ -1528,6 +1600,8 @@ pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []cons
     errdefer img.destroy();
     const name = try heap.allocator.dupe(u8, path);
     errdefer heap.allocator.free(name);
+    const cmdline = try joinArgs(run_argv, run_path);
+    errdefer heap.allocator.free(cmdline);
 
     // The other threads end; this one, if another got here first or the
     // process is ending, goes with them.
@@ -1544,6 +1618,25 @@ pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []cons
     p.exec_thread.store(null, .release);
     if (p.killed.load(.acquire)) return error.Interrupted;
 
+    replaceProgram(p, &img, name, cmdline);
+    resetForExec(p, me);
+
+    // Into the new program, as a new process starts: every register zero
+    // but the stack pointer and the instruction pointer.
+    frame.* = std.mem.zeroes(arch_syscall.Frame);
+    frame.rip = img.entry;
+    frame.rcx = img.entry;
+    frame.rsp = img.entry_rsp;
+    frame.rflags = 0x202;
+    frame.r11 = 0x202;
+    frame.cs = @import("../arch/x86_64/sysret.zig").USER_CS;
+    frame.ss = @import("../arch/x86_64/sysret.zig").USER_SS;
+}
+
+/// `execve`'s switch to the new program's address space, name and
+/// arguments, freeing the old ones. Not inlined, to keep `execve`'s frame
+/// small.
+noinline fn replaceProgram(p: *Process, img: *const Image, name: []const u8, cmdline: []u8) void {
     // The new address space in, the old one out.
     const old_root = p.root;
     var old_regions: vm_regions.Regions = undefined;
@@ -1570,7 +1663,21 @@ pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []cons
     const old_name = p.name;
     p.name = name;
     heap.allocator.free(old_name);
+    const old_cmdline = blk: {
+        // Under the descriptor lock, which readers of it take (`procfs`).
+        const held = p.files_lock.acquire();
+        defer p.files_lock.release(held);
+        const before = p.cmdline;
+        p.cmdline = cmdline;
+        break :blk before;
+    };
+    heap.allocator.free(old_cmdline);
+}
 
+/// What `execve` resets once the new program is in place: descriptors
+/// marked close-on-exec, signal handlers, the thread's bases, extended
+/// state and alternate stack, and a waiting `vfork` parent. Not inlined.
+noinline fn resetForExec(p: *Process, me: *thread.Thread) void {
     closeOnExec(p);
     {
         const held = p.signal_lock.acquire();
@@ -1598,17 +1705,6 @@ pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []cons
             _ = p.exited.wakeAll();
         }
     }
-
-    // Into the new program, as a new process starts: every register zero
-    // but the stack pointer and the instruction pointer.
-    frame.* = std.mem.zeroes(arch_syscall.Frame);
-    frame.rip = img.entry;
-    frame.rcx = img.entry;
-    frame.rsp = img.entry_rsp;
-    frame.rflags = 0x202;
-    frame.r11 = 0x202;
-    frame.cs = @import("../arch/x86_64/sysret.zig").USER_CS;
-    frame.ss = @import("../arch/x86_64/sysret.zig").USER_SS;
 }
 
 /// Close the descriptors of `p` marked close-on-exec.
@@ -1850,6 +1946,8 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     p.cwd = cwd;
     p.signal_actions = try newActions(null);
     errdefer heap.allocator.destroy(p.signal_actions);
+    p.cmdline = try joinArgs(options.argv, name);
+    errdefer heap.allocator.free(p.cmdline);
     // (On an error below, the list is freed through `regions`, which
     // still refers to it; the structure goes separately.)
 
