@@ -428,6 +428,16 @@ pub fn isMapped(p: *Process, addr: u64) bool {
     return p.mem.regions.find(addr) != null;
 }
 
+/// Whether every page from `addr` for `len` bytes is in a mapping of `p`
+/// (`mlock` and `munlock`: `ENOMEM` for a range that is not).
+pub fn isCovered(p: *Process, addr: u64, len: u64) bool {
+    const start = std.mem.alignBackward(u64, addr, PAGE);
+    const end = std.mem.alignForward(u64, addr +| len, PAGE);
+    const held = p.mem.lock.acquire();
+    defer p.mem.lock.release(held);
+    return p.mem.regions.isCovered(start, end - start);
+}
+
 /// `munmap`.
 pub fn munmap(p: *Process, addr: u64, length: u64) u64 {
     if (length == 0 or addr % PAGE != 0 or length > MAP_MAX) return abi.err(.INVAL);

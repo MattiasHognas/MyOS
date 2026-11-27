@@ -144,7 +144,7 @@ Linux calls, with Linux's numbers:
 | 145 | `sched_getscheduler(pid)` | `SCHED_OTHER`. |
 | 146 | `sched_get_priority_max(policy)` | 0 for `SCHED_OTHER`; `EINVAL` for the real-time policies, which do not exist here. |
 | 147 | `sched_get_priority_min(policy)` | The same. |
-| 149 | `mlock(addr, length)` | Memory is never paged out: checks the range and succeeds. |
+| 149 | `mlock(addr, length)` | Memory is never paged out: succeeds for a range that is all mapped, `ENOMEM` otherwise. |
 | 150 | `munlock(addr, length)` | The same. |
 | 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches, also when the program sets them itself with `wrfsbase`/`wrgsbase` (FSGSBASE, on where the CPU has it). A base outside user space is `EPERM`. |
@@ -153,7 +153,7 @@ Linux calls, with Linux's numbers:
 | 201 | `time(tloc)` | Seconds of the real-time clock. |
 | 202 | `futex(addr, op, val, timeout, addr2, val3)` | `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, with or without `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`. Only within one process. Timeouts have the timer's resolution and never end early. |
 | 203 | `sched_setaffinity(pid, size, mask)` | Accepted if the mask has a CPU that is up, and changes nothing: threads run on any CPU. |
-| 204 | `sched_getaffinity(pid, size, mask)` | Every CPU that is up; 8 bytes. |
+| 204 | `sched_getaffinity(pid, size, mask)` | Every CPU that is up; 8 bytes. `EINVAL` for a size below 8, `ESRCH` for a thread not of the caller's process. |
 | 217 | `getdents64(fd, buf, count)` | The next entries of a directory as `struct linux_dirent64`, "." and ".." first; 0 at the end. `EINVAL` if not one entry fits. |
 | 218 | `set_tid_address(ptr)` | Returns the thread ID. When the thread exits, zero is written to `ptr` and one futex waiter on it is woken. |
 | 228 | `clock_gettime(clock, ts)` | `CLOCK_MONOTONIC` (and `_RAW`, `_COARSE`, `CLOCK_BOOTTIME`): time since boot, from the TSC where it is invariant and the HPET otherwise. `CLOCK_REALTIME` (and `_COARSE`): the RTC's date at boot plus that. The CPU-time clocks give time since boot, an upper bound: CPU time is not counted yet. `EINVAL` for other clocks. |
@@ -182,7 +182,7 @@ Linux calls, with Linux's numbers:
 | 296 | `pwritev(fd, iov, count, offset)` | The same for `pwrite64`. |
 | 302 | `prlimit64(pid, resource, new, old)` | The calling process's limits: `RLIMIT_DATA` is its memory limit (in bytes, whole pages), `RLIMIT_NOFILE` its descriptors, `RLIMIT_NPROC` the processes alive below it (Linux counts per user); the others are kept and reported as set (`RLIMIT_STACK` 8 MiB, the rest unlimited), not enforced. A limit may be set up to its ceiling, and the ceiling lowered, never raised (`EPERM`). `EINVAL` for a resource above 15 or `cur` above `max`, `ESRCH` for another process. `getrlimit` (97) and `setrlimit` (160) are the same for the caller. |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | As `rename`; no flags (`EINVAL`). |
-| 318 | `getrandom(buf, len, flags)` | Never blocks. |
+| 318 | `getrandom(buf, len, flags)` | Never blocks, so `GRND_NONBLOCK`, `GRND_RANDOM` and `GRND_INSECURE` change nothing; `EINVAL` for other flags. |
 | 319 | `memfd_create(name, flags)` | Not offered yet: `ENOSYS`, on purpose. |
 | 322 | `execveat(dirfd, path, argv, envp, flags)` | `execve` with `path` relative to `dirfd`; `flags` must be 0. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
@@ -191,7 +191,7 @@ Linux calls, with Linux's numbers:
 | 332 | `statx(dirfd, path, flags, mask, buf)` | What `newfstatat` says, in `struct statx`, every basic field filled whatever `mask` asks (no birth time). The Zig standard library uses it. |
 | 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
 | 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules (threads, and processes with `exit_signal`). Fields past the first version of the structure must be zero. |
-| 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`. |
+| 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`; `AT_EACCESS`, `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH` accepted, `EINVAL` for other flags. |
 | 441 | `epoll_pwait2(epfd, events, max, timeout_ts, sigmask, size)` | `epoll_pwait` with the timeout as a `timespec`. |
 
 There are no calls of MyOS's own any more: the two there were

@@ -906,6 +906,14 @@ fn forkWait() TestError!void {
     try expectFootprint(memory);
 }
 
+/// Every system call from ring 3 with arguments whose result Linux
+/// documents: mostly the error numbers.
+fn documentedErrors() TestError!void {
+    const code = helpers.runProgram("/test/errors") orelse return error.Failed;
+    if (code != 0) report("/test/errors failed row", code);
+    try check(code == 0);
+}
+
 /// Job control from ring 3: stopping and continuing children, what
 /// `wait4` and `SIGCHLD` say of it, the terminal's background rules.
 /// Not run in pairs: the terminal's foreground group is one for all.
@@ -2011,6 +2019,7 @@ fn runCases() noreturn {
         .{ .name = "FS and GS base set by the program itself (FSGSBASE)", .func = fsgsbase },
         .{ .name = "fork, vfork, clone of a process, wait4 (ring 3)", .func = forkWait },
         .{ .name = "job control: stop, continue, the terminal's background (ring 3)", .func = jobControl },
+        .{ .name = "every system call's documented errors (ring 3)", .func = documentedErrors },
         .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
         .{ .name = "clocks: TSC or HPET, in step on every CPU; sleeps; the wall clock from the RTC", .func = clocks },
         .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },

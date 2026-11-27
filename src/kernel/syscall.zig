@@ -400,7 +400,7 @@ fn sysTruncate(path_ptr: u64, length: u64) u64 {
     defer given.deinit();
     if (length > std.math.maxInt(i64)) return err(.INVAL);
     switch (named(given.text)) {
-        .none => return err(.NOENT),
+        .none => return missing(given.text),
         .directory => return err(.ISDIR),
         .file => {},
         else => return err(.INVAL),
@@ -437,7 +437,7 @@ fn sysUnlink(dirfd: u64, path_ptr: u64, flags: u64) u64 {
     defer given.deinit();
     const directory = flags & abi.AT_REMOVEDIR != 0;
     switch (named(given.text)) {
-        .none => return err(.NOENT),
+        .none => return missing(given.text),
         .file => if (directory or given.directory_wanted) return err(.NOTDIR),
         .directory => if (!directory) return err(.ISDIR),
         .symlink => if (directory) return err(.NOTDIR), // the link goes, not what it points to
@@ -466,7 +466,7 @@ fn sysRename(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: 
     };
     defer new.deinit();
     switch (named(old.text)) {
-        .none => return err(.NOENT),
+        .none => return missing(old.text),
         .file, .directory, .symlink => {},
         else => return err(.PERM),
     }
@@ -752,7 +752,7 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
     switch (what) {
         .symlink => return err(.LOOP),
         .none => {
-            if (flags & abi.O.CREAT == 0) return err(.NOENT);
+            if (flags & abi.O.CREAT == 0) return missing(path);
             if (directory_wanted) return err(.ISDIR); // Linux's answer to creating "name/"
             opened.node = vfs.create(path) catch |e| switch (e) {
                 // Another thread made it between the look and now.
@@ -1028,6 +1028,22 @@ fn named(path: []const u8) Named {
     return if (vfs.isDirectory(path)) .directory else .none;
 }
 
+/// The error for `path` (absolute), which names nothing: `ENOTDIR` if a
+/// directory it goes through is a file (`/etc/motd/x`), `ENOENT`
+/// otherwise, as on Linux.
+fn missing(path: []const u8) u64 {
+    var end: usize = 1;
+    while (std.mem.indexOfScalarPos(u8, path, end, '/')) |slash| : (end = slash + 1) {
+        if (slash <= 1) continue;
+        switch (named(path[0..slash])) {
+            .none => return err(.NOENT),
+            .directory => {},
+            else => return err(.NOTDIR),
+        }
+    }
+    return err(.NOENT);
+}
+
 fn procEntry(path: []const u8) ?Named {
     const p = thread.current().process orelse return null;
     var rest = std.mem.trimEnd(u8, path, "/");
@@ -1144,7 +1160,7 @@ fn statPath(dirfd: u64, path_ptr: u64, flags: u64) StatResult {
     const what = named(path);
     if (given.directory_wanted and what != .directory and what != .none) return .{ .fail = err(.NOTDIR) };
     const st = switch (what) {
-        .none => return .{ .fail = err(.NOENT) },
+        .none => return .{ .fail = missing(path) },
         .directory => directoryStat(),
         .file => blk: {
             const node = fileAt(path) orelse return .{ .fail = err(.NOENT) };
@@ -1202,7 +1218,7 @@ fn sysAccess(dirfd: u64, path_ptr: u64, mode: u64) u64 {
     };
     defer given.deinit();
     const path = given.text;
-    if (named(path) == .none) return err(.NOENT);
+    if (named(path) == .none) return missing(path);
     return if (mode & abi.ACCESS.W_OK != 0 and !vfs.isWritablePath(path)) err(.ROFS) else 0;
 }
 
@@ -1218,7 +1234,7 @@ fn sysReadlink(dirfd: u64, path_ptr: u64, buf: u64, size: u64) u64 {
     defer given.deinit();
     const path = given.text;
     const target = switch (named(path)) {
-        .none => return err(.NOENT),
+        .none => return missing(path),
         .file, .directory, .generated, .device => return err(.INVAL),
         .symlink => vfs.readLink(path) orelse return err(.NOENT),
         // The name can change under another thread's feet only by the
@@ -1262,7 +1278,7 @@ fn sysChdir(path_ptr: u64) u64 {
     };
     defer given.deinit();
     return switch (named(given.text)) {
-        .none => err(.NOENT),
+        .none => missing(given.text),
         .directory => setCwd(given.text),
         else => err(.NOTDIR),
     };
@@ -2409,7 +2425,7 @@ fn sysStatfs(path_ptr: u64, ptr: u64) u64 {
     };
     defer given.deinit();
     const path = given.text;
-    if (named(path) == .none) return err(.NOENT);
+    if (named(path) == .none) return missing(path);
     const st: abi.StatFs = .{ .type = abi.TMPFS_MAGIC };
     return if (toUser(ptr, st)) 0 else err(.FAULT);
 }
@@ -2436,6 +2452,8 @@ fn sysGetMempolicy(mode_ptr: u64, mask_ptr: u64, maxnode: u64, flags: u64) u64 {
 /// to lock; the range only has to be the program's.
 fn sysMlock(addr: u64, len: u64) u64 {
     if (!user_range.valid(addr, len)) return err(.NOMEM);
+    const p = thread.current().process orelse return err(.NOSYS);
+    if (len != 0 and !user_memory.isCovered(p, addr, len)) return err(.NOMEM); // not all mapped
     return 0;
 }
 
@@ -2444,6 +2462,7 @@ fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, 
     const p = thread.current().process orelse return err(.NOSYS);
     return switch (call) {
         .mmap => blk: {
+            if (f.r9 % 4096 != 0) break :blk err(.INVAL); // checked for every mapping, as on Linux
             // The descriptor and the offset only mean something for a file.
             if (f.r10 & abi.MAP.ANONYMOUS != 0) break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, null);
             const of = getFile(f.r8) orelse break :blk err(.BADF);
@@ -2538,7 +2557,10 @@ fn dispatchCall(f: *arch.Frame) void {
         // once instead.
         Sys.memfd_create => err(.NOSYS),
         Sys.access => sysAccess(CWD, f.rdi, f.rsi),
-        Sys.faccessat, Sys.faccessat2 => sysAccess(f.rdi, f.rsi, f.rdx),
+        Sys.faccessat => sysAccess(f.rdi, f.rsi, f.rdx),
+        // Its flags: AT_EACCESS (no users: the same), AT_SYMLINK_NOFOLLOW,
+        // AT_EMPTY_PATH.
+        Sys.faccessat2 => if (f.r10 & ~@as(u64, 0x200 | abi.AT_SYMLINK_NOFOLLOW | abi.AT_EMPTY_PATH) != 0) err(.INVAL) else sysAccess(f.rdi, f.rsi, f.rdx),
         Sys.readlink => sysReadlink(CWD, f.rdi, f.rsi, f.rdx),
         Sys.readlinkat => sysReadlink(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getcwd => sysGetcwd(f.rdi, f.rsi),
@@ -2597,8 +2619,10 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.setsid => if (thread.current().process == null) err(.NOSYS) else proc.newSession() catch err(.PERM),
         Sys.time => sysTime(f.rdi),
         Sys.futex => sysFutex(f),
-        Sys.sched_getaffinity => sysSchedGetAffinity(f.rsi, f.rdx),
-        Sys.getrandom => sysGetRandom(f.rdi, f.rsi),
+        Sys.sched_getaffinity => if (schedTarget(f.rdi)) |e| e else sysSchedGetAffinity(f.rsi, f.rdx),
+        // GRND_NONBLOCK, GRND_RANDOM, GRND_INSECURE: the generator never
+        // blocks, so they change nothing.
+        Sys.getrandom => if (f.rdx & ~@as(u64, 7) != 0) err(.INVAL) else sysGetRandom(f.rdi, f.rsi),
         Sys.uname => sysUname(f.rdi),
         Sys.prlimit64 => sysPrlimit(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getrlimit => sysPrlimit(0, f.rdi, 0, f.rsi),
