@@ -260,20 +260,35 @@ pub fn main() noreturn {
     expect(lib.syscall6(Sys.mremap, m, 4 * PAGE, 6 * PAGE, 0, 0, 0) == m, 66); // and comes back, empty
     expect(bytes(m, 1)[0] == 0x5A and bytes(m + 3 * PAGE, 1)[0] == 0x5B and bytes(m + 5 * PAGE, 1)[0] == 0, 67);
     expect(lib.syscall6(Sys.mremap, m, 6 * PAGE, 6 * PAGE, 0, 0, 0) == m, 68); // the same size
-    // Not into what is mapped already, with or without leave to move:
-    // mappings are not moved.
+    // Not into what is mapped already, nor from the middle of a mapping,
+    // unless it may move.
     const stop = lib.mmap(m + 6 * PAGE, PAGE, RW, MAP.FIXED_NOREPLACE);
     expect(stop == m + 6 * PAGE, 69);
     expect(lib.syscall6(Sys.mremap, m, 6 * PAGE, 8 * PAGE, 0, 0, 0) == lib.err(.NOMEM), 71);
-    expect(lib.syscall6(Sys.mremap, m, 6 * PAGE, 8 * PAGE, abi.MREMAP.MAYMOVE, 0, 0) == lib.err(.NOMEM), 72);
-    // Nor the middle of a mapping; nor what is not mapped.
     expect(lib.syscall6(Sys.mremap, m, 2 * PAGE, 3 * PAGE, 0, 0, 0) == lib.err(.NOMEM), 73);
     expect(lib.syscall6(Sys.mremap, hint, PAGE, 2 * PAGE, 0, 0, 0) == lib.err(.FAULT), 74);
     expect(lib.syscall6(Sys.mremap, m + 1, PAGE, 2 * PAGE, 0, 0, 0) == lib.err(.INVAL), 75);
     expect(lib.syscall6(Sys.mremap, m, 0, PAGE, 0, 0, 0) == lib.err(.INVAL), 76);
     expect(lib.syscall6(Sys.mremap, m, PAGE, 0, 0, 0, 0) == lib.err(.INVAL), 77);
     expect(lib.syscall6(Sys.mremap, m, PAGE, 2 * PAGE, abi.MREMAP.FIXED, 0, 0) == lib.err(.INVAL), 78);
-    expect(lib.munmap(m, 7 * PAGE) == 0, 79);
+    expect(lib.syscall6(Sys.mremap, m + PAGE, PAGE, 2 * PAGE, abi.MREMAP.FIXED | abi.MREMAP.MAYMOVE, m, 0) == lib.err(.INVAL), 110); // onto itself
+
+    // --- mremap that moves: the pages go, with what is in them.
+    bytes(m + 5 * PAGE, 1)[0] = 0x5C;
+    const moved = lib.syscall6(Sys.mremap, m, 6 * PAGE, 9 * PAGE, abi.MREMAP.MAYMOVE, 0, 0);
+    expect(!lib.isError(moved) and moved != m, 111);
+    expect(bytes(moved, 1)[0] == 0x5A and bytes(moved + 3 * PAGE, 1)[0] == 0x5B and bytes(moved + 5 * PAGE, 1)[0] == 0x5C, 112);
+    expect(bytes(moved + 8 * PAGE, 1)[0] == 0, 113); // the new part, empty and usable
+    bytes(moved + 8 * PAGE, 1)[0] = 1;
+    // The old place is free: mapping there anew works and finds zeroes.
+    expect(lib.mmap(m, 6 * PAGE, RW, MAP.FIXED_NOREPLACE) == m and bytes(m, 1)[0] == 0, 114);
+    expect(lib.munmap(m, 6 * PAGE) == 0, 115);
+    // The middle of a mapping, to a chosen address; the parts around stay.
+    const fixed_to = moved + 64 * PAGE;
+    expect(lib.syscall6(Sys.mremap, moved + 3 * PAGE, PAGE, PAGE, abi.MREMAP.FIXED | abi.MREMAP.MAYMOVE, fixed_to, 0) == fixed_to, 116);
+    expect(bytes(fixed_to, 1)[0] == 0x5B and bytes(moved, 1)[0] == 0x5A and bytes(moved + 5 * PAGE, 1)[0] == 0x5C, 117);
+    expect(lib.munmap(moved, 9 * PAGE) == 0 and lib.munmap(fixed_to, PAGE) == 0, 118);
+    expect(lib.munmap(m + 6 * PAGE, PAGE) == 0, 79);
 
     // --- The stack grows as it is used.
     expect(recurse(512) < 512 * 256, 80); // half a megabyte

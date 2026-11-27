@@ -362,6 +362,26 @@ pub fn mapCounting(root: u64, virt: u64, phys: u64, flags: u64, tables_added: *u
     tables_added.* = userTablePagesOnPath(root, virt) - before;
 }
 
+/// Move the 4 KiB user page mapped at `from` to `to`, with its permission
+/// and accessed/dirty bits, adding page tables for `to` if needed (counted
+/// in `tables_added`). Returns false if nothing is mapped at `from`.
+/// `from` is cleared but not flushed: the caller flushes the old range
+/// once, when it has moved everything (`flushUserRange`). On an error
+/// nothing has changed.
+pub fn moveUserPage(root: u64, from: u64, to: u64, tables_added: *usize) MapError!bool {
+    const e = leafEntry(root, from) orelse return false;
+    const flags = e & ~ADDR_MASK & ~PRESENT;
+    try mapCounting(root, to, e & ADDR_MASK, flags, tables_added);
+    _ = clearLeaf(root, from);
+    return true;
+}
+
+/// Flush the user range `[start, start + pages * 4 KiB)` of `root` from
+/// every CPU that has it loaded.
+pub fn flushUserRange(root: u64, start: u64, pages: u64) void {
+    flushEverywhere(root, start, pages);
+}
+
 /// Number of page tables below the PML4 on the way to `virt` that exist.
 fn userTablePagesOnPath(root: u64, virt: u64) usize {
     var t = table(root);

@@ -267,40 +267,110 @@ fn nodeOf(backing: vm_regions.Backing) vfs.Node {
 ///
 /// Shrinking unmaps the end. Growing takes the addresses after the
 /// mapping if they are free; the new part is anonymous memory with the
-/// mapping's protection. A mapping is never moved: where Linux would move
-/// it (`MREMAP_MAYMOVE`), this fails with `ENOMEM` like growing without
-/// that flag does, and the caller maps anew and copies, which it has to
-/// be able to do anyway.
+/// mapping's protection (or more of the file, for a file's mapping). If
+/// they are not free, or the range is not the end of its mapping, the
+/// mapping is moved with `MREMAP_MAYMOVE`: to free addresses, or to
+/// `new_addr` with `MREMAP_FIXED` too, which first unmaps what is there.
+/// Moving moves the pages (their page-table entries), not their contents.
 ///
-/// `EINVAL` for an unaligned address, a zero length, or flags other than
-/// `MREMAP_MAYMOVE`; `EFAULT` if the old range is not all mapped as one
-/// mapping; `ENOMEM` if it cannot grow where it is.
-pub fn mremap(p: *Process, addr: u64, old_length: u64, new_length: u64, flags: u64) u64 {
-    if (flags & ~@as(u64, abi.MREMAP.MAYMOVE) != 0) return abi.err(.INVAL);
+/// `EINVAL` for an unaligned address, a zero length, unknown flags,
+/// `MREMAP_FIXED` without `MREMAP_MAYMOVE`, or a fixed address that
+/// overlaps the old range; `EFAULT` if the old range is not all mapped as
+/// one mapping; `ENOMEM` if it cannot grow where it is and may not move,
+/// or there is no room or memory to move it.
+pub fn mremap(p: *Process, addr: u64, old_length: u64, new_length: u64, flags: u64, new_addr: u64) u64 {
+    if (flags & ~@as(u64, abi.MREMAP.MAYMOVE | abi.MREMAP.FIXED) != 0) return abi.err(.INVAL);
+    const may_move = flags & abi.MREMAP.MAYMOVE != 0;
+    const fixed = flags & abi.MREMAP.FIXED != 0;
+    if (fixed and !may_move) return abi.err(.INVAL);
     if (addr % PAGE != 0 or old_length == 0 or new_length == 0) return abi.err(.INVAL);
     if (old_length > MAP_MAX or new_length > MAP_MAX) return abi.err(.NOMEM);
     const old_len = std.mem.alignForward(u64, old_length, PAGE);
     const new_len = std.mem.alignForward(u64, new_length, PAGE);
     if (!mappable(addr, old_len)) return abi.err(.FAULT);
+    if (fixed) {
+        if (new_addr % PAGE != 0) return abi.err(.INVAL);
+        if (!mappable(new_addr, new_len)) return abi.err(.NOMEM);
+        if (new_addr < addr + old_len and addr < new_addr + new_len) return abi.err(.INVAL); // overlap
+    }
 
     const held = p.mem.lock.acquire();
     defer p.mem.lock.release(held);
     const region = p.mem.regions.find(addr) orelse return abi.err(.FAULT);
     if (region.end - addr < old_len) return abi.err(.FAULT);
-    if (new_len == old_len) return addr;
-    if (new_len < old_len) {
-        unmapLocked(p, addr + new_len, old_len - new_len) catch |e| return mapError(e);
-        return addr;
+    if (!fixed) {
+        if (new_len == old_len) return addr;
+        if (new_len < old_len) {
+            unmapLocked(p, addr + new_len, old_len - new_len) catch |e| return mapError(e);
+            return addr;
+        }
+        // The end of a mapping can grow into free addresses where it is.
+        const tail = addr + old_len;
+        const more = new_len - old_len;
+        if (tail == region.end and (region.kind == .anon or region.kind == .file) and mappable(tail, more) and
+            tail + more <= p.mem.mmap_top and p.mem.regions.isFree(tail, more))
+        {
+            if (region.kind == .file) {
+                var b = region.backing;
+                b.offset = region.fileOffset(tail);
+                p.mem.regions.addBacked(heap.allocator, tail, more, region.prot, .file, b) catch |e| return mapError(e);
+            } else p.mem.regions.add(heap.allocator, tail, more, region.prot, .anon) catch |e| return mapError(e);
+            return addr;
+        }
+        if (!may_move) return abi.err(.NOMEM);
     }
-    // Only the end of a mapping can grow, into free addresses.
-    const tail = addr + old_len;
-    const more = new_len - old_len;
-    // (Anonymous ones: growing a file's mapping would have to continue
-    // the file, which nothing needs yet.)
-    if (tail != region.end or region.kind != .anon or !mappable(tail, more) or tail + more > p.mem.mmap_top or
-        !p.mem.regions.isFree(tail, more)) return abi.err(.NOMEM);
-    p.mem.regions.add(heap.allocator, tail, more, region.prot, .anon) catch |e| return mapError(e);
-    return addr;
+    return moveLocked(p, region, addr, old_len, new_len, if (fixed) new_addr else null);
+}
+
+/// The moving part of `mremap`: `[addr, addr + old_len)` of `region` goes
+/// to `dest` (or the highest free place) as a mapping of `new_len` bytes.
+/// The lock must be held.
+fn moveLocked(p: *Process, region: vm_regions.Region, addr: u64, old_len: u64, new_len: u64, dest: ?u64) u64 {
+    // Room first for what changes below (unmapping at the destination and
+    // at the old place may each cut a region in two, and the new one is
+    // one more), so that nothing can fail halfway for want of memory.
+    p.mem.regions.reserve(heap.allocator, 6) catch |e| return mapError(e);
+    if (dest) |d| unmapLocked(p, d, new_len) catch |e| return mapError(e);
+    const to = dest orelse (p.mem.regions.findFree(new_len, MAP_MIN, p.mem.mmap_top) orelse return abi.err(.NOMEM));
+    // The new mapping is what the old one was, from `addr` on: a file's
+    // goes on at the same place in the file; anything else is anonymous
+    // memory from now on (the stack and the heap keep their own regions).
+    if (region.kind == .file) {
+        var b = region.backing;
+        b.offset = region.fileOffset(addr);
+        p.mem.regions.addBacked(heap.allocator, to, new_len, region.prot, .file, b) catch |e| return mapError(e);
+    } else p.mem.regions.add(heap.allocator, to, new_len, region.prot, .anon) catch |e| return mapError(e);
+
+    // The pages that are there, one by one; on running out of memory (for
+    // page tables at the new place), the moved ones go back, which needs
+    // none: their old tables are still there.
+    const moved = @min(old_len, new_len);
+    var off: u64 = 0;
+    var added: usize = 0;
+    while (off < moved) : (off += PAGE) {
+        var tables: usize = 0;
+        if (p.pages + 3 > p.limits.max_pages) break; // room for the tables it may need
+        _ = vmm.moveUserPage(p.root, addr + off, to + off, &tables) catch break;
+        added += tables;
+        p.pages += tables;
+    }
+    if (off < moved) {
+        var back: u64 = 0;
+        while (back < off) : (back += PAGE) {
+            var none: usize = 0;
+            _ = vmm.moveUserPage(p.root, to + back, addr + back, &none) catch unreachable;
+        }
+        vmm.flushUserRange(p.root, to, off / PAGE);
+        p.mem.regions.remove(heap.allocator, to, new_len) catch {};
+        releasePages(p, to, to + new_len); // the tables added for it
+        return abi.err(.NOMEM);
+    }
+    vmm.flushUserRange(p.root, addr, old_len / PAGE);
+    // The old range: out of the regions, and its emptied tables freed (its
+    // pages are at the new place; beyond `new_len` when shrinking they are
+    // still here, and go too).
+    unmapLocked(p, addr, old_len) catch {};
+    return to;
 }
 
 /// The mappings of `p` as `/proc/self/maps` lists them, one a line, lowest

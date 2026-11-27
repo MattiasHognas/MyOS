@@ -96,7 +96,7 @@ Linux calls, with Linux's numbers:
 | 21 | `access(path, mode)` | Files can be read and run, not written (`EROFS`). |
 | 22 | `pipe(fds)` | See `pipe2`. |
 | 24 | `sched_yield()` | |
-| 25 | `mremap(old, old_size, new_size, flags, new)` | Shrinks a mapping, or grows it into free addresses after it. Never moves one: `ENOMEM` where Linux would (`MREMAP_MAYMOVE`), as when there is no room. `EFAULT` if the old range is not mapped. |
+| 25 | `mremap(old, old_size, new_size, flags, new)` | Shrinks a mapping, or grows it into free addresses after it (a file's mapping goes on in the file). With `MREMAP_MAYMOVE` it moves where it cannot grow, also from the middle of a mapping, and with `MREMAP_FIXED` to `new` (unmapping what is there): the pages move, not their contents. `EFAULT` if the old range is not one mapping; `EINVAL` for `MREMAP_FIXED` alone or a new range overlapping the old; `ENOMEM` without room or leave to move. Not: `MREMAP_DONTUNMAP`. |
 | 28 | `madvise(addr, length, advice)` | `MADV_DONTNEED` and `MADV_FREE` give the pages back at once: they read as zeroes afterwards. Other advice is accepted and ignored. |
 | 32 | `dup(fd)` | The lowest free descriptor, for the same open file: they share its offset. |
 | 33 | `dup2(old, new)` | Closes what `new` was. |

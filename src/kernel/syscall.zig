@@ -2214,7 +2214,7 @@ fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, 
         },
         .mprotect => user_memory.mprotect(p, f.rdi, f.rsi, f.rdx),
         .munmap => user_memory.munmap(p, f.rdi, f.rsi),
-        .mremap => user_memory.mremap(p, f.rdi, f.rsi, f.rdx, f.r10),
+        .mremap => user_memory.mremap(p, f.rdi, f.rsi, f.rdx, f.r10, f.r8),
         .brk => user_memory.brk(p, f.rdi),
         .madvise => user_memory.madvise(p, f.rdi, f.rsi, f.rdx),
     };

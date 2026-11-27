@@ -191,6 +191,13 @@ pub const Regions = struct {
     }
 
     /// Add the region `[start, start + len)`, which must be free.
+    /// Make room for `n` more regions, so that the next changes that add at
+    /// most that many cannot fail for want of memory (or of the limit).
+    pub fn reserve(self: *Regions, gpa: std.mem.Allocator, n: usize) Error!void {
+        if (self.list.items.len + n > MAX_REGIONS) return error.TooManyRegions;
+        self.list.ensureUnusedCapacity(gpa, n) catch return error.OutOfMemory;
+    }
+
     pub fn add(self: *Regions, gpa: std.mem.Allocator, start: u64, len: u64, prot: Prot, kind: Kind) Error!void {
         return self.addBacked(gpa, start, len, prot, kind, .{});
     }
