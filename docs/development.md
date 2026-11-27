@@ -288,6 +288,11 @@ tagged by hand.
 - Pushes to other branches and pull requests run the tests but never release.
   Re-running the workflow on a commit that already has a version tag does
   nothing.
+- **In the order of `main`**: the jobs of different pushes finish in any
+  order, so a commit is released only if the newest release's commit is an
+  ancestor of it. One that finishes after a newer commit was released is
+  skipped: versions always go up along the history, and the release for
+  the newer commit contains its changes too.
 
 ### Conventions
 

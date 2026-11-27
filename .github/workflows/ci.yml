@@ -209,7 +209,8 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write # create the tag and the release
-    # One release at a time, in push order, so version numbers never collide.
+    # One release at a time, so version numbers never collide; a commit
+    # older than the last one released is skipped (Choose version).
     concurrency:
       group: release
       cancel-in-progress: false
@@ -221,8 +222,15 @@ jobs:
       - name: Choose version
         id: version
         run: |
+          latest="$(git tag --list 'v*' --sort=-v:refname | head -1)"
           if tag="$(git describe --tags --exact-match --match 'v*' 2>/dev/null)"; then
             echo "This commit is already released as $tag; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$latest" ]] && ! git merge-base --is-ancestor "$latest" HEAD; then
+            # Runs finish in any order: a newer commit was released first.
+            # Releasing this one now would give an older commit a higher
+            # version, so versions follow the history of main instead.
+            echo "$latest is a newer commit than this one; not releasing it."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             version="$(scripts/next-version.sh)"
