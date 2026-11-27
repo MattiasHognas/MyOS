@@ -22,9 +22,10 @@ Decided 2026-11-27, after milestone 8 and most of 6:
 2. Research: what MyOS could do better than Linux, given what it has and what is planned. The aim is not to build Linux again. Includes the ABI the .NET runtime needs, from its sources and documentation rather than from traces alone. Done: `design-beyond-linux.md`, with three decisions for the owner (views and rights before networking; completion inside the I/O core and a TCP of MyOS's own; a native copy-on-write filesystem, FAT32 for interchange only).
 3. Finish 9.2, and the open task of 3.4 (CPU affinity and load balancing, which comes with per-CPU run queues).
 4. Finish 9.3.
-5. Networking (12).
-6. Persistent storage (11).
-7. A second long research session before any work on graphics (10): whose programs run there (unmodified Linux programs through Wayland, MyOS's own, or both), what a terminal is (pseudo-terminals; foot, then Ghostty, as goals to weigh), and what drives the screen.
+5. Before networking: per-process views and rights on descriptors (`design-beyond-linux.md`, decision 1), and per-object wait lists for `epoll` (decision 2). Tasks in 12.0.
+6. Networking (12).
+7. Persistent storage (11).
+8. A second long research session before any work on graphics (10): whose programs run there (unmodified Linux programs through Wayland, MyOS's own, or both), what a terminal is (pseudo-terminals; foot, then Ghostty, as goals to weigh), and what drives the screen.
 
 ## Current foundation
 
@@ -708,9 +709,11 @@ Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
 
 ---
 
-## 11. Persistent storage and FAT32
+## 11. Persistent storage
 
-**Goal:** Read and write files that survive a reboot.
+**Goal:** Read and write files that survive a reboot, safely.
+
+Decided 2026-11-27 (`design-beyond-linux.md`, decision 3): the disk is a copy-on-write filesystem of MyOS's own, with its tools, built so that MyOS is not stuck with it (another format, btrfs say, can replace the one module). FAT32 is for exchanging files (the EFI system partition, USB sticks), not the disk. The system image becomes EROFS on two partitions.
 
 Off the critical path (programs can ship in the initrd). It does not depend on milestone 10 and can be taken any time after milestone 6.
 
@@ -718,7 +721,7 @@ Off the critical path (programs can ship in the initrd). It does not depend on m
 - [ ] Define a generic block-device interface for read/write/capacity/block size.
 - [ ] Add device registration and consistent I/O error reporting.
 - [ ] Validate LBA ranges, buffer sizes, and alignment.
-- [ ] Add a small block cache with explicit flush (FAT32 writes in 11.5 rely on it for flush ordering).
+- [ ] Add a small block cache with explicit flush (the page cache of 11.4 takes it over; FAT32 writes in 11.8 rely on it for flush ordering).
 - [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, error propagation, and cache hits, eviction and flush.
 - [ ] Stress-test I/O from every CPU at once (several programs reading and writing files on the disk, and later sockets), as 3.4 stress-tests memory and processes.
 
@@ -738,7 +741,24 @@ Off the critical path (programs can ship in the initrd). It does not depend on m
 - [ ] Expose partitions as block devices.
 - [ ] Test corrupted and empty partition tables.
 
-### 11.4 FAT32 read support
+### 11.4 Page cache and the promises
+- [ ] One page cache, keyed by file and page, shared by `read`, `write` and `mmap` (`MAP_SHARED` dirty pages found through the page tables); the block cache of 11.1 is this cache for block devices. Write-back by a thread, on a timer and above a dirty threshold no larger than Linux's.
+- [ ] A write-back error sticks to the file: every later `fsync` or `fdatasync`, through any descriptor, returns `EIO` until the file is rewritten or truncated; failed pages are never quietly made clean (Linux's "fsyncgate"). Counted per mount too.
+- [ ] `fsync` means on the medium: an NVMe flush (or FUA) before the commit. Directory `fsync` honored.
+- [ ] The persistence model written down on one page (`docs/`), and tested: a recorder of the block writes a QEMU run makes, and a replay of every prefix of them, with the filesystem's `fsck` and the program's own invariants checked on each (ALICE's method), including a .NET program that saves by writing a temporary file and renaming it.
+
+### 11.5 The native filesystem
+- [ ] Design the on-disk format: copy-on-write throughout, B-trees for directories and extents, a checksum of each block kept in its parent, two superblocks taking turns, each with a generation and the root; commit = write the new tree, flush, write the superblock, flush; recovery = the newest valid superblock. A version and feature flags from the first image. Written down in `docs/`.
+- [ ] Keep it replaceable: nothing outside the filesystem module sees inside it; the VFS, page cache and block layer, and the promises of 11.4, are the same for any format; system updates do not depend on its snapshots.
+- [ ] `mkfs` and `fsck` in `tools/` (the `fsck` checks every image the tests leave behind).
+- [ ] Implement it: files, directories, full POSIX metadata (modes, owner, nanosecond times), symbolic and hard links, `rename` atomic over an existing file and ordered after the writes before it, `fsync`, `ftruncate`, `fallocate`, `mmap`.
+- [ ] Test it on the host against the format's own model, and in QEMU across reboots and with the crash replay of 11.4.
+- [ ] Later, once it is right: snapshots (nearly free with copy-on-write, through an interface of MyOS's own), clones (`FICLONE`, which .NET's `File.Copy` tries first), compression.
+
+### 11.6 System image
+- [ ] Read EROFS, and boot from an EROFS image on one of two partitions (A and B), the writable state (`/var`, `/home`, `/etc`'s changes) on the native filesystem; an update writes the other partition and switches. Replaces the initrd as the system image.
+
+### 11.7 FAT32 read support (for exchanging files)
 - [ ] Validate FAT32 BPB/boot-sector fields.
 - [ ] Read FAT entries and traverse cluster chains.
 - [ ] Enumerate directories and open nested paths.
@@ -746,35 +766,42 @@ Off the critical path (programs can ship in the initrd). It does not depend on m
 - [ ] Support 8.3 names, then long filename entries.
 - [ ] Detect invalid clusters, loops, and malformed metadata.
 - [ ] Mount FAT32 through the VFS.
-- [ ] Test reads against generated fixture images (11.6), including corrupted boot sectors, cluster loops and bad directory entries.
+- [ ] Test reads against generated fixture images (11.9), including corrupted boot sectors, cluster loops and bad directory entries.
 
-### 11.5 FAT32 write support
+### 11.8 FAT32 write support
 - [ ] Allocate/free clusters safely.
 - [ ] Create files and directories.
 - [ ] Write, extend, truncate, and delete files.
 - [ ] Update directory entries and filesystem metadata.
-- [ ] Add flush ordering and document crash-consistency limits.
+- [ ] Add flush ordering and document crash-consistency limits. Mounted as a volume that says what it cannot do: `EPERM` for links and modes, `rename` documented as not crash-safe.
 - [ ] Test filesystem integrity from both MyOS and Linux after writes.
 
-### 11.6 Reproducible disk fixtures
+### 11.9 Reproducible disk fixtures
 - [ ] Generate disposable GPT/FAT32 disk images with scripts.
 - [ ] Populate fixtures using Linux `mkfs.fat`/`mcopy` tools.
 - [ ] Check MyOS writes by remounting/inspecting the image from Linux.
 - [ ] Run read/write regressions in CI, never against real user disks.
 
-**Milestone 11 done when:** A FAT32 volume can be mounted and files persist correctly across reboot.
+**Milestone 11 done when:** A .NET program's files persist across reboots on the native filesystem, and survive every crash point the replay test tries; a FAT32 volume can be read and written for exchanging files.
 
 ---
 
 ## 12. Networking
 
-**Goal:** Communicate with other machines over IP.
+**Goal:** Communicate with other machines over IP, and host a .NET or Go HTTP API that the host can reach.
 
-Off the critical path (only network programs need it). It can be taken any time after milestone 6.
+Decided 2026-11-27 (`design-beyond-linux.md`, decisions 1 and 2): completion inside the I/O core with `epoll` and `poll` on top; virtio-net; a TCP of MyOS's own (smoltcp's state machine as the reference); per-core connection tables; no general io_uring; the network as a grant from the first socket.
+
+### 12.0 Before networking
+- [ ] Per-process views: the filesystem a process sees is a list of mounts its parent composed (Plan 9's namespaces), inherited and only narrowed; one path walk over it. The persistent filesystem (11) and `/etc/resolv.conf` are mounted into views. A synthesized `/etc/passwd` and `/etc/group` with the process's identity, and `HOME`, `USER`, `TMPDIR` set by the launcher.
+- [ ] Rights on descriptors: each entry of the descriptor table carries what may be done with it, and `dup` and passing it to another process only narrow it (Capsicum, Zircon). Denials are clean errors, never `SIGSYS`.
+- [ ] Per-object wait lists: each object keeps who waits for it and each epoll instance a ready list (Linux's `ep_poll_callback`), replacing the one readiness queue of 6.2 (and its entry in 9.2's slow paths); `EPOLLET`, `EPOLLONESHOT`, `EPOLLEXCLUSIVE`, `EPOLLRDHUP` exact.
+- [ ] The I/O core as completions: an operation on a socket, pipe or file is a request that ends in a callback, and a readiness change is one such event; `epoll` and `poll` are built on it.
+- [ ] Test views (what a process can and cannot name), rights (narrowed, never widened) and the wait lists (only the watchers of an object woken) from ring 3.
 
 ### 12.1 Network hardware
 - [ ] Define a generic network-device interface.
-- [ ] Choose the first network device: virtio-net is simpler than e1000e and its virtio groundwork is reusable for virtio-blk and virtio-gpu; e1000e matches real hardware.
+- [x] Choose the first network device: virtio-net is simpler than e1000e and its virtio groundwork is reusable for virtio-blk and virtio-gpu; e1000e matches real hardware. Decided: modern virtio-net over PCI (2026-11-27), with QEMU's user networking and `hostfwd` for tests from the host.
 - [ ] Implement the driver with TX/RX rings, using MSI/MSI-X interrupts (11.2).
 - [ ] Handle RX interrupts and link state.
 - [ ] Send/receive Ethernet frames in QEMU networking tests.
@@ -786,7 +813,8 @@ Off the critical path (only network programs need it). It can be taken any time 
 - [ ] Add a DHCP client.
 - [ ] Implement ICMP echo (ping).
 - [ ] Implement UDP.
-- [ ] Implement TCP handshake, data exchange, close, retransmission, and timeouts.
+- [ ] Implement TCP handshake, data exchange, close, retransmission, and timeouts: in Zig, smoltcp's state machine as the reference; NewReno, window scaling, timestamps, a real `TIME_WAIT`, keepalive; SACK later. Tested with packetdrill scripts from Linux's tests and a fuzzer on received packets.
+- [ ] Per-core connection tables and accept queues, steered by a hash of the address and port pairs; `SO_REUSEPORT` as the native model.
 - [ ] Replace the sorted list behind kernel timers (2.8) with a heap or a timer wheel before TCP arms several timers per connection.
 - [ ] Implement packet buffers and basic flow control.
 - [ ] Add DNS resolution.
@@ -795,11 +823,15 @@ Off the critical path (only network programs need it). It can be taken any time 
 ### 12.3 Sockets and programs
 - [ ] Define socket create/bind/listen/accept/connect/send/receive/close syscalls (Linux's numbers and layouts).
 - [ ] Unix domain sockets (`AF_UNIX`, stream and datagram): the .NET runtime opens one for its diagnostics (9.3) and many programs talk to local services through them. No network needed.
+- [ ] The network as a grant: binding, connecting and listening only with a network right the launcher gave, filtered by port and address; `EACCES` otherwise.
+- [ ] What servers and .NET rely on: `accept4`, non-blocking `connect` then `SO_ERROR`, `SO_REUSEADDR`/`SO_REUSEPORT`, `TCP_NODELAY`, keepalive options, `MSG_NOSIGNAL`, `sendfile`, `sendmsg`/`recvmsg` with `IP_PKTINFO`, `sendmmsg`, `SO_PEERCRED`, `connect(AF_UNSPEC)`, `IPV6_V6ONLY=0` (or `EAFNOSUPPORT` for IPv6 until it exists), `fchmod` on a socket before `bind`.
+- [ ] Names and interfaces: `/etc/nsswitch.conf`, `/etc/hosts`, `/etc/resolv.conf` (written from DHCP), `/etc/gai.conf` in the image; netlink's `RTM_GETLINK` and `RTM_GETADDR` for `getifaddrs`; a loopback interface.
+- [ ] Host an ASP.NET Core (Kestrel) API and a Go `net/http` server, reached with `curl` from the host through `hostfwd`.
 - [ ] Implement `ping` and a small TCP client.
 - [ ] Implement a minimal HTTP client or server.
 - [ ] Add network integration tests with a host-side peer.
 
-**Milestone 12 done when:** MyOS can ping a peer and establish a TCP connection.
+**Milestone 12 done when:** MyOS can ping a peer and establish a TCP connection, and an unmodified ASP.NET Core API running on it answers `curl` from the host.
 
 ---
 

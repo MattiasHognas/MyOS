@@ -5,8 +5,9 @@ That decides what programs see; it does not decide what is behind it.
 This document is the research session the order of work in `todo.md`
 asks for after 9.1: for each area, where MyOS stands, what Linux does,
 what could be done better, and a recommendation. The recommendations
-marked **Decision** change the plan of a later milestone and wait for
-the owner; the rest are tasks in `todo.md`.
+marked **Decision** change the plan of a later milestone; what was
+decided is at the end ([Decided](#decided-2026-11-27)). The rest are
+tasks in `todo.md`.
 
 The papers already summarized in `research.md` (CortenMM, LLFree,
 Converos, FRED, LASS, Loupe, Asterinas, ...) are not repeated here.
@@ -392,6 +393,37 @@ storage (11), then research before graphics. What changes inside it:
 | 12 | Completion inside; virtio-net; TCP of MyOS's own, tested with packetdrill and fuzzing; per-core connection tables and `SO_REUSEPORT` as the model; the network grant from the first socket; Unix sockets for .NET's diagnostics; `getaddrinfo`'s files and netlink's `getifaddrs` | Decision 2 |
 | 11 | A native copy-on-write filesystem with sticky errors and whole commits; the page cache; crash-replay testing; FAT32 for interchange only; EROFS system image on A/B slots | Decision 3 |
 | Before 10 | Profiles applied by the launcher; Landlock and seccomp | Decision 1 |
+
+## Decided (2026-11-27)
+
+1. **Security by design: yes.** Per-process views, rights on
+   descriptors, the network as a grant from the first socket, profiles
+   applied by the launcher; no users in the kernel. Views and rights come
+   before networking.
+2. **I/O and networking: yes.** Completion inside, `epoll` and `poll` on
+   top; per-object wait lists; virtio-net; a TCP of MyOS's own with
+   smoltcp's state machine as the reference, tested with packetdrill and
+   fuzzing; per-core connection tables with `SO_REUSEPORT` as the model;
+   no general io_uring.
+3. **Storage: a copy-on-write format of MyOS's own, with its tools, that
+   MyOS does not get stuck with.** Chosen over ext4 (a journal: in-place
+   overwrites not atomic without writing data twice, no data checksums, no
+   cheap snapshots) and btrfs (copy-on-write and Linux's tools, but the
+   largest and most complex to implement). So that another format (btrfs)
+   can take its place later at the cost of one module:
+   - Nothing outside the filesystem module sees inside it: the VFS, the
+     page cache and the block layer are the same for any format.
+   - The promises (errors that stay, `fsync` on the medium, ordered
+     commits) are defined and tested at the VFS, so any format is held to
+     them; the crash-replay and POSIX tests do not know the format.
+   - System updates use the EROFS image on A/B partitions, not this
+     format's snapshots; snapshots, if offered, go through an interface of
+     MyOS's own.
+   - A version and feature flags on disk from the first `mkfs`.
+   - `mkfs` and `fsck` in `tools/`, the `fsck` also run against every image
+     the tests leave behind.
+   - FAT32 (and read-write ext4 later, perhaps) for exchanging files, not as
+     the disk.
 
 ## Sources
 
