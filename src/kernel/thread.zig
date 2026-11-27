@@ -273,6 +273,9 @@ pub const Thread = struct {
     /// Signals sent to this thread and not yet delivered (`tgkill`, and
     /// those from its faults). Others set bits, the thread clears them.
     signal_pending: std.atomic.Value(u64) = .init(0),
+    /// What was queued with them (`signal.Queue`), under the process's
+    /// `signal_lock`.
+    signal_queue: @import("signal.zig").Queue = .{},
     /// What the fault that became a pending signal was: delivered with
     /// it, on the way back to the program that made it.
     signal_fault: ?@import("signal_frame.zig").SigInfo = null,

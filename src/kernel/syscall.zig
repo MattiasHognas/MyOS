@@ -500,6 +500,7 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
             },
             .eventfd => return eventFdWrite(of, ptr, count),
             .pipe_read, .directory, .epoll => return err(.BADF),
+            .signalfd => return err(.INVAL),
         }
     }
     const len = @min(count, abi.MAX_RW_COUNT);
@@ -929,6 +930,7 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
         .random_device => return sysGetRandom(ptr, count),
         .directory => return err(.ISDIR),
         .eventfd => return eventFdRead(of, ptr, count),
+        .signalfd => return signalfdRead(of, ptr, count),
         .epoll => return err(.INVAL),
         .console => return consoleRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
         .pipe_write => return err(.BADF),
@@ -1468,7 +1470,7 @@ fn statFd(fd: u64) StatResult {
         .null_device, .random_device => st = deviceStat(),
         .directory => st = directoryStat(),
         // No file of any kind: what Linux says of its anonymous files.
-        .eventfd, .epoll => st.mode = 0o600,
+        .eventfd, .epoll, .signalfd => st.mode = 0o600,
         .file => st = fileStat(of.node),
     }
     return .{ .stat = st };
@@ -1555,7 +1557,7 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
         3 => { // F_GETFL
             const access: u64 = switch (of.kind) {
                 .console, .null_device, .random_device, .eventfd => abi.O.RDWR,
-                .epoll => abi.O.RDONLY,
+                .epoll, .signalfd => abi.O.RDONLY,
                 .file => (if (!of.readable) @as(u64, abi.O.WRONLY) else if (of.writable) @as(u64, abi.O.RDWR) else abi.O.RDONLY) |
                     (if (of.append) @as(u64, abi.O.APPEND) else 0),
                 .pipe_read => abi.O.RDONLY,
@@ -1748,6 +1750,148 @@ fn pollState(of: *OpenFile, events: i16) i16 {
         // Ready when one of what it watches is; that is for `epoll_wait`
         // to find out, and nothing waits on an epoll inside another yet.
         .epoll => return 0,
+        // Readable while a signal of its set is pending for the caller.
+        .signalfd => {
+            const t = thread.current();
+            const pending = signal.pendingSet(t) & @atomicLoad(u64, &of.signal_mask, .acquire);
+            return if (pending != 0) events & abi.POLL.IN else 0;
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signals taken without a handler, and with a value.
+
+/// `rt_sigqueueinfo` (`tid` null) and `rt_tgsigqueueinfo`: send `sig` to
+/// the process `tgid` (or its thread `tid`) with the caller's `siginfo`,
+/// whose value the receiver gets (`sigqueue`). A program may not claim
+/// the kernel or `tgkill` sent it (`si_code` 0 or above, or `SI_TKILL`)
+/// except to itself: `EPERM`, as on Linux. `EAGAIN` when the receiver has
+/// as many signals queued as it may; `EINVAL`, `ESRCH`, `EFAULT`.
+fn sysSigQueueInfo(tgid: u64, tid: ?u64, sig_arg: u64, info_ptr: u64) u64 {
+    const me = thread.current().process orelse return err(.NOSYS);
+    if (sig_arg > abi.NSIG) return err(.INVAL);
+    const sig: u32 = @intCast(sig_arg);
+    var info = fromUser(signal.SigInfo, info_ptr) orelse return err(.FAULT);
+    if ((info.code >= 0 or info.code == signal.SI.TKILL) and tgid != me.pid) return err(.PERM);
+    if (sig != 0) info.signo = @intCast(sig);
+    if (tid) |one| {
+        if (tgid != me.pid) return err(.SRCH); // other processes' threads: not reachable yet, as with tgkill
+        return switch (proc.signalThreadInfo(me, one, sig, info)) {
+            .sent => 0,
+            .no_such, .zombie => err(.SRCH),
+            .full => err(.AGAIN),
+        };
+    }
+    return switch (proc.signalPidInfo(tgid, sig, info)) {
+        .sent, .zombie => 0,
+        .no_such => err(.SRCH),
+        .full => err(.AGAIN),
+    };
+}
+
+/// `rt_sigtimedwait`: take a pending signal of the set at `set_ptr`, the
+/// calling thread's or its process's, without running a handler; wait
+/// for one until the time at `ts_ptr` has passed (`EAGAIN`; for ever
+/// without one). Returns the signal and writes its `siginfo`. The set is
+/// usually blocked, so that nothing else takes them; while the thread
+/// waits it takes them out of its mask, as Linux does, so that a signal of
+/// the set sent to the process comes to it. `EINTR` for a signal outside
+/// the set that a handler took; `EINVAL`, `EFAULT`.
+fn sysSigTimedWait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, size: u64) u64 {
+    if (size != abi.SIGSET_SIZE) return err(.INVAL);
+    const t = thread.current();
+    const p = t.process orelse return err(.NOSYS);
+    const set = (fromUser(u64, set_ptr) orelse return err(.FAULT)) & ~signal.UNBLOCKABLE;
+    var deadline: ?u64 = null;
+    if (ts_ptr != 0) {
+        const ts = fromUser(abi.TimeSpec, ts_ptr) orelse return err(.FAULT);
+        if (ts.sec < 0 or ts.nsec < 0 or ts.nsec >= NS_PER_SEC) return err(.INVAL);
+        const ms: u64 = @as(u64, @intCast(ts.sec)) *| 1000 +| @as(u64, @intCast(ts.nsec)) / 1_000_000;
+        deadline = if (ts.sec == 0 and ts.nsec == 0) timer.now() else deadlineAfter(timer.msToTicks(ms) + @intFromBool(@rem(ts.nsec, 1_000_000) != 0));
+    }
+    const saved = t.signal_mask;
+    defer t.signal_mask = saved;
+    while (true) {
+        t.signal_mask = saved;
+        if (signal.take(t, p, set)) |got| {
+            if (info_ptr != 0) {
+                var info = got.info orelse signal.SigInfo.fromProcess(got.sig, signal.SI.KERNEL, 0, 0);
+                info.signo = @intCast(got.sig);
+                if (!toUser(info_ptr, info)) return err(.FAULT);
+            }
+            return got.sig;
+        }
+        if (thread.interrupted()) return err(.INTR); // a signal outside the set, or the end
+        const left: ?u64 = if (deadline) |d| d -| timer.now() else null;
+        if (left != null and left.? == 0) return err(.AGAIN);
+        t.signal_mask = saved & ~set;
+        // One may have come before the mask let it wake this thread.
+        if ((t.signal_pending.load(.acquire) | p.signal_pending.load(.acquire)) & set != 0) continue;
+        _ = timer.sleepTicksKillable(left orelse timer.HZ);
+    }
+}
+
+/// `signalfd` and `signalfd4`: a descriptor for the signals of the set at
+/// `mask_ptr` (`fd` -1), or a new set for the signalfd `fd`. Reading it
+/// takes the reader's pending signals of the set, as `rt_sigtimedwait`
+/// does, one `signalfd_siginfo` record each; `poll` and `epoll` see it
+/// readable while one is pending. `SFD_NONBLOCK`, `SFD_CLOEXEC`. `EINVAL`
+/// for a size other than 8, other flags, or an `fd` that is no signalfd;
+/// `EBADF`, `EFAULT`.
+fn sysSignalfd(fd: u64, mask_ptr: u64, size: u64, flags: u64) u64 {
+    if (size != abi.SIGSET_SIZE) return err(.INVAL);
+    if (flags & ~@as(u64, abi.SFD.NONBLOCK | abi.SFD.CLOEXEC) != 0) return err(.INVAL);
+    const p = thread.current().process orelse return err(.BADF);
+    const mask = (fromUser(u64, mask_ptr) orelse return err(.FAULT)) & ~signal.UNBLOCKABLE;
+    if (@as(i32, @truncate(@as(i64, @bitCast(fd)))) != -1) {
+        const of = getFile(fd) orelse return err(.BADF);
+        defer putFile(of);
+        if (of.kind != .signalfd) return err(.INVAL);
+        @atomicStore(u64, &of.signal_mask, mask, .release);
+        return fd;
+    }
+    const of = heap.allocator.create(OpenFile) catch return err(.NOMEM);
+    of.* = .{ .kind = .signalfd, .signal_mask = mask, .readable = true, .nonblock = flags & abi.SFD.NONBLOCK != 0 };
+    return installFileFlags(p, of, 0, flags & abi.SFD.CLOEXEC != 0) orelse {
+        open_file.destroy(of);
+        return err(.MFILE);
+    };
+}
+
+/// `read` of a signalfd: a record for each pending signal of its set, as
+/// many as fit; waits for one unless the file is non-blocking.
+fn signalfdRead(of: *OpenFile, ptr: u64, len: u64) u64 {
+    const RECORD = @sizeOf(abi.SignalfdSiginfo);
+    if (len < RECORD) return err(.INVAL);
+    const t = thread.current();
+    const p = t.process orelse return err(.BADF);
+    var done: u64 = 0;
+    while (true) {
+        const seq = readiness.now(); // before looking: a signal after it ends the wait
+        const mask = @atomicLoad(u64, &of.signal_mask, .acquire);
+        while (done + RECORD <= len) {
+            const got = signal.take(t, p, mask) orelse break;
+            const info = got.info orelse signal.SigInfo.fromProcess(got.sig, signal.SI.KERNEL, 0, 0);
+            const rec: abi.SignalfdSiginfo = .{
+                .signo = got.sig,
+                .errno = info.errno,
+                .code = info.code,
+                .pid = std.mem.readInt(u32, info.fields[0..4], .little),
+                .uid = std.mem.readInt(u32, info.fields[4..8], .little),
+                .int = std.mem.readInt(i32, info.fields[8..12], .little),
+                .ptr = std.mem.readInt(u64, info.fields[8..16], .little),
+                .addr = std.mem.readInt(u64, info.fields[0..8], .little),
+            };
+            if (!toUser(ptr + done, rec)) return if (done == 0) err(.FAULT) else done;
+            done += RECORD;
+        }
+        if (done != 0) return done;
+        if (nonblocking(of)) return err(.AGAIN);
+        switch (readiness.waitForChange(seq, null)) {
+            .changed, .timed_out => {},
+            .interrupted => return err(.INTR),
+        }
     }
 }
 
@@ -1938,6 +2082,7 @@ fn objectVersion(of: *OpenFile) u64 {
         .pipe_read, .pipe_write => kpipe.version(of.pipe),
         .console => tty.changeCount(),
         .eventfd => kepoll.eventVersion(of.eventfd),
+        .signalfd => if (thread.current().process) |p| p.signal_version.load(.monotonic) else 0,
         else => 0,
     };
 }
@@ -2346,7 +2491,14 @@ fn sysKill(pid_arg: u64, sig: u64) u64 {
     return switch (proc.signalPid(@intCast(pid), @intCast(sig))) {
         .sent, .zombie => 0,
         .no_such => err(.SRCH),
+        .full => err(.AGAIN),
     };
+}
+
+/// `tgkill`'s sending, from the caller (`SI_TKILL`). A real-time signal
+/// that cannot be queued is lost (Linux: `EAGAIN`).
+fn sendTkillLocked(p: *proc.Process, t: *thread.Thread, sig: u32) void {
+    signal.sendFromCallerLocked(p, t, sig) catch {};
 }
 
 /// `tgkill` and `tkill`: send `sig` to the thread `tid` of the process
@@ -2356,7 +2508,7 @@ fn sysTgkill(tgid: u64, tid: u64, sig: u64) u64 {
     if (sig > abi.NSIG) return err(.INVAL);
     if (tgid != p.pid) return err(.SRCH);
     if (sig == 0) return if (proc.hasThread(p, tid)) 0 else err(.SRCH);
-    return if (proc.withThread(p, tid, signal.sendThreadLocked, @intCast(sig))) 0 else err(.SRCH);
+    return if (proc.withThread(p, tid, sendTkillLocked, @intCast(sig))) 0 else err(.SRCH);
 }
 
 /// `rt_sigpending`: the signals waiting for the calling thread that it
@@ -2572,6 +2724,11 @@ fn dispatchCall(f: *arch.Frame) void {
         // and does without.
         Sys.rseq => err(.NOSYS),
         Sys.eventfd => sysEventFd(f.rdi, 0),
+        Sys.rt_sigqueueinfo => sysSigQueueInfo(f.rdi, null, f.rsi, f.rdx),
+        Sys.rt_tgsigqueueinfo => sysSigQueueInfo(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.rt_sigtimedwait => sysSigTimedWait(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.signalfd => sysSignalfd(f.rdi, f.rsi, f.rdx, 0),
+        Sys.signalfd4 => sysSignalfd(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.eventfd2 => sysEventFd(f.rdi, f.rsi),
         Sys.epoll_create => if (@as(i32, @truncate(@as(i64, @bitCast(f.rdi)))) <= 0) err(.INVAL) else sysEpollCreate(0),
         Sys.epoll_create1 => sysEpollCreate(f.rdi),

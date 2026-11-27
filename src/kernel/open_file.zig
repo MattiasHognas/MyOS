@@ -57,6 +57,9 @@ pub const OpenFile = struct {
     epoll: *epoll.Epoll = undefined,
     /// The pipe, for the two pipe kinds.
     pipe: *pipe.Pipe = undefined,
+    /// The signals a signalfd is for; changed by `signalfd` on it, so read
+    /// and written atomically.
+    signal_mask: u64 = 0,
     /// `O_NONBLOCK`: reads and writes that would wait fail with `EAGAIN`.
     /// Read and written atomically: descriptors of several processes may
     /// share the open file (after `fork`).
@@ -107,6 +110,8 @@ pub const Kind = enum {
     /// on together (`epoll_create1`): `epoll.zig`.
     eventfd,
     epoll,
+    /// Signals of a set, read as `signalfd_siginfo` records (`signalfd`).
+    signalfd,
 };
 
 /// A node for a file that is `text` in memory.
@@ -133,7 +138,7 @@ pub fn destroy(of: *OpenFile) void {
         .file => if (of.generated == null) vfs.release(&of.node),
         .eventfd => epoll.destroyEventFd(of.eventfd),
         .epoll => epoll.destroyEpoll(of.epoll),
-        .console, .null_device, .random_device, .directory => {},
+        .console, .null_device, .random_device, .directory, .signalfd => {},
     }
     freeContents(of);
     heap.allocator.destroy(of);

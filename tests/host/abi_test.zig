@@ -25,6 +25,23 @@ test "syscall numbers are Linux's x86-64 numbers" {
         try std.testing.expectEqual(@backingInt(SYS.exit), abi.Sys.exit);
         try std.testing.expectEqual(@backingInt(SYS.gettid), abi.Sys.gettid);
     }
+    // Every number MyOS has a name for is the one Zig's standard library
+    // has under that name (its table is generated from Linux's).
+    var compared: usize = 0;
+    inline for (comptime std.meta.declarations(abi.Sys)) |name| {
+        const value = @field(abi.Sys, name);
+        if (@TypeOf(value) == comptime_int or @TypeOf(value) == u64 or @TypeOf(value) == usize) {
+            if (@hasField(std.os.linux.SYS, name)) {
+                const want = @backingInt(@field(std.os.linux.SYS, name));
+                if (want != value) {
+                    std.debug.print("Sys.{s} is {d}, Linux's is {d}\n", .{ name, value, want });
+                    return error.TestUnexpectedResult;
+                }
+                compared += 1;
+            }
+        }
+    }
+    try std.testing.expect(compared >= 129); // all of them, at the time of writing
 }
 
 test "private syscall numbers are clear of Linux's and of the x32 bit" {
@@ -140,6 +157,12 @@ test "struct layouts are Linux's x86-64 ones" {
     try expectLayout(abi.WinSize, 8, .{ .{ "rows", 0 }, .{ "cols", 2 }, .{ "xpixel", 4 }, .{ "ypixel", 6 } });
     // Packed on x86-64 (`__EPOLL_PACKED`).
     try expectLayout(abi.EpollEvent, 12, .{ .{ "events", 0 }, .{ "data", 4 } });
+    try expectLayout(abi.SignalfdSiginfo, 128, .{
+        .{ "signo", 0 }, .{ "errno", 4 },   .{ "code", 8 },     .{ "pid", 12 },   .{ "uid", 16 },
+        .{ "fd", 20 },   .{ "tid", 24 },    .{ "band", 28 },    .{ "overrun", 32 }, .{ "trapno", 36 },
+        .{ "status", 40 }, .{ "int", 44 },  .{ "ptr", 48 },     .{ "utime", 56 }, .{ "stime", 64 },
+        .{ "addr", 72 }, .{ "addr_lsb", 80 }, .{ "syscall", 84 }, .{ "call_addr", 88 }, .{ "arch", 96 },
+    });
     try expectLayout(abi.StatxTimestamp, 16, .{ .{ "sec", 0 }, .{ "nsec", 8 } });
     try expectLayout(abi.Statx, 256, .{
         .{ "mask", 0 },        .{ "blksize", 4 },    .{ "attributes", 8 },       .{ "nlink", 16 },

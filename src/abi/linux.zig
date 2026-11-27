@@ -44,6 +44,18 @@ pub const Sys = struct {
     /// `rt_sigsuspend(mask, size)`: wait for a signal with `mask` blocked
     /// meanwhile; returns `EINTR` once it has been handled.
     pub const rt_sigsuspend = 130;
+    /// `rt_sigtimedwait(set, info, timeout, size) -> signal`: take a
+    /// pending signal of `set` without a handler, waiting for one.
+    pub const rt_sigtimedwait = 128;
+    /// `rt_sigqueueinfo(tgid, sig, info)` and `rt_tgsigqueueinfo(tgid,
+    /// tid, sig, info)`: send a signal with a `siginfo` of the caller's,
+    /// its value with it (`sigqueue`).
+    pub const rt_sigqueueinfo = 129;
+    pub const rt_tgsigqueueinfo = 297;
+    /// `signalfd(fd, mask, size)` and `signalfd4(..., flags) -> fd`: a
+    /// descriptor that signals of `mask` are read from.
+    pub const signalfd = 282;
+    pub const signalfd4 = 289;
     /// `pread64(fd, buf, count, offset) -> bytes read`, leaving the file's offset.
     pub const pread64 = 17;
     /// `ioctl(fd, request, arg)`: no device has requests yet, so `ENOTTY`.
@@ -630,6 +642,7 @@ pub const RLIMIT = struct {
     pub const NPROC = 6;
     pub const NOFILE = 7;
     pub const AS = 9;
+    pub const SIGPENDING = 11;
     /// The number of resources (`RLIM_NLIMITS`).
     pub const COUNT = 16;
 };
@@ -794,6 +807,38 @@ pub const EPOLL = struct {
     pub const CTL_DEL = 2;
     pub const CTL_MOD = 3;
     pub const CLOEXEC = 0o2000000;
+};
+
+pub const SFD = struct {
+    pub const NONBLOCK = 0o4000;
+    pub const CLOEXEC = 0o2000000;
+};
+
+/// `struct signalfd_siginfo`: what a read of a signalfd gives for each
+/// signal.
+pub const SignalfdSiginfo = extern struct {
+    signo: u32 = 0,
+    errno: i32 = 0,
+    code: i32 = 0,
+    pid: u32 = 0,
+    uid: u32 = 0,
+    fd: i32 = 0,
+    tid: u32 = 0,
+    band: u32 = 0,
+    overrun: u32 = 0,
+    trapno: u32 = 0,
+    status: i32 = 0,
+    int: i32 = 0,
+    ptr: u64 = 0,
+    utime: u64 = 0,
+    stime: u64 = 0,
+    addr: u64 = 0,
+    addr_lsb: u16 = 0,
+    _pad2: u16 = 0,
+    syscall: i32 = 0,
+    call_addr: u64 = 0,
+    arch: u32 = 0,
+    _pad: [28]u8 = @splat(0),
 };
 
 pub const EFD = struct {

@@ -135,6 +135,8 @@ Linux calls, with Linux's numbers:
 | 121 | `getpgid(pid)` | A process's group (0: the caller's); `ESRCH`. |
 | 124 | `getsid(pid)` | A process's session (0: the caller's); `ESRCH`. A process starts in its parent's group and session, or in its own if the kernel started it. |
 | 127 | `rt_sigpending(set, size)` | The signals waiting that the thread blocks. |
+| 128 | `rt_sigtimedwait(set, info, timeout, size)` | Takes a pending signal of `set` (the thread's or its process's, the lowest first) without running a handler, writes its `siginfo`, and returns it; waits for one until `timeout` (`EAGAIN`; for ever without one, at once for zero). While it waits the set is taken out of the thread's mask, so that a signal of it sent to the process comes to this thread. `EINTR` for a signal outside the set that a handler took. |
+| 129 | `rt_sigqueueinfo(tgid, sig, info)` | Sends `sig` to the process with the caller's `siginfo` (`sigqueue`: `SI_QUEUE` and a value). A real-time signal is queued as often as it is sent, up to `RLIMIT_SIGPENDING` (1024) in the receiving process (`EAGAIN`). `EPERM` for an `si_code` of 0 or above, or `SI_TKILL`, to another process. |
 | 130 | `rt_sigsuspend(mask, size)` | Waits with `mask` blocked instead until a signal is handled; the old mask is back after the handler. `EINTR`. |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, used by handlers with `SA_ONSTACK`; reported as `SS_ONSTACK` while in use. |
 | 137 | `statfs(path, buf)` | One filesystem, in memory and read-only, reported as `tmpfs`. `ENOENT` for a path that does not exist. |
@@ -173,13 +175,16 @@ Linux calls, with Linux's numbers:
 | 269 | `faccessat(dirfd, path, mode)` | As `access`. |
 | 273 | `set_robust_list(head, size)` | Accepted and not used: a thread that dies takes its process with it. |
 | 281 | `epoll_pwait(epfd, events, max, timeout, sigmask, size)` | `epoll_wait` with `sigmask` blocked meanwhile. |
+| 282 | `signalfd(fd, mask, size)` | See `signalfd4`. |
 | 284 | `eventfd(initval)` | See `eventfd2`. |
+| 289 | `signalfd4(fd, mask, size, flags)` | A descriptor for the signals of `mask` (`fd` -1), or a new mask for the signalfd `fd`. A read takes the reader's pending signals of the mask as `rt_sigtimedwait` does, a `signalfd_siginfo` record (128 bytes) for each, as many as fit (`EINVAL` for less than one); it waits unless `SFD_NONBLOCK`. Readable to `poll` and `epoll` while one is pending. `SFD_CLOEXEC`. |
 | 290 | `eventfd2(initval, flags)` | A 64-bit counter: a write adds, a read takes all (one with `EFD_SEMAPHORE`) and waits while it is zero unless `EFD_NONBLOCK`. |
 | 291 | `epoll_create1(flags)` | A new instance; `epoll_create(size)` (213) the same. |
 | 292 | `dup3(old, new, flags)` | `dup2`, with `EINVAL` if `old` is `new`. |
 | 293 | `pipe2(fds, flags)` | A pipe of 4096 bytes (Linux: 65536); a write of up to that is not mixed with another. `O_NONBLOCK`; `O_CLOEXEC` is accepted. |
 | 295 | `preadv(fd, iov, count, offset)` | `pread64` into each buffer in turn, from `offset`; the file offset stays. `ESPIPE` for what is not a file. |
 | 296 | `pwritev(fd, iov, count, offset)` | The same for `pwrite64`. |
+| 297 | `rt_tgsigqueueinfo(tgid, tid, sig, info)` | `rt_sigqueueinfo` to a thread of the caller's process. |
 | 302 | `prlimit64(pid, resource, new, old)` | The calling process's limits: `RLIMIT_DATA` is its memory limit (in bytes, whole pages), `RLIMIT_NOFILE` its descriptors, `RLIMIT_NPROC` the processes alive below it (Linux counts per user); the others are kept and reported as set (`RLIMIT_STACK` 8 MiB, the rest unlimited), not enforced. A limit may be set up to its ceiling, and the ceiling lowered, never raised (`EPERM`). `EINVAL` for a resource above 15 or `cur` above `max`, `ESRCH` for another process. `getrlimit` (97) and `setrlimit` (160) are the same for the caller. |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | As `rename`; no flags (`EINVAL`). |
 | 318 | `getrandom(buf, len, flags)` | Never blocks, so `GRND_NONBLOCK`, `GRND_RANDOM` and `GRND_INSECURE` change nothing; `EINVAL` for other flags. |
@@ -284,9 +289,12 @@ Every other number returns `ENOSYS`.
   as it is sent; signals sent meanwhile wait, `SIGKILL` excepted. Sending
   a stop signal throws away a pending `SIGCONT`, and `SIGCONT` the
   pending stop signals. The parent hears of both through `wait4` and
-  `SIGCHLD` (unless `SA_NOCLDSTOP`). Not yet: queued real-time signals,
-  and stop signals thrown away for an orphaned process group, as Linux
-  does.
+  `SIGCHLD` (unless `SA_NOCLDSTOP`). The terminal's stop signals are
+  thrown away for an orphaned process group. Real-time signals (32 to 64)
+  are queued, each one sent delivered with its `siginfo`; a standard
+  signal sent while pending is one, with the details of the first
+  sender. Signals that waited for a handler to return are delivered as
+  `rt_sigreturn` returns.
 - **A process the kernel kills** for a fault it does not handle ends
   with status 255.
 

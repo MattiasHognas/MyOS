@@ -32,9 +32,12 @@
 //! group, and a group left orphaned with a stopped process in it gets
 //! `SIGHUP` and `SIGCONT`.
 //!
-//! What is not there yet: queued real-time signals (a second one sent
-//! before the first is delivered is lost, as with the standard signals),
-//! and `siginfo` values beyond the sender and the faulting address.
+//! Real-time signals (`SIGRTMIN`, 32, to 64) are queued: each one sent
+//! is delivered, with the `siginfo` it was sent with (`rt_sigqueueinfo`
+//! gives a value), up to `RLIMIT_SIGPENDING` of them in a process. A
+//! standard signal sent while it is pending is one signal, as on Linux,
+//! with the details of the first. Signals can also be taken without a
+//! handler: `rt_sigtimedwait`, and reading a `signalfd`.
 
 const std = @import("std");
 const root = @import("root");
@@ -51,6 +54,7 @@ const thread = @import("thread.zig");
 const heap = @import("heap.zig");
 const user_memory = @import("user_memory.zig");
 const uaccess = @import("uaccess.zig");
+const readiness = @import("readiness.zig");
 
 const Process = proc.Process;
 const Thread = thread.Thread;
@@ -104,6 +108,8 @@ pub const SI = struct {
     pub const USER: i32 = 0;
     pub const KERNEL: i32 = 0x80;
     pub const TKILL: i32 = -6;
+    /// `sigqueue`.
+    pub const QUEUE: i32 = -1;
 };
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
@@ -153,9 +159,17 @@ pub fn wouldTake(sig: u32) bool {
 /// signals and continues the process. Tree lock held.
 fn onSend(p: *Process, sig: u32) void {
     const drop: u64 = if (sig == SIG.CONT) STOP_SIGNALS else if (STOP_SIGNALS & bit(sig) != 0) bit(SIG.CONT) else return;
-    _ = p.signal_pending.fetchAnd(~drop, .acq_rel);
-    var t = p.thread_list;
-    while (t) |one| : (t = one.proc_next) _ = one.signal_pending.fetchAnd(~drop, .acq_rel);
+    {
+        const held = p.signal_lock.acquire();
+        defer p.signal_lock.release(held);
+        _ = p.signal_pending.fetchAnd(~drop, .acq_rel);
+        freeList(p, p.signal_queue.takeMask(drop));
+        var t = p.thread_list;
+        while (t) |one| : (t = one.proc_next) {
+            _ = one.signal_pending.fetchAnd(~drop, .acq_rel);
+            freeList(p, one.signal_queue.takeMask(drop));
+        }
+    }
     if (sig == SIG.CONT) proc.continueLocked(p);
 }
 
@@ -193,35 +207,177 @@ fn ignored(p: *Process, sig: u32) bool {
 // ---------------------------------------------------------------------------
 // Sending
 
-/// Send `sig` (1-64) to the process `p` as a whole: the first of its
-/// threads that does not block it will take it. `SIGKILL` ends it at once.
-/// With the process tree's lock held (`proc.signalProcess` takes it),
-/// which keeps the threads from going meanwhile; callable from interrupt
-/// handlers (Ctrl+C).
-pub fn sendProcessLocked(p: *Process, sig: u32) void {
+/// The first real-time signal (`SIGRTMIN` as the kernel numbers them; C
+/// libraries keep the first two or three for themselves).
+pub const SIGRTMIN = 32;
+
+pub const SigInfo = sf.SigInfo;
+
+/// One signal sent with what `siginfo` says about it, waiting to be
+/// taken: every real-time signal sent, and a standard signal sent by a
+/// program, once while it is pending.
+pub const Queued = struct {
+    next: ?*Queued = null,
+    info: sf.SigInfo,
+};
+
+/// Signals sent with their `siginfo`, oldest first, for a thread or a
+/// process. Under the process's `signal_lock`.
+pub const Queue = struct {
+    head: ?*Queued = null,
+    tail: ?*Queued = null,
+
+    fn push(q: *Queue, e: *Queued) void {
+        e.next = null;
+        if (q.tail) |last| last.next = e else q.head = e;
+        q.tail = e;
+    }
+
+    fn has(q: *const Queue, sig: u32) bool {
+        var e = q.head;
+        while (e) |one| : (e = one.next) if (one.info.signo == @as(i32, @intCast(sig))) return true;
+        return false;
+    }
+
+    /// Take out the oldest entry for `sig`, if there is one.
+    fn takeSig(q: *Queue, sig: u32) ?*Queued {
+        var prev: ?*Queued = null;
+        var e = q.head;
+        while (e) |one| : ({
+            prev = one;
+            e = one.next;
+        }) {
+            if (one.info.signo != @as(i32, @intCast(sig))) continue;
+            if (prev) |pr| pr.next = one.next else q.head = one.next;
+            if (q.tail == one) q.tail = prev;
+            one.next = null;
+            return one;
+        }
+        return null;
+    }
+
+    /// Take out every entry for a signal in `mask`; the caller frees them.
+    fn takeMask(q: *Queue, mask: u64) ?*Queued {
+        var out: ?*Queued = null;
+        var link = &q.head;
+        q.tail = null;
+        while (link.*) |one| {
+            if (bit(@intCast(one.info.signo)) & mask != 0) {
+                link.* = one.next;
+                one.next = out;
+                out = one;
+            } else {
+                q.tail = one;
+                link = &one.next;
+            }
+        }
+        return out;
+    }
+};
+
+/// Free a list of entries (from `takeMask`), counting them off `p`.
+fn freeList(p: *Process, list: ?*Queued) void {
+    var e = list;
+    while (e) |one| {
+        e = one.next;
+        p.signals_queued -= 1;
+        heap.allocator.destroy(one);
+    }
+}
+
+/// Throw away what is queued for `t`, which is leaving its process. With
+/// the tree lock held.
+pub fn dropThreadQueue(p: *Process, t: *Thread) void {
+    const held = p.signal_lock.acquire();
+    defer p.signal_lock.release(held);
+    freeList(p, t.signal_queue.takeMask(~@as(u64, 0)));
+}
+
+/// Throw away what is queued for `p` as a whole, which is being freed.
+pub fn dropProcessQueue(p: *Process) void {
+    const held = p.signal_lock.acquire();
+    defer p.signal_lock.release(held);
+    freeList(p, p.signal_queue.takeMask(~@as(u64, 0)));
+}
+
+pub const SendError = error{
+    /// The process has as many signals queued as `RLIMIT_SIGPENDING`
+    /// allows, or there is no memory for one more (`EAGAIN`).
+    Again,
+};
+
+/// Send `sig` (1-64) to the process `p` as a whole, or to its thread `t`:
+/// the first thread that does not block it will take it (or `t`).
+/// `SIGKILL` ends the process at once. `info` is what the handler's
+/// `siginfo` says (null: a signal from the kernel, which says little);
+/// with it a real-time signal is queued as often as it is sent, and a
+/// standard one once. With the tree lock held, which keeps the threads
+/// from going meanwhile. Callable from interrupt handlers with no `info`
+/// and a standard signal: then nothing is allocated.
+pub fn sendLocked(p: *Process, t: ?*Thread, sig: u32, info: ?sf.SigInfo) SendError!void {
     if (sig == SIG.KILL) return proc.requestKillLocked(p, sig);
     onSend(p, sig);
     if (ignored(p, sig)) return;
-    _ = p.signal_pending.fetchOr(bit(sig), .acq_rel);
+    const pending_bits = if (t) |one| &one.signal_pending else &p.signal_pending;
+    const realtime = sig >= SIGRTMIN;
+    if (realtime or info != null) {
+        const held = p.signal_lock.acquire();
+        defer p.signal_lock.release(held);
+        const queue = if (t) |one| &one.signal_queue else &p.signal_queue;
+        // A standard signal is pending once, with the details of the first.
+        const already = !realtime and pending_bits.load(.acquire) & bit(sig) != 0;
+        if (!already) {
+            const limit = p.other_limits[abi.RLIMIT.SIGPENDING].cur;
+            const room = p.signals_queued < limit;
+            if (room) {
+                if (heap.allocator.create(Queued)) |e| {
+                    e.* = .{ .info = info orelse sf.SigInfo.fromProcess(sig, SI.KERNEL, 0, 0) };
+                    e.info.signo = @intCast(sig);
+                    queue.push(e);
+                    p.signals_queued += 1;
+                } else |_| if (realtime) return error.Again;
+            } else if (realtime) return error.Again;
+        }
+        _ = pending_bits.fetchOr(bit(sig), .acq_rel);
+    } else {
+        _ = pending_bits.fetchOr(bit(sig), .acq_rel);
+    }
+    _ = p.signal_version.fetchAdd(1, .monotonic);
+    readiness.changed(); // a signalfd may be waited on
+    if (t) |one| return thread.interrupt(one);
     // Wake a thread that may take it: one that does not block it, if
     // there is one (it may be waiting in the kernel, or running a program
     // on another CPU, which is interrupted to come through the kernel).
-    var t = p.thread_list;
-    while (t) |one| : (t = one.proc_next) {
+    var it = p.thread_list;
+    while (it) |one| : (it = one.proc_next) {
         if (one.signal_mask & bit(sig) != 0) continue;
         thread.interrupt(one);
         return;
     }
 }
 
-/// Send `sig` to the thread `t` of the process `p` (`tgkill`), with the
-/// process tree's lock held (`proc.withThread`).
+/// Send `sig` to the process `p` from the kernel (`sendLocked` without
+/// `info`); a real-time signal that cannot be queued is lost.
+pub fn sendProcessLocked(p: *Process, sig: u32) void {
+    sendLocked(p, null, sig, null) catch {};
+}
+
+/// Send `sig` to the thread `t` of `p` from the kernel.
 pub fn sendThreadLocked(p: *Process, t: *Thread, sig: u32) void {
-    if (sig == SIG.KILL) return proc.requestKillLocked(p, sig);
-    onSend(p, sig);
-    if (ignored(p, sig)) return;
-    _ = t.signal_pending.fetchOr(bit(sig), .acq_rel);
-    thread.interrupt(t);
+    sendLocked(p, t, sig, null) catch {};
+}
+
+/// What `siginfo` says of a signal the calling thread's process sends
+/// with `kill` (`SI_USER`) or `tgkill` (`SI_TKILL`).
+pub fn fromCaller(sig: u32, code: i32) sf.SigInfo {
+    const pid: u32 = if (thread.current().process) |me| @intCast(me.pid) else 0;
+    return sf.SigInfo.fromProcess(sig, code, pid, 0);
+}
+
+/// `sendLocked` for `kill` and `tgkill`: from the calling process, with
+/// `siginfo` saying so.
+pub fn sendFromCallerLocked(p: *Process, t: ?*Thread, sig: u32) SendError!void {
+    return sendLocked(p, t, sig, fromCaller(sig, if (t == null) SI.USER else SI.TKILL));
 }
 
 /// Whether the calling thread has a signal it does not block waiting for
@@ -239,22 +395,32 @@ pub fn pendingSet(t: *const Thread) u64 {
     return t.signal_pending.load(.acquire) | p.signal_pending.load(.acquire);
 }
 
-/// Take the next signal for `t`: the lowest-numbered one it does not
-/// block, its own before its process's. Null if there is none.
-fn take(t: *Thread, p: *Process) ?u32 {
-    while (true) {
-        const mine = t.signal_pending.load(.acquire) & ~t.signal_mask;
-        if (mine != 0) {
-            const sig: u32 = @ctz(mine) + 1;
-            if (t.signal_pending.fetchAnd(~bit(sig), .acq_rel) & bit(sig) != 0) return sig;
-            continue;
+/// A signal taken, with its `siginfo` if it was sent with one.
+pub const Taken = struct { sig: u32, info: ?sf.SigInfo };
+
+/// Take the next signal for `t` of those in `allowed`: the lowest-numbered,
+/// its own before its process's, with what was queued for it. Null if
+/// there is none.
+pub fn take(t: *Thread, p: *Process, allowed: u64) ?Taken {
+    // Nothing there: the usual case, after every system call; no lock.
+    if ((t.signal_pending.load(.acquire) | p.signal_pending.load(.acquire)) & allowed == 0) return null;
+    const held = p.signal_lock.acquire();
+    defer p.signal_lock.release(held);
+    for ([_]*std.atomic.Value(u64){ &t.signal_pending, &p.signal_pending }, [_]*Queue{ &t.signal_queue, &p.signal_queue }) |bits, queue| {
+        const ready = bits.load(.acquire) & allowed;
+        if (ready == 0) continue;
+        const sig: u32 = @ctz(ready) + 1;
+        var info: ?sf.SigInfo = null;
+        if (queue.takeSig(sig)) |e| {
+            info = e.info;
+            p.signals_queued -= 1;
+            heap.allocator.destroy(e);
         }
-        const shared = p.signal_pending.load(.acquire) & ~t.signal_mask;
-        if (shared == 0) return null;
-        const sig: u32 = @ctz(shared) + 1;
-        // Another thread may take it first.
-        if (p.signal_pending.fetchAnd(~bit(sig), .acq_rel) & bit(sig) != 0) return sig;
+        // A real-time signal sent more often than taken stays pending.
+        if (sig < SIGRTMIN or !queue.has(sig)) _ = bits.fetchAnd(~bit(sig), .acq_rel);
+        return .{ .sig = sig, .info = info };
     }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,11 +552,16 @@ fn neverRestarted(number: u64) bool {
 /// an interrupted call again where that is what should happen. Returns
 /// true if the registers changed in a way only `iretq` restores.
 pub fn atSyscallReturn(f: *arch_syscall.Frame, number: u64) bool {
-    // `rt_sigreturn` has put back a whole context already.
-    if (number == abi.Sys.rt_sigreturn) return true;
     const t = thread.current();
     const p = t.process orelse return false;
     proc.waitWhileStopped();
+    // `rt_sigreturn` has put back a whole context already, and the mask
+    // with it: a signal that waited for the handler to end is delivered
+    // now, on top of that context, as on Linux (nothing to make again).
+    if (number == abi.Sys.rt_sigreturn) {
+        _ = deliverNext(t, p, .{ .syscall = f }, null);
+        return true;
+    }
     const interrupted = f.rax == abi.err(.INTR) and !neverRestarted(number);
     const outcome = deliverNext(t, p, .{ .syscall = f }, if (interrupted) number else null);
     // `rt_sigsuspend` with nothing handled: its mask is undone here; with
@@ -436,7 +607,8 @@ const Outcome = enum { none, ignored, handled };
 /// again first if the handler has `SA_RESTART`.
 fn deliverNext(t: *Thread, p: *Process, regs: Regs, interrupted: ?u64) Outcome {
     var outcome: Outcome = .none;
-    while (take(t, p)) |sig| {
+    while (take(t, p, ~t.signal_mask)) |taken| {
+        const sig = taken.sig;
         const action = actionOf(p, sig);
         const from_fault = t.signal_fault != null and t.signal_fault.?.signo == @as(i32, @intCast(sig));
         if (action.handler == SIG_IGN or (action.handler == SIG_DFL and defaultAction(sig) == .ignore)) {
@@ -469,7 +641,7 @@ fn deliverNext(t: *Thread, p: *Process, regs: Regs, interrupted: ?u64) Outcome {
                 .interrupt => {},
             }
         }
-        const info = if (from_fault) t.signal_fault.? else sf.SigInfo.fromProcess(sig, SI.USER, @intCast(p.pid), 0);
+        const info = if (from_fault) t.signal_fault.? else taken.info orelse sf.SigInfo.fromProcess(sig, SI.KERNEL, 0, 0);
         const fault_regs = if (from_fault) t.signal_fault_regs else @TypeOf(t.signal_fault_regs){};
         t.signal_fault = null;
         setUpHandler(t, p, regs, sig, action, info, fault_regs) catch |e| {

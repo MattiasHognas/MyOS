@@ -306,6 +306,14 @@ pub const Process = struct {
     /// Signals sent to the process as a whole (`kill`) and not yet
     /// delivered: any of its threads that does not block one takes it.
     signal_pending: std.atomic.Value(u64) = .init(0),
+    /// What was queued with them (`signal.Queue`), and how many entries
+    /// there are of this process's, its threads' included: under
+    /// `signal_lock`.
+    signal_queue: signal.Queue = .{},
+    signals_queued: u64 = 0,
+    /// Moves on with every signal sent to the process or one of its
+    /// threads: for edge-triggered `epoll` on a `signalfd`.
+    signal_version: std.atomic.Value(u64) = .init(0),
     /// Its regions of memory, `brk` heap and the lock for them and its
     /// page tables (`user_memory.zig`).
     mem: user_memory.UserMemory = .{},
@@ -359,6 +367,9 @@ pub const Process = struct {
 const default_other_limits = blk: {
     var all: [abi.RLIMIT.COUNT]abi.RLimit = @splat(.{ .cur = abi.RLIM_INFINITY, .max = abi.RLIM_INFINITY });
     all[abi.RLIMIT.STACK].cur = STACK_RESERVE;
+    // Signals queued at once (Linux sizes it by the machine's memory, to
+    // thousands; each takes 136 bytes here).
+    all[abi.RLIMIT.SIGPENDING] = .{ .cur = 1024, .max = 1024 };
     break :blk all;
 };
 
@@ -465,14 +476,35 @@ fn joinArgs(argv: []const []const u8, name: []const u8) error{OutOfMemory}![]u8 
 /// Send `sig` to the process with ID `pid` (`kill`); 0 checks only. False
 /// if there is no such process, or it has ended (as a zombie it gets
 /// nothing, and that is not an error on Linux: `zombie_ok`).
-pub fn signalPid(pid: u64, sig: u32) enum { sent, no_such, zombie } {
+pub const SignalResult = enum { sent, no_such, zombie, full };
+
+pub fn signalPid(pid: u64, sig: u32) SignalResult {
+    return signalPidInfo(pid, sig, signal.fromCaller(sig, signal.SI.USER));
+}
+
+/// `signalPid` with the `siginfo` given (`rt_sigqueueinfo`), from the
+/// calling process.
+pub fn signalPidInfo(pid: u64, sig: u32, info: signal.SigInfo) SignalResult {
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
     var q = all_processes;
     while (q) |p| : (q = p.all_next) {
         if (p.pid != pid) continue;
         if (p.exit_code != null) return .zombie;
-        if (sig != 0) signal.sendProcessLocked(p, sig);
+        if (sig != 0) signal.sendLocked(p, null, sig, info) catch return .full;
+        return .sent;
+    }
+    return .no_such;
+}
+
+/// Send `sig` with `info` to the thread `tid` of `p` (`rt_tgsigqueueinfo`).
+pub fn signalThreadInfo(p: *Process, tid: u64, sig: u32, info: signal.SigInfo) SignalResult {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        if (one.id != tid) continue;
+        if (sig != 0) signal.sendLocked(p, one, sig, info) catch return .full;
         return .sent;
     }
     return .no_such;
@@ -487,7 +519,7 @@ pub fn signalAll(sig: u32, except: *Process) usize {
     var q = all_processes;
     while (q) |p| : (q = p.all_next) {
         if (p == except or p == init_process or p.exit_code != null) continue;
-        if (sig != 0) signal.sendProcessLocked(p, sig);
+        if (sig != 0) signal.sendFromCallerLocked(p, null, sig) catch {};
         n += 1;
     }
     return n;
@@ -677,6 +709,7 @@ fn unlinkThread(p: *Process, t: *thread.Thread) void {
         link.* = t.proc_next;
         t.proc_next = null;
         p.thread_count -= 1;
+        signal.dropThreadQueue(p, t); // signals for it alone go with it
         return;
     }
     assert.check(.process, false, "thread {d} is not in the thread list of '{s}'", .{ t.id, p.name });
@@ -777,21 +810,29 @@ fn groupExistsLocked(pgid: u64) bool {
 /// Send `sig` to every live process of the group `pgid`; how many got it.
 /// The tree lock must be held.
 fn signalGroupLocked(pgid: u64, sig: u32) usize {
+    return signalGroupFrom(pgid, sig, false);
+}
+
+/// `signalGroupLocked`, from the calling process (`kill`) if `by_caller`.
+fn signalGroupFrom(pgid: u64, sig: u32, by_caller: bool) usize {
     var n: usize = 0;
     var q = all_processes;
     while (q) |p| : (q = p.all_next) {
         if (p.pgid != pgid or p.exit_code != null) continue;
-        if (sig != 0) signal.sendProcessLocked(p, sig);
+        if (sig != 0) {
+            if (by_caller) signal.sendFromCallerLocked(p, null, sig) catch {} else signal.sendProcessLocked(p, sig);
+        }
         n += 1;
     }
     return n;
 }
 
-/// `kill(-pgid)`: `sig` to the group; how many got it.
+/// `kill(-pgid)`: `sig` to the group from the calling process; how many
+/// got it.
 pub fn signalGroup(pgid: u64, sig: u32) usize {
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
-    return signalGroupLocked(pgid, sig);
+    return signalGroupFrom(pgid, sig, true);
 }
 
 pub const GroupError = error{ NoSuchProcess, NotPermitted, Invalid };
@@ -945,7 +986,7 @@ pub fn waitWhileStopped() void {
 pub fn signalProcess(p: *Process, sig: u32) void {
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
-    @import("signal.zig").sendProcessLocked(p, sig);
+    signal.sendFromCallerLocked(p, null, sig) catch {};
 }
 
 /// The thread of `p` with ID `tid`, alive, with a reference? Threads have
@@ -1502,6 +1543,7 @@ pub fn release(p: *Process) void {
         live -= 1;
     }
     // Nobody else has a reference, so nobody else can reach it.
+    signal.dropProcessQueue(p);
     if (p.signal_actions != &none_set) heap.allocator.destroy(p.signal_actions);
     heap.allocator.free(p.cmdline);
     heap.allocator.free(p.name);
