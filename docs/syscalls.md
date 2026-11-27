@@ -138,7 +138,7 @@ Linux calls, with Linux's numbers:
 | 149 | `mlock(addr, length)` | Memory is never paged out: checks the range and succeeds. |
 | 150 | `munlock(addr, length)` | The same. |
 | 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
-| 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches. A base outside user space is `EPERM`. |
+| 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches, also when the program sets them itself with `wrfsbase`/`wrgsbase` (FSGSBASE, on where the CPU has it). A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
 | 200 | `tkill(tid, sig)` | As `tgkill` with the calling process. |
 | 201 | `time(tloc)` | Seconds of the real-time clock. |
@@ -280,7 +280,8 @@ one, with:
   and gets its pages as it is used;
 - `rsp` on a 16-byte boundary, pointing at the initial stack described
   below, which ends a random distance below the top of the stack;
-- FS and GS base zero, until the program sets them with `arch_prctl`;
+- FS and GS base zero, until the program sets them with `arch_prctl` (or
+  `wrfsbase`/`wrgsbase`, where `AT_HWCAP2` says it may);
 - memory that holds nothing from before: `.bss` and the rest of the stack
   are zero;
 - clean extended state: x87 control word `0x37f`, MXCSR `0x1f80`, all x87,
@@ -315,6 +316,7 @@ A program started without arguments gets the path it was started under as
 | `AT_UID` (11), `AT_EUID` (12), `AT_GID` (13), `AT_EGID` (14) | 0: there are no users yet |
 | `AT_PLATFORM` (15) | address of the string `x86_64` |
 | `AT_HWCAP` (16) | CPUID leaf 1, EDX |
+| `AT_HWCAP2` (26) | `HWCAP2_FSGSBASE` (bit 1) where the CPU has FSGSBASE: the program may use `rdfsbase`, `wrfsbase`, `rdgsbase` and `wrgsbase` |
 | `AT_CLKTCK` (17) | 100 |
 | `AT_SECURE` (23) | 0 |
 | `AT_RANDOM` (25) | address of 16 random bytes, new for every process |

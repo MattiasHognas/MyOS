@@ -41,6 +41,9 @@ pub const Args = struct {
     base: u64 = 0,
     /// CPUID.1:EDX.
     hwcap: u64,
+    /// `AT_HWCAP2`: bit 1 (`HWCAP2_FSGSBASE`) if programs may use the
+    /// FS and GS base instructions.
+    hwcap2: u64 = 0,
     /// Timer ticks per second.
     clktck: u64,
 };
@@ -55,7 +58,7 @@ const platform = "x86_64";
 const PAGE_SIZE = 4096;
 
 /// Number of (key, value) pairs `build` writes, `AT_NULL` included.
-const AUX_PAIRS = 18;
+const AUX_PAIRS = 19;
 
 /// Number of 8-byte words in the vectors: argc, the two pointer arrays
 /// with their terminators, and the auxiliary vector.
@@ -120,6 +123,7 @@ pub fn build(mem: []u8, top: u64, a: Args) Error!u64 {
     var w = Writer{ .mem = mem, .at = envp_slot + (a.envp.len + 1) * 8 };
     const aux = [AUX_PAIRS][2]u64{
         .{ AT.HWCAP, a.hwcap },
+        .{ AT.HWCAP2, a.hwcap2 },
         .{ AT.PAGESZ, PAGE_SIZE },
         .{ AT.CLKTCK, a.clktck },
         .{ AT.PHDR, a.phdr },

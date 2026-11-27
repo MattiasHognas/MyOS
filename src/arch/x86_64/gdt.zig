@@ -180,7 +180,10 @@ pub fn prepare(t: *Tables, stacks: [IST_INDEXES.len][]u8) void {
     t.* = .{ .ist_stacks = stacks };
     for (IST_INDEXES, stacks) |index, stack| {
         std.debug.assert(stack.len == IST_STACK_SIZE);
-        t.tss.ist[index - 1] = @intFromPtr(stack.ptr) + stack.len;
+        // The top 16 bytes: the CPU's per-CPU pointer (`setIstOwner`), and
+        // padding to keep the frame 16-byte aligned.
+        t.tss.ist[index - 1] = @intFromPtr(stack.ptr) + stack.len - 16;
+        istSlot(stack).* = 0;
     }
 
     // TSS descriptor: 16 bytes spread over two GDT slots.
@@ -193,6 +196,17 @@ pub fn prepare(t: *Tables, stacks: [IST_INDEXES.len][]u8) void {
         (((limit >> 16) & 0xF) << 48) |
         (((base >> 24) & 0xFF) << 56);
     t.gdt[6] = base >> 32;
+}
+
+/// The word at the top of an emergency stack that holds its CPU's
+/// `PerCpu` pointer, where `isr_paranoid` finds it without GS.
+fn istSlot(stack: []u8) *u64 {
+    return @ptrCast(@alignCast(stack.ptr + stack.len - 8));
+}
+
+/// Record `owner` (a `*PerCpu`) at the top of every emergency stack of `t`.
+pub fn setIstOwner(t: *Tables, owner: u64) void {
+    for (t.ist_stacks) |stack| istSlot(stack).* = owner;
 }
 
 /// Make `t` this CPU's GDT and TSS: load the GDT with `lgdt`, reload CS with

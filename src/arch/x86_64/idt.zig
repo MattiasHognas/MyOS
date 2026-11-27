@@ -19,8 +19,10 @@
 //! checks and debug exceptions can also interrupt ring 0 code that still (or
 //! already) has the user's GS base: the first instruction of `syscall_entry`, or the
 //! last ones before `sysretq`/`iretq`. For them the saved CS proves nothing,
-//! so `isr_paranoid` reads the GS base MSR instead: a kernel address has the
-//! top bit set, and a user program cannot make its own base look like one.
+//! and with FSGSBASE a program can load any GS base, a kernel-looking one
+//! too. So from ring 0 `isr_paranoid` saves the GS base, loads this CPU's
+//! own (kept at the top of each of its emergency stacks) and puts the
+//! saved one back on the way out, as Linux does.
 //!
 //! Both decisions are conditional branches, and the CPU may guess one wrong
 //! and run on for a while with the wrong GS base: the user's, at an address
@@ -190,11 +192,14 @@ comptime {
         \\# thread's kernel stack is unused, so, as Linux does, the frame
         \\# moves there and the common path handles it like any interrupt
         \\# from a program: the emergency stack holds seven words. From
-        \\# ring 0 they stay on it, and decide by the GS base MSR
-        \\# (0xC0000101), not by the saved CS: a #DB or NMI at the first
-        \\# instruction of `syscall_entry` is in ring 0 with the user's GS.
-        \\# EBX (callee-saved, so it survives the call) remembers whether GS
-        \\# was switched.
+        \\# ring 0 they stay on it, and the GS base may be the user's (at
+        \\# the first instruction of `syscall_entry`), which with FSGSBASE
+        \\# can be any value: it is saved (R12:R13, callee-saved, so they
+        \\# survive the call), this CPU's own is loaded from the word above
+        \\# the frame at the top of the stack (`gdt.setIstOwner`; 0 this
+        \\# early in boot that there is none: GS is left as it is), and the
+        \\# saved one is put back before `iretq`. 184 = 15 registers, then
+        \\# vector, error code and the CPU's five words, then the slot.
         \\.global isr_paranoid
         \\isr_paranoid:
         \\  testb $3, 24(%rsp)
@@ -238,13 +243,16 @@ comptime {
         \\  push %r13
         \\  push %r14
         \\  push %r15
-        \\  xor %ebx, %ebx
         \\  mov $0xC0000101, %ecx
         \\  rdmsr
-        \\  test %edx, %edx
-        \\  js 1f
-        \\  swapgs
-        \\  mov $1, %ebx
+        \\  mov %eax, %r12d
+        \\  mov %edx, %r13d
+        \\  mov 184(%rsp), %rax
+        \\  test %rax, %rax
+        \\  jz 1f
+        \\  mov %rax, %rdx
+        \\  shr $32, %rdx
+        \\  wrmsr
         \\1:
         \\.global isr_paranoid_fence
         \\isr_paranoid_fence:
@@ -256,10 +264,10 @@ comptime {
         \\  mov %rsp, %rdi
         \\  cld
         \\  call interruptHandler
-        \\  test %ebx, %ebx
-        \\  jz 3f
-        \\  swapgs
-        \\3:
+        \\  mov $0xC0000101, %ecx
+        \\  mov %r12d, %eax
+        \\  mov %r13d, %edx
+        \\  wrmsr
         \\  pop %r15
         \\  pop %r14
         \\  pop %r13

@@ -693,7 +693,6 @@ fn consoleRead(of: *OpenFile, ptr: u64, len: u64) u64 {
 /// GS base from a program's by exactly that (`idt.zig`). `EINVAL` for an
 /// unknown code, `EFAULT` if the result cannot be stored.
 fn sysArchPrctl(code: u64, addr: u64) u64 {
-    const me = thread.current();
     switch (code) {
         abi.ARCH.SET_FS, abi.ARCH.SET_GS => {
             if (!user_range.valid(addr, 1)) return err(.PERM); // below the end of user space
@@ -701,7 +700,8 @@ fn sysArchPrctl(code: u64, addr: u64) u64 {
             return 0;
         },
         abi.ARCH.GET_FS, abi.ARCH.GET_GS => {
-            const value = if (code == abi.ARCH.GET_FS) me.fs_base else me.gs_base;
+            const bases = thread.userBases();
+            const value = if (code == abi.ARCH.GET_FS) bases.fs else bases.gs;
             uaccess.copyToUser(addr, std.mem.asBytes(&value)) catch return err(.FAULT);
             return 0;
         },

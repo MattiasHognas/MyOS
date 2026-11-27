@@ -678,6 +678,8 @@ fn switchToNext() bool {
         if (p.root != vmm.loadedRoot()) vmm.loadRoot(p.root);
     }
 
+    // A program can change its bases itself: what they are now is prev's.
+    if (prev.process != null) saveUserBases(prev);
     fpu.switchState(prev.fpuArea(), next.fpuArea());
     if (next.process != null) percpu.setUserBases(next.fs_base, next.gs_base);
 
@@ -769,12 +771,30 @@ pub fn isParked(n: usize) bool {
     return !c.runs_threads and c.thread == c.idle_thread;
 }
 
+/// Record in `t`, the thread this CPU runs or last ran in ring 3, the FS
+/// and GS base its user code has now. Interrupts must be off.
+fn saveUserBases(t: *Thread) void {
+    const b = percpu.userBases();
+    t.fs_base = b.fs;
+    t.gs_base = b.gs;
+}
+
+/// The calling thread's FS and GS base as its user code has them now.
+pub fn userBases() struct { fs: u64, gs: u64 } {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const me = current();
+    if (me.process != null) saveUserBases(me);
+    return .{ .fs = me.fs_base, .gs = me.gs_base };
+}
+
 /// Set the FS or GS base of the calling thread's user code, now and
 /// whenever it runs again.
 pub fn setUserBase(which: enum { fs, gs }, value: u64) void {
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const me = current();
+    saveUserBases(me); // the other one, as the program may have set it
     switch (which) {
         .fs => me.fs_base = value,
         .gs => me.gs_base = value,

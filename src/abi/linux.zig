@@ -404,6 +404,8 @@ pub const AT = struct {
     pub const PLATFORM = 15;
     /// CPUID.1:EDX.
     pub const HWCAP = 16;
+    /// More of them; bit 1 says `rdfsbase` and the like may be used.
+    pub const HWCAP2 = 26;
     /// Clock ticks per second for `times`.
     pub const CLKTCK = 17;
     pub const SECURE = 23;
@@ -760,4 +762,10 @@ pub const EFD = struct {
     pub const SEMAPHORE = 1;
     pub const NONBLOCK = 0o4000;
     pub const CLOEXEC = 0o2000000;
+};
+
+/// `AT_HWCAP2` bits.
+pub const HWCAP2 = struct {
+    pub const RING3MWAIT = 1 << 0;
+    pub const FSGSBASE = 1 << 1;
 };

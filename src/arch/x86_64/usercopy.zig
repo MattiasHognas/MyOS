@@ -38,6 +38,7 @@ const log = std.log.scoped(.usercopy);
 const CR0_WP: u64 = 1 << 16;
 const CR4_UMIP: u64 = 1 << 11;
 const CR4_SMEP: u64 = 1 << 20;
+const CR4_FSGSBASE: u64 = 1 << 16;
 const CR4_SMAP: u64 = 1 << 21;
 
 /// Nonzero once SMAP is on. Read by the assembly here and in `idt.zig`, which
@@ -166,6 +167,11 @@ pub fn initCpu() u64 {
     if (features_ecx & (1 << 2) != 0) cr4 |= CR4_UMIP;
     if (features & (1 << 7) != 0) cr4 |= CR4_SMEP;
     if (features & (1 << 20) != 0) cr4 |= CR4_SMAP;
+    // Programs may read and write their FS and GS base themselves, as on
+    // Linux (it tells them through `AT_HWCAP2`). Safe because the kernel
+    // keeps its own GS base from them where it cannot rely on `swapgs`
+    // (`isr_paranoid`) and reads theirs back when it switches threads.
+    if (features & (1 << 0) != 0) cr4 |= CR4_FSGSBASE;
     cpu.writeCr4(cr4);
     return cr4;
 }
@@ -179,6 +185,7 @@ pub fn init() void {
     smep_enabled = cr4 & CR4_SMEP != 0;
     umip_enabled = cr4 & CR4_UMIP != 0;
     smap_enabled = @intFromBool(cr4 & CR4_SMAP != 0);
+    @import("percpu.zig").fsgsbase = cr4 & CR4_FSGSBASE != 0;
     log.info("UMIP {s}, SMEP {s}, SMAP {s}", .{
         if (umip_enabled) "on" else "not supported",
         if (smep_enabled) "on" else "not supported",

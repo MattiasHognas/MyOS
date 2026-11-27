@@ -596,8 +596,9 @@ pub fn cloneThread(frame: *const arch_syscall.Frame, args: CloneArgs) error{ Out
     start_frame.rax = 0; // what `clone` returns in the new thread
     if (args.stack != 0) start_frame.rsp = args.stack;
     t.user_frame = start_frame;
-    t.fs_base = if (args.flags & CLONE.SETTLS != 0) args.tls else me.fs_base;
-    t.gs_base = me.gs_base;
+    const bases = thread.userBases(); // as the program has them now
+    t.fs_base = if (args.flags & CLONE.SETTLS != 0) args.tls else bases.fs;
+    t.gs_base = bases.gs;
     t.signal_mask = me.signal_mask;
     if (args.flags & CLONE.CHILD_CLEARTID != 0) t.clear_child_tid = args.child_tid;
     // The extended state as it is now, in the registers.
@@ -843,6 +844,7 @@ noinline fn writeStartupData(
         .entry = loaded.entry,
         .base = interp_base,
         .hwcap = cpu.cpuid(1, 0).edx,
+        .hwcap2 = if (@import("../arch/x86_64/percpu.zig").fsgsbase) abi.HWCAP2.FSGSBASE else 0,
         .clktck = timer.HZ,
     };
     const start_size = startup_stack.size(start_args) catch return error.ArgumentsTooLong;

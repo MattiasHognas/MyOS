@@ -697,7 +697,8 @@ pub fn emergencyStacks() u32 {
     for (gdt.IST_INDEXES, 0..) |index, n| {
         const stack = gdt.istStack(index);
         const low = @intFromPtr(stack.ptr);
-        if (gdt.istTop(index) != low + stack.len or gdt.istTop(index) % 16 != 0) return 3;
+        // (Less 16 bytes: the CPU's per-CPU pointer and padding.)
+        if (gdt.istTop(index) != low + stack.len - 16 or gdt.istTop(index) % 16 != 0) return 3;
         for (gdt.IST_INDEXES[n + 1 ..]) |other_index| {
             const other = gdt.istStack(other_index);
             const other_low = @intFromPtr(other.ptr);
@@ -1338,6 +1339,17 @@ pub fn debugTrapEntry() u32 {
     if (after != 0) return 7; // the interrupted code did not get the user's base back
     if (!onIstStack(gdt.IST_DEBUG, debug_probe_frame)) return 8;
     if (cpu.rdmsr(percpu.MSR_GS_BASE) != kernel_gs or cpu.rdmsr(percpu.MSR_KERNEL_GS_BASE) != 0) return 9;
+
+    // A user GS base that looks like a kernel address, as a program can
+    // load with FSGSBASE: the kernel must not take it for its own.
+    const fake: u64 = 0xFFFF_8000_0010_0000;
+    const saved_user = cpu.rdmsr(percpu.MSR_KERNEL_GS_BASE);
+    cpu.wrmsr(percpu.MSR_KERNEL_GS_BASE, fake);
+    const after_fake = raiseDebug(true);
+    cpu.wrmsr(percpu.MSR_KERNEL_GS_BASE, saved_user);
+    if (debug_probe_runs != 3) return 10;
+    if (debug_probe_gs != kernel_gs) return 11; // it ran with the program's base
+    if (after_fake != fake) return 12; // and gave the wrong one back
     return 0;
 }
 
@@ -2628,14 +2640,18 @@ pub fn setOthersParked(parked: bool) bool {
 pub fn swapgsFences() u32 {
     const lfence = [3]u8{ 0x0f, 0xae, 0xe8 };
     const swapgs = [3]u8{ 0x0f, 0x01, 0xf8 };
+    const wrmsr = [2]u8{ 0x0f, 0x30 };
     for (idt.swapgsFences(), 0..) |fence, n| {
         if (!std.mem.eql(u8, fence, &lfence)) return @intCast(1 + 2 * n);
-        // The bytes before the join are the skipped path: it ends in the
-        // `swapgs` (followed, in the emergency path, by a 5-byte `mov`).
+        // The bytes before the join are the skipped path: in the common
+        // entry it ends in the `swapgs`; in the emergency one (from ring
+        // 0) in the `wrmsr` that loads this CPU's own GS base (from ring 3
+        // it swaps and jumps to the common entry's fence).
         const before = @as([*]const u8, @ptrCast(fence)) - 8;
         var found = false;
-        for (0..6) |at| { // by hand: `std.mem.indexOf` has a frame of 2.5 KiB in Debug builds
-            if (std.mem.eql(u8, before[at..][0..3], &swapgs)) found = true;
+        for (0..7) |at| { // by hand: `std.mem.indexOf` has a frame of 2.5 KiB in Debug builds
+            if (n == 0 and at < 6 and std.mem.eql(u8, before[at..][0..3], &swapgs)) found = true;
+            if (n == 1 and std.mem.eql(u8, before[at..][0..2], &wrmsr)) found = true;
         }
         if (!found) return @intCast(2 + 2 * n);
     }
@@ -2688,7 +2704,9 @@ pub fn cpuChecks(want: usize) u32 {
         // CPU that was started after memory management was up.
         for (gdt.IST_INDEXES) |index| {
             const ist = gdt.istStackOf(tables, index);
-            if (tables.tss.ist[index - 1] != @intFromPtr(ist.ptr) + ist.len) return base + 8;
+            if (tables.tss.ist[index - 1] != @intFromPtr(ist.ptr) + ist.len - 16) return base + 8;
+            // The word at the top names the CPU, for `isr_paranoid`.
+            if (@as(*const u64, @ptrCast(@alignCast(ist.ptr + ist.len - 8))).* != @intFromPtr(c)) return base + 8;
             if (i != 0 and (!kstack.owns(ist) or kernelMapped(@intFromPtr(ist.ptr) - 1))) return base + 9;
             if (overlap(ist, stack)) return base + 10;
         }

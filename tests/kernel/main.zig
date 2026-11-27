@@ -890,6 +890,22 @@ fn gsBaseSwitching() TestError!void {
 /// A debug exception that hits ring 0 code running with the user's GS base
 /// (as at the first instruction of `syscall_entry`) is handled on its own
 /// stack with the kernel's GS base.
+/// Programs that set their own FS and GS base (`wrfsbase`, `wrgsbase`):
+/// kept across switches and reported by `arch_prctl`; and a kernel-looking
+/// GS base at a debug exception in the syscall entry does not fool the
+/// kernel. Where the CPU has no FSGSBASE, there is nothing to run.
+fn fsgsbase() TestError!void {
+    const code = helpers.runProgram("/test/fsgsbase") orelse return error.Failed;
+    if (code == 1) return; // not offered here
+    if (code != 0) report("/test/fsgsbase failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/fsgsbase"));
+    // The trap kills it (or there is none); the kernel carries on.
+    const trapped = helpers.runProgramArgs("/test/fsgsbase", &.{ "fsgsbase", "kernel_gs" }, &.{}) orelse return error.Failed;
+    if (trapped != 0 and trapped != 255 and trapped != 128 + 5) report("/test/fsgsbase kernel_gs exit status", trapped);
+    try check(trapped == 0 or trapped == 255 or trapped == 128 + 5);
+}
+
 fn debugTrapEntry() TestError!void {
     const failed = helpers.debugTrapEntry();
     if (failed != 0) report("debug trap check", failed);
@@ -1919,6 +1935,7 @@ fn runCases() noreturn {
         .{ .name = "syscall return states (iretq fallback, bad states killed)", .func = syscallReturnStates },
         .{ .name = "GS base switched on every entry and exit", .func = gsBaseSwitching },
         .{ .name = "debug exception with the user GS base in ring 0", .func = debugTrapEntry },
+        .{ .name = "FS and GS base set by the program itself (FSGSBASE)", .func = fsgsbase },
         .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },
         .{ .name = "x87/SSE/AVX registers survive process switches", .func = extendedStateSwitching },
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },

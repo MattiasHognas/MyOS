@@ -131,6 +131,7 @@ var online_count: std.atomic.Value(u32) = .init(0);
 /// base) and before its first entry to ring 3.
 pub fn install(c: *PerCpu) void {
     c.self = c;
+    if (c.tables) |t| gdt.setIstOwner(t, @intFromPtr(c));
     cpu.wrmsr(MSR_GS_BASE, @intFromPtr(c));
     cpu.wrmsr(MSR_KERNEL_GS_BASE, 0);
 }
@@ -200,6 +201,22 @@ pub inline fn currentThread() ?*anyopaque {
 /// MSR holding the FS base. The kernel does not use FS, so it always holds
 /// the running program's.
 pub const MSR_FS_BASE = 0xC0000100;
+
+/// Whether programs can change their FS and GS base without the kernel
+/// (`wrfsbase`, `wrgsbase`): set by `usercopy.init` on the boot CPU.
+pub var fsgsbase = false;
+
+/// The FS and GS base user code on this CPU has now, which with FSGSBASE
+/// may not be what the kernel last set. Interrupts must be off; in ring 0,
+/// where the user's GS base is the inactive one.
+pub fn userBases() struct { fs: u64, gs: u64 } {
+    const c = current();
+    if (fsgsbase) {
+        c.user_fs_base = cpu.rdmsr(MSR_FS_BASE);
+        c.user_gs_base = cpu.rdmsr(MSR_KERNEL_GS_BASE);
+    }
+    return .{ .fs = c.user_fs_base, .gs = c.user_gs_base };
+}
 
 /// Make `fs` and `gs` the FS and GS base that user code runs with on this
 /// CPU. While the CPU is in the kernel the user's GS base is the inactive
