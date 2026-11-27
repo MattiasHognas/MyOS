@@ -265,6 +265,9 @@ pub const E = enum(u16) {
     SRCH = 3,
     /// Interrupted: the call was cut short.
     INTR = 4,
+    /// Input/output error (a read of the terminal from the background
+    /// that cannot be stopped for it).
+    IO = 5,
     /// Argument list too long.
     @"2BIG" = 7,
     /// Exec format error: not a program MyOS can load.

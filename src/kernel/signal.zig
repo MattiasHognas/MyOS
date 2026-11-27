@@ -20,12 +20,17 @@
 //! `SIGTRAP` for a program that handles it, and kills the program, as
 //! before, for one that does not.
 //!
-//! What is not there yet: stopping and continuing (`SIGSTOP`, `SIGTSTP`
-//! and `SIGCONT` are ignored: there is no job control), queued real-time
-//! signals (a second one sent before the first is delivered is lost, as
-//! with the standard signals), signals between processes (`kill` reaches
-//! the caller's own process only), and `siginfo` values beyond the sender
-//! and the faulting address.
+//! Stopping and continuing, for job control: `SIGSTOP`, and `SIGTSTP`,
+//! `SIGTTIN` and `SIGTTOU` where no handler takes them, stop the whole
+//! process when delivered (`proc.stopLocked`); its threads then wait on
+//! their way back to the program until `SIGCONT` continues it, which it
+//! does as it is sent, whatever its action. Sending a stop signal throws
+//! away a pending `SIGCONT`, and `SIGCONT` the pending stop signals, as on
+//! Linux. The parent hears of both through `wait4` and `SIGCHLD`.
+//!
+//! What is not there yet: queued real-time signals (a second one sent
+//! before the first is delivered is lost, as with the standard signals),
+//! and `siginfo` values beyond the sender and the faulting address.
 
 const std = @import("std");
 const root = @import("root");
@@ -108,16 +113,46 @@ pub const TRAP_TRACE: i32 = 2;
 const SIG_DFL = 0;
 const SIG_IGN = 1;
 
-/// What a signal does when nobody catches it.
-const Default = enum { terminate, ignore };
+/// What a signal does when nobody catches it. (`SIGCONT` continues the
+/// process when it is sent; delivered, it does nothing more.)
+const Default = enum { terminate, ignore, stop };
 
 fn defaultAction(sig: u32) Default {
     return switch (sig) {
-        SIG.CHLD, SIG.URG, SIG.WINCH => .ignore,
-        // No job control: stopping and continuing do nothing.
-        SIG.CONT, SIG.STOP, SIG.TSTP, SIG.TTIN, SIG.TTOU => .ignore,
+        SIG.CHLD, SIG.URG, SIG.WINCH, SIG.CONT => .ignore,
+        SIG.STOP, SIG.TSTP, SIG.TTIN, SIG.TTOU => .stop,
         else => .terminate,
     };
+}
+
+const STOP_SIGNALS: u64 = bit(SIG.STOP) | bit(SIG.TSTP) | bit(SIG.TTIN) | bit(SIG.TTOU);
+
+/// Whether the parent `p` is to get `SIGCHLD` when a child stops or is
+/// continued: unless its action for it has `SA_NOCLDSTOP`.
+pub fn tellsOfStops(p: *Process) bool {
+    return actionOf(p, SIG.CHLD).flags & SA.NOCLDSTOP == 0;
+}
+
+/// Whether the calling thread would take `sig` as it comes: not blocked
+/// and not ignored. For the terminal, which sends `SIGTTIN` and `SIGTTOU`
+/// only to a process they would stop, and fails the call with `EIO`
+/// otherwise, as Linux does.
+pub fn wouldTake(sig: u32) bool {
+    const t = thread.current();
+    const p = t.process orelse return false;
+    if (t.signal_mask & bit(sig) != 0) return false;
+    return actionOf(p, sig).handler != SIG_IGN;
+}
+
+/// What sending `sig` does at once, before it is pending: a stop signal
+/// throws away a pending `SIGCONT`, and `SIGCONT` the pending stop
+/// signals and continues the process. Tree lock held.
+fn onSend(p: *Process, sig: u32) void {
+    const drop: u64 = if (sig == SIG.CONT) STOP_SIGNALS else if (STOP_SIGNALS & bit(sig) != 0) bit(SIG.CONT) else return;
+    _ = p.signal_pending.fetchAnd(~drop, .acq_rel);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) _ = one.signal_pending.fetchAnd(~drop, .acq_rel);
+    if (sig == SIG.CONT) proc.continueLocked(p);
 }
 
 /// The exit status of a process a signal ended: 128 + the signal, as a
@@ -161,6 +196,7 @@ fn ignored(p: *Process, sig: u32) bool {
 /// handlers (Ctrl+C).
 pub fn sendProcessLocked(p: *Process, sig: u32) void {
     if (sig == SIG.KILL) return proc.requestKillLocked(p, sig);
+    onSend(p, sig);
     if (ignored(p, sig)) return;
     _ = p.signal_pending.fetchOr(bit(sig), .acq_rel);
     // Wake a thread that may take it: one that does not block it, if
@@ -178,6 +214,7 @@ pub fn sendProcessLocked(p: *Process, sig: u32) void {
 /// process tree's lock held (`proc.withThread`).
 pub fn sendThreadLocked(p: *Process, t: *Thread, sig: u32) void {
     if (sig == SIG.KILL) return proc.requestKillLocked(p, sig);
+    onSend(p, sig);
     if (ignored(p, sig)) return;
     _ = t.signal_pending.fetchOr(bit(sig), .acq_rel);
     thread.interrupt(t);
@@ -349,6 +386,7 @@ pub fn atSyscallReturn(f: *arch_syscall.Frame, number: u64) bool {
     if (number == abi.Sys.rt_sigreturn) return true;
     const t = thread.current();
     const p = t.process orelse return false;
+    proc.waitWhileStopped();
     const interrupted = f.rax == abi.err(.INTR) and !neverRestarted(number);
     const outcome = deliverNext(t, p, .{ .syscall = f }, if (interrupted) number else null);
     // `rt_sigsuspend` with nothing handled: its mask is undone here; with
@@ -381,6 +419,7 @@ fn restart(f: *arch_syscall.Frame, number: u64) void {
 pub fn atInterruptReturn(f: *idt.Frame) void {
     const t = thread.current();
     const p = t.process orelse return;
+    proc.waitWhileStopped();
     if (!pending(t)) return;
     _ = deliverNext(t, p, .{ .interrupt = f }, null);
 }
@@ -397,6 +436,14 @@ fn deliverNext(t: *Thread, p: *Process, regs: Regs, interrupted: ?u64) Outcome {
         const action = actionOf(p, sig);
         const from_fault = t.signal_fault != null and t.signal_fault.?.signo == @as(i32, @intCast(sig));
         if (action.handler == SIG_IGN or (action.handler == SIG_DFL and defaultAction(sig) == .ignore)) {
+            outcome = .ignored;
+            continue;
+        }
+        if (action.handler == SIG_DFL and defaultAction(sig) == .stop) {
+            // The whole process stops here, this thread with it; an
+            // interrupted call is made again once it is continued.
+            proc.stopProcess(p, sig);
+            proc.waitWhileStopped();
             outcome = .ignored;
             continue;
         }

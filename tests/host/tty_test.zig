@@ -118,6 +118,23 @@ test "tty: Ctrl+C throws the line away and asks for an interrupt" {
     try testing.expectEqualStrings("ab\n", h.read(64).?);
 }
 
+test "tty: Ctrl+Z and Ctrl+\\ throw the line away and ask for SIGTSTP and SIGQUIT" {
+    var h: Harness = .{};
+    h.typeKeys("sleep 9\x1a");
+    try expectEqual(.suspend_, h.asked);
+    try testing.expectEqualStrings("sleep 9^Z\n", h.shown());
+    try expectEqual(null, h.read(64));
+    h.typeKeys("x\x1c");
+    try expectEqual(.quit, h.asked);
+    try testing.expectEqualStrings("x^\\\n", h.shown());
+    try expectEqual(null, h.read(64));
+    // With signals off they are bytes like any other.
+    h.tty.configure(.{ .canonical = false, .echo = false, .signals = false });
+    h.typeKeys("\x1a\x1c");
+    try expectEqual(.readable, h.asked);
+    try testing.expectEqualStrings("\x1a\x1c", h.read(64).?);
+}
+
 test "tty: without line editing every key goes through at once" {
     var h: Harness = .{};
     h.tty.configure(.{ .canonical = false, .echo = false });

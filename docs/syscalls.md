@@ -88,7 +88,7 @@ Linux calls, with Linux's numbers:
 | 13 | `rt_sigaction(sig, act, oldact, size)` | What a signal does: default, ignore, or a handler with `SA_SIGINFO`, `SA_ONSTACK`, `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND` and `sa_mask`. A handler needs `SA_RESTORER` (C libraries always set it); without, delivering to it kills the program, as on Linux. `EINVAL` for `SIGKILL` and `SIGSTOP`. |
 | 14 | `rt_sigprocmask(how, set, oldset, size)` | The thread's blocked signals; `SIGKILL` and `SIGSTOP` cannot be blocked. A signal unblocked here is delivered as the call returns. |
 | 15 | `rt_sigreturn()` | Back from a handler: registers, signal mask, alternate stack and FP state as the frame says, with what the handler changed in it. Selectors are user mode's whatever it says, flags only user-settable ones, the return address checked like any; an FP image cannot make the kernel fault. A frame that cannot be read kills the program. |
-| 16 | `ioctl(fd, request, arg)` | The terminal: `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` (line editing, echo, Ctrl+C, CR to newline; other settings are ignored), `TIOCGWINSZ` (80 by 25), `FIONREAD`, `TCFLSH`, `TIOCSPGRP` and `TIOCGPGRP` (the foreground process group, which Ctrl+C sends `SIGINT` to; until one is set, the caller's group). `EINVAL` for other requests; `ENOTTY` for every descriptor that is not the terminal (how a C library finds out that its output is not one), `EBADF` otherwise. |
+| 16 | `ioctl(fd, request, arg)` | The terminal: `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` (line editing, echo, Ctrl+C, CR to newline; other settings are ignored), `TIOCGWINSZ` (80 by 25), `FIONREAD`, `TCFLSH`, `TIOCSPGRP` and `TIOCGPGRP` (the foreground process group, which Ctrl+C, Ctrl+\\ and Ctrl+Z send `SIGINT`, `SIGQUIT` and `SIGTSTP` to; until one is set, the caller's group; it has none again when the group's last process ends). A process in the background that reads the terminal gets `SIGTTIN` and `EINTR` (`EIO` if it blocks or ignores `SIGTTIN`), and one that sets the foreground group `SIGTTOU` unless it blocks or ignores that. `EINVAL` for other requests; `ENOTTY` for every descriptor that is not the terminal (how a C library finds out that its output is not one), `EBADF` otherwise. |
 | 17 | `pread64(fd, buf, count, offset)` | |
 | 18 | `pwrite64(fd, buf, count, offset)` | `write` to a file at an offset; the descriptor's own stays. |
 | 19 | `readv(fd, iov, iovcnt)` | `read` into up to 1024 buffers. |
@@ -109,7 +109,7 @@ Linux calls, with Linux's numbers:
 | 58 | `vfork()` | `fork` that holds the caller until the child calls `execve` or ends. |
 | 59 | `execve(path, argv, envp)` | Replaces the program of the calling process. The new one is loaded first: on an error the old one goes on as it was. Then the process's other threads end; it keeps its ID, parent, children, descriptors (but those marked close-on-exec), working directory, signal mask, pending signals and limits. Signal handlers go back to the default (ignored signals stay ignored); the alternate stack, FS and GS base and extended state are cleared; a parent waiting in `vfork` goes on. A file that starts with `#!` runs its interpreter with the file as an argument (one level, as on Linux). `ENOENT`, `ENOEXEC`, `E2BIG`, `EFAULT`, `ENOMEM`, `EINTR` (another thread replaced or ended the process first). |
 | 60 | `exit(status)` | Ends the calling thread. The last thread's status is the process's: the parent sees `status & 0xff`. |
-| 61 | `wait4(pid, status, options, rusage)` | Collects a child that has ended, any (`pid` -1), the one given, any in the caller's process group (0) or in the group `-pid`, and writes its status as Linux does (`code << 8`, or the signal that ended it; a fault the kernel killed it for counts as that fault's signal). An ended child is a zombie until then, or until its parent ends. `WNOHANG` returns 0 if none has ended; `WUNTRACED` and `WCONTINUED` change nothing yet. `rusage` is zeroes. `ECHILD`, `EINTR`, `EINVAL`, `EFAULT`. |
+| 61 | `wait4(pid, status, options, rusage)` | Collects a child that has ended, any (`pid` -1), the one given, any in the caller's process group (0) or in the group `-pid`, and writes its status as Linux does (`code << 8`, or the signal that ended it; a fault the kernel killed it for counts as that fault's signal). An ended child is a zombie until then, or until its parent ends. `WNOHANG` returns 0 if none has ended; `WUNTRACED` also reports a child that stopped (`(sig << 8) | 0x7f`) and `WCONTINUED` one that was continued (`0xffff`), each once. `rusage` is zeroes. `ECHILD`, `EINTR`, `EINVAL`, `EFAULT`. |
 | 62 | `kill(pid, sig)` | Any process by its ID; `-1`: every process but `init` and the caller, then the caller; `0`: the caller's process group; `-pgid`: that group. Any of the process's threads that does not block the signal takes it. Signal 0 checks. An ended process not yet collected takes nothing, without an error. `ESRCH`, `EINVAL`. |
 | 63 | `uname(buf)` | Says `Linux`, release `6.1.0-myos`, machine `x86_64`: programs built for Linux check. |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` and `F_DUPFD_CLOEXEC` (the lowest free descriptor from `arg` up), `F_GETFL`, `F_SETFL` (only `O_NONBLOCK` changes), `F_GETFD`; `F_SETFD` is accepted and changes nothing: there is no exec. |
@@ -279,8 +279,14 @@ Every other number returns `ENOSYS`.
   always made again. A signal no handler catches ends the process with
   status 128 + its number; one that ignores by default (`SIGCHLD`,
   `SIGURG`, `SIGWINCH`) does nothing.
-  Not yet: stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT` are
-  ignored), queued real-time signals, signals to other processes.
+  `SIGSTOP`, and `SIGTSTP`, `SIGTTIN` and `SIGTTOU` that no handler
+  takes, stop the whole process until `SIGCONT` comes, which continues it
+  as it is sent; signals sent meanwhile wait, `SIGKILL` excepted. Sending
+  a stop signal throws away a pending `SIGCONT`, and `SIGCONT` the
+  pending stop signals. The parent hears of both through `wait4` and
+  `SIGCHLD` (unless `SA_NOCLDSTOP`). Not yet: queued real-time signals,
+  and stop signals thrown away for an orphaned process group, as Linux
+  does.
 - **A process the kernel kills** for a fault it does not handle ends
   with status 255.
 

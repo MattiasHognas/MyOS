@@ -17,6 +17,7 @@ const readiness = @import("readiness.zig");
 
 const abi = @import("abi");
 const proc = @import("process.zig");
+const signal = @import("signal.zig");
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const thread = @import("thread.zig");
 const tty_core = @import("tty_core.zig");
@@ -76,27 +77,38 @@ pub fn input(c: u8) void {
         break :blk action;
     };
     if (echo.items.len != 0) if (show) |f| f(echo.items);
-    if (action == .interrupt) _ = proc.terminateForeground(INTERRUPTED);
+    if (signalFor(action)) |sig| _ = proc.signalForeground(sig);
+}
+
+/// The signal a key sends the foreground, if it is one of those keys.
+fn signalFor(action: tty_core.Action) ?u32 {
+    return switch (action) {
+        .interrupt => signal.SIG.INT,
+        .quit => signal.SIG.QUIT,
+        .suspend_ => signal.SIG.TSTP,
+        .none, .readable => null,
+    };
 }
 
 /// Type `text` as if it came from the keyboard, all of it before any
-/// reader looks: for tests. Ctrl+C in it acts once, at the end.
+/// reader looks: for tests. Ctrl+C (or Ctrl+\, Ctrl+Z) in it acts once,
+/// at the end: the last of them.
 pub fn inject(text: []const u8) void {
     var echo_buf: [512]u8 = undefined;
     var echo: std.ArrayListUnmanaged(u8) = .initBuffer(&echo_buf);
-    var interrupt = false;
+    var send: ?u32 = null;
     {
         const held = lock.acquire();
         defer lock.release(held);
         for (text) |c| {
             // What is shown is dropped once the buffer is nearly full.
             if (echo.capacity - echo.items.len < 64) echo.clearRetainingCapacity();
-            if (core.input(c, &echo) == .interrupt) interrupt = true;
+            if (signalFor(core.input(c, &echo))) |sig| send = sig;
         }
         wakeReaders();
     }
     if (echo.items.len != 0) if (show) |f| f(echo.items);
-    if (interrupt) _ = proc.terminateForeground(INTERRUPTED);
+    if (send) |sig| _ = proc.signalForeground(sig);
 }
 
 fn leaveLine(me: *Reader) void {

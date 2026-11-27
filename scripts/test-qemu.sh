@@ -36,7 +36,8 @@
 #   shell  the system as a user boots it: init starts the shell, and a
 #          session is typed over the serial line (tests/shell/session.txt):
 #          commands, pipelines with Zig and C programs, redirection, line
-#          editing, Ctrl+C, a shell that ends and is started again
+#          editing, Ctrl+C, Ctrl+Z with jobs, fg and bg, a shell that
+#          ends and is started again
 #
 # After the scenarios, the addresses the kernel was loaded at are compared:
 # with KASLR they must not be the same in every boot.
@@ -397,6 +398,13 @@ run_scenario() {
             expect_line '^hello editing$'
             expect_line '^after-kill$'
             expect_line '^after-ctrl-c 130$'
+            expect_line '^\[1\]\+  Stopped +sleep 30$' # Ctrl+Z
+            expect_line '^after-ctrl-z 148$'
+            expect_line '^\[1\]   Stopped +sleep 30$' # jobs
+            expect_line '^\[1\]\+ sleep 30 &$' # bg
+            expect_line '^\[1\]   Running +sleep 30$'
+            expect_line '^after-fg 130$' # fg, then Ctrl+C
+            if grep -B1 '^no-jobs-left$' "$log" | grep -q '^\[1\]'; then fail "a job was left after fg"; fi
             expect_line '^argv\[1\]=from-shell$'
             expect_line '^init: the shell ended \(status 5\); starting a new one$'
             expect_line '^second shell$'

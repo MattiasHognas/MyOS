@@ -277,6 +277,17 @@ pub const Process = struct {
     /// Made by `vfork` (`CLONE_VFORK`): its parent's thread waits until it
     /// has called `execve` or ended, which sets this. Under the tree lock.
     vfork_pending: bool = false,
+    /// Stopped by a signal (`SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`)
+    /// until `SIGCONT` comes: each of its threads waits on `resumed` on
+    /// its way back to the program (`waitWhileStopped`). Written under the
+    /// tree lock.
+    stopped: std.atomic.Value(bool) = .init(false),
+    resumed: WaitQueue = .{},
+    /// What `wait4` has yet to tell the parent: the signal that stopped
+    /// the process (`WUNTRACED`), and that it was continued
+    /// (`WCONTINUED`). Under the tree lock.
+    stop_report: u32 = 0,
+    continued_report: bool = false,
 };
 
 /// The signal actions of a process structure that is not a real process
@@ -328,7 +339,7 @@ pub fn describe(p: *Process) struct { state: u8, ppid: u64, pgid: u64, sid: u64,
         if (st == .running or st == .ready) running = true;
     }
     return .{
-        .state = if (p.exit_code != null) 'Z' else if (running) 'R' else 'S',
+        .state = if (p.exit_code != null) 'Z' else if (p.stopped.load(.acquire)) 'T' else if (running) 'R' else 'S',
         .ppid = if (p.parent) |parent| parent.pid else 0,
         .pgid = p.pgid,
         .sid = p.sid,
@@ -550,6 +561,9 @@ pub fn exit(code: u64) noreturn {
     releaseDescendant(p.parent);
     p.exit_code = code;
     p.vfork_pending = false;
+    // The last of the terminal's foreground group: the terminal has none
+    // now, until a shell gives it to another.
+    if (p.pgid == foreground_group and !groupExistsLocked(p.pgid)) foreground_group = 0;
     _ = p.exited.wakeAll(); // before the lock is released: the waiters are still there
     // A zombie in its parent's list until the parent collects it.
     if (p.parent) |parent| {
@@ -638,20 +652,27 @@ pub fn setForeground(p: ?*Process) ?*Process {
     return before;
 }
 
-/// End the foreground program, if there is one, with status `code`. For
-/// the terminal's Ctrl+C: callable from an interrupt handler holding no
-/// lock. True if there was one.
-pub fn terminateForeground(code: u64) bool {
-    _ = code;
+/// Send `sig` to the foreground: the terminal's foreground process group,
+/// if a shell has set one; else the foreground program a kernel test set
+/// (`setForeground`). For the terminal's Ctrl+C (`SIGINT`), Ctrl+\
+/// (`SIGQUIT`) and Ctrl+Z (`SIGTSTP`): callable from an interrupt handler
+/// holding no lock. True if there was anyone to send it to.
+pub fn signalForeground(sig: u32) bool {
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
-    // SIGINT, which ends them unless they handle or ignore it: to the
-    // terminal's foreground process group, if a shell has set one; else to
-    // the foreground program a kernel test set (`setForeground`).
-    if (foreground_group != 0) return signalGroupLocked(foreground_group, signal.SIG.INT) != 0;
+    if (foreground_group != 0) return signalGroupLocked(foreground_group, sig) != 0;
     const p = foreground orelse return false;
-    signal.sendProcessLocked(p, signal.SIG.INT);
+    signal.sendProcessLocked(p, sig);
     return true;
+}
+
+/// Whether the calling process is in the background on the terminal: a
+/// shell has given the terminal to a group, and not to the caller's.
+pub fn inBackground() bool {
+    const me = thread.current().process orelse return false;
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    return foreground_group != 0 and me.pgid != foreground_group;
 }
 
 /// The terminal's foreground process group (`TIOCSPGRP`), 0 for none.
@@ -754,6 +775,60 @@ pub fn groupOf(pid: u64, which: enum { group, session }) ?u64 {
         if (pid == 0 or p.pid == pid) return if (which == .group) p.pgid else p.sid;
     }
     return null;
+}
+
+/// Stop `p` for the signal `sig`: its threads wait on their way back to
+/// the program until it is continued, and its parent hears of it
+/// (`wait4` with `WUNTRACED`, and `SIGCHLD` unless it asked not to with
+/// `SA_NOCLDSTOP`). With the tree lock held. Nothing for a process that is
+/// stopped or ending already.
+pub fn stopLocked(p: *Process, sig: u32) void {
+    if (p.stopped.load(.acquire) or ending(p)) return;
+    p.stopped.store(true, .release);
+    p.stop_report = sig;
+    p.continued_report = false;
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) thread.interrupt(one);
+    if (p.parent) |parent| {
+        _ = parent.children_changed.wakeAll();
+        if (signal.tellsOfStops(parent)) signal.sendProcessLocked(parent, signal.SIG.CHLD);
+    }
+}
+
+/// `stopLocked`, taking the tree lock.
+pub fn stopProcess(p: *Process, sig: u32) void {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    stopLocked(p, sig);
+}
+
+/// Continue `p` if it is stopped (`SIGCONT`, as it is sent): its threads
+/// go on, and its parent hears of it (`wait4` with `WCONTINUED`, and
+/// `SIGCHLD` unless `SA_NOCLDSTOP`). With the tree lock held.
+pub fn continueLocked(p: *Process) void {
+    if (!p.stopped.load(.acquire)) return;
+    p.stopped.store(false, .release);
+    p.stop_report = 0;
+    p.continued_report = true;
+    _ = p.resumed.wakeAll();
+    if (p.parent) |parent| {
+        _ = parent.children_changed.wakeAll();
+        if (signal.tellsOfStops(parent)) signal.sendProcessLocked(parent, signal.SIG.CHLD);
+    }
+}
+
+/// Wait while the calling thread's process is stopped. Called on the way
+/// back to the program, holding no lock; only the end of the process
+/// (`SIGKILL`) ends the wait early: other signals stay pending until it
+/// is continued, as on Linux.
+pub fn waitWhileStopped() void {
+    const p = thread.current().process orelse return;
+    if (!p.stopped.load(.acquire)) return;
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    while (p.stopped.load(.acquire)) {
+        if (!p.resumed.waitUnlessEnding(&tree_lock)) return;
+    }
 }
 
 /// Send `sig` to the process `p` (`signal.sendProcessLocked`, with the
@@ -966,10 +1041,21 @@ pub fn reap(child: *Process) void {
     if (drop) release(child);
 }
 
+/// What `waitChild` is to report besides children that ended.
+pub const WaitFor = struct {
+    /// Report `none_yet` instead of waiting (`WNOHANG`).
+    nohang: bool = false,
+    /// Children that stopped (`WUNTRACED`).
+    stopped: bool = false,
+    /// Children that were continued (`WCONTINUED`).
+    continued: bool = false,
+};
+
 /// What `waitChild` found.
 pub const WaitResult = union(enum) {
-    /// A child that ended: its process ID and the status `wait4` reports
-    /// (`(code << 8)`, or the signal that ended it).
+    /// A child that ended, stopped or was continued: its process ID and
+    /// the status `wait4` reports (`(code << 8)`, the signal that ended
+    /// it, `(sig << 8) | 0x7f` for a stop, `0xffff` for a continue).
     exited: struct { pid: usize, status: u32 },
     /// Children there are, and none has ended (`WNOHANG`).
     none_yet,
@@ -980,10 +1066,10 @@ pub const WaitResult = union(enum) {
 };
 
 /// `wait4`: wait for a child of the calling process to end and collect
-/// it. `pid` -1 means any child; a positive one, that child; 0, any in the
-/// caller's process group; below -1, any in the group `-pid`. With
-/// `nohang`, report `none_yet` instead of waiting.
-pub fn waitChild(pid: i64, nohang: bool) WaitResult {
+/// it, or, as `how` asks, to stop or be continued. `pid` -1 means any
+/// child; a positive one, that child; 0, any in the caller's process
+/// group; below -1, any in the group `-pid`.
+pub fn waitChild(pid: i64, how: WaitFor) WaitResult {
     const me = thread.current().process.?;
     const found: *Process = blk: {
         const held = tree_lock.acquire();
@@ -1001,9 +1087,18 @@ pub fn waitChild(pid: i64, nohang: bool) WaitResult {
                     child.parent = null;
                     break :blk child;
                 }
+                if (how.stopped and child.stop_report != 0) {
+                    const sig = child.stop_report;
+                    child.stop_report = 0;
+                    return .{ .exited = .{ .pid = child.pid, .status = (sig << 8) | 0x7f } };
+                }
+                if (how.continued and child.continued_report) {
+                    child.continued_report = false;
+                    return .{ .exited = .{ .pid = child.pid, .status = 0xffff } };
+                }
             }
             if (!any) return .no_child;
-            if (nohang) return .none_yet;
+            if (how.nohang) return .none_yet;
             if (!me.children_changed.waitKillable(&tree_lock)) return .interrupted;
         }
     };

@@ -621,6 +621,9 @@ fn sysIoctl(fd: u64, request: u64, arg: u64) u64 {
         abi.TIOC.TIOCSPGRP => {
             const g = fromUser(i32, arg) orelse return err(.FAULT);
             if (g <= 0) return err(.INVAL);
+            // From the background: SIGTTOU to the caller's group, which
+            // stops it, unless it blocks or ignores that (as shells do).
+            if (backgroundStops(signal.SIG.TTOU)) |e| return e;
             return switch (proc.setForegroundGroup(@intCast(g))) {
                 .ok => 0,
                 .no_such => err(.PERM),
@@ -630,9 +633,24 @@ fn sysIoctl(fd: u64, request: u64, arg: u64) u64 {
     }
 }
 
+/// A process in the background that uses the terminal as only the
+/// foreground may: `sig` (`SIGTTIN` for a read, `SIGTTOU`) goes to its
+/// process group, which stops, and the call returns `EINTR`, to be made
+/// again once it is continued. If the caller blocks or ignores `sig`,
+/// nothing is sent: the call fails with `EIO` for a read and goes ahead
+/// otherwise, as on Linux. Null: go ahead.
+fn backgroundStops(sig: u32) ?u64 {
+    if (!proc.inBackground()) return null;
+    if (!signal.wouldTake(sig)) return if (sig == signal.SIG.TTIN) err(.IO) else null;
+    const g = proc.groupOf(0, .group) orelse return null;
+    _ = proc.signalGroup(g, sig);
+    return err(.INTR);
+}
+
 /// `read` from the terminal: a line, or each key without line editing.
 fn consoleRead(of: *OpenFile, ptr: u64, len: u64) u64 {
     if (!user_range.valid(ptr, len)) return err(.FAULT);
+    if (backgroundStops(signal.SIG.TTIN)) |e| return e;
     var chunk: [CHUNK]u8 = undefined;
     const want: usize = @intCast(@min(CHUNK, len));
     switch (tty.read(chunk[0..want], nonblocking(of))) {
@@ -2145,7 +2163,11 @@ fn sysWait4(pid_arg: u64, status_ptr: u64, options: u64, rusage_ptr: u64) u64 {
     if (options & ~@as(u64, abi.WNOHANG | abi.WUNTRACED | abi.WCONTINUED) != 0) return err(.INVAL);
     if (thread.current().process == null) return err(.CHILD);
     const pid: i64 = @as(i32, @truncate(@as(i64, @bitCast(pid_arg))));
-    return switch (proc.waitChild(pid, options & abi.WNOHANG != 0)) {
+    return switch (proc.waitChild(pid, .{
+        .nohang = options & abi.WNOHANG != 0,
+        .stopped = options & abi.WUNTRACED != 0,
+        .continued = options & abi.WCONTINUED != 0,
+    })) {
         .exited => |x| blk: {
             if (status_ptr != 0 and !toUser(status_ptr, @as(i32, @bitCast(x.status)))) break :blk err(.FAULT);
             if (rusage_ptr != 0 and !toUser(rusage_ptr, std.mem.zeroes([18]u64))) break :blk err(.FAULT);

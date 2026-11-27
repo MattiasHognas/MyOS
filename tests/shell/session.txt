@@ -27,6 +27,22 @@ sleep 30
 \x03
 #wait 1
 echo after-ctrl-c $?
+sleep 30
+#wait 2
+\x1a
+#wait 1
+echo after-ctrl-z $?
+jobs
+bg
+#wait 1
+jobs
+fg
+#wait 1
+\x03
+#wait 1
+echo after-fg $?
+jobs
+echo no-jobs-left
 /fixtures/musl-hello-static from-shell
 exit 5
 #wait 4

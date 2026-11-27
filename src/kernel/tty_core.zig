@@ -30,7 +30,8 @@ pub const Settings = struct {
     canonical: bool = true,
     /// Typed characters are shown.
     echo: bool = true,
-    /// Ctrl+C interrupts the foreground program.
+    /// Ctrl+C, Ctrl+\ and Ctrl+Z send the foreground program `SIGINT`,
+    /// `SIGQUIT` and `SIGTSTP` (`ISIG`).
     signals: bool = true,
     /// Carriage return is taken as newline (`ICRNL`): what Enter sends on
     /// a serial line.
@@ -45,6 +46,10 @@ pub const Action = enum {
     /// Ctrl+C: interrupt the foreground program. (Readers are woken too:
     /// nothing is readable, but one of them may be about to die.)
     interrupt,
+    /// Ctrl+\: `SIGQUIT` to the foreground program.
+    quit,
+    /// Ctrl+Z: stop the foreground program (`SIGTSTP`).
+    suspend_,
 };
 
 /// One waiting item: a character, or one of the two marks that end a
@@ -98,10 +103,18 @@ pub const Tty = struct {
         const s = self.settings;
         const c = if (typed == '\r' and s.cr_to_nl) '\n' else typed;
 
-        if (s.signals and c == 0x03) { // Ctrl+C
+        if (s.signals and (c == 0x03 or c == 0x1C or c == 0x1A)) { // Ctrl+C, Ctrl+\, Ctrl+Z
             self.line_len = 0;
-            if (s.echo) echo.appendSliceAssumeCapacity("^C\n");
-            return .interrupt;
+            if (s.echo) echo.appendSliceAssumeCapacity(switch (c) {
+                0x03 => "^C\n",
+                0x1C => "^\\\n",
+                else => "^Z\n",
+            });
+            return switch (c) {
+                0x03 => .interrupt,
+                0x1C => .quit,
+                else => .suspend_,
+            };
         }
         if (!s.canonical) {
             if (!self.push(.{ .char = c })) return .none; // nobody reads: dropped

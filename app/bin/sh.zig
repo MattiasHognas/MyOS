@@ -6,9 +6,16 @@
 //! `2>&1`. Words are quoted as in other shells: single quotes keep
 //! everything, double quotes and a backslash keep spaces and operators;
 //! outside single quotes `$?` is the last status and `$NAME` or `${NAME}`
-//! a variable. No globbing, no background jobs.
+//! a variable. No globbing, and no `&` yet.
 //!
-//! `cd`, `pwd`, `exit`, `export NAME=value` and `unset NAME` are built in;
+//! Job control, when it reads the terminal: Ctrl+Z stops the pipeline in
+//! the foreground, which becomes a job; `jobs` lists them, `fg [%N]`
+//! brings one back to the foreground and `bg [%N]` lets it go on in the
+//! background. The shell itself ignores `SIGTSTP`, `SIGTTIN` and
+//! `SIGTTOU`, as shells do; the programs it starts get the defaults.
+//!
+//! `cd`, `pwd`, `exit`, `export NAME=value`, `unset NAME`, `jobs`, `fg`
+//! and `bg` are built in;
 //! anything else is a program, found in `PATH` (`/usr/bin:/bin` if it is
 //! not set) unless its name has a slash. Each pipeline runs in a process
 //! group of its own, which gets the terminal while it runs, so Ctrl+C
@@ -217,6 +224,7 @@ fn execute(c: *Command) noreturn {
 /// What a status from `wait4` comes to, as `$?` has it; and a message
 /// for a program a signal ended.
 fn statusOf(raw: u32, name: []const u8) u8 {
+    if (raw & 0xFF == 0x7F) return @intCast(128 + ((raw >> 8) & 0x7F)); // stopped
     const sig = raw & 0x7F;
     if (sig == 0) return @intCast((raw >> 8) & 0xFF);
     const what: []const u8 = switch (sig) {
@@ -235,6 +243,160 @@ fn statusOf(raw: u32, name: []const u8) u8 {
     if (sig == 2) _ = u.writeAll(2, "\n");
     if (what.len > 0) say("{s}: {s} (signal {d})", .{ name, what, sig });
     return @intCast(128 + sig);
+}
+
+// ---------------------------------------------------------------------------
+// Jobs: pipelines stopped with Ctrl+Z, and those sent on with `bg`.
+
+const MAX_JOBS = 8;
+
+const Job = struct {
+    pgid: usize = 0,
+    /// The processes not collected yet, 0 for those that were.
+    pids: [MAX_CMDS]usize = @splat(0),
+    /// The command names, as `jobs` shows them.
+    name_buf: [80]u8 = undefined,
+    name_len: usize = 0,
+    stopped: bool = false,
+    /// The status of the pipeline's last command, once it has ended.
+    status: u8 = 0,
+
+    fn name(j: *const Job) []const u8 {
+        return j.name_buf[0..j.name_len];
+    }
+
+    fn alive(j: *const Job) bool {
+        for (j.pids) |pid| if (pid != 0) return true;
+        return false;
+    }
+};
+
+/// Jobs by number minus one; a slot with `pgid` 0 is free.
+var jobs: [MAX_JOBS]Job = @splat(.{});
+
+/// Wait for the processes of `j` that are left: until they have all ended
+/// (the job is done) or one has stopped (it is a stopped job). With
+/// `nohang`, only collect what has happened already. Returns the status
+/// as `$?` has it.
+fn waitJob(j: *Job, nohang: bool, last_index: usize) u8 {
+    var status: u8 = j.status;
+    for (&j.pids, 0..) |*pid, i| {
+        if (pid.* == 0) continue;
+        var raw: u32 = 0;
+        const options: usize = (if (interactive) @as(usize, linux.W.UNTRACED) else 0) | (if (nohang) @as(usize, linux.W.NOHANG) else 0);
+        while (true) {
+            const rc = u.sys4(.wait4, pid.*, @intFromPtr(&raw), options, 0);
+            if (!u.isErr(rc) or u.errnoOf(rc) != 4) {
+                if (rc == 0) break; // nohang, and nothing yet
+                if (u.isErr(rc)) {
+                    pid.* = 0; // not ours any more
+                    break;
+                }
+                if (raw & 0xFF == 0x7F) {
+                    j.stopped = true;
+                    return statusOf(raw, j.name());
+                }
+                const s = statusOf(raw, j.name());
+                if (i == last_index) status = s;
+                pid.* = 0;
+                break;
+            }
+        }
+    }
+    j.status = status;
+    return status;
+}
+
+/// The number (1-based) of a free job slot; null if all are taken.
+fn freeJob() ?usize {
+    for (&jobs, 0..) |*j, i| if (j.pgid == 0) return i;
+    return null;
+}
+
+fn lastIndexOf(j: *const Job) usize {
+    var last: usize = 0;
+    for (j.pids, 0..) |pid, i| if (pid != 0) {
+        last = i;
+    };
+    return last;
+}
+
+/// The job `arg` names (`%N` or `N`), or the newest one without `arg`.
+fn findJob(arg: ?[*:0]const u8) ?*Job {
+    if (arg) |a| {
+        var text = u.span(a);
+        if (text.len > 0 and text[0] == '%') text = text[1..];
+        const n = std.fmt.parseInt(usize, text, 10) catch return null;
+        if (n == 0 or n > MAX_JOBS or jobs[n - 1].pgid == 0) return null;
+        return &jobs[n - 1];
+    }
+    var i: usize = MAX_JOBS;
+    while (i > 0) : (i -= 1) if (jobs[i - 1].pgid != 0) return &jobs[i - 1];
+    return null;
+}
+
+fn jobNumber(j: *const Job) usize {
+    return (@intFromPtr(j) - @intFromPtr(&jobs[0])) / @sizeOf(Job) + 1;
+}
+
+/// Collect jobs running in the background that have ended or stopped, and
+/// say so: before each prompt.
+fn reapJobs() void {
+    for (&jobs) |*j| {
+        if (j.pgid == 0 or j.stopped) continue;
+        _ = waitJob(j, true, lastIndexOf(j));
+        if (j.stopped) {
+            u.print(2, "[{d}]+  Stopped                 {s}\n", .{ jobNumber(j), j.name() });
+        } else if (!j.alive()) {
+            u.print(2, "[{d}]+  Done                    {s}\n", .{ jobNumber(j), j.name() });
+            j.* = .{};
+        }
+    }
+}
+
+/// Wait for the foreground job `j`: if it stops it stays a job, and the
+/// shell says so; if it ends, its slot is freed. The terminal comes back
+/// to the shell either way.
+fn waitForeground(j: *Job) u8 {
+    const status = waitJob(j, false, lastIndexOf(j));
+    giveTerminal(shell_pgid);
+    if (j.stopped) {
+        u.print(2, "[{d}]+  Stopped                 {s}\n", .{ jobNumber(j), j.name() });
+    } else {
+        j.* = .{};
+    }
+    return status;
+}
+
+/// `jobs`, `fg` and `bg`.
+fn jobBuiltin(which: []const u8, c: *Command) u8 {
+    if (u.eql(which, "jobs")) {
+        for (&jobs) |*j| {
+            if (j.pgid == 0) continue;
+            u.print(1, "[{d}]   {s}                 {s}\n", .{ jobNumber(j), if (j.stopped) "Stopped" else "Running", j.name() });
+        }
+        return 0;
+    }
+    const j = findJob(if (c.argc > 1) c.argv[1] else null) orelse {
+        say("{s}: no such job", .{which});
+        return 1;
+    };
+    if (u.eql(which, "fg")) {
+        u.print(1, "{s}\n", .{j.name()});
+        giveTerminal(j.pgid);
+        j.stopped = false;
+        _ = u.sys2(.kill, -%j.pgid, @intFromEnum(linux.SIG.CONT));
+        return waitForeground(j);
+    }
+    // bg
+    if (!j.stopped) {
+        say("bg: job {d} is already running", .{jobNumber(j)});
+        return 0;
+    }
+    j.stopped = false;
+    _ = u.sys2(.kill, -%j.pgid, @intFromEnum(linux.SIG.CONT));
+    u.print(1, "[{d}]+ {s} &\n", .{ jobNumber(j), j.name() });
+    return 0;
 }
 
 /// Hand the terminal to the process group `pgid`.
@@ -294,6 +456,7 @@ fn builtin(c: *Command) ?u8 {
         for (c.argv[1..c.argc]) |a| unsetVar(u.span(a.?));
         return 0;
     }
+    if (u.eql(name, "jobs") or u.eql(name, "fg") or u.eql(name, "bg")) return jobBuiltin(name, c);
     return null;
 }
 
@@ -341,8 +504,9 @@ fn runPipeline(cmds: []Command) u8 {
             if (!last) _ = u.sys3(.dup3, @intCast(pfd[1]), 1, 0);
             // A program that ends its own group's foreground must not take
             // the handler the shell has for Ctrl+C: back to the default.
+            // The stop signals the shell ignores, too.
             const dfl = linux.Sigaction{ .handler = .{ .handler = linux.SIG.DFL }, .mask = std.mem.zeroes(linux.sigset_t), .flags = 0 };
-            _ = linux.sigaction(.INT, &dfl, null);
+            for ([_]linux.SIG{ .INT, .TSTP, .TTIN, .TTOU }) |sig| _ = linux.sigaction(sig, &dfl, null);
             if (!applyRedirections(c)) _ = u.sys1(.exit_group, 1);
             if (builtin(c)) |status| _ = u.sys1(.exit_group, status);
             execute(c);
@@ -360,22 +524,29 @@ fn runPipeline(cmds: []Command) u8 {
         }
     }
     if (prev_read) |r| u.close(r);
-    var status: u8 = 1;
-    for (pids[0..started], 0..) |pid, i| {
-        var raw: u32 = 0;
-        while (true) {
-            const rc = u.sys4(.wait4, pid, @intFromPtr(&raw), 0, 0);
-            if (!u.isErr(rc) or u.errnoOf(rc) != 4) break;
-        }
-        const s = statusOf(raw, u.span(cmds[i].argv[0].?));
-        if (i + 1 == started) status = s;
+    if (started == 0) {
+        giveTerminal(shell_pgid);
+        return 1;
     }
-    giveTerminal(shell_pgid);
-    return status;
+    // A job, while it runs: it stays one if it is stopped.
+    const slot = freeJob() orelse MAX_JOBS - 1; // all taken: the last is reused
+    const j = &jobs[slot];
+    j.* = .{ .pgid = pgid, .status = 1 };
+    @memcpy(j.pids[0..started], pids[0..started]);
+    var name_w: std.Io.Writer = .fixed(&j.name_buf);
+    for (cmds[0..started], 0..) |*c, i| {
+        if (i > 0) name_w.writeAll(" | ") catch {};
+        for (c.argv[0..c.argc], 0..) |a, k| {
+            if (k > 0) name_w.writeAll(" ") catch {};
+            name_w.writeAll(u.span(a.?)) catch {};
+        }
+    }
+    j.name_len = name_w.end;
+    return waitForeground(j);
 }
 
 fn isBuiltin(name: []const u8) bool {
-    for ([_][]const u8{ "exit", "cd", "pwd", "export", "unset" }) |b| if (u.eql(name, b)) return true;
+    for ([_][]const u8{ "exit", "cd", "pwd", "export", "unset", "jobs", "fg", "bg" }) |b| if (u.eql(name, b)) return true;
     return false;
 }
 
@@ -465,10 +636,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // the programs it starts do not inherit.
         const act = linux.Sigaction{ .handler = .{ .handler = onInterrupt }, .mask = std.mem.zeroes(linux.sigset_t), .flags = 0 };
         _ = linux.sigaction(.INT, &act, null);
+        // Job control: the shell is never stopped itself.
+        const ign = linux.Sigaction{ .handler = .{ .handler = linux.SIG.IGN }, .mask = std.mem.zeroes(linux.sigset_t), .flags = 0 };
+        for ([_]linux.SIG{ .TSTP, .TTIN, .TTOU }) |sig| _ = linux.sigaction(sig, &ign, null);
         giveTerminal(shell_pgid);
     }
     while (true) {
         if (interactive) {
+            reapJobs();
             if (last_status == 0) _ = u.writeAll(1, "$ ") else u.print(1, "[{d}] $ ", .{last_status});
         }
         const line = readLine(0) orelse break;
