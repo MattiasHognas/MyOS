@@ -278,6 +278,11 @@ pub fn flushLocal(start: u64, pages: u64) void {
 /// addresses, the ones that have `root` loaded for user addresses. Returns
 /// when every CPU has done it.
 fn flushEverywhere(root: u64, start: u64, pages: u64) void {
+    // On one CPU from start to end: a thread moved to another CPU between
+    // the local flush and the request would leave the new CPU, which the
+    // request skips as the sender's, with the old translation.
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
     if (start >= KERNEL_BASE) {
         flushLocal(start, pages);
         ipi.broadcast(.{ .flush_kernel = .{ .start = start, .pages = pages } });
@@ -493,11 +498,11 @@ pub fn rootLoads() usize {
 /// loaded for as long as it runs only kernel threads afterwards
 /// (`thread.zig`). Nothing may load `root` again: its threads are gone.
 pub fn unloadRoot(root: u64) void {
-    {
-        const flags = cpu.saveAndDisableInterrupts();
-        defer cpu.restoreInterrupts(flags);
-        if (percpu.current().loaded_root == root) loadRoot(kernel_root);
-    }
+    // On one CPU throughout, as in `flushEverywhere`: moved in between, the
+    // thread would be on a CPU the request skips, which may have `root`.
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    if (percpu.current().loaded_root == root) loadRoot(kernel_root);
     ipi.broadcast(.{ .unload_root = root });
 }
 
