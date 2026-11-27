@@ -105,6 +105,12 @@ pub const PerCpu = extern struct {
 
     /// What this CPU's control registers held when it came up.
     setup: Setup = .{},
+
+    /// When the hardware interrupts on this CPU came, folded together, not
+    /// yet given to the random generator; and how many there were
+    /// (`random.interruptTiming`). Touched only with interrupts off.
+    entropy: [4]u64 = @splat(0),
+    entropy_count: u32 = 0,
 };
 
 comptime {

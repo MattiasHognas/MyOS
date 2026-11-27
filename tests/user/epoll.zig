@@ -155,6 +155,44 @@ pub fn main() noreturn {
     _ = lib.close(rd);
     expect(wait(ep, 0) == 0, 47);
 
+    // Edge-triggered: reported once while it stays ready, again after a
+    // new change. (`efd` was added with EPOLLET.)
+    _ = write8(efd, 1);
+    expect(wait(ep, 0) == 1 and events[0].data == 100, 60);
+    expect(wait(ep, 0) == 0, 61); // still readable, nothing new
+    _ = write8(efd, 1);
+    expect(wait(ep, 0) == 1 and events[0].data == 100, 62); // something new
+    expect(read8(efd) == 2, 63);
+    // Level-triggered stays reported while ready.
+    var p2: [2]i32 = undefined;
+    expect(lib.syscall(Sys.pipe2, @intFromPtr(&p2), 0, 0) == 0, 64);
+    expect(ctl(ep, EPOLL.CTL_ADD, @intCast(p2[0]), EPOLL.IN, 300) == 0, 65);
+    _ = lib.syscall(Sys.write, @intCast(p2[1]), @intFromPtr("y"), 1);
+    expect(wait(ep, 0) == 1 and wait(ep, 0) == 1 and events[0].data == 300, 66);
+    // The watch is on the open file: closing the descriptor ends it, and a
+    // new file under the same number is not watched.
+    const old_fd: u64 = @intCast(p2[0]);
+    _ = lib.close(old_fd);
+    var p3: [2]i32 = undefined;
+    expect(lib.syscall(Sys.pipe2, @intFromPtr(&p3), 0, 0) == 0 and @as(u64, @intCast(p3[0])) == old_fd, 67);
+    _ = lib.syscall(Sys.write, @intCast(p3[1]), @intFromPtr("z"), 1);
+    expect(wait(ep, 0) == 0, 68);
+    expect(ctl(ep, EPOLL.CTL_DEL, old_fd, 0, 0) == lib.err(.NOENT), 69); // the watch is gone
+    for ([_]i32{ p2[1], p3[0], p3[1] }) |fd| _ = lib.close(@intCast(fd));
+
+    // `poll` waiting for ever on a pipe that another thread writes to: the
+    // pipe wakes it.
+    var p4: [2]i32 = undefined;
+    expect(lib.syscall(Sys.pipe2, @intFromPtr(&p4), 0, 0) == 0, 70);
+    (top - 1)[0] = @intFromPtr(&signaller);
+    (top - 2)[0] = @intCast(p4[1]);
+    expect(!lib.isError(clone_raw(flags, @intFromPtr(top - 2), @intFromPtr(&thread_tid), @intFromPtr(&thread_tid), @intFromPtr(&thread_tls))), 71);
+    var pfds = [_]abi.PollFd{.{ .fd = p4[0], .events = abi.POLL.IN, .revents = 0 }};
+    expect(lib.syscall(Sys.poll, @intFromPtr(&pfds), 1, @bitCast(@as(i64, -1))) == 1 and pfds[0].revents == abi.POLL.IN, 72);
+    expect(read8(@intCast(p4[0])) == 5, 73);
+    while (thread_tid.load(.acquire) != 0) _ = lib.syscall6(Sys.futex, @intFromPtr(&thread_tid), abi.FUTEX.WAIT, thread_tid.load(.acquire), 0, 0, 0);
+    for (p4) |fd| _ = lib.close(@intCast(fd));
+
     for ([_]u64{ efd, sem, ep, file }) |fd| expect(lib.close(fd) == 0, 50);
     lib.exit(0);
 }

@@ -79,7 +79,7 @@ Linux calls, with Linux's numbers:
 | 4 | `stat(path, statbuf)` | `newfstatat` for a path. |
 | 5 | `fstat(fd, statbuf)` | The console is a character device, a pipe a FIFO, an open file a regular file with its size. Two descriptors or paths are the same file if device and inode number are equal. |
 | 6 | `lstat(path, statbuf)` | `stat` without following a link at the end. |
-| 7 | `poll(fds, nfds, timeout)` | The console is writable, a file readable, a pipe when it has bytes or room; `POLLHUP` and `POLLERR` for a pipe whose other end is closed, `POLLNVAL` for a descriptor that is not open. Waits by looking again every tick. |
+| 7 | `poll(fds, nfds, timeout)` | The console is writable, a file readable, a pipe when it has bytes or room; `POLLHUP` and `POLLERR` for a pipe whose other end is closed, `POLLNVAL` for a descriptor that is not open. Waits until a pipe, the terminal or an eventfd reports a change, and looks again then. |
 | 8 | `lseek(fd, offset, whence)` | Open files; a directory only back to its start (`SEEK_SET`, 0); `ESPIPE` for the console and pipes. |
 | 9 | `mmap(addr, length, prot, flags, fd, offset)` | Anonymous memory, and files of the image: a private mapping gets each page from the file when it is first touched and keeps its changes to itself; a shared one may only be read (`EACCES`). A page wholly past the end of the file kills the program that touches it. `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, hints, `MAP_NORESERVE`; `MAP_DENYWRITE` is ignored. `ENODEV` for a descriptor that is not a file, and for a file in `/tmp`: what can change cannot be mapped yet. |
 | 10 | `mprotect(addr, length, prot)` | `ENOMEM` if part of the range is not mapped. Memory may be writable and executable at once. |
@@ -159,8 +159,8 @@ Linux calls, with Linux's numbers:
 | 228 | `clock_gettime(clock, ts)` | `CLOCK_MONOTONIC` (and `_RAW`, `_COARSE`, `CLOCK_BOOTTIME`): time since boot, from the TSC where it is invariant and the HPET otherwise. `CLOCK_REALTIME` (and `_COARSE`): the RTC's date at boot plus that. The CPU-time clocks give time since boot, an upper bound: CPU time is not counted yet. `EINVAL` for other clocks. |
 | 230 | `clock_nanosleep(clock, flags, req, rem)` | With `TIMER_ABSTIME` too. |
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
-| 232 | `epoll_wait(epfd, events, max, timeout)` | The watched descriptors that are ready, waiting up to `timeout` ms (for ever if negative). Readiness is looked at again each timer tick. Edge-triggered watching (`EPOLLET`) is reported as level-triggered; `EPOLLONESHOT` works. A signal ends the wait with `EINTR`. |
-| 233 | `epoll_ctl(epfd, op, fd, event)` | `EPOLL_CTL_ADD`, `MOD`, `DEL`. A descriptor is watched by its number: closing it ends the watch. `EPERM` for files and directories (always ready), `EINVAL` for an epoll instance (not inside another yet). |
+| 232 | `epoll_wait(epfd, events, max, timeout)` | The watched descriptors that are ready, waiting up to `timeout` ms (for ever if negative). Readiness is looked at again when a watched kind of object reports a change. `EPOLLET` reports a ready file once, and again only after its object has changed; `EPOLLONESHOT` works. A watch is on the open file: closing the descriptor, or reusing its number for another file, ends it. A signal ends the wait with `EINTR`. |
+| 233 | `epoll_ctl(epfd, op, fd, event)` | `EPOLL_CTL_ADD`, `MOD`, `DEL`. The open file the descriptor is on is watched: closing the descriptor, or the number coming to stand for another file, ends the watch (Linux keeps it while another descriptor still has the file, after a `dup`). `EPERM` for files and directories (always ready), `EINVAL` for an epoll instance (not inside another yet). |
 | 234 | `tgkill(tgid, tid, sig)` | A thread of the calling process (`ESRCH` otherwise). |
 | 239 | `get_mempolicy(mode, nodemask, maxnode, addr, flags)` | One memory node, the default policy: mode 0 and an empty mask. No flags. |
 | 257 | `openat(dirfd, path, flags, mode)` | `open` with a relative path starting at the directory `dirfd` is open on, or at the working directory for `AT_FDCWD`. `ENOTDIR` if `dirfd` is open on something else, `EBADF` if it is not open; neither matters for an absolute path. |
@@ -240,11 +240,13 @@ Every other number returns `ENOSYS`.
   and a filesystem in memory at `/tmp`, which can, holds at most half the
   machine's memory, and is empty again after a restart. A file there is
   at most 1 GiB. There are no owners and no permissions.
-- **`/proc` and `/dev`.** A process finds a few things about itself and
-  the machine as files, in Linux's format: `/proc/self/exe` (a link to
-  its program), `/proc/self/maps` (its mappings; a C library finds the
-  main thread's stack there), `/proc/self/stat`, `/proc/meminfo`;
-  `self` may be its own process ID, and no other process is visible.
+- **`/proc`, `/sys` and `/dev`.** A process finds a few things about
+  itself and the machine as files, in Linux's format: `/proc/self/exe` (a
+  link to its program), `/proc/self/maps` (its mappings; a C library finds
+  the main thread's stack there), `/proc/self/stat`, `/proc/meminfo`,
+  `/proc/cpuinfo`, and `/sys/devices/system/cpu/online` (`possible`,
+  `present`: "0-3"); `self` may be its own process ID, and every process
+  has a directory by its ID (`stat`, `cmdline`, `comm`).
   `/dev/null`, `/dev/urandom` and `/dev/random` are devices.
 - **Counts** above `0x7ffff000` are shortened to that, as on Linux.
 - **Limits.** Every process has limits, inherited from the process that

@@ -341,6 +341,21 @@ pub fn main() noreturn {
     const total_kb = std.fmt.parseInt(u64, std.mem.trim(u8, meminfo["MemTotal:".len..std.mem.indexOf(u8, meminfo, " kB").?], " "), 10) catch 0;
     expect(total_kb >= 16 * 1024, 57);
     expect(kind("/proc/meminfo") == S.IFREG and kind("/proc/self/meminfo") == 0, 58);
+    // /proc/cpuinfo: a block for each CPU, with the flags line, and the
+    // CPU lists of /sys agreeing with it.
+    const cpuinfo = slurp("/proc/cpuinfo");
+    const blocks = std.mem.count(u8, cpuinfo, "processor\t: ");
+    expect(std.mem.startsWith(u8, cpuinfo, "processor\t: 0\nvendor_id\t: ") and blocks >= 1, 59);
+    expect(std.mem.indexOf(u8, cpuinfo, "\nflags\t\t: fpu ") != null and std.mem.indexOf(u8, cpuinfo, " sse2 ") != null and std.mem.indexOf(u8, cpuinfo, " lm") != null, 141);
+    var online_buf: [16]u8 = undefined;
+    const online = std.mem.trimEnd(u8, slurp("/sys/devices/system/cpu/online"), "\n");
+    const want_online = if (blocks == 1) "0" else std.fmt.bufPrint(&online_buf, "0-{d}", .{blocks - 1}) catch unreachable;
+    expect(std.mem.eql(u8, online, want_online), 142);
+    expect(kind("/sys") == S.IFDIR and kind("/sys/devices/system/cpu") == S.IFDIR and kind("/sys/devices/system/cpu/possible") == S.IFREG and kind("/sys/devices/system/cpu/nothing") == 0 and kind("/sys/nothing") == 0, 143);
+    expect(openFlags("/sys/devices/system/cpu/online", abi.O.WRONLY) == lib.err(.ROFS), 144);
+    const cpu_dir = lib.open("/sys/devices/system/cpu");
+    expect(std.mem.eql(u8, listing(cpu_dir), ". .. online possible present"), 145);
+    _ = lib.close(cpu_dir);
 
     // --- /dev/null and /dev/urandom.
     const null_fd = openFlags("/dev/null", abi.O.RDWR);

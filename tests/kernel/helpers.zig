@@ -3430,6 +3430,16 @@ pub fn randomChecks() u32 {
     const t1 = random.timingOnlyOutput();
     const t2 = random.timingOnlyOutput();
     if (std.mem.eql(u8, &t1, &t2)) return 12;
+
+    // Interrupts (here the timer's, on every CPU) are mixed in: within a
+    // few seconds some CPU has seen enough of them when it draws.
+    const mixes = random.interrupt_mixes.load(.monotonic);
+    var waited: u64 = 0;
+    while (random.interrupt_mixes.load(.monotonic) == mixes) : (waited += 1) {
+        if (waited > 3 * timer.HZ) return 13;
+        timer.sleepTicks(1);
+        random.bytes(&a);
+    }
     return 0;
 }
 

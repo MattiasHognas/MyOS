@@ -19,6 +19,7 @@ const std = @import("std");
 const heap = @import("heap.zig");
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
+const readiness = @import("readiness.zig");
 
 /// Bytes a pipe holds, and the most a write puts in as one piece.
 pub const SIZE = 4096;
@@ -38,7 +39,23 @@ pub const Pipe = struct {
     readable: WaitQueue = .{},
     /// Writers waiting for room or for the last reader to go.
     writable: WaitQueue = .{},
+    /// Moves on whenever what `state` says may have changed: for
+    /// edge-triggered `epoll`.
+    version: u64 = 0,
 };
+
+/// The pipe's state may have changed: tell its pollers. With the lock.
+fn moved(p: *Pipe) void {
+    p.version +%= 1;
+    readiness.changed();
+}
+
+/// `Pipe.version`, for `epoll`.
+pub fn version(p: *Pipe) u64 {
+    const held = p.lock.acquire();
+    defer p.lock.release(held);
+    return p.version;
+}
 
 pub const ReadResult = union(enum) {
     /// Bytes read; 0 is end of file (no writer left and nothing buffered).
@@ -80,6 +97,7 @@ pub fn closeEnd(p: *Pipe, end: End) void {
                 if (p.writers == 0) _ = p.readable.wakeAll();
             },
         }
+        moved(p);
         break :blk p.readers == 0 and p.writers == 0;
     };
     // Nobody can reach it any more: both ends' last references are gone.
@@ -104,6 +122,7 @@ pub fn read(p: *Pipe, dst: []u8, nonblock: bool) ReadResult {
     p.head = (p.head + n) % SIZE;
     p.len -= n;
     _ = p.writable.wakeAll();
+    moved(p);
     return .{ .bytes = n };
 }
 
@@ -127,6 +146,7 @@ pub fn write(p: *Pipe, src: []const u8, nonblock: bool) WriteResult {
     @memcpy(p.buf[0 .. need - first], src[first..need]);
     p.len += need;
     _ = p.readable.wakeAll();
+    moved(p);
     return .{ .bytes = need };
 }
 

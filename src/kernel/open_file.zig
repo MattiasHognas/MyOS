@@ -23,6 +23,7 @@
 //!   share one table. A process the kernel starts gets 0, 1 and 2 on the
 //!   terminal and nothing else.
 
+const std = @import("std");
 const heap = @import("heap.zig");
 const epoll = @import("epoll.zig");
 const pipe = @import("pipe.zig");
@@ -66,7 +67,22 @@ pub const OpenFile = struct {
     /// `unref`), since processes that share the file have locks of their
     /// own.
     refs: u32 = 1,
+    /// A number no other open file has had since boot, given out the
+    /// first time it is asked for (`id`). 0 until then. Not the address:
+    /// a new open file may be put where a closed one was.
+    serial: u64 = 0,
 };
+
+var next_serial: std.atomic.Value(u64) = .init(1);
+
+/// `of.serial`, given out now if `of` has none yet. What `epoll` keeps to
+/// know a watched open file again.
+pub fn id(of: *OpenFile) u64 {
+    const have = @atomicLoad(u64, &of.serial, .acquire);
+    if (have != 0) return have;
+    const fresh = next_serial.fetchAdd(1, .monotonic);
+    return @cmpxchgStrong(u64, &of.serial, 0, fresh, .acq_rel, .acquire) orelse fresh;
+}
 
 /// What an open descriptor refers to.
 pub const Kind = enum {

@@ -149,6 +149,20 @@ pub const WaitQueue = struct {
         return !self.remove(me);
     }
 
+    /// `waitTimeout` that a signal or the end of the thread's process also
+    /// ends (`thread.interrupted`).
+    pub fn waitTimeoutKillable(self: *WaitQueue, lock: *SpinLock, ticks: u64) enum { woken, timed_out, interrupted } {
+        assertOnlyLock(lock);
+        const me = thread.current();
+        var timeout = timer.WakeTimer.init(me);
+        self.append(me);
+        timer.add(&timeout.timer, ticks);
+        while (me.wait_queue == self and !timeout.hasFired() and !thread.interrupted()) sleep(lock);
+        timeout.finish();
+        if (!self.remove(me)) return .woken;
+        return if (thread.interrupted()) .interrupted else .timed_out;
+    }
+
     /// Wake the thread that has waited longest. Returns it, or null if
     /// nobody is waiting. The caller holds the condition's lock and keeps
     /// it until this has returned. Safe from interrupt handlers.

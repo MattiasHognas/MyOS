@@ -1,16 +1,24 @@
 //! The kernel's random-number generator.
 //!
-//! Stack-protector canaries and address randomization draw from it now;
-//! `AT_RANDOM` and `getrandom` will. `bytes` and `int` never block and can
-//! be called from any context once `init` has run.
+//! Stack-protector canaries, address randomization, `AT_RANDOM`,
+//! `getrandom` and `/dev/urandom` draw from it. `bytes` and `int` never
+//! block and can be called from any context once `init` has run.
 //!
 //! Where the randomness comes from, best first:
 //!
 //! 1. **RDSEED**: the CPU's hardware entropy source.
 //! 2. **RDRAND**: the CPU's own generator, seeded from that source.
 //! 3. **Timing**: the low bits of the time-stamp counter, read around
-//!    operations whose duration varies (port I/O, and later interrupts).
-//!    Weak on its own, and weaker still in an emulator.
+//!    operations whose duration varies (port I/O at boot), and when each
+//!    hardware interrupt came (keys, the serial line, disks, the timer),
+//!    with where it interrupted. Weak on its own, and weaker still in an
+//!    emulator.
+//!
+//! Interrupt timings are folded into a few words of the CPU's own state
+//! (`interruptTiming`, no lock, a few instructions), and given to the
+//! generator once `IRQ_BATCH` have come, the next time that CPU draws
+//! random bytes, as Linux does with its per-CPU fast pool. That mixing
+//! does not count as the hardware reseed: it comes on top.
 //!
 //! Everything found is mixed into one generator (`random_core.zig`), so
 //! the result is at least as unpredictable as the best source. If the CPU has
@@ -23,6 +31,7 @@
 
 const std = @import("std");
 const cpu = @import("../arch/x86_64/cpu.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
 const core = @import("random_core.zig");
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const log = std.log.scoped(.random);
@@ -142,11 +151,42 @@ pub fn addEntropy(data: []const u8) void {
     generator.mix(std.mem.asBytes(&rdtsc()));
 }
 
+/// Interrupts a CPU folds together before they are mixed in.
+const IRQ_BATCH = 64;
+
+/// Times a CPU's interrupt timings were mixed into the generator. Read by
+/// tests.
+pub var interrupt_mixes: std.atomic.Value(u64) = .init(0);
+
+/// A hardware interrupt came: fold the time, the vector and the address it
+/// interrupted into this CPU's pool. Called from the interrupt handler with
+/// interrupts off; takes no lock.
+pub fn interruptTiming(vector: u64, rip: u64) void {
+    const c = percpu.currentIfReady() orelse return;
+    const i = c.entropy_count % c.entropy.len;
+    c.entropy[i] = std.math.rotl(u64, c.entropy[i], 19) ^ rdtsc() ^ (rip *% 0x9E3779B97F4A7C15) ^ vector;
+    c.entropy_count +|= 1;
+}
+
+/// Mix this CPU's interrupt timings in once there are enough of them.
+/// Holding `lock`, so interrupts are off and the pool is this CPU's alone.
+fn foldInterrupts() void {
+    const c = percpu.currentIfReady() orelse return;
+    if (c.entropy_count < IRQ_BATCH) return;
+    const produced = generator.produced;
+    generator.mix(std.mem.asBytes(&c.entropy));
+    generator.produced = produced; // not instead of the hardware reseed
+    c.entropy = @splat(0);
+    c.entropy_count = 0;
+    _ = interrupt_mixes.fetchAdd(1, .monotonic);
+}
+
 /// Fill `buf` with random bytes.
 pub fn bytes(buf: []u8) void {
     const held = lock.acquire();
     defer lock.release(held);
     if (!ready) @panic("random: used before init");
+    foldInterrupts();
     if (generator.produced >= RESEED_BYTES) _ = collect(&generator, true);
     generator.fill(buf);
 }

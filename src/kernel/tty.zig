@@ -13,6 +13,7 @@
 //! piece of input.
 
 const std = @import("std");
+const readiness = @import("readiness.zig");
 
 const abi = @import("abi");
 const proc = @import("process.zig");
@@ -39,6 +40,25 @@ var show: ?*const fn ([]const u8) void = null;
 /// shell reports one killed by that signal.
 pub const INTERRUPTED = 128 + 2;
 
+/// Wake the threads waiting to read, and the pollers: what there is to
+/// read may have changed. With the lock.
+fn wakeReaders() void {
+    _ = readers.wakeAll();
+    version +%= 1;
+    readiness.changed();
+}
+
+/// Moves on whenever what there is to read may have changed: for
+/// edge-triggered `epoll`. Under the lock.
+var version: u64 = 0;
+
+/// `version`, for `epoll`.
+pub fn changeCount() u64 {
+    const held = lock.acquire();
+    defer lock.release(held);
+    return version;
+}
+
 pub fn init(printer: *const fn ([]const u8) void) void {
     show = printer;
 }
@@ -52,7 +72,7 @@ pub fn input(c: u8) void {
         const held = lock.acquire();
         defer lock.release(held);
         const action = core.input(c, &echo);
-        if (action != .none) _ = readers.wakeAll();
+        if (action != .none) wakeReaders();
         break :blk action;
     };
     if (echo.items.len != 0) if (show) |f| f(echo.items);
@@ -73,7 +93,7 @@ pub fn inject(text: []const u8) void {
             if (echo.capacity - echo.items.len < 64) echo.clearRetainingCapacity();
             if (core.input(c, &echo) == .interrupt) interrupt = true;
         }
-        _ = readers.wakeAll();
+        wakeReaders();
     }
     if (echo.items.len != 0) if (show) |f| f(echo.items);
     if (interrupt) _ = proc.terminateForeground(INTERRUPTED);
@@ -118,13 +138,13 @@ pub fn read(buf: []u8, nonblock: bool) ReadResult {
         if (first_reader == &me) {
             if (core.read(buf)) |n| {
                 // The next reader's input may be there already.
-                if (core.readable()) _ = readers.wakeAll();
+                if (core.readable()) wakeReaders();
                 return .{ .bytes = n };
             }
             if (nonblock) return .again;
         }
         if (!readers.waitKillable(&lock)) {
-            _ = readers.wakeAll(); // whoever is first now
+            wakeReaders(); // whoever is first now
             return .killed;
         }
     }
@@ -188,7 +208,7 @@ pub fn setAttributes(t: abi.Termios, flush: bool) void {
         .signals = t.lflag & abi.TERMIOS.ISIG != 0,
         .cr_to_nl = t.iflag & abi.TERMIOS.ICRNL != 0,
     });
-    _ = readers.wakeAll(); // a change of mode can make input readable
+    wakeReaders(); // a change of mode can make input readable
 }
 
 /// Throw away typed input not yet read (`TCFLSH`).
@@ -204,7 +224,7 @@ pub fn restoreSettings() void {
     const held = lock.acquire();
     defer lock.release(held);
     core.configure(.{});
-    _ = readers.wakeAll();
+    wakeReaders();
 }
 
 /// Back to the usual settings with nothing waiting: for tests.

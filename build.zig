@@ -335,6 +335,7 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "signal_frame", "src/kernel/signal_frame.zig" },
         .{ "ansi_core", "src/kernel/ansi_core.zig" },
         .{ "calendar", "src/kernel/calendar.zig" },
+        .{ "cpuinfo", "src/kernel/cpuinfo.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),

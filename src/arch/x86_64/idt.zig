@@ -43,6 +43,7 @@ const apic = @import("../../arch/x86_64/apic.zig");
 const backtrace = @import("../../kernel/debug/backtrace.zig");
 const kstack = @import("../../kernel/kstack.zig");
 const process = @import("../../kernel/process.zig");
+const random = @import("../../kernel/random.zig");
 const signal = @import("../../kernel/signal.zig");
 const user_memory = @import("../../kernel/user_memory.zig");
 const thread = @import("../../kernel/thread.zig");
@@ -345,6 +346,7 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector == VECTOR_NMI) ipi.haltIfStopped(); // another CPU is reporting a crash
     if (f.vector >= 32) {
         apic.eoi(); // BEFORE the handler: it may switch threads
+        random.interruptTiming(f.vector, f.rip);
         if (handlers[f.vector]) |h| h(f) else root.print("unhandled vector {d}\n", .{f.vector});
         // On the way back to a program whose process is ending: not there.
         // A signal for it is delivered now.

@@ -8,14 +8,12 @@
 //!
 //! An epoll instance is a list of descriptors with the events each is
 //! watched for, and `epoll_wait` reports those that are ready. Readiness
-//! is what `poll` sees (`syscall.pollState`), looked at again every timer
-//! tick while nothing is ready: descriptors have no way yet to wake a
-//! waiter themselves. Two simplifications follow, both documented in
-//! `docs/syscalls.md`: edge-triggered watching (`EPOLLET`) is reported as
-//! level-triggered (a descriptor that stays ready is reported again), and
-//! a descriptor is watched by its number in the process, not by the open
-//! file behind it (closing it ends the watch; another file opened under
-//! the same number would be watched in its place).
+//! is what `poll` sees (`syscall.pollState`), looked at again when an
+//! object reports a change (`readiness.zig`). A watch is on the open file
+//! the descriptor had when it was added: if the descriptor is closed, or
+//! now refers to another open file, the watch ends. Edge-triggered
+//! watching (`EPOLLET`) reports a ready file once, and again only after
+//! the object has changed since (`syscall.objectVersion`).
 //!
 //! Each object has a spinlock of rank `condition`, held for a few
 //! instructions; bytes are copied to and from programs without it.
@@ -25,6 +23,7 @@ const std = @import("std");
 const heap = @import("heap.zig");
 const SpinLock = @import("sync/spinlock.zig").SpinLock;
 const WaitQueue = @import("sync/wait_queue.zig").WaitQueue;
+const readiness = @import("readiness.zig");
 
 // ---------------------------------------------------------------------------
 // eventfd
@@ -36,6 +35,8 @@ pub const EventFd = struct {
     semaphore: bool = false,
     readers: WaitQueue = .{},
     writers: WaitQueue = .{},
+    /// Moves on with every read and write: for edge-triggered `epoll`.
+    version: u64 = 0,
 };
 
 /// The most the counter can hold.
@@ -65,6 +66,8 @@ pub fn eventRead(e: *EventFd, nonblock: bool) Result {
     const taken = if (e.semaphore) 1 else e.value;
     e.value -= taken;
     _ = e.writers.wakeAll();
+    e.version +%= 1;
+    readiness.changed();
     return .{ .value = taken };
 }
 
@@ -79,6 +82,8 @@ pub fn eventWrite(e: *EventFd, n: u64, nonblock: bool) Result {
     }
     e.value += n;
     _ = e.readers.wakeAll();
+    e.version +%= 1;
+    readiness.changed();
     return .{ .value = n };
 }
 
@@ -89,11 +94,21 @@ pub fn eventState(e: *EventFd) struct { readable: bool, writable: bool } {
     return .{ .readable = e.value != 0, .writable = e.value < EVENTFD_MAX };
 }
 
+pub fn eventVersion(e: *EventFd) u64 {
+    const held = e.lock.acquire();
+    defer e.lock.release(held);
+    return e.version;
+}
+
 // ---------------------------------------------------------------------------
 // epoll
 
 pub const Interest = struct {
     fd: u32,
+    /// The open file watched (`open_file.id`).
+    file: u64,
+    /// For `EPOLLET`: the object's change count when it was last reported.
+    seen: u64 = std.math.maxInt(u64),
     /// The events asked for, and the flags (`EPOLLET`, `EPOLLONESHOT`).
     events: u32,
     /// Given back as it is with each event.
@@ -126,7 +141,7 @@ pub const MAX_WATCHED = 1024;
 pub const Op = enum { add, del, mod };
 
 /// `epoll_ctl`'s changes to the list.
-pub fn control(ep: *Epoll, op: Op, fd: u32, events: u32, data: u64) CtlError!void {
+pub fn control(ep: *Epoll, op: Op, fd: u32, file: u64, events: u32, data: u64) CtlError!void {
     // Room first, without the lock: allocation does not belong under it.
     if (op == .add) {
         const held = ep.lock.acquire();
@@ -155,11 +170,11 @@ pub fn control(ep: *Epoll, op: Op, fd: u32, events: u32, data: u64) CtlError!voi
         .add => {
             if (at != null) return error.Exists;
             if (ep.list.items.len == ep.list.capacity) return error.OutOfMemory; // taken by another thread meanwhile
-            ep.list.appendAssumeCapacity(.{ .fd = fd, .events = events, .data = data });
+            ep.list.appendAssumeCapacity(.{ .fd = fd, .file = file, .events = events, .data = data });
         },
         .mod => {
             const i = at orelse return error.NotFound;
-            ep.list.items[i] = .{ .fd = fd, .events = events, .data = data };
+            ep.list.items[i] = .{ .fd = fd, .file = file, .events = events, .data = data };
         },
         .del => {
             const i = at orelse return error.NotFound;
@@ -184,6 +199,28 @@ pub fn snapshot(ep: *Epoll, buf: []Interest) ?[]Interest {
         };
         _ = len;
         return null;
+    }
+}
+
+/// For `EPOLLET`: `fd` was reported with its object at change count `v`.
+pub fn setSeen(ep: *Epoll, fd: u32, v: u64) void {
+    const held = ep.lock.acquire();
+    defer ep.lock.release(held);
+    for (ep.list.items) |*w| {
+        if (w.fd == fd) w.seen = v;
+    }
+}
+
+/// End the watch of `fd` on `file`: the descriptor was closed, or is on
+/// another open file now.
+pub fn dropStale(ep: *Epoll, fd: u32, file: u64) void {
+    const held = ep.lock.acquire();
+    defer ep.lock.release(held);
+    for (ep.list.items, 0..) |w, i| {
+        if (w.fd == fd and w.file == file) {
+            _ = ep.list.swapRemove(i);
+            return;
+        }
     }
 }
 

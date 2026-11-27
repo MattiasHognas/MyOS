@@ -299,7 +299,8 @@ fn lifecycleStress() TestError!void {
     try expectChecks("lifecycle stress", helpers.lifecycleStress(40));
 }
 
-/// The random-number generator is seeded, balanced and does not repeat.
+/// The random-number generator is seeded, balanced, does not repeat, and
+/// takes in the timing of interrupts.
 fn randomNumbers() TestError!void {
     try expectChecks("random", helpers.randomChecks());
 }

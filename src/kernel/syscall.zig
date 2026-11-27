@@ -25,6 +25,7 @@ const percpu = @import("../arch/x86_64/percpu.zig");
 const kfutex = @import("futex.zig");
 const kpipe = @import("pipe.zig");
 const kclock = @import("clock.zig");
+const readiness = @import("readiness.zig");
 const kepoll = @import("epoll.zig");
 const open_file = @import("open_file.zig");
 const procfs = @import("procfs.zig");
@@ -991,6 +992,11 @@ const Named = union(enum) {
 /// are directories, and `exe` in the last two is a link to its program.
 fn named(path: []const u8) Named {
     if (procEntry(path)) |entry| return entry;
+    if (procfs.findSys(std.mem.trimEnd(u8, path, "/"))) |entry| return switch (entry) {
+        .none => .none,
+        .directory => .directory,
+        .file => |f| .{ .generated = .{ .file = f, .pid = 0 } },
+    };
     if (vfs.readLink(path) != null) return .symlink;
     if (std.mem.eql(u8, path, "/dev/null")) return .{ .device = .null_device };
     if (std.mem.eql(u8, path, "/dev/urandom") or std.mem.eql(u8, path, "/dev/random")) return .{ .device = .random_device };
@@ -1320,13 +1326,22 @@ const LIST_BASE = 16;
 fn extraEntries(dir: []const u8) []const ListEntry {
     const DIR = abi.DT.DIR;
     const REG = abi.DT.REG;
-    if (std.mem.eql(u8, dir, "/")) return &.{ .{ .name = "proc", .type = DIR }, .{ .name = "dev", .type = DIR } };
+    if (std.mem.eql(u8, dir, "/")) return &.{ .{ .name = "proc", .type = DIR }, .{ .name = "dev", .type = DIR }, .{ .name = "sys", .type = DIR } };
+    inline for (procfs.sys_dirs) |d| {
+        if (std.mem.eql(u8, dir, d[0])) return &.{.{ .name = d[1], .type = DIR }};
+    }
+    if (std.mem.eql(u8, dir, procfs.SYS_CPU_DIR)) return comptime blk: {
+        var list: [procfs.sys_cpu_files.len]ListEntry = undefined;
+        for (procfs.sys_cpu_files, 0..) |f, i| list[i] = .{ .name = f, .type = REG };
+        const final = list;
+        break :blk &final;
+    };
     if (std.mem.eql(u8, dir, "/dev")) return &.{
         .{ .name = "null", .type = abi.DT.CHR },
         .{ .name = "urandom", .type = abi.DT.CHR },
         .{ .name = "random", .type = abi.DT.CHR },
     };
-    if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG } };
+    if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG }, .{ .name = "cpuinfo", .type = REG } };
     if (named(dir) == .directory and std.mem.startsWith(u8, dir, "/proc/")) {
         const own = std.mem.eql(u8, dir, "/proc/self") or blk: {
             var id_buf: [24]u8 = undefined;
@@ -1638,9 +1653,9 @@ fn sysSigAltStack(new_ptr: u64, old_ptr: u64) u64 {
 fn sysPoll(fds: u64, count: u64, timeout_ms: u64) u64 {
     if (count > proc.MAX_FILES) return err(.INVAL);
     const timeout: i32 = @truncate(@as(i64, @bitCast(timeout_ms)));
-    // Ticks left to wait; null is for ever.
-    var left: ?u64 = if (timeout < 0) null else timer.msToTicks(@intCast(timeout));
+    const deadline: ?u64 = if (timeout < 0) null else deadlineAfter(timer.msToTicks(@intCast(timeout)));
     while (true) {
+        const seq = readiness.now(); // before looking: a change after it ends the wait
         var ready: u64 = 0;
         for (0..count) |i| {
             const at = fds + i * @sizeOf(abi.PollFd);
@@ -1656,13 +1671,12 @@ fn sysPoll(fds: u64, count: u64, timeout_ms: u64) u64 {
             if (!toUser(at, entry)) return err(.FAULT);
         }
         if (ready != 0) return ready;
-        // Nothing yet: look again a tick later. Descriptors have no way
-        // to wake a poller yet; that comes with `epoll`.
-        if (left) |l| {
-            if (l == 0) return 0;
-            left = l - 1;
+        // Nothing yet: until one of the objects reports a change.
+        switch (waitTill(seq, deadline)) {
+            .changed => {},
+            .timed_out => return 0,
+            .interrupted => return err(.INTR),
         }
-        if (!timer.sleepTicksKillable(1)) return err(.INTR);
     }
 }
 
@@ -1782,7 +1796,11 @@ fn sysEpollCtl(epfd: u64, op_code: u64, fd: u64, event_ptr: u64) u64 {
     };
     var event: abi.EpollEvent = .{ .events = 0, .data = 0 };
     if (op != .del) event = fromUser(abi.EpollEvent, event_ptr) orelse return err(.FAULT);
-    kepoll.control(ep_file.epoll, op, @intCast(fd), event.events, event.data) catch |e| return switch (e) {
+    // The open file the descriptor is on now is what is watched.
+    const watched = getFile(fd) orelse return err(.BADF);
+    const watched_id = open_file.id(watched);
+    putFile(watched);
+    kepoll.control(ep_file.epoll, op, @intCast(fd), watched_id, event.events, event.data) catch |e| return switch (e) {
         error.Exists => err(.EXIST),
         error.NotFound => err(.NOENT),
         error.TooMany => err(.NOSPC),
@@ -1818,32 +1836,74 @@ fn sysEpollWait(epfd: u64, events_ptr: u64, max: u64, timeout_ms: i64, sigmask_p
             t.signal_saved_mask = null;
         }
     };
-    var left: ?u64 = if (timeout_ms < 0) null else timer.msToTicks(@intCast(timeout_ms));
+    const deadline: ?u64 = if (timeout_ms < 0) null else deadlineAfter(timer.msToTicks(@intCast(timeout_ms)));
     var small: [16]kepoll.Interest = undefined;
-    const big = heap.allocator.alloc(kepoll.Interest, kepoll.MAX_WATCHED) catch return err(.NOMEM);
+    var big: []kepoll.Interest = &.{};
     defer heap.allocator.free(big);
     while (true) {
-        const watched = kepoll.snapshot(ep_file.epoll, &small) orelse kepoll.snapshot(ep_file.epoll, big).?;
+        const seq = readiness.now(); // before looking: a change after it ends the wait
+        const watched = kepoll.snapshot(ep_file.epoll, &small) orelse blk: {
+            if (big.len == 0) big = heap.allocator.alloc(kepoll.Interest, kepoll.MAX_WATCHED) catch return err(.NOMEM);
+            break :blk kepoll.snapshot(ep_file.epoll, big).?;
+        };
         var n: u64 = 0;
         for (watched) |w| {
             if (w.disabled or n == @as(u64, @intCast(max_events))) continue;
-            const of = getFile(w.fd) orelse continue; // closed: no events
+            const of = getFile(w.fd) orelse {
+                kepoll.dropStale(ep_file.epoll, w.fd, w.file); // closed: the watch ends
+                continue;
+            };
+            defer putFile(of);
+            if (open_file.id(of) != w.file) {
+                kepoll.dropStale(ep_file.epoll, w.fd, w.file); // another open file under the number now
+                continue;
+            }
             const asked: i16 = @truncate(@as(i32, @bitCast(w.events & (abi.EPOLL.IN | abi.EPOLL.OUT | abi.EPOLL.PRI))));
+            const version = objectVersion(of);
             const ready = pollState(of, asked);
-            putFile(of);
             if (ready == 0) continue;
+            if (w.events & abi.EPOLL.ET != 0) {
+                if (version == w.seen) continue; // reported, and nothing new since
+                kepoll.setSeen(ep_file.epoll, w.fd, version);
+            }
             const ev: abi.EpollEvent = .{ .events = @as(u32, @bitCast(@as(i32, ready))) & 0xFFFF, .data = w.data };
             if (!toUser(events_ptr + n * @sizeOf(abi.EpollEvent), ev)) return err(.FAULT);
             if (w.events & abi.EPOLL.ONESHOT != 0) kepoll.disable(ep_file.epoll, w.fd);
             n += 1;
         }
         if (n != 0) return n;
-        if (left) |l| {
-            if (l == 0) return 0;
-            left = l - 1;
+        switch (waitTill(seq, deadline)) {
+            .changed => {},
+            .timed_out => return 0,
+            .interrupted => return err(.INTR),
         }
-        if (!timer.sleepTicksKillable(1)) return err(.INTR);
     }
+}
+
+/// The tick by which `ticks` whole ticks have passed: one more than that
+/// from now, since the current tick has partly gone already (as
+/// `timer.sleepTicks`). 0 ticks is no wait at all.
+fn deadlineAfter(ticks: u64) u64 {
+    return timer.now() + if (ticks == 0) 0 else ticks + 1;
+}
+
+/// Wait for a change any poller might care about, until the tick
+/// `deadline` (null: for ever).
+fn waitTill(seq: u64, deadline: ?u64) readiness.Outcome {
+    const ticks: ?u64 = if (deadline) |d| d -| timer.now() else null;
+    if (ticks != null and ticks.? == 0) return .timed_out;
+    return readiness.waitForChange(seq, ticks);
+}
+
+/// How many times the object behind `of` has changed (pipe, terminal,
+/// eventfd), for edge-triggered `epoll`; 0 for what never changes.
+fn objectVersion(of: *OpenFile) u64 {
+    return switch (of.kind) {
+        .pipe_read, .pipe_write => kpipe.version(of.pipe),
+        .console => tty.changeCount(),
+        .eventfd => kepoll.eventVersion(of.eventfd),
+        else => 0,
+    };
 }
 
 const NS_PER_SEC: u64 = 1_000_000_000;

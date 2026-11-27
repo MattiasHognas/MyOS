@@ -21,6 +21,9 @@ pub const Rank = enum(u8) {
     /// A condition some thread waits for, with the wait queue for it: the
     /// keyboard buffer, a mutex's owner. The default.
     condition,
+    /// The pollers' wait queue (`readiness.zig`), which objects tell of
+    /// changes holding their own condition lock.
+    readiness,
     /// The timer queue and the tick count.
     timer,
     /// The ready queue and every thread's scheduling state.
@@ -48,7 +51,7 @@ pub const Stack = extern struct {
     len: u32 = 0,
 
     /// More than the deepest nesting the lock order allows for.
-    pub const capacity = 12;
+    pub const capacity = 16;
 
     pub const PushError = error{
         /// The lock's rank is not higher than that of the innermost lock held.

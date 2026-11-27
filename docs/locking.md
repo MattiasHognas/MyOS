@@ -53,6 +53,7 @@ belongs to this CPU.
 | A process's address-space lock | `address_space` | Its regions, its `brk` heap and its user page tables | `user_memory.zig` |
 | A process's descriptor-table lock | `descriptor_table` | Its open files and their reference counts | `syscall.zig` |
 | A condition's lock | `condition` | A condition some thread waits for, together with the wait queue for it: the keyboard's modifier state, a mutex's owner and its waiters, every futex and its waiters (one lock for all of them), a pipe's buffer with its readers and writers (one lock per pipe), the terminal's input with its readers | `ps2_keyboard.zig`, `sync/mutex.zig`, `futex.zig`, `pipe.zig`, `tty.zig` |
+| The pollers' lock | `readiness` | The threads asleep in `poll` and `epoll_wait`, woken when a pipe, the terminal or an eventfd reports a change; taken by those objects holding their own condition lock | `readiness.zig` |
 | Timer lock | `timer` | The timer queue and the tick count | `timer.zig` |
 | Scheduler lock (one, global, to begin with) | `scheduler` | The ready queue, every thread's `state`, `link`, `on_cpu` and wake-up permit, the zombie list | `thread.zig` |
 | Heap lock | `kernel_region` | The kernel heap, and the page tables of the heap's region | `heap.zig` |
@@ -88,14 +89,15 @@ above it.
 1. Process-tree lock
 2. A process's address-space lock, then its descriptor-table lock
 3. A condition's lock (including a mutex's internal lock)
-4. Timer lock
-5. Scheduler lock
-6. A CPU's heap-cache lock (never two of them)
-7. Heap lock, kernel-stack lock or device-window lock (never two of them)
-8. A CPU's page-cache lock (never two of them)
-9. Page-allocator lock
-10. Random-generator lock
-11. Console lock
+4. The pollers' lock (`readiness.zig`)
+5. Timer lock
+6. Scheduler lock
+7. A CPU's heap-cache lock (never two of them)
+8. Heap lock, kernel-stack lock or device-window lock (never two of them)
+9. A CPU's page-cache lock (never two of them)
+10. Page-allocator lock
+11. Random-generator lock
+12. Console lock
 
 Two locks of the same rank are never held together either: not two
 conditions' locks, not two regions' locks.
