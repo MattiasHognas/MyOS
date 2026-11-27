@@ -780,7 +780,7 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
             if (what == .generated) {
                 if (access != abi.O.RDONLY) return err(.ROFS);
                 const g = what.generated;
-                const text = if (g.pid == 0 or g.pid == p.pid) procfs.generate(g.file, p) catch return err(.NOMEM) else blk: {
+                const text = if (g.pid == 0 or g.pid == p.pid) procfs.generateArg(g.file, p, g.arg) catch return err(.NOMEM) else blk: {
                     const other = proc.findRetained(g.pid) orelse return err(.NOENT);
                     defer proc.release(other);
                     break :blk procfs.generate(g.file, other) catch return err(.NOMEM);
@@ -1005,7 +1005,7 @@ const Named = union(enum) {
     symlink,
     /// A text file made when it is opened (`procfs.zig`), about the
     /// process with the ID `pid` (0: none, the machine).
-    generated: struct { file: procfs.File, pid: u64 },
+    generated: struct { file: procfs.File, pid: u64, arg: u8 = 0 },
     /// `/dev/null`, `/dev/urandom`, `/dev/random`.
     device: open_file.Kind,
 };
@@ -1019,7 +1019,7 @@ fn named(path: []const u8) Named {
     if (procfs.findSys(std.mem.trimEnd(u8, path, "/"))) |entry| return switch (entry) {
         .none => .none,
         .directory => .directory,
-        .file => |f| .{ .generated = .{ .file = f, .pid = 0 } },
+        .file => |f| .{ .generated = .{ .file = f.file, .pid = 0, .arg = f.arg } },
     };
     if (vfs.readLink(path) != null) return .symlink;
     if (std.mem.eql(u8, path, "/dev/null")) return .{ .device = .null_device };

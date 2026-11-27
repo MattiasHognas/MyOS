@@ -180,3 +180,43 @@ pub fn rangeList(buf: []u8, n: usize) []const u8 {
     if (n <= 1) return std.fmt.bufPrint(buf, "0\n", .{}) catch unreachable;
     return std.fmt.bufPrint(buf, "0-{d}\n", .{n - 1}) catch unreachable;
 }
+
+/// One cache, as `cpuid` leaf 4 (Intel) or 0x8000001D (AMD) describes it:
+/// both have this layout.
+pub const Cache = struct {
+    level: u32,
+    kind: enum { data, instruction, unified },
+    size: u64,
+    line: u32,
+    ways: u32,
+    sets: u32,
+};
+
+/// The cache a subleaf of those leaves describes; null for the subleaf
+/// that ends the list (type 0) or one of an unknown type.
+pub fn cacheFromLeaf(l: Leaf) ?Cache {
+    const kind: @FieldType(Cache, "kind") = switch (l.eax & 0x1F) {
+        1 => .data,
+        2 => .instruction,
+        3 => .unified,
+        else => return null,
+    };
+    const line = (l.ebx & 0xFFF) + 1;
+    const partitions = ((l.ebx >> 12) & 0x3FF) + 1;
+    const ways = ((l.ebx >> 22) & 0x3FF) + 1;
+    const sets = l.ecx + 1;
+    return .{
+        .level = (l.eax >> 5) & 0x7,
+        .kind = kind,
+        .size = @as(u64, line) * partitions * ways * sets,
+        .line = line,
+        .ways = ways,
+        .sets = sets,
+    };
+}
+
+/// A size as Linux's `/sys/devices/system/cpu/cpu0/cache/index*/size` has
+/// it: in kibibytes, "32K".
+pub fn cacheSizeText(buf: []u8, size: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}K\n", .{size / 1024}) catch unreachable;
+}

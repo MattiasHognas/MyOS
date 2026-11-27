@@ -353,8 +353,20 @@ pub fn main() noreturn {
     expect(std.mem.eql(u8, online, want_online), 142);
     expect(kind("/sys") == S.IFDIR and kind("/sys/devices/system/cpu") == S.IFDIR and kind("/sys/devices/system/cpu/possible") == S.IFREG and kind("/sys/devices/system/cpu/nothing") == 0 and kind("/sys/nothing") == 0, 143);
     expect(openFlags("/sys/devices/system/cpu/online", abi.O.WRONLY) == lib.err(.ROFS), 144);
+    // The caches, from cpuid, as the .NET collector reads them: each index
+    // a level and a size in kibibytes (empty where the CPU does not say,
+    // as QEMU's emulated CPUs may not).
+    const level = std.mem.trimEnd(u8, slurp("/sys/devices/system/cpu/cpu0/cache/index0/level"), "\n");
+    if (level.len != 0) {
+        expect(level[0] >= '1' and level[0] <= '3', 36);
+        const size = std.mem.trimEnd(u8, slurp("/sys/devices/system/cpu/cpu0/cache/index0/size"), "\n");
+        expect(size.len > 1 and size[size.len - 1] == 'K' and (std.fmt.parseInt(u64, size[0 .. size.len - 1], 10) catch 0) > 0, 37);
+    }
+    const cache_dir = lib.open("/sys/devices/system/cpu/cpu0/cache/index1");
+    expect(std.mem.eql(u8, listing(cache_dir), ". .. level size type coherency_line_size ways_of_associativity number_of_sets"), 38);
+    _ = lib.close(cache_dir);
     const cpu_dir = lib.open("/sys/devices/system/cpu");
-    expect(std.mem.eql(u8, listing(cpu_dir), ". .. online possible present"), 145);
+    expect(std.mem.eql(u8, listing(cpu_dir), ". .. online possible present cpu0"), 145);
     _ = lib.close(cpu_dir);
     // The control-group files, which say what this process may use: the
     // memory limit is its RLIMIT_DATA.

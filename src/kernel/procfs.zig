@@ -67,6 +67,9 @@ pub const File = enum {
     cg_memory_stat,
     cg_cpu_max,
     cg_cpuset,
+    /// A file of `/sys/devices/system/cpu/cpu0/cache/index<N>`; the
+    /// argument says which index and which file (`cacheText`).
+    cpu_cache,
 };
 
 /// The generated file `name` names below `/proc/self` (or `/proc/<pid>`),
@@ -84,7 +87,30 @@ pub fn find(name: []const u8, per_process: bool) ?File {
 
 /// Everything there is below `/sys`: directories, and the generated
 /// files in them. A directory lists the entries whose parent it is.
-pub const SysEntry = struct { path: []const u8, file: ?File = null };
+pub const SysEntry = struct { path: []const u8, file: ?File = null, arg: u8 = 0 };
+
+/// The caches listed under `/sys/devices/system/cpu/cpu0/cache`, at most,
+/// and the files of each, in that order: what the .NET collector sizes its
+/// youngest generation by (`size`, `level`).
+const CACHE_INDEXES = 4;
+const cache_files = [_][]const u8{ "level", "size", "type", "coherency_line_size", "ways_of_associativity", "number_of_sets" };
+
+fn cacheEntries() [2 + CACHE_INDEXES * (1 + cache_files.len)]SysEntry {
+    var list: [2 + CACHE_INDEXES * (1 + cache_files.len)]SysEntry = undefined;
+    list[0] = .{ .path = "/sys/devices/system/cpu/cpu0" };
+    list[1] = .{ .path = "/sys/devices/system/cpu/cpu0/cache" };
+    var n = 2;
+    for (0..CACHE_INDEXES) |i| {
+        const dir = std.fmt.comptimePrint("/sys/devices/system/cpu/cpu0/cache/index{d}", .{i});
+        list[n] = .{ .path = dir };
+        n += 1;
+        for (cache_files, 0..) |f, k| {
+            list[n] = .{ .path = dir ++ "/" ++ f, .file = .cpu_cache, .arg = @intCast(i * 16 + k) };
+            n += 1;
+        }
+    }
+    return list;
+}
 pub const sys_tree = [_]SysEntry{
     .{ .path = "/sys" },
     .{ .path = "/sys/devices" },
@@ -93,6 +119,7 @@ pub const sys_tree = [_]SysEntry{
     .{ .path = "/sys/devices/system/cpu/online", .file = .cpus_online },
     .{ .path = "/sys/devices/system/cpu/possible", .file = .cpus_online },
     .{ .path = "/sys/devices/system/cpu/present", .file = .cpus_online },
+} ++ cacheEntries() ++ [_]SysEntry{
     .{ .path = "/sys/fs" },
     .{ .path = "/sys/fs/cgroup" },
     .{ .path = "/sys/fs/cgroup/cgroup.controllers", .file = .cg_controllers },
@@ -105,11 +132,11 @@ pub const sys_tree = [_]SysEntry{
 
 /// What the absolute `path` names below `/sys`: a directory, one of the
 /// generated files, or nothing (null) if it is not below `/sys` at all.
-pub fn findSys(path: []const u8) ?union(enum) { none, directory, file: File } {
+pub fn findSys(path: []const u8) ?union(enum) { none, directory, file: struct { file: File, arg: u8 } } {
     if (!std.mem.eql(u8, path, "/sys") and !std.mem.startsWith(u8, path, "/sys/")) return null;
     for (sys_tree) |e| {
         if (!std.mem.eql(u8, path, e.path)) continue;
-        return if (e.file) |f| .{ .file = f } else .directory;
+        return if (e.file) |f| .{ .file = .{ .file = f, .arg = e.arg } } else .directory;
     }
     return .none;
 }
@@ -132,7 +159,13 @@ pub fn fsMagic(path: []const u8) i64 {
 /// The text of `file` for the process `p`, in memory the caller frees with
 /// `heap.allocator`.
 pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
+    return generateArg(file, p, 0);
+}
+
+/// `generate` for a file that takes an argument (`SysEntry.arg`).
+pub fn generateArg(file: File, p: *proc.Process, arg: u8) error{OutOfMemory}![]u8 {
     switch (file) {
+        .cpu_cache => return cacheText(arg),
         .maps => return user_memory.describe(p),
         .stat => {
             // pid (comm) state ppid pgrp session tty tpgid flags, four
@@ -237,6 +270,35 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
             , .{ total, free, free, @import("../arch/x86_64/vmm.zig").huge_mapped.load(.monotonic) * 2048 });
         },
     }
+}
+
+/// A file of a cache's directory (`arg`: its index times 16 plus the
+/// file's place in `cache_files`), from `cpuid`'s cache leaf: 4 on Intel,
+/// 0x8000001D on AMD, which have one layout. An index past the caches
+/// there are reads as empty.
+fn cacheText(arg: u8) error{OutOfMemory}![]u8 {
+    const index: u32 = arg / 16;
+    const which = arg % 16;
+    const vendor_amd = cpu.cpuid(0, 0).ecx == 0x444d4163; // "AuthenticAMD": ..."cAMD"
+    const leaf: u32 = if (vendor_amd) 0x8000_001D else 4;
+    const top = if (vendor_amd) cpu.cpuid(0x8000_0000, 0).eax else cpu.cpuid(0, 0).eax;
+    if (top < leaf) return heap.allocator.dupe(u8, "");
+    const r = cpu.cpuid(leaf, index);
+    const c = cpuinfo.cacheFromLeaf(.{ .eax = r.eax, .ebx = r.ebx, .ecx = r.ecx, .edx = r.edx }) orelse return heap.allocator.dupe(u8, "");
+    var buf: [32]u8 = undefined;
+    const text: []const u8 = switch (which) {
+        0 => std.fmt.bufPrint(&buf, "{d}\n", .{c.level}) catch unreachable,
+        1 => cpuinfo.cacheSizeText(&buf, c.size),
+        2 => switch (c.kind) {
+            .data => "Data\n",
+            .instruction => "Instruction\n",
+            .unified => "Unified\n",
+        },
+        3 => std.fmt.bufPrint(&buf, "{d}\n", .{c.line}) catch unreachable,
+        4 => std.fmt.bufPrint(&buf, "{d}\n", .{c.ways}) catch unreachable,
+        else => std.fmt.bufPrint(&buf, "{d}\n", .{c.sets}) catch unreachable,
+    };
+    return heap.allocator.dupe(u8, text);
 }
 
 /// The name `stat` and `comm` give: the program file's name, at most 15

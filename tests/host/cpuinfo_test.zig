@@ -67,3 +67,18 @@ test "the CPU lists of /sys/devices/system/cpu" {
     try std.testing.expectEqualStrings("0\n", cpuinfo.rangeList(&buf, 1));
     try std.testing.expectEqualStrings("0-3\n", cpuinfo.rangeList(&buf, 4));
 }
+
+test "a cache from cpuid's cache leaf, and its size as /sys says it" {
+    // A 32 KiB data cache of level 1: 64-byte lines, 8 ways, 64 sets.
+    const l1d = cpuinfo.cacheFromLeaf(.{ .eax = 0x21, .ebx = (7 << 22) | 63, .ecx = 63 }).?;
+    try std.testing.expectEqual(@as(u32, 1), l1d.level);
+    try std.testing.expectEqual(.data, l1d.kind);
+    try std.testing.expectEqual(@as(u64, 32 * 1024), l1d.size);
+    // A 32 MiB unified level 3: 64-byte lines, 16 ways, 32768 sets.
+    const l3 = cpuinfo.cacheFromLeaf(.{ .eax = 0x63, .ebx = (15 << 22) | 63, .ecx = 32767 }).?;
+    try std.testing.expectEqual(@as(u32, 3), l3.level);
+    try std.testing.expectEqual(.unified, l3.kind);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("32768K\n", cpuinfo.cacheSizeText(&buf, l3.size));
+    try std.testing.expectEqual(@as(?cpuinfo.Cache, null), cpuinfo.cacheFromLeaf(.{ .eax = 0 }));
+}

@@ -250,8 +250,10 @@ Every other number returns `ENOSYS`.
   itself and the machine as files, in Linux's format: `/proc/self/exe` (a
   link to its program), `/proc/self/maps` (its mappings; a C library finds
   the main thread's stack there), `/proc/self/stat`, `/proc/meminfo`,
-  `/proc/cpuinfo`, `/proc/self/mountinfo`, `/proc/self/cgroup`, and
-  `/sys/devices/system/cpu/online` (`possible`, `present`: "0-3"); `self`
+  `/proc/cpuinfo`, `/proc/self/mountinfo`, `/proc/self/cgroup`,
+  `/sys/devices/system/cpu/online` (`possible`, `present`: "0-3"), and
+  the caches in `/sys/devices/system/cpu/cpu0/cache/index*` (`level`,
+  `size`, `type`, ...: what the .NET collector sizes itself by); `self`
   may be its own process ID, and every process has a directory by its ID
   (`stat`, `cmdline`, `comm`). There are no control groups, but
   `/sys/fs/cgroup` is laid out as the root of a cgroup v2 hierarchy whose
