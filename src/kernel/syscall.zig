@@ -285,10 +285,7 @@ fn startChild(ptr: u64, argv: u64, envp: u64) union(enum) { child: *proc.Process
 /// later part of the buffer cannot be read, or `EFAULT` if none of it can.
 /// Whether the descriptor behind `of` is non-blocking.
 fn nonblocking(of: *OpenFile) bool {
-    const p = thread.current().process.?;
-    const held = p.files_lock.acquire();
-    defer p.files_lock.release(held);
-    return of.nonblock;
+    return open_file.isNonblocking(of);
 }
 
 /// `read` from a pipe: what is there, up to `len` bytes, waiting only
@@ -355,12 +352,13 @@ fn sysPipe(fds_ptr: u64, flags: u64) u64 {
     // From here the open files own the pipe: destroying both frees it.
     r.* = .{ .kind = .pipe_read, .pipe = pp, .nonblock = nonblock };
     w.* = .{ .kind = .pipe_write, .pipe = pp, .nonblock = nonblock };
-    const rfd = installFile(p, r, 0) orelse {
+    const cloexec = flags & abi.O.CLOEXEC != 0;
+    const rfd = installFileFlags(p, r, 0, cloexec) orelse {
         open_file.destroy(r);
         open_file.destroy(w);
         return err(.MFILE);
     };
-    const wfd = installFile(p, w, 0) orelse {
+    const wfd = installFileFlags(p, w, 0, cloexec) orelse {
         _ = sysClose(rfd);
         open_file.destroy(w);
         return err(.MFILE);
@@ -728,20 +726,13 @@ fn getFile(fd: u64) ?*OpenFile {
     defer p.files_lock.release(held);
     if (fd >= p.files.len) return null;
     const of = p.files[nospec.index(fd, p.files.len)] orelse return null;
-    of.refs += 1;
+    open_file.retain(of);
     return of;
 }
 
 /// Give back a reference from `getFile`; the file is freed with its last one.
 fn putFile(of: *OpenFile) void {
-    const p = thread.current().process.?;
-    const last = blk: {
-        const held = p.files_lock.acquire();
-        defer p.files_lock.release(held);
-        of.refs -= 1;
-        break :blk of.refs == 0;
-    };
-    if (last) open_file.destroy(of);
+    open_file.unref(of);
 }
 
 /// True if `fd` is an open file.
@@ -833,7 +824,7 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
         return err(.NOMEM);
     };
     of.* = opened;
-    return installFile(p, of, 0) orelse {
+    return installFileFlags(p, of, 0, flags & abi.O.CLOEXEC != 0) orelse {
         open_file.destroy(of);
         return err(.MFILE);
     };
@@ -843,6 +834,11 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
 /// and within the process's limit, and return it; null if there is none.
 /// The reference the caller holds becomes the descriptor's.
 fn installFile(p: *proc.Process, of: *OpenFile, from: usize) ?usize {
+    return installFileFlags(p, of, from, false);
+}
+
+/// `installFile`, with the descriptor closed by `execve` if `cloexec`.
+fn installFileFlags(p: *proc.Process, of: *OpenFile, from: usize, cloexec: bool) ?usize {
     const limit = @min(proc.MAX_FILES, p.limits.max_files);
     while (true) {
         const len = blk: {
@@ -852,6 +848,7 @@ fn installFile(p: *proc.Process, of: *OpenFile, from: usize) ?usize {
             while (fd < @min(p.files.len, limit)) : (fd += 1) {
                 if (p.files[fd] != null) continue;
                 p.files[fd] = of;
+                p.fd_cloexec[fd] = cloexec;
                 return fd;
             }
             break :blk p.files.len;
@@ -866,12 +863,12 @@ fn installFile(p: *proc.Process, of: *OpenFile, from: usize) ?usize {
 /// `dup` and `fcntl(F_DUPFD)`: a second descriptor for what `fd` refers
 /// to, the lowest free one that is at least `from`. Both share the file
 /// and its offset. `EBADF`, `EINVAL` (no such descriptor number), `EMFILE`.
-fn sysDup(fd: u64, from: u64) u64 {
+fn sysDup(fd: u64, from: u64, cloexec: bool) u64 {
     const p = thread.current().process orelse return err(.BADF);
     if (from >= @min(proc.MAX_FILES, p.limits.max_files)) return err(.INVAL);
     const of = getFile(fd) orelse return err(.BADF);
     // The reference from `getFile` becomes the new descriptor's.
-    return installFile(p, of, @intCast(from)) orelse {
+    return installFileFlags(p, of, @intCast(from), cloexec) orelse {
         putFile(of);
         return err(.MFILE);
     };
@@ -880,7 +877,7 @@ fn sysDup(fd: u64, from: u64) u64 {
 /// `dup2` and `dup3`: make `new` refer to what `old` does, closing what
 /// `new` referred to. With `same_is_error`, `old == new` is `EINVAL`
 /// (`dup3`); otherwise it does nothing and returns `new` (`dup2`).
-fn sysDup2(old: u64, new: u64, same_is_error: bool) u64 {
+fn sysDup2(old: u64, new: u64, same_is_error: bool, cloexec: bool) u64 {
     const p = thread.current().process orelse return err(.BADF);
     const of = getFile(old) orelse return err(.BADF);
     if (new >= @min(proc.MAX_FILES, p.limits.max_files)) {
@@ -899,9 +896,10 @@ fn sysDup2(old: u64, new: u64, same_is_error: bool) u64 {
     const replaced = blk: {
         const held = p.files_lock.acquire();
         defer p.files_lock.release(held);
-        const slot = &p.files[nospec.index(new, p.files.len)];
-        const before = slot.*;
-        slot.* = of; // with the reference from `getFile`
+        const at = nospec.index(new, p.files.len);
+        const before = p.files[at];
+        p.files[at] = of; // with the reference from `getFile`
+        p.fd_cloexec[at] = cloexec;
         break :blk before;
     };
     if (replaced) |r| putFile(r);
@@ -1435,10 +1433,16 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
     defer putFile(of);
     const p = thread.current().process.?;
     switch (command) {
-        // F_DUPFD and F_DUPFD_CLOEXEC. Nothing is closed on exec yet:
-        // there is no exec.
-        0, 1030 => return sysDup(fd, arg),
-        1, 2 => return 0, // F_GETFD, F_SETFD
+        0, 1030 => return sysDup(fd, arg, command == 1030), // F_DUPFD, F_DUPFD_CLOEXEC
+        1, 2 => { // F_GETFD, F_SETFD: FD_CLOEXEC, the only descriptor flag
+            const held = p.files_lock.acquire();
+            defer p.files_lock.release(held);
+            if (fd >= p.files.len or p.files[nospec.index(fd, p.files.len)] != of) return err(.BADF); // closed meanwhile
+            const at = nospec.index(fd, p.files.len);
+            if (command == 1) return @intFromBool(p.fd_cloexec[at]);
+            p.fd_cloexec[at] = arg & 1 != 0;
+            return 0;
+        },
         3 => { // F_GETFL
             const access: u64 = switch (of.kind) {
                 .console, .null_device, .random_device, .eventfd => abi.O.RDWR,
@@ -1452,9 +1456,7 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
             return access | if (nonblocking(of)) @as(u64, abi.O.NONBLOCK) else 0;
         },
         4 => { // F_SETFL: only O_NONBLOCK can change
-            const held = p.files_lock.acquire();
-            defer p.files_lock.release(held);
-            of.nonblock = arg & abi.O.NONBLOCK != 0;
+            open_file.setNonblocking(of, arg & abi.O.NONBLOCK != 0);
             return 0;
         },
         else => return err(.INVAL),
@@ -1642,7 +1644,7 @@ fn pollState(of: *OpenFile, events: i16) i16 {
 }
 
 /// `eventfd` and `eventfd2`: a new counter, starting at `initial`.
-/// `EFD_SEMAPHORE`, `EFD_NONBLOCK`, `EFD_CLOEXEC` (accepted: no exec yet).
+/// `EFD_SEMAPHORE`, `EFD_NONBLOCK`, `EFD_CLOEXEC`.
 fn sysEventFd(initial: u64, flags: u64) u64 {
     if (flags & ~@as(u64, abi.EFD.SEMAPHORE | abi.EFD.NONBLOCK | abi.EFD.CLOEXEC) != 0) return err(.INVAL);
     const p = thread.current().process orelse return err(.BADF);
@@ -1652,7 +1654,7 @@ fn sysEventFd(initial: u64, flags: u64) u64 {
         return err(.NOMEM);
     };
     of.* = .{ .kind = .eventfd, .eventfd = e, .readable = true, .writable = true, .nonblock = flags & abi.EFD.NONBLOCK != 0 };
-    return installFile(p, of, 0) orelse {
+    return installFileFlags(p, of, 0, flags & abi.EFD.CLOEXEC != 0) orelse {
         open_file.destroy(of);
         return err(.MFILE);
     };
@@ -1692,7 +1694,7 @@ fn sysEpollCreate(flags: u64) u64 {
         return err(.NOMEM);
     };
     of.* = .{ .kind = .epoll, .epoll = ep };
-    return installFile(p, of, 0) orelse {
+    return installFileFlags(p, of, 0, flags & abi.EPOLL.CLOEXEC != 0) orelse {
         open_file.destroy(of);
         return err(.MFILE);
     };
@@ -2321,9 +2323,9 @@ fn dispatchCall(f: *arch.Frame) void {
         },
         Sys.pipe => sysPipe(f.rdi, 0),
         Sys.pipe2 => sysPipe(f.rdi, f.rsi),
-        Sys.dup => sysDup(f.rdi, 0),
-        Sys.dup2 => sysDup2(f.rdi, f.rsi, false),
-        Sys.dup3 => sysDup2(f.rdi, f.rsi, true),
+        Sys.dup => sysDup(f.rdi, 0, false),
+        Sys.dup2 => sysDup2(f.rdi, f.rsi, false, false),
+        Sys.dup3 => if (f.rdx & ~@as(u64, abi.O.CLOEXEC) != 0) err(.INVAL) else sysDup2(f.rdi, f.rsi, true, f.rdx & abi.O.CLOEXEC != 0),
         Sys.nanosleep => sysSleep(abi.CLOCK.MONOTONIC, false, f.rdi),
         Sys.clock_nanosleep => sysSleep(f.rdi, f.rsi & 1 != 0, f.rdx),
         Sys.clock_gettime => sysClockGetTime(f.rdi, f.rsi),

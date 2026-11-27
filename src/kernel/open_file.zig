@@ -37,11 +37,14 @@ pub const OpenFile = struct {
     /// The pipe, for the two pipe kinds.
     pipe: *pipe.Pipe = undefined,
     /// `O_NONBLOCK`: reads and writes that would wait fail with `EAGAIN`.
-    /// Under the process's `files_lock`, like `refs`.
+    /// Read and written atomically: descriptors of several processes may
+    /// share the open file (after `fork`).
     nonblock: bool = false,
-    /// The descriptor's reference, and one for every system call that is
-    /// using the file right now: another thread may close the descriptor
-    /// meanwhile. Under the process's `files_lock`.
+    /// A reference for each descriptor, of any process, and one for every
+    /// system call that is using the file right now: another thread may
+    /// close the descriptor meanwhile. Changed atomically (`retain`,
+    /// `unref`), since processes that share the file have locks of their
+    /// own.
     refs: u32 = 1,
 };
 
@@ -106,4 +109,22 @@ pub fn freeContents(of: *OpenFile) void {
     if (of.path.len != 0) heap.allocator.free(of.path);
     of.generated = null;
     of.path = &.{};
+}
+
+/// Take another reference to `of`; the caller holds one already.
+pub fn retain(of: *OpenFile) void {
+    _ = @atomicRmw(u32, &of.refs, .Add, 1, .monotonic);
+}
+
+/// Give up a reference to `of`; frees it with the last one.
+pub fn unref(of: *OpenFile) void {
+    if (@atomicRmw(u32, &of.refs, .Sub, 1, .acq_rel) == 1) destroy(of);
+}
+
+pub fn isNonblocking(of: *const OpenFile) bool {
+    return @atomicLoad(bool, &of.nonblock, .monotonic);
+}
+
+pub fn setNonblocking(of: *OpenFile, on: bool) void {
+    @atomicStore(bool, &of.nonblock, on, .monotonic);
 }

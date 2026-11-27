@@ -400,5 +400,25 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.getsid, 0, 0, 0) == pid and lib.syscall(Sys.getsid, pid, 0, 0) == pid, 106);
     expect(lib.syscall(Sys.getsid, 0x7FFF_FFF0, 0, 0) == lib.err(.SRCH), 107);
 
+    // FD_CLOEXEC: a flag of the descriptor, not of the open file.
+    const F_GETFD = 1;
+    const F_SETFD = 2;
+    const ce = lib.syscall6(Sys.openat, @bitCast(@as(i64, abi.AT_FDCWD)), @intFromPtr("/etc/motd"), abi.O.RDONLY | abi.O.CLOEXEC, 0, 0, 0);
+    expect(!lib.isError(ce) and lib.syscall(Sys.fcntl, ce, F_GETFD, 0) == 1, 200);
+    const plain = lib.syscall(Sys.dup, ce, 0, 0); // dup leaves it off
+    expect(lib.syscall(Sys.fcntl, plain, F_GETFD, 0) == 0, 201);
+    expect(lib.syscall(Sys.fcntl, plain, F_SETFD, 1) == 0 and lib.syscall(Sys.fcntl, plain, F_GETFD, 0) == 1, 202);
+    expect(lib.syscall(Sys.fcntl, ce, F_SETFD, 0) == 0 and lib.syscall(Sys.fcntl, ce, F_GETFD, 0) == 0, 203);
+    const dup_ce = lib.syscall(Sys.fcntl, ce, 1030, 0); // F_DUPFD_CLOEXEC
+    expect(lib.syscall(Sys.fcntl, dup_ce, F_GETFD, 0) == 1, 204);
+    expect(lib.syscall(Sys.dup3, ce, 60, abi.O.CLOEXEC) == 60 and lib.syscall(Sys.fcntl, 60, F_GETFD, 0) == 1, 205);
+    expect(lib.syscall(Sys.dup2, ce, 60, 0) == 60 and lib.syscall(Sys.fcntl, 60, F_GETFD, 0) == 0, 206); // dup2 replaces it, flag off
+    expect(lib.syscall(Sys.dup3, ce, 61, 0) == 61 and lib.syscall(Sys.fcntl, 61, F_GETFD, 0) == 0, 207);
+    expect(lib.syscall(Sys.dup3, ce, 62, 0x40) == lib.err(.INVAL), 208);
+    var pfd: [2]i32 = undefined;
+    expect(lib.syscall(Sys.pipe2, @intFromPtr(&pfd), abi.O.CLOEXEC, 0) == 0, 209);
+    expect(lib.syscall(Sys.fcntl, @intCast(pfd[0]), F_GETFD, 0) == 1 and lib.syscall(Sys.fcntl, @intCast(pfd[1]), F_GETFD, 0) == 1, 210);
+    for ([_]u64{ ce, plain, dup_ce, 60, 61, @intCast(pfd[0]), @intCast(pfd[1]) }) |fd| expect(lib.close(fd) == 0, 211);
+
     lib.exit(0);
 }

@@ -193,6 +193,9 @@ pub const Process = struct {
     /// The table is replaced by a longer one when it has to grow, so its
     /// address and length are read under `files_lock` too.
     files: []?*open_file.OpenFile = &.{},
+    /// `FD_CLOEXEC` of each descriptor: closed by `execve`. As long as
+    /// `files`, and replaced with it.
+    fd_cloexec: []bool = &.{},
     /// What this process may use.
     limits: Limits = .{},
     /// Pages of physical memory the process takes (see `Limits.max_pages`).
@@ -730,14 +733,13 @@ var live: usize = 0;
 /// else uses them: the caller is the process's last thread.
 fn closeFiles(p: *Process) void {
     for (p.files) |*slot| {
-        if (slot.*) |of| {
-            of.refs -= 1;
-            if (of.refs == 0) open_file.destroy(of);
-        }
+        if (slot.*) |of| open_file.unref(of);
         slot.* = null;
     }
     heap.allocator.free(p.files);
     p.files = &.{};
+    heap.allocator.free(p.fd_cloexec);
+    p.fd_cloexec = &.{};
     heap.allocator.free(p.cwd);
     p.cwd = &.{};
 }
@@ -752,17 +754,25 @@ pub fn growFiles(p: *Process, slots: usize) bool {
     var want: usize = FILES_INITIAL;
     while (want < slots) want *= 2;
     const new = heap.allocator.alloc(?*open_file.OpenFile, want) catch return false;
-    const old = blk: {
+    const new_flags = heap.allocator.alloc(bool, want) catch {
+        heap.allocator.free(new);
+        return false;
+    };
+    const old, const old_flags = blk: {
         const held = p.files_lock.acquire();
         defer p.files_lock.release(held);
-        if (p.files.len >= want) break :blk new; // not needed after all
+        if (p.files.len >= want) break :blk .{ new, new_flags }; // not needed after all
         @memcpy(new[0..p.files.len], p.files);
         @memset(new[p.files.len..], null);
-        const before = p.files;
+        @memcpy(new_flags[0..p.files.len], p.fd_cloexec);
+        @memset(new_flags[p.files.len..], false);
+        const before = .{ p.files, p.fd_cloexec };
         p.files = new;
+        p.fd_cloexec = new_flags;
         break :blk before;
     };
     heap.allocator.free(old);
+    heap.allocator.free(old_flags);
     return true;
 }
 
@@ -974,6 +984,9 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     console.* = .{ .kind = .console, .refs = 3 };
     const files = try heap.allocator.alloc(?*open_file.OpenFile, FILES_INITIAL);
     errdefer heap.allocator.free(files);
+    const fd_cloexec = try heap.allocator.alloc(bool, FILES_INITIAL);
+    errdefer heap.allocator.free(fd_cloexec);
+    @memset(fd_cloexec, false);
     const cwd = try heap.allocator.dupe(u8, options.cwd);
     errdefer heap.allocator.free(cwd);
     @memset(files, null);
@@ -997,6 +1010,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         },
     };
     p.files = files;
+    p.fd_cloexec = fd_cloexec;
     p.cwd = cwd;
     // (On an error below, the list is freed through `regions`, which
     // still refers to it; the structure goes separately.)

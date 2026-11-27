@@ -11,8 +11,8 @@ linked. `tests/fixtures/` will hold them with the commands that built them
 ([roadmap 4.3](todo.md#43-fixtures)).
 
 Measured on 2026-11-25 with Zig's bundled musl, Go 1.27 and Rust 1.95.
-Which of the calls must really work and which may fail is still to be
-measured (the Loupe method, [research](research.md)).
+Which of them must really work and which may fail is measured below
+(["Which calls must work"](#which-calls-must-work)).
 
 The .NET Native AOT program (.NET 10, linux-musl, static) was not traced
 into the table; it was run on MyOS with every unknown call logged
@@ -62,6 +62,104 @@ files under `/sys/devices/system/cpu`, and goes on without them.
 | `/proc/self/cgroup`, `/proc/self/mountinfo`, a `cpu.max` file | Go | CPU limit of its container | uses all CPUs |
 
 None of these files has to exist: each program goes on without them.
+
+## Which calls must work
+
+Measured on 2026-11-27 with `tools/syscall-survey/survey.sh`, Loupe's
+method ([research](research.md)) with nothing but `strace`: each program
+runs once as it is, then once for every call it makes with every use of
+that call failing with `ENOSYS`, and once with every use faking success
+(returning 0). The output and exit status are compared with the plain
+run.
+
+- **needed**: the program breaks (crashes, exits differently or hangs)
+  both ways. These have to work.
+- **may fail**: `ENOSYS` is fine; the call can be left out at first.
+- **may be faked**: answering 0 is fine, failing is not.
+- **either**: the program does not care: it ends the same, saying the
+  same, with the call failing or faked.
+- **output**: it ends as before but says something else (fewer CPUs, for
+  one). To be judged by what it says.
+
+`exit_group`, `exit` and `execve` are left out. A call no program makes is
+not listed.
+
+| Call | C, static musl | C with pthreads, static musl | Rust, static | C, dynamic glibc | Go, static | .NET ahead of time (glibc) | .NET self-contained, JIT |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `access` |  |  |  | either |  | either | may be faked |
+| `arch_prctl` | may be faked | **needed** | **needed** | **needed** | **needed** | **needed** | **needed** |
+| `bind` |  |  |  |  |  |  | either |
+| `brk` |  |  | either | either |  | either | either |
+| `clone3` |  |  |  |  |  | may fail | may fail |
+| `clone` |  | **needed** |  |  | **needed** |  |  |
+| `close` |  |  |  | may be faked | either | may be faked | may be faked |
+| `epoll_create1` |  |  |  |  | **needed** |  |  |
+| `epoll_ctl` |  |  |  |  | may be faked |  |  |
+| `epoll_pwait` |  |  |  |  | may be faked |  |  |
+| `eventfd2` |  |  |  |  | **needed** |  |  |
+| `fchmod` |  |  |  |  |  |  | either |
+| `fcntl` |  |  |  |  | may be faked | **needed** | **needed** |
+| `fstat` |  |  |  | **needed** |  | **needed** | **needed** |
+| `ftruncate` |  |  |  |  |  |  | may fail |
+| `futex` |  | either |  |  | may be faked | may be faked | may be faked |
+| `get_mempolicy` |  |  |  |  |  | either | either |
+| `getdents64` |  |  |  |  |  | either | either |
+| `getpid` |  |  |  |  | **needed** | either | may fail |
+| `getrandom` |  |  |  | either |  | either | either |
+| `getsid` |  |  |  |  |  |  | either |
+| `gettid` |  |  |  |  | **needed** | either | either |
+| `ioctl` | either | either |  | either |  | may fail | may fail |
+| `listen` |  |  |  |  |  |  | either |
+| `lseek` |  |  |  |  |  | either | either |
+| `madvise` |  |  |  |  | either | either | either |
+| `membarrier` |  |  |  |  |  | either | either |
+| `memfd_create` |  |  |  |  |  |  | either |
+| `mknodat` |  |  |  |  |  |  | either |
+| `mmap` |  | **needed** | **needed** | **needed** | **needed** | **needed** | **needed** |
+| `mprotect` |  | **needed** | may be faked | may be faked |  | **needed** | **needed** |
+| `munmap` |  | either | either |  |  | either | may be faked |
+| `nanosleep` |  |  |  |  | either |  |  |
+| `newfstatat` |  |  |  | either |  | either | either |
+| `openat` |  |  |  | **needed** | either | **needed** | **needed** |
+| `pipe2` |  |  |  |  |  | may be faked | **needed** |
+| `poll` |  |  | may be faked |  |  |  | either |
+| `prctl` |  |  |  |  | either | either | either |
+| `pread64` |  |  |  |  | either |  | either |
+| `prlimit64` |  |  |  | either | either | may fail | **needed** |
+| `read` |  |  |  | **needed** | either | **needed** | **needed** |
+| `readlink` |  |  |  |  |  |  | **needed** |
+| `rseq` |  |  |  | either |  | either | either |
+| `rt_sigaction` |  |  | may be faked |  | **needed** | **needed** | **needed** |
+| `rt_sigprocmask` |  | either | either |  | may be faked | either | either |
+| `rt_sigreturn` |  |  |  |  | **needed** | **needed** |  |
+| `sched_get_priority_max` |  |  |  |  |  |  | either |
+| `sched_get_priority_min` |  |  |  |  |  |  | either |
+| `sched_getaffinity` |  |  |  |  | output | either | may fail |
+| `sched_getparam` |  |  |  |  |  |  | either |
+| `sched_getscheduler` |  |  |  |  |  |  | either |
+| `sched_setaffinity` |  |  |  |  |  |  | may be faked |
+| `sched_setscheduler` |  |  |  |  |  |  | either |
+| `sched_yield` |  |  |  |  | either | either | either |
+| `set_robust_list` |  |  |  | either |  | either | either |
+| `set_tid_address` | either | either | either | either |  | either | may fail |
+| `sigaltstack` |  |  | either |  | **needed** |  | may be faked |
+| `socket` |  |  |  |  |  |  | either |
+| `stat` |  |  |  |  |  |  | may fail |
+| `statfs` |  |  |  |  |  | either | either |
+| `sysinfo` |  |  |  |  |  | **needed** | **needed** |
+| `tgkill` |  |  |  |  | **needed** |  |  |
+| `unlink` |  |  |  |  |  |  | either |
+| `write` |  |  | **needed** | **needed** | output | **needed** | **needed** |
+| `writev` | **needed** | **needed** |  |  |  |  |  |
+
+What follows for the work: every call marked needed is implemented. Of
+those that may fail or may be faked, nothing is left to do for these
+programs; they show which calls a smaller kernel could answer with
+`ENOSYS` (`set_robust_list`, `rseq`, `clone3` where glibc falls back to
+`clone`, `prlimit64`, `getrandom` for glibc, `sched_getaffinity` for
+.NET). The table is from the fixtures' hello-world programs: a program
+that does more needs more, and is surveyed the same way
+(`tools/syscall-survey/survey.sh NAME -- PROGRAM ARGS`).
 
 ## What the kernel has to hand over at startup
 

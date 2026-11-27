@@ -190,7 +190,7 @@ the terminal.
 | `tests/user/` | Ring 3 test programs, packaged as `/test/<name>` in the test initrd |
 | `tests/support/` | QEMU exit device helper for the test kernel |
 | `tests/models/` | Models of the blocking protocols, checked in every order of their steps (see [testing](testing.md#model-checks)) |
-| `tools/` | Tools that are not part of the OS. `tools/modelcheck/` is the model checker |
+| `tools/` | Tools that are not part of the OS. `tools/modelcheck/` is the model checker; `tools/syscall-survey/` measures which system calls a Linux program needs (`docs/linux-programs.md`) |
 | `scripts/` | Build, run, test, release, CI install scripts and the GDB setup |
 | `VERSION` | `<major>.<minor>` of the next release (see [releases](#releases)) |
 | `linker.ld`, `limine.conf` | Kernel link layout (a position-independent executable linked at 0xffffffff80000000) and boot menu, which turns on KASLR |
