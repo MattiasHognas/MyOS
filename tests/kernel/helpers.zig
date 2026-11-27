@@ -3286,7 +3286,12 @@ pub fn orphanedChild() u32 {
         grandparent.first_child != parent or parent.first_child != child or child.parent != parent) return 3;
 
     tty.inject("p");
-    if (process.wait(parent) != 'p') return 4; // `parent` is gone after this
+    // The parent stays in the grandparent's list as a zombie until it is
+    // collected, as `wait4` would.
+    process.retain(parent);
+    if (process.wait(parent) != 'p') return 4;
+    process.reap(parent);
+    process.release(parent); // `parent` is gone after this
     // The child is still running, and is now the grandparent's.
     if (child.exit_code != null) return 5; // it should have outlived its parent
     if (child.parent != grandparent) return 6;
@@ -3294,7 +3299,10 @@ pub fn orphanedChild() u32 {
     if (grandparent.descendants != 1) return 8;
 
     tty.inject("k");
+    process.retain(child);
     if (process.wait(child) != 'k') return 9;
+    process.reap(child);
+    process.release(child);
     tty.reset();
     if (grandparent.descendants != 0 or grandparent.first_child != null) return 10;
     if (!untilLive(live)) return 11;
@@ -4049,4 +4057,10 @@ pub fn spuriousKernelFault(faults: *usize) u32 {
     if (vmm.unmap(vmm.kernel_root, SPARE_KERNEL_PAGE) != page) failed = 6;
     pmm.free(page);
     return failed;
+}
+
+/// `Process` structures that exist (running, or kept for their status).
+pub fn processCount() usize {
+    quiesce();
+    return process.liveCount();
 }

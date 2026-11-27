@@ -99,6 +99,7 @@ const startup_stack = @import("startup_stack.zig");
 const user_memory = @import("user_memory.zig");
 const vm_regions = @import("vm_regions.zig");
 const timer = @import("timer.zig");
+const signal = @import("signal.zig");
 const abi = @import("abi");
 
 /// Highest address a user stack can end at. Each process's stack ends at
@@ -233,7 +234,9 @@ pub const Process = struct {
     files_lock: SpinLock = .{ .rank = .descriptor_table },
     /// What each signal does (`rt_sigaction`), by signal number minus
     /// one, under `signal_lock`.
-    signal_actions: [abi.NSIG]abi.SigAction = @splat(.{}),
+    /// (On the heap: 2 KiB, which a structure built on the stack would
+    /// carry. `none_set` for a process structure that never runs.)
+    signal_actions: *[abi.NSIG]abi.SigAction = &none_set,
     signal_lock: SpinLock = .{ .rank = .descriptor_table },
     /// Signals sent to the process as a whole (`kill`) and not yet
     /// delivered: any of its threads that does not block one takes it.
@@ -241,11 +244,105 @@ pub const Process = struct {
     /// Its regions of memory, `brk` heap and the lock for them and its
     /// page tables (`user_memory.zig`).
     mem: user_memory.UserMemory = .{},
-    /// This process's children that have not exited, and its link in its
-    /// parent's list.
+    /// This process's children, and its link in its parent's list. A
+    /// child that has exited stays in the list, a zombie, until its
+    /// parent collects its status (`waitChild`) or exits itself; the
+    /// list holds a reference to it (`refs`) for that.
     first_child: ?*Process = null,
     next_sibling: ?*Process = null,
+    /// Threads of this process waiting in `wait4` for a child to change.
+    /// Under the tree lock.
+    children_changed: WaitQueue = .{},
+    /// The signal the parent gets when this process ends (`clone`'s low
+    /// byte; `SIGCHLD` for `fork`), 0 for none.
+    exit_signal: u32 = 0,
+    /// The signal that ended the process, 0 if it ended by itself or by
+    /// the kernel without one: what `wait4` reports.
+    term_signal: std.atomic.Value(u32) = .init(0),
+    /// Link in the list of every process (`all_processes`), from when it is
+    /// started until its structure is freed. Under the tree lock.
+    all_next: ?*Process = null,
+    /// Made by `vfork` (`CLONE_VFORK`): its parent's thread waits until it
+    /// has called `execve` or ended, which sets this. Under the tree lock.
+    vfork_pending: bool = false,
 };
+
+/// The signal actions of a process structure that is not a real process
+/// (tests' stand-ins): every one the default, never changed.
+var none_set: [abi.NSIG]abi.SigAction = @splat(.{});
+
+/// A table of signal actions for a new process: a copy of `from`, or all
+/// defaults.
+fn newActions(from: ?*const [abi.NSIG]abi.SigAction) error{OutOfMemory}!*[abi.NSIG]abi.SigAction {
+    const t = try heap.allocator.create([abi.NSIG]abi.SigAction);
+    if (from) |f| {
+        @memcpy(t, f);
+    } else {
+        for (t) |*a| a.* = .{};
+    }
+    return t;
+}
+
+/// Every process that has been started and not freed, newest first, for
+/// finding one by its ID (`kill`). Under the tree lock.
+var all_processes: ?*Process = null;
+
+fn registerLocked(p: *Process) void {
+    p.all_next = all_processes;
+    all_processes = p;
+}
+
+fn unregisterLocked(p: *Process) void {
+    var link = &all_processes;
+    while (link.*) |q| : (link = &q.all_next) {
+        if (q == p) {
+            link.* = p.all_next;
+            return;
+        }
+    }
+}
+
+/// Send `sig` to the process with ID `pid` (`kill`); 0 checks only. False
+/// if there is no such process, or it has ended (as a zombie it gets
+/// nothing, and that is not an error on Linux: `zombie_ok`).
+pub fn signalPid(pid: u64, sig: u32) enum { sent, no_such, zombie } {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var q = all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (p.pid != pid) continue;
+        if (p.exit_code != null) return .zombie;
+        if (sig != 0) signal.sendProcessLocked(p, sig);
+        return .sent;
+    }
+    return .no_such;
+}
+
+/// Send `sig` to every process but `init` and `except` (`kill(-1)`).
+/// Returns how many got it.
+pub fn signalAll(sig: u32, except: *Process) usize {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var n: usize = 0;
+    var q = all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (p == except or p == init_process or p.exit_code != null) continue;
+        if (sig != 0) signal.sendProcessLocked(p, sig);
+        n += 1;
+    }
+    return n;
+}
+
+/// The process that adopts orphans: `init`, once the kernel has started
+/// it (`setInit`). Under the tree lock.
+var init_process: ?*Process = null;
+
+/// Make `p` the process orphans go to. Its reference is the caller's.
+pub fn setInit(p: ?*Process) void {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    init_process = p;
+}
 
 /// The process-tree lock: see "Locking" at the top of this file.
 var tree_lock: SpinLock = .{ .rank = .process_tree };
@@ -307,16 +404,40 @@ fn unlinkChild(child: *Process) void {
     assert.check(.process, false, "process '{s}' is not in its parent's child list", .{child.name});
 }
 
-/// Give the children of `p`, which is exiting, to its parent (or to nobody).
-/// The ancestors above `p` already count them as descendants, so only the
-/// links change. The tree lock must be held.
-fn reparentChildren(p: *Process) void {
+/// Give the children of `p`, which is exiting, to `init` if `p` is one of
+/// its descendants, or else to `p`'s parent (or to nobody). The ancestors
+/// on the way already count them as descendants, so only the links
+/// change. Children that have exited (zombies) nobody will collect now,
+/// nor those that go to nobody: they are returned, linked through
+/// `next_sibling`, for the caller to release once the lock is dropped.
+/// The tree lock must be held.
+fn reparentChildren(p: *Process) ?*Process {
+    const adopter: ?*Process = blk: {
+        const init = init_process orelse break :blk p.parent;
+        if (init == p) break :blk null;
+        var a = p.parent;
+        while (a) |anc| : (a = anc.parent) {
+            if (anc == init) break :blk init;
+        }
+        break :blk p.parent;
+    };
+    var gone: ?*Process = null;
     while (p.first_child) |child| {
         p.first_child = child.next_sibling;
         child.next_sibling = null;
-        child.parent = p.parent;
+        if (child.exit_code != null or adopter == null) {
+            child.parent = null;
+            child.next_sibling = gone;
+            gone = child;
+            continue;
+        }
+        child.parent = adopter;
         linkChild(child);
+        // Adopted by init: it collects them (`waitChild`); an orphan that
+        // ended already is news for it.
+        if (adopter) |a| _ = a.children_changed.wakeAll();
     }
+    return gone;
 }
 
 /// Terminate the current process with exit status `code` (0-255; the
@@ -348,14 +469,40 @@ pub fn exit(code: u64) noreturn {
     tree_lock.take();
     assert.check(.process, p.exit_code == null, "process '{s}' exits twice", .{p.name});
     unlinkThread(p, me);
-    reparentChildren(p);
-    unlinkChild(p);
+    var gone = reparentChildren(p);
     releaseDescendant(p.parent);
-    p.parent = null;
     p.exit_code = code;
+    p.vfork_pending = false;
     _ = p.exited.wakeAll(); // before the lock is released: the waiters are still there
+    // A zombie in its parent's list until the parent collects it.
+    if (p.parent) |parent| {
+        _ = parent.children_changed.wakeAll();
+        if (p.exit_signal != 0) signal.sendProcessLocked(parent, p.exit_signal);
+    }
+    if (p == init_process) init_process = null;
     tree_lock.drop();
+    // The references this process's list held to children it had to let go.
+    while (gone) |c| {
+        gone = c.next_sibling;
+        c.next_sibling = null;
+        release(c);
+    }
     thread.exit();
+}
+
+/// `exit` for a process a signal ends: `wait4` says so.
+pub fn exitBySignal(sig: u32) noreturn {
+    const p = thread.current().process.?;
+    _ = p.term_signal.cmpxchgStrong(0, sig, .acq_rel, .acquire);
+    exit(128 + sig);
+}
+
+/// `exit` for a process the kernel kills for a fault it does not handle:
+/// as if the fault's signal had ended it, as on Linux.
+pub fn exitForFault(sig: u32) noreturn {
+    const p = thread.current().process.?;
+    _ = p.term_signal.cmpxchgStrong(0, sig, .acq_rel, .acquire);
+    exit(EXIT_KILLED);
 }
 
 /// Take `t` out of the thread list of `p`. The tree lock must be held.
@@ -510,6 +657,13 @@ pub fn requestExitLocked(p: *Process, code: u64) void {
     requestExit(p, code);
 }
 
+/// End `p` because of the signal `sig` (`SIGKILL`), with the tree lock held.
+pub fn requestKillLocked(p: *Process, sig: u32) void {
+    if (p.killed.load(.acquire)) return;
+    _ = p.term_signal.cmpxchgStrong(0, sig, .acq_rel, .acquire);
+    requestExit(p, 128 + sig);
+}
+
 fn requestExit(p: *Process, code: u64) void {
     if (p.killed.load(.acquire)) return;
     _ = p.exit_request.cmpxchgStrong(NO_REQUEST, code, .acq_rel, .acquire);
@@ -558,6 +712,7 @@ pub const CLONE = struct {
     pub const SIGHAND = 0x800;
     pub const THREAD = 0x10000;
     pub const SYSVSEM = 0x40000;
+    pub const VFORK = 0x4000;
     pub const SETTLS = 0x80000;
     pub const PARENT_SETTID = 0x100000;
     pub const CHILD_CLEARTID = 0x200000;
@@ -647,6 +802,308 @@ fn cloneStart() void {
     arch_syscall.enterUserFrame(&frame);
 }
 
+/// Collect `child`, which the caller has waited for and holds a reference
+/// to, from its parent's list if it is still there as a zombie (the
+/// private `myos_run`, which collects it itself).
+pub fn reap(child: *Process) void {
+    const drop = blk: {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        if (child.exit_code == null) break :blk false;
+        if (child.parent == null) break :blk false;
+        unlinkChild(child);
+        child.parent = null;
+        break :blk true;
+    };
+    if (drop) release(child);
+}
+
+/// What `waitChild` found.
+pub const WaitResult = union(enum) {
+    /// A child that ended: its process ID and the status `wait4` reports
+    /// (`(code << 8)`, or the signal that ended it).
+    exited: struct { pid: usize, status: u32 },
+    /// Children there are, and none has ended (`WNOHANG`).
+    none_yet,
+    /// No child matches.
+    no_child,
+    /// The thread was interrupted (a signal, or its process is ending).
+    interrupted,
+};
+
+/// `wait4`: wait for a child of the calling process to end and collect
+/// it. `pid` -1 (or 0: there are no process groups yet, so the caller's
+/// group is everyone) means any child; a positive one, that child. With
+/// `nohang`, report `none_yet` instead of waiting.
+pub fn waitChild(pid: i64, nohang: bool) WaitResult {
+    const me = thread.current().process.?;
+    const found: *Process = blk: {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        while (true) {
+            var any = false;
+            var c = me.first_child;
+            while (c) |child| : (c = child.next_sibling) {
+                if (pid > 0 and child.pid != @as(u64, @intCast(pid))) continue;
+                any = true;
+                if (child.exit_code != null) {
+                    unlinkChild(child);
+                    child.parent = null;
+                    break :blk child;
+                }
+            }
+            if (!any) return .no_child;
+            if (nohang) return .none_yet;
+            if (!me.children_changed.waitKillable(&tree_lock)) return .interrupted;
+        }
+    };
+    const sig = found.term_signal.load(.acquire);
+    const status: u32 = if (sig != 0) sig else @as(u32, @intCast(found.exit_code.? & 0xFF)) << 8;
+    const child_pid = found.pid;
+    release(found); // the list's reference
+    return .{ .exited = .{ .pid = child_pid, .status = status } };
+}
+
+/// The parent's process ID, or 0 for a process with none.
+pub fn parentPid(p: *Process) usize {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    return if (p.parent) |parent| parent.pid else 0;
+}
+
+/// Make a new process that is a copy of the calling one (`fork`, and
+/// `clone` without `CLONE_THREAD`). It has a copy of the caller's memory
+/// (every page copied now: there is no copy-on-write yet), of its
+/// descriptors (sharing their open files), its working directory, its
+/// signal actions and limits, and one thread that starts as if it had
+/// just returned from the same call with result 0, with the caller's
+/// registers, extended state, FS and GS base and signal mask.
+///
+/// `CLONE_VM` (with `CLONE_VFORK`, which is how `vfork` and
+/// `posix_spawn` use it) gets a copy too, not the same memory: what the
+/// child writes before `execve` stays its own. `CLONE_VFORK` holds the
+/// caller until the child calls `execve` or ends. `CLONE_SETTLS`,
+/// `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
+/// work as for threads. `exit_signal` goes to this process when the
+/// child ends. Returns the child's process ID.
+pub fn forkProcess(frame: *const arch_syscall.Frame, args: CloneArgs, exit_signal: u32) error{ OutOfMemory, Fault, BadAddress, TooManyProcesses, Interrupted }!usize {
+    const me = thread.current();
+    const parent = me.process.?;
+    if (args.flags & CLONE.SETTLS != 0 and args.tls >= vmm.USER_END) return error.BadAddress;
+
+    const root = try vmm.createAddressSpace();
+    errdefer vmm.destroyAddressSpace(root);
+    var mem: user_memory.UserMemory = .{};
+    errdefer mem.regions.deinit(heap.allocator);
+    const copied = try copyMemory(parent, root, &mem);
+    const pages = copied + kstack.STACK_PAGES;
+    if (pages > parent.limits.max_pages) return error.OutOfMemory;
+
+    const child = try heap.allocator.create(Process);
+    errdefer heap.allocator.destroy(child);
+    const name = try heap.allocator.dupe(u8, parent.name);
+    errdefer heap.allocator.free(name);
+
+    // Descriptors: the same open files, each with a reference more.
+    const fds = try copyDescriptors(parent);
+    const files = fds.files;
+    const cloexec = fds.cloexec;
+    const cwd = fds.cwd;
+    errdefer heap.allocator.free(cwd);
+    errdefer heap.allocator.free(cloexec);
+    errdefer heap.allocator.free(files);
+    var files_given = false;
+    errdefer if (!files_given) for (files) |slot| if (slot) |of| open_file.unref(of);
+
+    initChild(child, parent, root, name, pages, exit_signal, args.flags & CLONE.VFORK != 0, &mem);
+    child.files = files;
+    child.fd_cloexec = cloexec;
+    child.cwd = cwd;
+    child.signal_actions = try newActions(null);
+    errdefer heap.allocator.destroy(child.signal_actions);
+    {
+        const held = parent.signal_lock.acquire();
+        defer parent.signal_lock.release(held);
+        @memcpy(child.signal_actions, parent.signal_actions); // (not by assignment: that copies 2 KiB through the stack)
+    }
+
+    // Until the thread has an ID, an error takes it back here; after that,
+    // by hand below.
+    var unnumbered = true;
+    const made = try newChildThread(child, frame, args, me);
+    const t = made[0];
+    const start_frame = made[1];
+    errdefer if (unnumbered) {
+        heap.allocator.destroy(start_frame);
+        thread.destroy(t);
+    };
+
+    const tid = thread.assignId(t);
+    unnumbered = false;
+    const tid32: u32 = @truncate(tid);
+    // Told in the parent's memory, and in the child's copy.
+    if (args.flags & CLONE.PARENT_SETTID != 0) uaccess.copyToUser(args.parent_tid, std.mem.asBytes(&tid32)) catch {};
+    if (args.flags & CLONE.CHILD_SETTID != 0) writeInto(root, args.child_tid, tid32);
+
+    const charged = blk: {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        chargeDescendant(parent) catch break :blk false;
+        linkChild(child);
+        registerLocked(child);
+        live += 1;
+        child.pid = tid;
+        child.thread_list = t;
+        child.thread_count = 1;
+        files_given = true;
+        thread.start(t);
+        break :blk true;
+    };
+    if (!charged) {
+        // Freed outside the tree lock; the rest goes with the errdefers.
+        heap.allocator.destroy(start_frame);
+        thread.discard(t);
+        return error.TooManyProcesses;
+    }
+
+    if (child.vfork_pending) waitForVfork(child);
+    return tid;
+}
+
+/// Hold the calling thread until `child`, made by `vfork`, has called
+/// `execve` or ended. It cannot be freed meanwhile: its exit wakes this
+/// wait before anyone can collect it.
+noinline fn waitForVfork(child: *Process) void {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    while (child.vfork_pending) {
+        if (!child.exited.waitUnlessEnding(&tree_lock)) break;
+    }
+}
+
+/// The fields of `forkProcess`'s child that come from its parent. Not
+/// inlined, as `copyMemory`.
+noinline fn initChild(child: *Process, parent: *Process, root: u64, name: []const u8, pages: u64, exit_signal: u32, vfork: bool, mem: *const user_memory.UserMemory) void {
+    child.* = .{
+        .root = root,
+        .entry = parent.entry,
+        .stack_top = parent.stack_top,
+        .entry_rsp = parent.entry_rsp,
+        .name = name,
+        .limits = parent.limits,
+        .pages = pages,
+        .parent = parent,
+        .refs = 2, // the thread's and the parent's list's
+        .start_ticks = timer.now(),
+        .exit_signal = exit_signal,
+        .vfork_pending = vfork,
+        .mem = mem.*,
+    };
+}
+
+/// `forkProcess`'s thread for the child: made, not started, with the
+/// registers `frame` (returning 0), the stack, the FS and GS base, the
+/// signal mask and alternate stack and the extended state of `me`. Not
+/// inlined, as `copyMemory`.
+noinline fn newChildThread(child: *Process, frame: *const arch_syscall.Frame, args: CloneArgs, me: *thread.Thread) error{OutOfMemory}!struct { *thread.Thread, *arch_syscall.Frame } {
+    const t = try thread.create(cloneStart, child);
+    errdefer thread.destroy(t);
+    const start_frame = try heap.allocator.create(arch_syscall.Frame);
+    start_frame.* = frame.*;
+    start_frame.rax = 0;
+    if (args.stack != 0) start_frame.rsp = args.stack;
+    t.user_frame = start_frame;
+    const bases = thread.userBases();
+    t.fs_base = if (args.flags & CLONE.SETTLS != 0) args.tls else bases.fs;
+    t.gs_base = bases.gs;
+    t.signal_mask = me.signal_mask;
+    t.signal_stack = me.signal_stack;
+    if (args.flags & CLONE.CHILD_CLEARTID != 0) t.clear_child_tid = args.child_tid;
+    if (t.fpuArea()) |area| {
+        const flags = cpu.saveAndDisableInterrupts();
+        fpu.saveCurrent(area);
+        cpu.restoreInterrupts(flags);
+    }
+    return .{ t, start_frame };
+}
+
+/// `forkProcess`'s copy of the memory of `parent` into the empty address
+/// space `root`: the regions and the pages, at one moment (under the
+/// address-space lock). Returns the pages and tables `root` took. Not
+/// inlined: it keeps its locals off `forkProcess`'s frame.
+noinline fn copyMemory(parent: *Process, root: u64, mem: *user_memory.UserMemory) error{OutOfMemory}!usize {
+    // The regions' room first (it needs memory, and the lock is a
+    // spinlock), then everything at once under the lock.
+    var room: usize = 0;
+    while (true) {
+        {
+            const held = parent.mem.lock.acquire();
+            defer parent.mem.lock.release(held);
+            if (mem.regions.list.capacity >= parent.mem.regions.list.items.len) {
+                mem.regions.list.clearRetainingCapacity();
+                mem.regions.list.appendSliceAssumeCapacity(parent.mem.regions.list.items);
+                mem.brk_start = parent.mem.brk_start;
+                mem.brk_end = parent.mem.brk_end;
+                mem.mmap_top = parent.mem.mmap_top;
+                // (An empty space has nothing mapped already.)
+                return vmm.copyUserSpace(parent.root, root) catch error.OutOfMemory;
+            }
+            room = parent.mem.regions.list.items.len + 8;
+        }
+        try mem.regions.list.ensureTotalCapacity(heap.allocator, room);
+    }
+}
+
+/// `forkProcess`'s copy of the descriptor table and working directory of
+/// `parent`: the same open files, each with a reference more. Not inlined,
+/// as `copyMemory`.
+noinline fn copyDescriptors(parent: *Process) error{OutOfMemory}!struct { files: []?*open_file.OpenFile, cloexec: []bool, cwd: []u8 } {
+    var files: []?*open_file.OpenFile = &.{};
+    var cloexec: []bool = &.{};
+    var cwd: []u8 = &.{};
+    while (true) {
+        const want = blk: {
+            const held = parent.files_lock.acquire();
+            defer parent.files_lock.release(held);
+            if (files.len == parent.files.len and cwd.len == parent.cwd.len) {
+                @memcpy(files, parent.files);
+                @memcpy(cloexec, parent.fd_cloexec);
+                @memcpy(cwd, parent.cwd);
+                for (files) |slot| if (slot) |of| open_file.retain(of);
+                return .{ .files = files, .cloexec = cloexec, .cwd = cwd };
+            }
+            break :blk .{ parent.files.len, parent.cwd.len };
+        };
+        heap.allocator.free(files);
+        heap.allocator.free(cloexec);
+        heap.allocator.free(cwd);
+        files = &.{};
+        cloexec = &.{};
+        cwd = &.{};
+        files = try heap.allocator.alloc(?*open_file.OpenFile, want[0]);
+        cloexec = heap.allocator.alloc(bool, want[0]) catch |e| {
+            heap.allocator.free(files);
+            return e;
+        };
+        cwd = heap.allocator.alloc(u8, want[1]) catch |e| {
+            heap.allocator.free(files);
+            heap.allocator.free(cloexec);
+            return e;
+        };
+    }
+}
+
+/// Write `value` at the user address `addr` of the address space `root`,
+/// which need not be loaded: through the kernel's mapping of the page.
+/// Nothing is written if the page is not there or not writable.
+fn writeInto(root: u64, addr: u64, value: u32) void {
+    if (addr % 4 != 0 or addr >= vmm.USER_END) return;
+    const e = vmm.leafEntry(root, addr) orelse return;
+    if (e & vmm.WRITABLE == 0 or e & vmm.USER == 0) return;
+    const phys = vmm.translate(root, addr) orelse return;
+    @as(*u32, @ptrCast(@alignCast(pmm.physToVirt(phys)))).* = value;
+}
+
 /// Wait for `p` to exit and return its exit status, giving up the caller's
 /// reference: `p` must not be used afterwards. Returns at once if it has
 /// already exited, however long ago. Several threads may wait for the same
@@ -700,9 +1157,11 @@ pub fn release(p: *Process) void {
         if (p.refs > 0) return;
         assert.check(.process, p.exit_code != null and p.root == 0, "freeing process '{s}' while it is alive", .{p.name});
         assert.check(.process, p.exited.waiting() == 0 and p.first_child == null, "freeing process '{s}' that others still point at", .{p.name});
+        unregisterLocked(p);
         live -= 1;
     }
     // Nobody else has a reference, so nobody else can reach it.
+    if (p.signal_actions != &none_set) heap.allocator.destroy(p.signal_actions);
     heap.allocator.free(p.name);
     heap.allocator.destroy(p);
 }
@@ -978,19 +1437,15 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     errdefer heap.allocator.destroy(p);
     const name_copy = try heap.allocator.dupe(u8, name);
     errdefer heap.allocator.free(name_copy);
-    // The standard streams: three descriptors for one open console.
-    const console = try heap.allocator.create(open_file.OpenFile);
+    const fds = try newDescriptors(options.cwd);
+    const console = fds.files[0].?;
+    const files = fds.files;
+    const fd_cloexec = fds.cloexec;
+    const cwd = fds.cwd;
     errdefer heap.allocator.destroy(console);
-    console.* = .{ .kind = .console, .refs = 3 };
-    const files = try heap.allocator.alloc(?*open_file.OpenFile, FILES_INITIAL);
     errdefer heap.allocator.free(files);
-    const fd_cloexec = try heap.allocator.alloc(bool, FILES_INITIAL);
     errdefer heap.allocator.free(fd_cloexec);
-    @memset(fd_cloexec, false);
-    const cwd = try heap.allocator.dupe(u8, options.cwd);
     errdefer heap.allocator.free(cwd);
-    @memset(files, null);
-    @memset(files[0..3], console);
     p.* = .{
         .root = root,
         .start_ticks = timer.now(),
@@ -1001,7 +1456,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         .limits = limits,
         .pages = pages,
         .parent = options.parent,
-        .refs = 2, // the thread's and the caller's
+        .refs = if (options.parent != null) 3 else 2, // the thread's, the caller's, and the parent's list's
         .mem = .{
             .regions = regions,
             .brk_start = loaded.end,
@@ -1012,6 +1467,8 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     p.files = files;
     p.fd_cloexec = fd_cloexec;
     p.cwd = cwd;
+    p.signal_actions = try newActions(null);
+    errdefer heap.allocator.destroy(p.signal_actions);
     // (On an error below, the list is freed through `regions`, which
     // still refers to it; the structure goes separately.)
 
@@ -1030,12 +1487,31 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     }
     try chargeDescendant(options.parent);
     linkChild(p);
+    registerLocked(p);
     live += 1;
     p.pid = thread.assignId(t);
     p.thread_list = t;
     p.thread_count = 1;
     thread.start(t);
     return p;
+}
+
+/// A new process's descriptor table, with the standard streams: three
+/// descriptors for one open console; and its working directory. Not
+/// inlined: it keeps `spawn`'s frame small.
+noinline fn newDescriptors(cwd_path: []const u8) error{OutOfMemory}!struct { files: []?*open_file.OpenFile, cloexec: []bool, cwd: []u8 } {
+    const console = try heap.allocator.create(open_file.OpenFile);
+    errdefer heap.allocator.destroy(console);
+    console.* = .{ .kind = .console, .refs = 3 };
+    const files = try heap.allocator.alloc(?*open_file.OpenFile, FILES_INITIAL);
+    errdefer heap.allocator.free(files);
+    const cloexec = try heap.allocator.alloc(bool, FILES_INITIAL);
+    errdefer heap.allocator.free(cloexec);
+    const cwd = try heap.allocator.dupe(u8, cwd_path);
+    @memset(cloexec, false);
+    @memset(files, null);
+    @memset(files[0..3], console);
+    return .{ .files = files, .cloexec = cloexec, .cwd = cwd };
 }
 
 /// Copy `data` to the address `addr` of a new process's stack, whose pages

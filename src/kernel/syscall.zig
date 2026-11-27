@@ -224,6 +224,7 @@ fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
     const handover = proc.giveForeground(me, child);
     const status = proc.waitKillable(child);
     proc.takeForegroundBack(me, child, handover);
+    if (status != null) proc.reap(child); // collected here, not by wait4
     proc.release(child);
     // A program that changed the terminal's settings and ended without
     // changing them back leaves them to the next one: the shell, which
@@ -1932,10 +1933,12 @@ fn futexError(e: kfutex.WaitError) u64 {
 /// yet). Returns the new thread's ID in the caller, 0 in the new thread.
 fn sysClone(f: *const arch.Frame) u64 {
     const flags = f.rdi;
-    if (flags & proc.CLONE.THREAD_FLAGS != proc.CLONE.THREAD_FLAGS) return err(.INVAL);
     if (thread.current().process == null) return err(.NOSYS);
     // The order of the last arguments is x86-64's: child_tid, then tls.
-    const tid = proc.cloneThread(f, .{ .flags = flags, .stack = f.rsi, .parent_tid = f.rdx, .child_tid = f.r10, .tls = f.r8 }) catch |e| return switch (e) {
+    const args: proc.CloneArgs = .{ .flags = flags & ~@as(u64, 0xFF), .stack = f.rsi, .parent_tid = f.rdx, .child_tid = f.r10, .tls = f.r8 };
+    if (flags & proc.CLONE.THREAD == 0) return newProcess(f, args, @intCast(flags & 0xFF));
+    if (flags & proc.CLONE.THREAD_FLAGS != proc.CLONE.THREAD_FLAGS) return err(.INVAL);
+    const tid = proc.cloneThread(f, args) catch |e| return switch (e) {
         error.OutOfMemory => err(.NOMEM),
         error.Fault => err(.FAULT),
         error.BadAddress => err(.PERM),
@@ -1960,10 +1963,15 @@ fn sysClone3(f: *const arch.Frame) u64 {
         const byte = fromUser(u8, f.rdi + extra) orelse return err(.FAULT);
         if (byte != 0) return err(.INVAL); // set_tid, cgroup: not offered
     }
-    if (args.flags & proc.CLONE.THREAD_FLAGS != proc.CLONE.THREAD_FLAGS) return err(.INVAL);
-    if (args.exit_signal != 0 or (args.stack == 0) != (args.stack_size == 0)) return err(.INVAL);
+    if ((args.stack == 0) != (args.stack_size == 0)) return err(.INVAL);
     const top = std.math.add(u64, args.stack, args.stack_size) catch return err(.INVAL);
     if (thread.current().process == null) return err(.NOSYS);
+    if (args.flags & proc.CLONE.THREAD == 0) {
+        if (args.exit_signal > abi.NSIG) return err(.INVAL);
+        return newProcess(f, .{ .flags = args.flags, .stack = top, .parent_tid = args.parent_tid, .child_tid = args.child_tid, .tls = args.tls }, @intCast(args.exit_signal));
+    }
+    if (args.flags & proc.CLONE.THREAD_FLAGS != proc.CLONE.THREAD_FLAGS) return err(.INVAL);
+    if (args.exit_signal != 0) return err(.INVAL);
     const tid = proc.cloneThread(f, .{ .flags = args.flags, .stack = top, .parent_tid = args.parent_tid, .child_tid = args.child_tid, .tls = args.tls }) catch |e| return switch (e) {
         error.OutOfMemory => err(.NOMEM),
         error.Fault => err(.FAULT),
@@ -1971,6 +1979,48 @@ fn sysClone3(f: *const arch.Frame) u64 {
         error.ProcessEnding => err(.INTR),
     };
     return tid;
+}
+
+/// `clone` and `clone3` without `CLONE_THREAD`, `fork` and `vfork`: a new
+/// process, a copy of this one (`proc.forkProcess`). `EINVAL` for what
+/// only threads may ask (`CLONE_SIGHAND` without `CLONE_VM`, sharing the
+/// descriptor table or the signal actions with another process),
+/// `EAGAIN` past the descendant limit, `ENOMEM`.
+fn newProcess(f: *const arch.Frame, args: proc.CloneArgs, exit_signal: u32) u64 {
+    const C = proc.CLONE;
+    const known = C.VM | C.FS | C.VFORK | C.SETTLS | C.PARENT_SETTID | C.CHILD_SETTID | C.CHILD_CLEARTID | C.SYSVSEM | C.DETACHED;
+    if (args.flags & ~@as(u64, known) != 0) return err(.INVAL);
+    if (exit_signal > abi.NSIG) return err(.INVAL);
+    const pid = proc.forkProcess(f, args, exit_signal) catch |e| return switch (e) {
+        error.OutOfMemory => err(.NOMEM),
+        error.Fault => err(.FAULT),
+        error.BadAddress => err(.PERM),
+        error.TooManyProcesses => err(.AGAIN),
+        error.Interrupted => err(.INTR),
+    };
+    return pid;
+}
+
+/// `wait4`: collect a child that has ended (`proc.waitChild`), writing its
+/// status at `status_ptr` and nothing (zeroes) at `rusage_ptr`. `WNOHANG`
+/// returns 0 if none has ended yet; `WUNTRACED` and `WCONTINUED` are
+/// accepted and change nothing, as nothing stops yet. `ECHILD` if no child
+/// matches, `EINTR`, `EINVAL`, `EFAULT`.
+fn sysWait4(pid_arg: u64, status_ptr: u64, options: u64, rusage_ptr: u64) u64 {
+    if (options & ~@as(u64, abi.WNOHANG | abi.WUNTRACED | abi.WCONTINUED) != 0) return err(.INVAL);
+    if (thread.current().process == null) return err(.CHILD);
+    const pid: i64 = @as(i32, @truncate(@as(i64, @bitCast(pid_arg))));
+    if (pid < -1) {} // a process group: there is one, so it is everyone
+    return switch (proc.waitChild(if (pid < -1) -1 else pid, options & abi.WNOHANG != 0)) {
+        .exited => |x| blk: {
+            if (status_ptr != 0 and !toUser(status_ptr, @as(i32, @bitCast(x.status)))) break :blk err(.FAULT);
+            if (rusage_ptr != 0 and !toUser(rusage_ptr, std.mem.zeroes([18]u64))) break :blk err(.FAULT);
+            break :blk x.pid;
+        },
+        .none_yet => 0,
+        .no_child => err(.CHILD),
+        .interrupted => err(.INTR),
+    };
 }
 
 /// The thread a scheduling call is about: `tid` 0 is the caller, anything
@@ -2084,13 +2134,23 @@ fn sysPrlimit(pid: u64, resource: u64, new: u64, old: u64) u64 {
 /// `kill`: send `sig` to the process `pid`, which must be the caller's
 /// own: other processes cannot be reached yet. Signal 0 only checks that
 /// it exists. `EINVAL` for a number above 64, `ESRCH`.
-fn sysKill(pid: u64, sig: u64) u64 {
+fn sysKill(pid_arg: u64, sig: u64) u64 {
     const p = thread.current().process orelse return err(.NOSYS);
     if (sig > abi.NSIG) return err(.INVAL);
-    if (pid != p.pid) return err(.SRCH);
-    if (sig == 0) return 0;
-    proc.signalProcess(p, @intCast(sig));
-    return 0;
+    const pid: i64 = @as(i32, @truncate(@as(i64, @bitCast(pid_arg))));
+    if (pid == -1) {
+        // Everyone but init and the caller; then the caller too, as Linux.
+        const n = proc.signalAll(@intCast(sig), p);
+        if (sig != 0) proc.signalProcess(p, @intCast(sig));
+        return if (n == 0 and sig != 0) 0 else 0;
+    }
+    // Process groups are not there yet: a group means the caller's, which
+    // is the caller (0, or its own ID negated).
+    const target: u64 = if (pid == 0 or -pid == @as(i64, @intCast(p.pid))) p.pid else if (pid < 0) return err(.SRCH) else @intCast(pid);
+    return switch (proc.signalPid(target, @intCast(sig))) {
+        .sent, .zombie => 0,
+        .no_such => err(.SRCH),
+    };
 }
 
 /// `tgkill` and `tkill`: send `sig` to the thread `tid` of the process
@@ -2332,6 +2392,10 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.gettimeofday => sysGetTimeOfDay(f.rdi),
         Sys.getpid => if (thread.current().process) |p| p.pid else err(.NOSYS),
         Sys.clone => sysClone(f),
+        Sys.fork => newProcess(f, .{ .flags = 0, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
+        Sys.vfork => newProcess(f, .{ .flags = proc.CLONE.VM | proc.CLONE.VFORK, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
+        Sys.wait4 => sysWait4(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.getppid => if (thread.current().process) |me| proc.parentPid(me) else err(.NOSYS),
         Sys.clone3 => sysClone3(f),
         Sys.sched_setaffinity => sysSchedSetAffinity(f.rdi, f.rsi, f.rdx),
         Sys.sched_getscheduler => sysSchedPolicy(.get_policy, f),
@@ -2402,7 +2466,7 @@ pub fn badReturn(f: *const arch.Frame) noreturn {
     const p = thread.current().process.?;
     root.print("\n*** thread {d} ({s}): invalid return state after syscall, killed\n", .{ thread.id(), p.name });
     root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x} CS=0x{x} SS=0x{x}\n", .{ f.rip, f.rsp, f.rflags, f.cs, f.ss });
-    proc.exit(proc.EXIT_KILLED);
+    proc.exitForFault(abi.SIGSEGV);
 }
 
 /// Enable the `syscall` instruction, which the arch layer routes to

@@ -890,6 +890,20 @@ fn gsBaseSwitching() TestError!void {
 /// A debug exception that hits ring 0 code running with the user's GS base
 /// (as at the first instruction of `syscall_entry`) is handled on its own
 /// stack with the kernel's GS base.
+/// New processes: `fork`, `vfork`, `clone` without `CLONE_THREAD`, and
+/// `wait4` collecting them, from ring 3; nothing left behind.
+fn forkWait() TestError!void {
+    _ = helpers.runProgram("/test/fork"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const processes = helpers.processCount();
+    const code = helpers.runProgram("/test/fork") orelse return error.Failed;
+    if (code != 0) report("/test/fork failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/fork"));
+    try check(helpers.processCount() == processes);
+    try expectFootprint(memory);
+}
+
 /// Programs that set their own FS and GS base (`wrfsbase`, `wrgsbase`):
 /// kept across switches and reported by `arch_prctl`; and a kernel-looking
 /// GS base at a debug exception in the syscall entry does not fool the
@@ -1936,6 +1950,7 @@ fn runCases() noreturn {
         .{ .name = "GS base switched on every entry and exit", .func = gsBaseSwitching },
         .{ .name = "debug exception with the user GS base in ring 0", .func = debugTrapEntry },
         .{ .name = "FS and GS base set by the program itself (FSGSBASE)", .func = fsgsbase },
+        .{ .name = "fork, vfork, clone of a process, wait4 (ring 3)", .func = forkWait },
         .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },
         .{ .name = "x87/SSE/AVX registers survive process switches", .func = extendedStateSwitching },
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },

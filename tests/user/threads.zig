@@ -371,8 +371,8 @@ pub fn main() noreturn {
     for (handles[0..3]) |*h| join(h);
     expect(woken.load(.acquire) == 3, 30);
 
-    // --- clone makes threads and nothing else.
-    expect(clone_raw(0x11, 0, 0, 0, 0) == lib.err(.INVAL), 40); // a fork
+    // --- What clone refuses for threads (processes: `/test/fork`).
+    expect(clone_raw(0x400 | 0x11, 0, 0, 0, 0) == lib.err(.INVAL), 40); // a process sharing the descriptor table
     expect(clone_raw(CLONE_VM | CLONE_SIGHAND, 0, 0, 0, 0) == lib.err(.INVAL), 41); // not in this thread group
     expect(clone_raw(THREAD_FLAGS | CLONE_SETTLS, 0, 0, 0, 0xFFFF_8000_0000_0000) == lib.err(.PERM), 42);
     expect(clone_raw(THREAD_FLAGS | CLONE_PARENT_SETTID, 0, 8, 0, 0) == lib.err(.FAULT), 43); // nowhere to write the ID
@@ -418,7 +418,7 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs) - 8, 0) == lib.err(.INVAL), 145); // shorter than the first version
     expect(lib.syscall(Sys.clone3, cap, 8192, 0) == lib.err(.INVAL), 146);
     expect(lib.syscall(Sys.clone3, 8, @sizeOf(abi.CloneArgs), 0) == lib.err(.FAULT), 147);
-    ca.known.flags = CLONE_VM; // a process of its own: no fork yet
+    ca.known.flags = CLONE_VM | 0x400; // a process sharing the descriptor table
     expect(lib.syscall(Sys.clone3, cap, @sizeOf(abi.CloneArgs), 0) == lib.err(.INVAL), 148);
     ca.known.flags = all_flags;
     ca.known.exit_signal = 17;

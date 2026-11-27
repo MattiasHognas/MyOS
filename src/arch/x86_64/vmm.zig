@@ -376,6 +376,38 @@ pub fn moveUserPage(root: u64, from: u64, to: u64, tables_added: *usize) MapErro
     return true;
 }
 
+/// Copy every user page of the address space `from` into the empty address
+/// space `to`: a new page with the same contents and the same entry bits
+/// for each one (`fork`, without copy-on-write). Returns how many pages
+/// and page tables `to` took. On `error.OutOfMemory`, what was copied so
+/// far stays in `to`, for the caller to destroy with it. Whoever holds the
+/// lock of `from`'s mappings must hold it throughout.
+pub fn copyUserSpace(from: u64, to: u64) MapError!usize {
+    var taken: usize = 0;
+    try copyLevel(table(from), to, 3, 0, &taken);
+    return taken;
+}
+
+fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapError!void {
+    const n: usize = if (level == 3) 256 else 512; // the user half only
+    for (t[0..n], 0..) |e, i| {
+        if (e & PRESENT == 0) continue;
+        const virt = base + i * span(level);
+        if (level == 0) {
+            const page = pmm.alloc() orelse return error.OutOfMemory;
+            @memcpy(pmm.physToVirt(page)[0..pmm.PAGE_SIZE], pmm.physToVirt(e & ADDR_MASK)[0..pmm.PAGE_SIZE]);
+            var tables: usize = 0;
+            mapCounting(to, virt, page, e & ~ADDR_MASK & ~PRESENT, &tables) catch |err| {
+                pmm.free(page);
+                return err;
+            };
+            taken.* += 1 + tables;
+        } else if (e & HUGE == 0) {
+            try copyLevel(table(e & ADDR_MASK), to, level - 1, virt, taken);
+        }
+    }
+}
+
 /// Flush the user range `[start, start + pages * 4 KiB)` of `root` from
 /// every CPU that has it loaded.
 pub fn flushUserRange(root: u64, start: u64, pages: u64) void {

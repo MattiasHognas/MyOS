@@ -75,6 +75,15 @@ pub const Sys = struct {
     /// `exit(status)`: terminate the calling thread; the process with it
     /// if it was the last. Does not return.
     pub const exit = 60;
+    /// `fork() -> pid`, `vfork() -> pid`: a new process, a copy of this one.
+    pub const fork = 57;
+    pub const vfork = 58;
+    /// `execve(path, argv, envp)`: run another program in this process.
+    pub const execve = 59;
+    /// `wait4(pid, status, options, rusage) -> pid`: collect a child that ended.
+    pub const wait4 = 61;
+    /// `getppid() -> pid` of the parent.
+    pub const getppid = 110;
     /// `kill(pid, signal)`.
     pub const kill = 62;
     /// `uname(buf) -> 0`.
@@ -251,6 +260,8 @@ pub const E = enum(u16) {
     NOEXEC = 8,
     /// Bad file descriptor.
     BADF = 9,
+    /// No child processes (`wait4`).
+    CHILD = 10,
     /// Resource temporarily unavailable: a limit on processes was reached.
     AGAIN = 11,
     /// Permission denied.
@@ -457,6 +468,8 @@ pub const MADV = struct {
 /// Signal numbers go from 1 to this.
 pub const NSIG = 64;
 pub const SIGKILL = 9;
+pub const SIGSEGV = 11;
+pub const SIGCHLD = 17;
 pub const SIGSTOP = 19;
 /// A signal mask is this many bytes: one bit per signal.
 pub const SIGSET_SIZE = 8;
@@ -769,3 +782,8 @@ pub const HWCAP2 = struct {
     pub const RING3MWAIT = 1 << 0;
     pub const FSGSBASE = 1 << 1;
 };
+
+/// `wait4` options.
+pub const WNOHANG = 1;
+pub const WUNTRACED = 2;
+pub const WCONTINUED = 8;

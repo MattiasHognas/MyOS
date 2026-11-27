@@ -430,7 +430,7 @@ noinline fn killForFault(f: *const Frame, name: []const u8, out_of_memory: bool)
     root.print("\n*** thread {d} ({s}): {s} in user mode (vector {d}, error 0x{x}), killed\n", .{ thread.id(), p.name, name, f.vector, f.error_code });
     root.print("RIP=0x{x} RSP=0x{x} RFLAGS=0x{x}\n", .{ f.rip, f.rsp, f.rflags });
     if (f.vector == VECTOR_PAGE_FAULT) root.print("CR2=0x{x} (faulting address)\n", .{readCr2()});
-    process.exit(process.EXIT_KILLED); // the parent sees exit status 255 for a crash
+    process.exitForFault(signal.forVector(f.vector)); // exit status 255; wait4 says which signal
 }
 
 var crash_frame: Frame = undefined;

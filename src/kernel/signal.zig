@@ -126,6 +126,17 @@ pub fn killedStatus(sig: u32) u64 {
     return 128 + sig;
 }
 
+/// The signal a CPU exception from ring 3 stands for (as `fault` sends).
+pub fn forVector(vector: u64) u32 {
+    return switch (vector) {
+        0, 16, 19 => SIG.FPE,
+        1, 3 => SIG.TRAP,
+        6 => SIG.ILL,
+        12, 17 => SIG.BUS,
+        else => SIG.SEGV,
+    };
+}
+
 fn actionOf(p: *Process, sig: u32) abi.SigAction {
     const held = p.signal_lock.acquire();
     defer p.signal_lock.release(held);
@@ -149,7 +160,7 @@ fn ignored(p: *Process, sig: u32) bool {
 /// which keeps the threads from going meanwhile; callable from interrupt
 /// handlers (Ctrl+C).
 pub fn sendProcessLocked(p: *Process, sig: u32) void {
-    if (sig == SIG.KILL) return proc.requestExitLocked(p, killedStatus(sig));
+    if (sig == SIG.KILL) return proc.requestKillLocked(p, sig);
     if (ignored(p, sig)) return;
     _ = p.signal_pending.fetchOr(bit(sig), .acq_rel);
     // Wake a thread that may take it: one that does not block it, if
@@ -166,7 +177,7 @@ pub fn sendProcessLocked(p: *Process, sig: u32) void {
 /// Send `sig` to the thread `t` of the process `p` (`tgkill`), with the
 /// process tree's lock held (`proc.withThread`).
 pub fn sendThreadLocked(p: *Process, t: *Thread, sig: u32) void {
-    if (sig == SIG.KILL) return proc.requestExitLocked(p, killedStatus(sig));
+    if (sig == SIG.KILL) return proc.requestKillLocked(p, sig);
     if (ignored(p, sig)) return;
     _ = t.signal_pending.fetchOr(bit(sig), .acq_rel);
     thread.interrupt(t);
@@ -391,7 +402,7 @@ fn deliverNext(t: *Thread, p: *Process, regs: Regs, interrupted: ?u64) Outcome {
         }
         if (action.handler == SIG_DFL) {
             if (from_fault) t.signal_fault = null;
-            proc.exit(killedStatus(sig));
+            proc.exitBySignal(sig);
         }
         // A handler. An interrupted call is made again when it returns, if
         // the handler asks for that.
@@ -414,7 +425,7 @@ fn deliverNext(t: *Thread, p: *Process, regs: Regs, interrupted: ?u64) Outcome {
                 else => "a signal frame that cannot be written",
             };
             root.print("\n*** thread {d} ({s}): {s} for signal {d}, killed\n", .{ thread.id(), p.name, why, sig });
-            proc.exit(proc.EXIT_KILLED);
+            proc.exitForFault(SIG.SEGV);
         };
         return .handled;
     }
@@ -559,5 +570,5 @@ pub fn sigreturn(f: *arch_syscall.Frame) void {
 
 fn badFrame(p: *Process) void {
     root.print("\n*** thread {d} ({s}): rt_sigreturn without a readable signal frame, killed\n", .{ thread.id(), p.name });
-    proc.exit(proc.EXIT_KILLED);
+    proc.exitForFault(SIG.SEGV);
 }
