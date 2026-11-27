@@ -1187,6 +1187,15 @@ fn eventLoop() TestError!void {
     try expectFootprint(memory);
 }
 
+/// A page fault from a stale translation of a kernel page that has just
+/// been made writable is let through, not reported as a crash.
+fn spuriousKernelFault() TestError!void {
+    var faults: usize = 0;
+    const failed = helpers.spuriousKernelFault(&faults);
+    if (failed != 0) report("spurious fault check", failed);
+    try check(failed == 0);
+}
+
 /// A woken thread runs soon even when every CPU is busy: within a few
 /// ticks, not after a time slice (`thread.preemptForWoken`).
 fn wakeLatency() TestError!void {
@@ -1958,6 +1967,7 @@ fn runCases() noreturn {
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
         .{ .name = "a woken thread preempts a busy CPU", .func = wakeLatency },
+        .{ .name = "a spurious kernel page fault (stale TLB entry) is retried", .func = spuriousKernelFault },
         .{ .name = "eventfd and epoll: counters, waiting on several descriptors (ring 3)", .func = eventLoop },
         .{ .name = "signals: handlers, masks, faults, alternate stack, EINTR and SA_RESTART (ring 3)", .func = signals },
         .{ .name = "the terminal: line editing, Ctrl+D, raw keys, settings, Ctrl+C ends the foreground (ring 3)", .func = terminal },

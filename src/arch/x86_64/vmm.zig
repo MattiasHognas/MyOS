@@ -446,6 +446,36 @@ pub fn leafEntry(root: u64, virt: u64) ?u64 {
     }
 }
 
+/// The 4 KiB leaf entry of `virt` under `root`, to change in place, or null
+/// if there is none. For tests that need a translation the TLB has not
+/// caught up with: nothing is flushed.
+pub fn leafEntryPtr(root: u64, virt: u64) ?*u64 {
+    var t = table(root);
+    var level: u6 = 3;
+    while (true) : (level -= 1) {
+        const e = &t[@intCast((virt >> (12 + 9 * level)) & 0x1FF)];
+        if (level == 0) return e;
+        if (e.* & PRESENT == 0 or e.* & HUGE != 0) return null;
+        t = table(e.* & ADDR_MASK);
+    }
+}
+
+/// Whether the page tables under `root` let ring 0 make this access to
+/// `virt` now: every level present, writable for a write, not NX for an
+/// instruction fetch. For telling a spurious page fault from a real one.
+pub fn permits(root: u64, virt: u64, write: bool, exec: bool) bool {
+    var t = table(root);
+    var level: u6 = 3;
+    while (true) : (level -= 1) {
+        const e = t[@intCast((virt >> (12 + 9 * level)) & 0x1FF)];
+        if (e & PRESENT == 0) return false;
+        if (write and e & WRITABLE == 0) return false;
+        if (exec and e & NX != 0) return false;
+        if (level == 0 or (level <= 2 and e & HUGE != 0)) return true;
+        t = table(e & ADDR_MASK);
+    }
+}
+
 /// Translate `virt` in the address space whose PML4 is `root` to a physical
 /// address. Returns null if it is not mapped. Handles 2 MiB pages.
 pub fn translate(root: u64, virt: u64) ?u64 {

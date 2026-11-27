@@ -47,6 +47,7 @@ const thread = @import("../../kernel/thread.zig");
 const gdt = @import("gdt.zig");
 const ipi = @import("ipi.zig");
 const usercopy = @import("usercopy.zig");
+const vmm = @import("vmm.zig");
 
 var idt = std.mem.zeroes([256]Entry);
 var handlers: [256]?Handler = @splat(null);
@@ -384,11 +385,33 @@ export fn interruptHandler(f: *Frame) callconv(.c) void {
             f.rip = resume_at;
             return;
         }
+        if (!from_user and spuriousKernelFault(readCr2(), f.error_code)) return;
     }
     reportKernelFault(f, name, from_user);
     if (f.vector == VECTOR_BREAKPOINT) return; // breakpoint: resume after int3
     root.halt();
 }
+
+/// Whether a page fault in ring 0 on a kernel address was spurious: the
+/// page tables allow the access now, and the fault came from a translation
+/// this CPU had looked up before they did (a CPU may walk the tables for
+/// an access ahead of time, and hold on to what it found, so a page just
+/// mapped by another CPU can fault once). Then the address is flushed
+/// here and the access made again, as Linux does (`spurious_kernel_fault`).
+/// Faults the page tables explain are reported as before.
+pub fn spuriousKernelFault(addr: u64, error_code: u64) bool {
+    if (addr < vmm.KERNEL_BASE) return false;
+    if (error_code & (1 << 3) != 0) return false; // a reserved bit set: never spurious
+    const write = error_code & 2 != 0;
+    const exec = error_code & 16 != 0;
+    if (!vmm.permits(vmm.loadedRoot(), addr, write, exec)) return false;
+    vmm.flushLocal(addr & ~@as(u64, 0xFFF), 1);
+    spurious_faults += 1;
+    return true;
+}
+
+/// Spurious kernel page faults since boot (`spuriousKernelFault`).
+pub var spurious_faults: usize = 0;
 
 /// The end of a process whose program faulted and does not handle it.
 /// Kept out of `interruptHandler`, as is the report below, so that the

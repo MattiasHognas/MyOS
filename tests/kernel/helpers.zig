@@ -3988,3 +3988,47 @@ pub fn wakeLatency() ?u64 {
     waitForDone(&lat_done, n + 1, &done_queue);
     return lat_worst;
 }
+
+/// A kernel page whose permissions are widened without a flush, as
+/// `spuriousKernelFault` expects can happen: mapped read-only and read, so
+/// this CPU caches the read-only translation, then made writable in the
+/// page table alone, then written. A CPU that faults on its stale entry
+/// must be let through (`idt.spuriousKernelFault`), not reported. Returns
+/// 0, or the number of the first failing check; `faults` says how many
+/// spurious faults there were (none where the CPU looks at the tables again
+/// before it faults, as QEMU and AMD CPUs do: so the decision itself is
+/// checked too).
+pub fn spuriousKernelFault(faults: *usize) u32 {
+    const flags = cpu.saveAndDisableInterrupts(); // one CPU's TLB throughout
+    defer cpu.restoreInterrupts(flags);
+    const page = pmm.allocZeroed() orelse return 1;
+    vmm.map(vmm.kernel_root, SPARE_KERNEL_PAGE, page, vmm.NX, false) catch {
+        pmm.free(page);
+        return 2;
+    };
+    const here: *volatile u64 = @ptrFromInt(SPARE_KERNEL_PAGE);
+    var failed: u32 = 0;
+    if (here.* != 0) failed = 3; // the read-only translation, cached
+    const pte = vmm.leafEntryPtr(vmm.kernel_root, SPARE_KERNEL_PAGE) orelse return 4;
+    const before = idt.spurious_faults;
+    pte.* |= vmm.WRITABLE; // no flush: the TLB still says read-only
+    here.* = 0x5917;
+    faults.* = idt.spurious_faults - before;
+    if (@as(*volatile u64, @ptrCast(@alignCast(pmm.physToVirt(page)))).* != 0x5917) failed = 5;
+    // What the handler decides, asked directly (the CPU above may not have
+    // faulted at all): allowed by the tables now is spurious; anything the
+    // tables refuse is a real fault.
+    const W: u64 = 2;
+    const FETCH: u64 = 16;
+    if (!idt.spuriousKernelFault(SPARE_KERNEL_PAGE + 8, W)) failed = 7; // writable now
+    if (idt.spuriousKernelFault(SPARE_KERNEL_PAGE, FETCH)) failed = 8; // NX
+    if (idt.spuriousKernelFault(SPARE_KERNEL_PAGE + pmm.PAGE_SIZE, 0)) failed = 9; // not mapped
+    if (idt.spuriousKernelFault(0x40_0000, 0)) failed = 10; // a user address
+    if (idt.spuriousKernelFault(SPARE_KERNEL_PAGE, W | 8)) failed = 11; // a reserved bit
+    pte.* &= ~vmm.WRITABLE;
+    vmm.flushLocal(SPARE_KERNEL_PAGE, 1);
+    if (idt.spuriousKernelFault(SPARE_KERNEL_PAGE, W)) failed = 12; // read-only again
+    if (vmm.unmap(vmm.kernel_root, SPARE_KERNEL_PAGE) != page) failed = 6;
+    pmm.free(page);
+    return failed;
+}
