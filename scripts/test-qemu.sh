@@ -36,7 +36,7 @@
 #   shell  the system as a user boots it: init starts the shell, and a
 #          session is typed over the serial line (tests/shell/session.txt):
 #          commands, pipelines with Zig and C programs, redirection, line
-#          editing, Ctrl+C, Ctrl+Z with jobs, fg and bg, a shell that
+#          editing, Ctrl+C, Ctrl+Z with jobs, fg and bg, &, a shell that
 #          ends and is started again
 #
 # After the scenarios, the addresses the kernel was loaded at are compared:
@@ -405,6 +405,9 @@ run_scenario() {
             expect_line '^\[1\]   Running +sleep 30$'
             expect_line '^after-fg 130$' # fg, then Ctrl+C
             if grep -B1 '^no-jobs-left$' "$log" | grep -q '^\[1\]'; then fail "a job was left after fg"; fi
+            expect_line '^\[1\] [0-9]+$' # sleep 1 &
+            expect_line '^started-in-background$'
+            expect_line '^\[1\]\+  Done +sleep 1$' # said before the next prompt
             expect_line '^argv\[1\]=from-shell$'
             expect_line '^init: the shell ended \(status 5\); starting a new one$'
             expect_line '^second shell$'

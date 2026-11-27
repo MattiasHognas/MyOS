@@ -638,10 +638,12 @@ fn sysIoctl(fd: u64, request: u64, arg: u64) u64 {
 /// process group, which stops, and the call returns `EINTR`, to be made
 /// again once it is continued. If the caller blocks or ignores `sig`,
 /// nothing is sent: the call fails with `EIO` for a read and goes ahead
-/// otherwise, as on Linux. Null: go ahead.
+/// otherwise, as on Linux; in an orphaned group it fails with `EIO`.
+/// Null: go ahead.
 fn backgroundStops(sig: u32) ?u64 {
     if (!proc.inBackground()) return null;
     if (!signal.wouldTake(sig)) return if (sig == signal.SIG.TTIN) err(.IO) else null;
+    if (proc.ownGroupOrphaned()) return err(.IO); // nobody to continue it
     const g = proc.groupOf(0, .group) orelse return null;
     _ = proc.signalGroup(g, sig);
     return err(.INTR);

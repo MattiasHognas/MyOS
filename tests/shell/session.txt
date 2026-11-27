@@ -43,6 +43,9 @@ fg
 echo after-fg $?
 jobs
 echo no-jobs-left
+sleep 1 & echo started-in-background
+#wait 3
+echo after-background
 /fixtures/musl-hello-static from-shell
 exit 5
 #wait 4

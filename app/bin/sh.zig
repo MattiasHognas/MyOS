@@ -6,10 +6,13 @@
 //! `2>&1`. Words are quoted as in other shells: single quotes keep
 //! everything, double quotes and a backslash keep spaces and operators;
 //! outside single quotes `$?` is the last status and `$NAME` or `${NAME}`
-//! a variable. No globbing, and no `&` yet.
+//! a variable. No globbing. A pipeline that ends in `&` runs in the
+//! background: the shell says its job number and process group and goes
+//! on.
 //!
 //! Job control, when it reads the terminal: Ctrl+Z stops the pipeline in
-//! the foreground, which becomes a job; `jobs` lists them, `fg [%N]`
+//! the foreground, which becomes a job, as one started with `&` is;
+//! `jobs` lists them, says which have ended before a prompt, `fg [%N]`
 //! brings one back to the foreground and `bg [%N]` lets it go on in the
 //! background. The shell itself ignores `SIGTSTP`, `SIGTTIN` and
 //! `SIGTTOU`, as shells do; the programs it starts get the defaults.
@@ -260,6 +263,8 @@ const Job = struct {
     stopped: bool = false,
     /// The status of the pipeline's last command, once it has ended.
     status: u8 = 0,
+    /// Where the last command is in `pids`.
+    last: usize = 0,
 
     fn name(j: *const Job) []const u8 {
         return j.name_buf[0..j.name_len];
@@ -278,7 +283,7 @@ var jobs: [MAX_JOBS]Job = @splat(.{});
 /// (the job is done) or one has stopped (it is a stopped job). With
 /// `nohang`, only collect what has happened already. Returns the status
 /// as `$?` has it.
-fn waitJob(j: *Job, nohang: bool, last_index: usize) u8 {
+fn waitJob(j: *Job, nohang: bool) u8 {
     var status: u8 = j.status;
     for (&j.pids, 0..) |*pid, i| {
         if (pid.* == 0) continue;
@@ -297,7 +302,7 @@ fn waitJob(j: *Job, nohang: bool, last_index: usize) u8 {
                     return statusOf(raw, j.name());
                 }
                 const s = statusOf(raw, j.name());
-                if (i == last_index) status = s;
+                if (i == j.last) status = s;
                 pid.* = 0;
                 break;
             }
@@ -311,14 +316,6 @@ fn waitJob(j: *Job, nohang: bool, last_index: usize) u8 {
 fn freeJob() ?usize {
     for (&jobs, 0..) |*j, i| if (j.pgid == 0) return i;
     return null;
-}
-
-fn lastIndexOf(j: *const Job) usize {
-    var last: usize = 0;
-    for (j.pids, 0..) |pid, i| if (pid != 0) {
-        last = i;
-    };
-    return last;
 }
 
 /// The job `arg` names (`%N` or `N`), or the newest one without `arg`.
@@ -344,7 +341,7 @@ fn jobNumber(j: *const Job) usize {
 fn reapJobs() void {
     for (&jobs) |*j| {
         if (j.pgid == 0 or j.stopped) continue;
-        _ = waitJob(j, true, lastIndexOf(j));
+        _ = waitJob(j, true);
         if (j.stopped) {
             u.print(2, "[{d}]+  Stopped                 {s}\n", .{ jobNumber(j), j.name() });
         } else if (!j.alive()) {
@@ -358,7 +355,7 @@ fn reapJobs() void {
 /// shell says so; if it ends, its slot is freed. The terminal comes back
 /// to the shell either way.
 fn waitForeground(j: *Job) u8 {
-    const status = waitJob(j, false, lastIndexOf(j));
+    const status = waitJob(j, false);
     giveTerminal(shell_pgid);
     if (j.stopped) {
         u.print(2, "[{d}]+  Stopped                 {s}\n", .{ jobNumber(j), j.name() });
@@ -460,10 +457,11 @@ fn builtin(c: *Command) ?u8 {
     return null;
 }
 
-/// Run a pipeline of `n` commands and return its status: the last one's.
-fn runPipeline(cmds: []Command) u8 {
+/// Run a pipeline of `n` commands and return its status: the last one's;
+/// 0 for one sent to the `background`.
+fn runPipeline(cmds: []Command, background: bool) u8 {
     // A single built-in runs in the shell itself, with its redirections
-    // undone afterwards.
+    // undone afterwards (in the foreground even after `&`).
     if (cmds.len == 1 and isBuiltin(u.span(cmds[0].argv[0].?))) {
         const saved = [3]usize{ u.sys3(.fcntl, 0, 1030, 10), u.sys3(.fcntl, 1, 1030, 10), u.sys3(.fcntl, 2, 1030, 10) };
         const status = if (applyRedirections(&cmds[0])) builtin(&cmds[0]).? else 1;
@@ -513,7 +511,7 @@ fn runPipeline(cmds: []Command) u8 {
         }
         if (pgid == 0) pgid = pid;
         _ = u.sys2(.setpgid, pid, pgid); // in the parent too: whichever runs first
-        if (i == 0) giveTerminal(pgid);
+        if (i == 0 and !background) giveTerminal(pgid);
         pids[started] = pid;
         started += 1;
         if (prev_read) |r| u.close(r);
@@ -525,13 +523,13 @@ fn runPipeline(cmds: []Command) u8 {
     }
     if (prev_read) |r| u.close(r);
     if (started == 0) {
-        giveTerminal(shell_pgid);
+        if (!background) giveTerminal(shell_pgid);
         return 1;
     }
     // A job, while it runs: it stays one if it is stopped.
     const slot = freeJob() orelse MAX_JOBS - 1; // all taken: the last is reused
     const j = &jobs[slot];
-    j.* = .{ .pgid = pgid, .status = 1 };
+    j.* = .{ .pgid = pgid, .status = 1, .last = started - 1 };
     @memcpy(j.pids[0..started], pids[0..started]);
     var name_w: std.Io.Writer = .fixed(&j.name_buf);
     for (cmds[0..started], 0..) |*c, i| {
@@ -542,6 +540,10 @@ fn runPipeline(cmds: []Command) u8 {
         }
     }
     j.name_len = name_w.end;
+    if (background) {
+        if (interactive) u.print(2, "[{d}] {d}\n", .{ jobNumber(j), pgid });
+        return 0;
+    }
     return waitForeground(j);
 }
 
@@ -566,7 +568,7 @@ fn runLine(line: []const u8) void {
     var i: usize = 0;
     while (i <= toks.len) : (i += 1) {
         const sep: ?Op = if (i == toks.len) null else switch (toks[i]) {
-            .op => |op| if (op == .semicolon or op == .and_and or op == .or_or) op else null,
+            .op => |op| if (op == .semicolon or op == .and_and or op == .or_or or op == .background) op else null,
             .word => null,
         };
         if (i < toks.len and sep == null) continue;
@@ -575,7 +577,7 @@ fn runLine(line: []const u8) void {
         if (!skip and part.len > 0) {
             var cmds: [MAX_CMDS]Command = undefined;
             if (parsePipeline(part, &cmds)) |n| {
-                if (n > 0) last_status = runPipeline(cmds[0..n]);
+                if (n > 0) last_status = runPipeline(cmds[0..n], sep == .background);
             } else last_status = 2;
         }
         // `&&` goes on after success, `||` after failure; `;` always.

@@ -159,8 +159,12 @@ pub fn main() noreturn {
 
     // --- SIGTSTP stops a process that does not handle it; one that stops
     // itself is continued, and ends as it likes.
+    // (In a group of its own, whose parent is in another group of the
+    // session: not orphaned. This process's own group is, since nothing
+    // started it but the kernel.)
     const c = lib.syscall(Sys.fork, 0, 0, 0);
     if (c == 0) {
+        _ = lib.syscall(Sys.setpgid, 0, 0, 0);
         _ = lib.syscall(Sys.kill, lib.syscall(Sys.getpid, 0, 0, 0), SIGTSTP, 0);
         lib.exit(5); // once continued
     }
@@ -213,6 +217,39 @@ pub fn main() noreturn {
     kill(f, SIGKILL);
     expect(wait4(f, &status, 0) == f and status == SIGKILL, 53);
     _ = drain(rd);
+
+    // --- An orphaned group: this process's own (nothing in the session
+    // started it). SIGTSTP is thrown away there; SIGSTOP is not.
+    const k = lib.syscall(Sys.fork, 0, 0, 0);
+    if (k == 0) {
+        _ = lib.syscall(Sys.kill, lib.syscall(Sys.getpid, 0, 0, 0), SIGTSTP, 0);
+        lib.exit(7);
+    }
+    expect(wait4(k, &status, abi.WUNTRACED) == k and status == 7 << 8, 55);
+    // A group left orphaned while one of its processes is stopped gets
+    // SIGHUP and SIGCONT: a child starts a session of its own, its child
+    // stops, and the first ends; the second is then this process's, in
+    // another session, and SIGHUP ends it.
+    var nfd: [2]i32 = undefined;
+    expect(lib.syscall(Sys.pipe2, @intFromPtr(&nfd), 0, 0) == 0, 56);
+    const m = lib.syscall(Sys.fork, 0, 0, 0);
+    if (m == 0) {
+        _ = lib.syscall(Sys.setsid, 0, 0, 0);
+        const n = lib.syscall(Sys.fork, 0, 0, 0);
+        if (n == 0) {
+            _ = lib.syscall(Sys.kill, lib.syscall(Sys.getpid, 0, 0, 0), SIGSTOP, 0);
+            lib.exit(8); // not reached: SIGHUP comes with the SIGCONT
+        }
+        var st: i32 = 0;
+        if (wait4(n, &st, abi.WUNTRACED) != n or st != stopped(SIGSTOP)) lib.exit(1);
+        _ = lib.syscall(Sys.write, @intCast(nfd[1]), @intFromPtr(&n), 8);
+        lib.exit(0);
+    }
+    var grandchild: u64 = 0;
+    expect(lib.read(@intCast(nfd[0]), std.mem.asBytes(&grandchild)) == 8, 57);
+    expect(wait4(m, &status, 0) == m and status == 0, 58);
+    expect(wait4(grandchild, &status, 0) == grandchild and status == 1, 59); // SIGHUP
+    for (nfd) |fd| _ = lib.close(@intCast(fd));
 
     // --- The terminal: this process's group has it, so a child in a group
     // of its own is in the background.

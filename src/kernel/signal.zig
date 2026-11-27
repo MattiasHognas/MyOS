@@ -28,6 +28,10 @@
 //! away a pending `SIGCONT`, and `SIGCONT` the pending stop signals, as on
 //! Linux. The parent hears of both through `wait4` and `SIGCHLD`.
 //!
+//! The terminal's stop signals are thrown away for an orphaned process
+//! group, and a group left orphaned with a stopped process in it gets
+//! `SIGHUP` and `SIGCONT`.
+//!
 //! What is not there yet: queued real-time signals (a second one sent
 //! before the first is delivered is lost, as with the standard signals),
 //! and `siginfo` values beyond the sender and the faulting address.
@@ -440,6 +444,12 @@ fn deliverNext(t: *Thread, p: *Process, regs: Regs, interrupted: ?u64) Outcome {
             continue;
         }
         if (action.handler == SIG_DFL and defaultAction(sig) == .stop) {
+            // The terminal's stop signals are thrown away for a group no
+            // shell is left to continue (`SIGSTOP` is not), as on Linux.
+            if (sig != SIG.STOP and proc.ownGroupOrphaned()) {
+                outcome = .ignored;
+                continue;
+            }
             // The whole process stops here, this thread with it; an
             // interrupted call is made again once it is continued.
             proc.stopProcess(p, sig);

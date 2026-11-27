@@ -564,6 +564,7 @@ pub fn exit(code: u64) noreturn {
     // The last of the terminal's foreground group: the terminal has none
     // now, until a shell gives it to another.
     if (p.pgid == foreground_group and !groupExistsLocked(p.pgid)) foreground_group = 0;
+    wakeOrphanedLocked();
     _ = p.exited.wakeAll(); // before the lock is released: the waiters are still there
     // A zombie in its parent's list until the parent collects it.
     if (p.parent) |parent| {
@@ -775,6 +776,42 @@ pub fn groupOf(pid: u64, which: enum { group, session }) ?u64 {
         if (pid == 0 or p.pid == pid) return if (which == .group) p.pgid else p.sid;
     }
     return null;
+}
+
+/// Whether the process group `pgid` is orphaned: no live member has a
+/// parent outside the group but in the same session, so no shell is left
+/// to continue it. Linux throws away the terminal's stop signals for such
+/// a group (`SIGTSTP`, `SIGTTIN`, `SIGTTOU`). Tree lock held.
+fn orphanedLocked(pgid: u64) bool {
+    var q = all_processes;
+    while (q) |p| : (q = p.all_next) {
+        if (p.pgid != pgid or p.exit_code != null) continue;
+        const parent = p.parent orelse continue;
+        if (parent.exit_code == null and parent.pgid != pgid and parent.sid == p.sid) return false;
+    }
+    return true;
+}
+
+/// `orphanedLocked` for the calling process's group.
+pub fn ownGroupOrphaned() bool {
+    const me = thread.current().process orelse return true;
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    return orphanedLocked(me.pgid);
+}
+
+/// After a process has ended: a group it left orphaned that has a
+/// stopped process gets `SIGHUP` and `SIGCONT`, as on Linux, so it is not
+/// stopped for ever with nobody to continue it. Any stopped process will
+/// do to look at, since there are few. Tree lock held.
+fn wakeOrphanedLocked() void {
+    var q = all_processes;
+    while (q) |m| : (q = m.all_next) {
+        if (m.exit_code != null or !m.stopped.load(.acquire) or !orphanedLocked(m.pgid)) continue;
+        // Continued now, so the group's other members are passed over.
+        _ = signalGroupLocked(m.pgid, signal.SIG.HUP);
+        _ = signalGroupLocked(m.pgid, signal.SIG.CONT);
+    }
 }
 
 /// Stop `p` for the signal `sig`: its threads wait on their way back to

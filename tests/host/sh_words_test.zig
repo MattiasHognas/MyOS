@@ -44,8 +44,8 @@ test "dollar: status, variables, braces, and a dollar alone" {
 }
 
 test "operators, with and without spaces around them" {
-    const toks = try split("a|b && c||d; e < in > out >> app 2> err 2>> err2 2>&1");
-    const ops = [_]w.Op{ .pipe, .and_and, .or_or, .semicolon, .in, .out, .append, .err_out, .err_append, .err_to_out };
+    const toks = try split("a|b && c||d; e < in > out >> app 2> err 2>> err2 2>&1 & f&");
+    const ops = [_]w.Op{ .pipe, .and_and, .or_or, .semicolon, .in, .out, .append, .err_out, .err_append, .err_to_out, .background, .background };
     var seen: usize = 0;
     for (toks) |t| switch (t) {
         .op => |o| {

@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-pub const Op = enum { pipe, semicolon, and_and, or_or, in, out, append, err_out, err_append, err_to_out };
+pub const Op = enum { pipe, semicolon, and_and, or_or, background, in, out, append, err_out, err_append, err_to_out };
 pub const Token = union(enum) { word: [:0]const u8, op: Op };
 
 pub const Error = error{
@@ -144,7 +144,7 @@ fn operator(rest: []const u8) ?struct { op: Op, len: usize } {
     const ops = [_]struct { []const u8, Op }{
         .{ "2>&1", .err_to_out }, .{ "2>>", .err_append }, .{ "2>", .err_out }, .{ ">>", .append },
         .{ "&&", .and_and },      .{ "||", .or_or },       .{ "|", .pipe },     .{ ";", .semicolon },
-        .{ "<", .in },            .{ ">", .out },
+        .{ "&", .background },    .{ "<", .in },           .{ ">", .out },
     };
     for (ops) |o| {
         if (std.mem.startsWith(u8, rest, o[0])) return .{ .op = o[1], .len = o[0].len };
