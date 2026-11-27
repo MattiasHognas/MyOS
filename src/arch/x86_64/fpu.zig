@@ -244,6 +244,13 @@ pub fn saveCurrent(area: [*]align(AREA_ALIGN) u8) void {
     save(area);
 }
 
+/// Give the running thread the state a new one starts with (`execve`),
+/// through its own save area `area`.
+pub fn resetCurrent(area: [*]align(AREA_ALIGN) u8) void {
+    initArea(area[0..areaSize()]);
+    restore(area);
+}
+
 /// Load extended state from `area`, replacing all of the CPU's.
 fn restore(area: [*]align(AREA_ALIGN) const u8) void {
     switch (mode) {

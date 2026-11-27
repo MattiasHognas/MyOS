@@ -521,8 +521,9 @@ pub fn interrupt(t: *Thread) void {
 /// that the thread is to end too instead of waiting or returning to its
 /// program (`process.dieIfKilled`).
 pub fn dying() bool {
-    const p = current().process orelse return false;
-    return proc.ending(p);
+    const me = current();
+    const p = me.process orelse return false;
+    return proc.ending(p) or proc.endsForExec(p, me);
 }
 
 /// True if the calling thread is to stop waiting: its process is ending,

@@ -141,7 +141,7 @@ pub fn main() noreturn {
         if (nr == Sys.epoll_wait or nr == Sys.epoll_pwait or nr == Sys.epoll_pwait2) continue;
         // New processes (a fork bomb, or children waited for with nothing
         // to end them), and signals to everyone (`kill(-1)`).
-        if (nr == Sys.fork or nr == Sys.vfork or nr == Sys.clone or nr == Sys.clone3 or nr == Sys.wait4 or nr == Sys.kill) continue;
+        if (nr == Sys.fork or nr == Sys.vfork or nr == Sys.clone or nr == Sys.clone3 or nr == Sys.wait4 or nr == Sys.kill or nr == Sys.execve or nr == Sys.execveat) continue;
         if (nr == Sys.futex) args[1] = (args[1] & ~@as(u64, 0x7F)) | lib.abi.FUTEX.WAKE;
         if (nr == Sys.kill or nr == Sys.tkill) args[1] = 0;
         if (nr == Sys.tgkill) args[2] = 0;

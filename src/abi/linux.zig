@@ -84,6 +84,8 @@ pub const Sys = struct {
     pub const wait4 = 61;
     /// `getppid() -> pid` of the parent.
     pub const getppid = 110;
+    /// `execveat(dirfd, path, argv, envp, flags)`.
+    pub const execveat = 322;
     /// `kill(pid, signal)`.
     pub const kill = 62;
     /// `uname(buf) -> 0`.

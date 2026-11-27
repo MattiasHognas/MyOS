@@ -201,6 +201,40 @@ fn copyStringList(ptr: u64, bytes_left: *usize, count_left: *usize) union(enum) 
     return .{ .list = .{ .storage = storage, .slots = items, .len = n } };
 }
 
+/// `execve` and `execveat` (with `dirfd` and `flags` 0 or `AT_FDCWD`):
+/// replace the program of the calling process with the one at the user
+/// path `ptr` (`proc.execve`). Returns only on an error, leaving the
+/// program as it was: those of `Path.from`, `ENOENT`, `ENOEXEC`, `E2BIG`,
+/// `EFAULT`, `ENOMEM`, `EINTR` (another thread replaced or ended the
+/// process first).
+fn sysExecve(f: *arch.Frame, dirfd: u64, ptr: u64, argv: u64, envp: u64) u64 {
+    var given = switch (Path.from(dirfd, ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    var bytes_left: usize = abi.ARG_MAX;
+    var count_left: usize = abi.ARG_COUNT_MAX;
+    const args = switch (copyStringList(argv, &bytes_left, &count_left)) {
+        .list => |l| l,
+        .fail => |e| return e,
+    };
+    defer args.deinit();
+    const env = switch (copyStringList(envp, &bytes_left, &count_left)) {
+        .list => |l| l,
+        .fail => |e| return e,
+    };
+    defer env.deinit();
+    proc.execve(f, given.text, args.items(), env.items()) catch |e| return switch (e) {
+        error.FileNotFound => err(.NOENT),
+        error.OutOfMemory, error.TooLarge => err(.NOMEM),
+        error.ArgumentsTooLong => err(.@"2BIG"),
+        error.Interrupted => err(.INTR),
+        error.ReadFailed, error.NotExecutable => err(.NOEXEC),
+    };
+    return 0; // the new program's RAX, which `proc.execve` cleared too
+}
+
 /// `myos_run`: spawn the program at the user path `ptr` as a child process,
 /// with the arguments `argv` and the environment `envp` (user arrays as for
 /// `execve`; null for none), and block until it exits. Returns the child's
@@ -2395,6 +2429,8 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.fork => newProcess(f, .{ .flags = 0, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
         Sys.vfork => newProcess(f, .{ .flags = proc.CLONE.VM | proc.CLONE.VFORK, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
         Sys.wait4 => sysWait4(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.execve => sysExecve(f, CWD, f.rdi, f.rsi, f.rdx),
+        Sys.execveat => if (f.r8 != 0) err(.INVAL) else sysExecve(f, f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getppid => if (thread.current().process) |me| proc.parentPid(me) else err(.NOSYS),
         Sys.clone3 => sysClone3(f),
         Sys.sched_setaffinity => sysSchedSetAffinity(f.rdi, f.rsi, f.rdx),

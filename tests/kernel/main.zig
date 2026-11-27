@@ -904,6 +904,21 @@ fn forkWait() TestError!void {
     try expectFootprint(memory);
 }
 
+/// `execve`: arguments, environment, descriptors and signal actions across
+/// it; failures that keep the program; `vfork` with it; scripts; a
+/// process with several threads. Nothing left behind.
+fn execProgram() TestError!void {
+    _ = helpers.runProgram("/test/exec"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const processes = helpers.processCount();
+    const code = helpers.runProgram("/test/exec") orelse return error.Failed;
+    if (code != 0) report("/test/exec failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/exec"));
+    try check(helpers.processCount() == processes);
+    try expectFootprint(memory);
+}
+
 /// Programs that set their own FS and GS base (`wrfsbase`, `wrgsbase`):
 /// kept across switches and reported by `arch_prctl`; and a kernel-looking
 /// GS base at a debug exception in the syscall entry does not fool the
@@ -1951,6 +1966,7 @@ fn runCases() noreturn {
         .{ .name = "debug exception with the user GS base in ring 0", .func = debugTrapEntry },
         .{ .name = "FS and GS base set by the program itself (FSGSBASE)", .func = fsgsbase },
         .{ .name = "fork, vfork, clone of a process, wait4 (ring 3)", .func = forkWait },
+        .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
         .{ .name = "extended state setup (SSE, XSAVE or FXSAVE)", .func = extendedStateSetup },
         .{ .name = "x87/SSE/AVX registers survive process switches", .func = extendedStateSwitching },
         .{ .name = "new process starts with clean x87/SSE/AVX state", .func = extendedStateClean },

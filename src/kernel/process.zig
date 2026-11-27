@@ -259,6 +259,9 @@ pub const Process = struct {
     /// The signal that ended the process, 0 if it ended by itself or by
     /// the kernel without one: what `wait4` reports.
     term_signal: std.atomic.Value(u32) = .init(0),
+    /// The thread that is replacing the program (`execve`), while it makes
+    /// the others end.
+    exec_thread: std.atomic.Value(?*thread.Thread) = .init(null),
     /// Link in the list of every process (`all_processes`), from when it is
     /// started until its structure is freed. Under the tree lock.
     all_next: ?*Process = null,
@@ -536,8 +539,9 @@ fn die() noreturn {
 /// its program: after a system call and after an interrupt taken in ring
 /// 3. No lock may be held.
 pub fn dieIfKilled() void {
-    const p = thread.current().process orelse return;
-    if (p.killed.load(.acquire)) die();
+    const me = thread.current();
+    const p = me.process orelse return;
+    if (p.killed.load(.acquire) or endsForExec(p, me)) die();
     const code = p.exit_request.load(.acquire);
     if (code != NO_REQUEST) exit(code);
 }
@@ -674,6 +678,13 @@ fn requestExit(p: *Process, code: u64) void {
 /// Whether someone has asked `p` to end (`terminate`) or it is ending.
 pub fn ending(p: *const Process) bool {
     return p.killed.load(.acquire) or p.exit_request.load(.acquire) != NO_REQUEST;
+}
+
+/// Whether `t` is to end because another thread of `p` is replacing the
+/// program (`execve`).
+pub fn endsForExec(p: *const Process, t: *const thread.Thread) bool {
+    const by = p.exec_thread.load(.acquire) orelse return false;
+    return by != t;
 }
 
 /// Terminate the calling thread with status `code` (the `exit` syscall).
@@ -1365,20 +1376,239 @@ noinline fn loadInterpreter(root: u64, path: []const u8, limits: elf_image.Limit
     return elf.loadAt(root, &img, bias, regions);
 }
 
-/// Create a process named `name` that runs the ELF executable `image`.
+/// Why `execve` did not replace the program.
+pub const ExecError = error{ FileNotFound, ReadFailed, OutOfMemory, TooLarge, ArgumentsTooLong, NotExecutable, Interrupted };
+
+/// `execve`: replace the calling process's program with the one in the
+/// file at `path` (absolute and normalized), with arguments `argv` and
+/// environment `envp`, and set `frame` so that the system call returns
+/// to its first instruction. A file that starts with `#!` names its
+/// interpreter, which is run instead with the file as an argument, as on
+/// Linux (one level).
 ///
-/// Creates a new address space, loads `image` into it (`image` is copied and
-/// may be freed afterwards), maps a zeroed 16 KiB user stack and spawns a
-/// thread that enters user mode at the entry point. Returns immediately
-/// without waiting for the process. The caller receives a reference to the
-/// new process and must give it up with `wait` or `release`.
-///
-/// Fails with `error.TooManyProcesses` if an ancestor has reached its
-/// descendant limit, `error.TooLarge` if the program does not fit the memory
-/// limit, `error.OutOfMemory`, or an error of the ELF loader. On error
-/// nothing is leaked and nothing is counted.
-pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Process {
-    const limits = options.limits orelse if (options.parent) |parent| parent.limits else Limits{};
+/// The new program is loaded first: on an error the old one goes on as
+/// it was. Then the process's other threads end, and the process keeps
+/// its ID, parent, children, descriptors (but those marked close-on-exec),
+/// working directory, signal mask and pending signals, and limits; signal
+/// handlers go back to the default (ignored signals stay ignored), the
+/// alternate stack, FS and GS base and extended state are cleared, and a
+/// parent waiting in `vfork` goes on.
+pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []const u8, envp: []const []const u8) ExecError!void {
+    const me = thread.current();
+    const p = me.process.?;
+    const file = readProgram(path, argv) catch |e| return e;
+    defer heap.allocator.free(file.image);
+    defer if (file.argv_storage) |a| heap.allocator.free(a);
+    defer if (file.argv) |a| heap.allocator.free(a);
+    const run_argv = if (file.argv) |a| a else argv;
+    const run_path = file.run_path orelse path;
+
+    // (The working directory does not matter: `path` is absolute.)
+    const img = buildImage(run_path, file.image, .{ .argv = run_argv, .envp = envp }, p.limits) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooLarge,
+        error.ArgumentsTooLong => error.ArgumentsTooLong,
+        error.FileNotFound => error.FileNotFound,
+        else => error.NotExecutable,
+    };
+    errdefer img.destroy();
+    const name = try heap.allocator.dupe(u8, path);
+    errdefer heap.allocator.free(name);
+
+    // The other threads end; this one, if another got here first or the
+    // process is ending, goes with them.
+    if (p.exec_thread.cmpxchgStrong(null, me, .acq_rel, .acquire) != null) return error.Interrupted;
+    {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        var t = p.thread_list;
+        while (t) |other| : (t = other.proc_next) {
+            if (other != me) thread.interrupt(other);
+        }
+        while (p.thread_count > 1) p.threads_gone.wait(&tree_lock);
+    }
+    p.exec_thread.store(null, .release);
+    if (p.killed.load(.acquire)) return error.Interrupted;
+
+    // The new address space in, the old one out.
+    const old_root = p.root;
+    var old_regions: vm_regions.Regions = undefined;
+    {
+        const flags = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(flags);
+        vmm.loadRoot(img.root);
+        const held = p.mem.lock.acquire();
+        defer p.mem.lock.release(held);
+        old_regions = p.mem.regions;
+        p.mem.regions = img.regions;
+        p.mem.brk_start = img.brk;
+        p.mem.brk_end = img.brk;
+        p.mem.mmap_top = img.mmap_top;
+        p.root = img.root;
+        p.pages = img.pages + kstack.STACK_PAGES;
+    }
+    vmm.unloadRoot(old_root); // no other CPU should have it, but make sure
+    vmm.destroyAddressSpace(old_root);
+    old_regions.deinit(heap.allocator);
+    p.entry = img.entry;
+    p.entry_rsp = img.entry_rsp;
+    p.stack_top = img.stack_top;
+    const old_name = p.name;
+    p.name = name;
+    heap.allocator.free(old_name);
+
+    closeOnExec(p);
+    {
+        const held = p.signal_lock.acquire();
+        defer p.signal_lock.release(held);
+        for (p.signal_actions) |*a| {
+            if (a.handler != 1) a.* = .{}; // SIG_IGN stays
+        }
+    }
+    {
+        const flags = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(flags);
+        me.fs_base = 0;
+        me.gs_base = 0;
+        @import("../arch/x86_64/percpu.zig").setUserBases(0, 0);
+        if (me.fpuArea()) |area| fpu.resetCurrent(area);
+    }
+    me.signal_stack = .{};
+    me.signal_saved_mask = null;
+    me.clear_child_tid = 0;
+    {
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        if (p.vfork_pending) {
+            p.vfork_pending = false;
+            _ = p.exited.wakeAll();
+        }
+    }
+
+    // Into the new program, as a new process starts: every register zero
+    // but the stack pointer and the instruction pointer.
+    frame.* = std.mem.zeroes(arch_syscall.Frame);
+    frame.rip = img.entry;
+    frame.rcx = img.entry;
+    frame.rsp = img.entry_rsp;
+    frame.rflags = 0x202;
+    frame.r11 = 0x202;
+    frame.cs = @import("../arch/x86_64/sysret.zig").USER_CS;
+    frame.ss = @import("../arch/x86_64/sysret.zig").USER_SS;
+}
+
+/// Close the descriptors of `p` marked close-on-exec.
+fn closeOnExec(p: *Process) void {
+    while (true) {
+        const of = blk: {
+            const held = p.files_lock.acquire();
+            defer p.files_lock.release(held);
+            for (p.files, p.fd_cloexec) |*slot, *ce| {
+                if (!ce.*) continue;
+                ce.* = false;
+                const one = slot.* orelse continue;
+                slot.* = null;
+                break :blk one;
+            }
+            return;
+        };
+        open_file.unref(of); // outside the lock: it may free a pipe
+    }
+}
+
+/// A program file `execve` is to run: its contents, and for a script the
+/// interpreter to run instead and the arguments for it.
+const ProgramFile = struct {
+    image: []u8,
+    run_path: ?[]const u8 = null,
+    argv: ?[][]const u8 = null,
+    /// What `run_path` and `argv` point into, freed with the image.
+    argv_storage: ?[]u8 = null,
+};
+
+/// Read the program at `path`. A script (`#!interpreter [argument]` on
+/// its first line, at most 256 bytes) is read as its interpreter, whose
+/// arguments are the interpreter, the argument if there is one, the
+/// script's path, and then `argv` from its second on, as on Linux.
+fn readProgram(path: []const u8, argv: []const []const u8) ExecError!ProgramFile {
+    const first = readWhole(path) catch |e| return e;
+    if (first.len < 2 or first[0] != '#' or first[1] != '!') return .{ .image = first };
+    defer heap.allocator.free(first);
+    const line_end = std.mem.indexOfScalar(u8, first[0..@min(first.len, 256)], '\n') orelse return error.NotExecutable;
+    const line = std.mem.trim(u8, first[2..line_end], " \t");
+    const sep = std.mem.indexOfAny(u8, line, " \t");
+    const interp = if (sep) |i| line[0..i] else line;
+    const arg = if (sep) |i| std.mem.trim(u8, line[i..], " \t") else "";
+    if (interp.len == 0 or interp[0] != '/') return error.NotExecutable;
+    // The interpreter path and its argument outlive `first`: a copy.
+    const storage = try heap.allocator.alloc(u8, interp.len + arg.len + path.len);
+    errdefer heap.allocator.free(storage);
+    @memcpy(storage[0..interp.len], interp);
+    @memcpy(storage[interp.len..][0..arg.len], arg);
+    @memcpy(storage[interp.len + arg.len ..], path);
+    const image = readWhole(storage[0..interp.len]) catch |e| return e;
+    if (image.len >= 2 and image[0] == '#' and image[1] == '!') {
+        heap.allocator.free(image);
+        return error.NotExecutable; // one level, as on Linux
+    }
+    errdefer heap.allocator.free(image);
+    const rest = if (argv.len > 0) argv[1..] else argv;
+    const list = try heap.allocator.alloc([]const u8, @as(usize, 2) + @intFromBool(arg.len != 0) + rest.len);
+    var n: usize = 0;
+    list[n] = storage[0..interp.len];
+    n += 1;
+    if (arg.len != 0) {
+        list[n] = storage[interp.len..][0..arg.len];
+        n += 1;
+    }
+    list[n] = storage[interp.len + arg.len ..];
+    n += 1;
+    @memcpy(list[n..], rest);
+    return .{ .image = image, .run_path = storage[0..interp.len], .argv = list, .argv_storage = storage };
+}
+
+/// The whole file at `path`, symbolic links followed, on the heap.
+fn readWhole(path: []const u8) ExecError![]u8 {
+    const node = lookupFollowing(path) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.FileNotFound,
+    };
+    defer vfs.release(&node);
+    const size = vfs.sizeOf(&node);
+    const image = try heap.allocator.alloc(u8, size);
+    errdefer heap.allocator.free(image);
+    if (vfs.read(&node, 0, image) != size) return error.ReadFailed;
+    return image;
+}
+
+/// A program loaded into an address space of its own, ready to run: what
+/// `spawn` starts a process with and `execve` replaces one's with.
+const Image = struct {
+    root: u64,
+    regions: vm_regions.Regions,
+    /// Where it starts (its interpreter's entry, if it has one), with which
+    /// stack pointer, and the top of its stack.
+    entry: u64,
+    entry_rsp: u64,
+    stack_top: u64,
+    mmap_top: u64,
+    /// Where the `brk` heap begins: the end of the program.
+    brk: u64,
+    /// Pages it takes: program, interpreter, stack, page tables.
+    pages: u64,
+
+    fn destroy(img: *const Image) void {
+        var r = img.regions;
+        r.deinit(heap.allocator);
+        vmm.destroyAddressSpace(img.root);
+    }
+};
+
+/// Load the program `image` into a new address space, with a stack holding
+/// its arguments, environment and auxiliary vector, and its interpreter if
+/// it names one. `name` is the path it is started under. On error nothing
+/// is left. Not inlined: its frame stays out of its callers'.
+noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOptions, limits: Limits) !Image {
 
     const root = try vmm.createAddressSpace();
     errdefer vmm.destroyAddressSpace(root);
@@ -1429,9 +1659,48 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
 
     const entry_rsp = try writeStartupData(name, options, loaded, interp_base, &stack_pages, stack_top, data_top);
 
-    // Everything the process takes, now that its page tables exist.
-    const pages = loaded.pages + interp_pages + STACK_PAGES + vmm.userTablePages(root) + kstack.STACK_PAGES;
-    if (pages > limits.max_pages) return error.TooLarge;
+    // Everything the program takes, now that its page tables exist (the
+    // thread's kernel stack comes on top).
+    const pages = loaded.pages + interp_pages + STACK_PAGES + vmm.userTablePages(root);
+    if (pages + kstack.STACK_PAGES > limits.max_pages) return error.TooLarge;
+    return .{
+        .root = root,
+        .regions = regions,
+        .entry = first_entry,
+        .entry_rsp = entry_rsp,
+        .stack_top = stack_top,
+        .mmap_top = mmap_top,
+        .brk = loaded.end,
+        .pages = pages,
+    };
+
+}
+
+/// Create a process named `name` that runs the ELF executable `image`.
+///
+/// Creates a new address space, loads `image` into it (`image` is copied and
+/// may be freed afterwards), maps a zeroed 16 KiB user stack and spawns a
+/// thread that enters user mode at the entry point. Returns immediately
+/// without waiting for the process. The caller receives a reference to the
+/// new process and must give it up with `wait` or `release`.
+///
+/// Fails with `error.TooManyProcesses` if an ancestor has reached its
+/// descendant limit, `error.TooLarge` if the program does not fit the memory
+/// limit, `error.OutOfMemory`, or an error of the ELF loader. On error
+/// nothing is leaked and nothing is counted.
+pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Process {
+    const limits = options.limits orelse if (options.parent) |parent| parent.limits else Limits{};
+
+    const img = try buildImage(name, image, options, limits);
+    errdefer img.destroy();
+    const root = img.root;
+    const regions = img.regions;
+    const first_entry = img.entry;
+    const stack_top = img.stack_top;
+    const entry_rsp = img.entry_rsp;
+    const mmap_top = img.mmap_top;
+    const pages = img.pages + kstack.STACK_PAGES;
+    const loaded_end = img.brk;
 
     const p = try heap.allocator.create(Process);
     errdefer heap.allocator.destroy(p);
@@ -1459,8 +1728,8 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
         .refs = if (options.parent != null) 3 else 2, // the thread's, the caller's, and the parent's list's
         .mem = .{
             .regions = regions,
-            .brk_start = loaded.end,
-            .brk_end = loaded.end,
+            .brk_start = loaded_end,
+            .brk_end = loaded_end,
             .mmap_top = mmap_top,
         },
     };

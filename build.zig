@@ -103,7 +103,7 @@ pub fn build(b: *std.Build) void {
         "bad_return", "single_step", "recurse",    "open_count",     "run_many",
         "getchar",    "zero_pages",  "linux_abi",  "vm",             "threads",
         "pipes",      "files",       "alloc",      "tmp",            "terminal",
-        "signals",    "epoll",       "fsgsbase",   "fork",
+        "signals",    "epoll",       "fsgsbase",   "fork",           "exec",
     }) |name| {
         const exe = userProgram(b, "test-" ++ name, "tests/user/" ++ name ++ ".zig", 0x40_0000, user_target, optimize);
         exe.root_module.addImport("lib", user_lib);
