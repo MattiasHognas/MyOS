@@ -256,6 +256,11 @@ pub const Thread = struct {
     /// For a thread made by `clone`: the user registers it starts with, a
     /// heap block it frees when it has taken them. Null otherwise.
     user_frame: ?*anyopaque = null,
+    /// Return from the current system call with `iretq`, which restores
+    /// RCX and R11 as the frame has them (`execve`, which zeroes them as
+    /// Linux does; `sysretq` would put the return address and flags
+    /// there). Cleared on the way out.
+    return_by_iret: bool = false,
     /// Set while the thread reads user memory under a spinlock: a page
     /// fault then fails the read instead of being resolved, which would
     /// need the address-space lock (`futex.zig`).

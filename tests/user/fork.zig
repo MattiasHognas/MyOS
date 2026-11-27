@@ -62,6 +62,21 @@ pub fn main() noreturn {
     expect(shared == 42, 6); // what the child wrote was its own
     expect(wait4(@intCast(child), &status, 0) == lib.err(.CHILD), 7); // collected once
 
+    // --- One open file, one offset: what the child reads, the parent does
+    // not read again.
+    const motd = lib.open("/etc/motd");
+    expect(!lib.isError(motd), 22);
+    const reader = lib.syscall(Sys.fork, 0, 0, 0);
+    if (reader == 0) {
+        var three: [3]u8 = undefined;
+        lib.exit(if (lib.read(motd, &three) == 3 and three[0] == 'W') 0 else 1);
+    }
+    expect(wait4(@intCast(reader), &status, 0) == reader and exited(status) == 0, 23);
+    var rest: [4]u8 = undefined;
+    expect(lib.read(motd, &rest) == 4 and std.mem.eql(u8, &rest, "come"), 24);
+    expect(lib.syscall(Sys.lseek, motd, 0, 1) == 7, 25);
+    _ = lib.close(motd);
+
     // --- WNOHANG, and "any child".
     const slow = lib.syscall(Sys.fork, 0, 0, 0);
     if (slow == 0) {

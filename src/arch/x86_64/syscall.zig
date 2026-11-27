@@ -44,6 +44,7 @@ const assert = @import("../../kernel/debug/assert.zig");
 const dispatcher = @import("../../kernel/syscall.zig");
 const process = @import("../../kernel/process.zig");
 const signal = @import("../../kernel/signal.zig");
+const thread = @import("../../kernel/thread.zig");
 const cpu = @import("cpu.zig");
 const gdt = @import("gdt.zig");
 const sysret = @import("sysret.zig");
@@ -197,7 +198,14 @@ export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     process.dieIfKilled(); // its process is ending: no return to the program
     // A signal to deliver, or an interrupted call to make again: either
     // rewrites the registers, which `iretq` then restores whole.
-    const rewritten = signal.atSyscallReturn(f, number);
+    var rewritten = signal.atSyscallReturn(f, number);
+    {
+        const me = thread.current();
+        if (me.return_by_iret) {
+            me.return_by_iret = false;
+            rewritten = true;
+        }
+    }
     f.rflags = sysret.sanitizeFlags(f.rflags);
     var how = sysret.classify(f.rip, f.rflags, f.cs, f.ss);
     if (rewritten and how == .sysret) how = .iret;

@@ -115,8 +115,8 @@ pub fn main() noreturn {
     expect(lib.run("/does/not/exist") == err(.NOENT)); // 60
     expect(lib.run("/etc/motd") == err(.NOEXEC)); // 61
     expect(lib.run("") == err(.NOENT)); // 62
-    expect(lib.syscall(Sys.myos_run, KERNEL_PTR, 0, 0) == err(.FAULT)); // 63
-    expect(lib.syscall(Sys.myos_run, longPath(300), 0, 0) == err(.NAMETOOLONG)); // 64
+    expect(lib.syscall(Sys.execve, KERNEL_PTR, 0, 0) == err(.FAULT)); // 63
+    expect(lib.syscall(Sys.execve, longPath(300), 0, 0) == err(.NAMETOOLONG)); // 64
     // A child's exit status is its low 8 bits, so it can never look like an error.
     expect(lib.run("/test/entry_regs") == 0); // 65
 

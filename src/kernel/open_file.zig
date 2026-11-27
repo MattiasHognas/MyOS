@@ -4,6 +4,24 @@
 //! (`Process.files`). Several descriptors can refer to one open file
 //! (`dup`); it goes when the last of them is closed and no system call is
 //! using it any more.
+//!
+//! ## What is whose
+//!
+//! - **The open file** holds the offset, what it was opened for, the
+//!   `O_APPEND` and `O_NONBLOCK` flags, and what it is open on (a file, a
+//!   pipe end, the terminal). Every descriptor on it shares them: `dup`,
+//!   `fork` and `execve` make descriptors on the same open file, never a
+//!   new one, so a parent and its child read on from the same offset, as
+//!   on Linux. Its reference count and these fields are changed
+//!   atomically, since the processes that share it have locks of their
+//!   own (`retain`, `unref`, `offset`).
+//! - **The descriptor** holds only `FD_CLOEXEC` (`Process.fd_cloexec`),
+//!   set by `O_CLOEXEC` and the like, cleared by `dup` and `dup2`.
+//! - **Inheritance**: a child made by `fork` gets a copy of the table,
+//!   each descriptor on the same open file with its flag; `execve` closes
+//!   the descriptors marked close-on-exec and keeps the others; threads
+//!   share one table. A process the kernel starts gets 0, 1 and 2 on the
+//!   terminal and nothing else.
 
 const heap = @import("heap.zig");
 const epoll = @import("epoll.zig");
@@ -17,6 +35,8 @@ pub const OpenFile = struct {
     /// The file, for `kind == .file`. The open file holds it
     /// (`vfs.release` when it goes), unless its text is `generated`.
     node: vfs.Node = undefined,
+    /// Where the next `read` or `write` goes; read and changed with
+    /// `getOffset`, `setOffset` and `advance` (atomically: see above).
     offset: u64 = 0,
     /// What the descriptor was opened for (`O_RDONLY`, `O_WRONLY`,
     /// `O_RDWR`), and `O_APPEND`: every write goes to the end.
@@ -127,4 +147,17 @@ pub fn isNonblocking(of: *const OpenFile) bool {
 
 pub fn setNonblocking(of: *OpenFile, on: bool) void {
     @atomicStore(bool, &of.nonblock, on, .monotonic);
+}
+
+pub fn getOffset(of: *const OpenFile) u64 {
+    return @atomicLoad(u64, &of.offset, .monotonic);
+}
+
+pub fn setOffset(of: *OpenFile, to: u64) void {
+    @atomicStore(u64, &of.offset, to, .monotonic);
+}
+
+/// Move the offset on by `n`; returns where it was.
+pub fn advance(of: *OpenFile, n: u64) u64 {
+    return @atomicRmw(u64, &of.offset, .Add, n, .monotonic);
 }

@@ -85,9 +85,58 @@ pub fn build(b: *std.Build) void {
     const exe_hello = userProgram(b, "hello", "app/hello.zig", 0x80_0000, user_target, optimize);
     exe_hello.root_module.addImport("abi", abi);
     b.installArtifact(exe_hello);
-    const exe_shell = userProgram(b, "sh", "app/sh.zig", 0x40_0000, user_target, optimize);
-    exe_shell.root_module.addImport("abi", abi);
-    b.installArtifact(exe_shell);
+
+    // MyOS's own programs: ordinary Linux programs, built with the Zig
+    // standard library for x86_64-linux, packaged as /usr/bin/<name>.
+    const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none });
+    // Built optimized with the safety checks on even in a Debug build, and
+    // without symbols: a Debug build of a standard-library program is
+    // 11 MB, and the image holds them all in memory.
+    const app_optimize: std.builtin.OptimizeMode = if (optimize == .debug) .ReleaseSafe else optimize;
+    const util = b.createModule(.{
+        .root_source_file = b.path("app/util.zig"),
+        .target = linux_target,
+        .optimize = app_optimize,
+    });
+    const sh_words = b.createModule(.{
+        .root_source_file = b.path("app/sh_words.zig"),
+        .target = linux_target,
+        .optimize = app_optimize,
+    });
+    inline for (.{
+        "sh", "init",  "echo", "cat",   "ls",    "pwd", "mkdir", "rmdir",
+        "rm", "clear", "true", "false", "sleep", "env", "kill",  "ps",
+    }) |name| {
+        const exe = b.addExecutable(.{
+            .name = "bin-" ++ name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("app/bin/" ++ name ++ ".zig"),
+                .target = linux_target,
+                .optimize = app_optimize,
+                .strip = true,
+            }),
+        });
+        exe.root_module.addImport("util", util);
+        exe.root_module.addImport("sh_words", sh_words);
+        b.installArtifact(exe); // scripts/build.sh puts zig-out/bin/bin-<name> at /usr/bin/<name>
+    }
+    // A few utilities in plain C, built as any Linux toolchain builds them
+    // (Zig's clang and musl, statically linked), packaged next to them.
+    const musl_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
+    inline for (.{ "wc", "head" }) |name| {
+        const exe = b.addExecutable(.{
+            .name = "bin-" ++ name,
+            .root_module = b.createModule(.{
+                .target = musl_target,
+                .optimize = .ReleaseSmall,
+                .link_libc = true,
+                .strip = true,
+            }),
+            .linkage = .static,
+        });
+        exe.root_module.addCSourceFile(.{ .file = b.path("app/c/" ++ name ++ ".c"), .flags = &.{ "-std=c11", "-Wall", "-Werror" } });
+        b.installArtifact(exe);
+    }
 
     // User-mode test programs, packaged into the test initrd as /test/<name>.
     const user_lib = b.createModule(.{
@@ -276,13 +325,14 @@ fn hostTests(b: *std.Build, filters: []const []const u8, use_llvm: bool) *std.Bu
         .{ "meltdown_rule", "src/arch/x86_64/meltdown_rule.zig" },
         .{ "timer_queue", "src/kernel/sync/timer_queue.zig" },
         .{ "startup_stack", "src/kernel/startup_stack.zig" },
-        .{ "cmdline", "app/cmdline.zig" },
+        .{ "sh_words", "app/sh_words.zig" },
         .{ "vm_regions", "src/kernel/vm_regions.zig" },
         .{ "tar", "src/kernel/fs/tar.zig" },
         .{ "alloc", "app/alloc.zig" },
         .{ "ramfs", "src/kernel/fs/ramfs.zig" },
         .{ "tty_core", "src/kernel/tty_core.zig" },
         .{ "signal_frame", "src/kernel/signal_frame.zig" },
+        .{ "ansi_core", "src/kernel/ansi_core.zig" },
     }) |m| {
         tests.root_module.addImport(m[0], b.createModule(.{
             .root_source_file = b.path(m[1]),

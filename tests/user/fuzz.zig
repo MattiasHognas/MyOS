@@ -36,11 +36,12 @@ var STACK_TOP: u64 = 0;
 const PAGE = 4096;
 
 const implemented = [_]u64{
-    Sys.read,        Sys.write,           Sys.open,              Sys.close,        Sys.sched_yield,   Sys.gettid,       Sys.myos_run,
-    Sys.arch_prctl,  Sys.set_tid_address, Sys.writev,            Sys.ioctl,        Sys.poll,          Sys.rt_sigaction, Sys.rt_sigprocmask,
-    Sys.sigaltstack, Sys.mmap,            Sys.brk,               Sys.futex,        Sys.clock_gettime, Sys.fstat,        Sys.lseek,
-    Sys.pread64,     Sys.openat,          Sys.fcntl,             Sys.getpid,       Sys.kill,          Sys.tgkill,       Sys.uname,
-    Sys.prlimit64,   Sys.getrandom,       Sys.sched_getaffinity, Sys.gettimeofday,
+    Sys.read,           Sys.write,           Sys.open,    Sys.close,     Sys.sched_yield, Sys.gettid,
+    Sys.arch_prctl,     Sys.set_tid_address, Sys.writev,  Sys.ioctl,     Sys.poll,        Sys.rt_sigaction,
+    Sys.rt_sigprocmask, Sys.sigaltstack,     Sys.mmap,    Sys.brk,       Sys.futex,       Sys.clock_gettime,
+    Sys.fstat,          Sys.lseek,           Sys.pread64, Sys.openat,    Sys.fcntl,       Sys.getpid,
+    Sys.kill,           Sys.tgkill,          Sys.uname,   Sys.prlimit64, Sys.getrandom,   Sys.sched_getaffinity,
+    Sys.gettimeofday,
 };
 /// Paths a call may be given. Never this program or the shell: one would
 /// recurse, the other waits for the keyboard.

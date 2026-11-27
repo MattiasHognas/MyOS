@@ -64,12 +64,19 @@ Limine loads the kernel and the initrd, answers the requests declared in
    checked against it (`src/arch/x86_64/smp.zig`);
 7. the initrd as the root filesystem.
 
-The normal kernel then starts `/bin/sh` and its boot thread blocks for good.
+The normal kernel then starts `/sbin/init`, which starts the shell, and its
+boot thread blocks for good.
 The test kernel runs the test scenario QEMU asked for instead
 ([testing](testing.md)).
 
-The initrd is a tar archive built by `scripts/build.sh`: `/bin/sh`,
-`/usr/bin/hello` (also `/bin/hello`: `/bin` is a link to `usr/bin`), `/etc/motd`, and `/test/*` in the test image.
+The initrd is a tar archive built by `scripts/build.sh`: MyOS's programs in
+`/usr/bin` (`/bin` and `/sbin` are links to it), `/etc/motd`, and `/test/*`
+and `/fixtures/*` in the test image. The programs are ordinary Linux
+programs: `init`, the shell and the commands are built with Zig's standard
+library for `x86_64-linux` (`app/bin/`, sharing `app/util.zig` and
+`app/sh_words.zig`), `wc` and `head` are C built against musl (`app/c/`).
+Only `/usr/bin/hello` and the test programs use MyOS's own small runtime
+(`app/lib.zig`).
 
 ## Address-space layout
 

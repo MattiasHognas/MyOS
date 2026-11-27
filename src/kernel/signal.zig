@@ -331,7 +331,7 @@ const Syscall = struct {
 /// like never restart after a handler).
 fn restartable(number: u64) bool {
     return switch (number) {
-        abi.Sys.read, abi.Sys.readv, abi.Sys.write, abi.Sys.writev, abi.Sys.pread64, abi.Sys.pwrite64, abi.Sys.ioctl, abi.Sys.futex, abi.Sys.myos_run, abi.Sys.open, abi.Sys.openat => true,
+        abi.Sys.read, abi.Sys.readv, abi.Sys.write, abi.Sys.writev, abi.Sys.pread64, abi.Sys.pwrite64, abi.Sys.ioctl, abi.Sys.futex, abi.Sys.wait4, abi.Sys.open, abi.Sys.openat => true,
         else => false,
     };
 }

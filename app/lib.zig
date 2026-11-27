@@ -146,10 +146,10 @@ pub fn readKey() ?u8 {
 }
 
 /// Start the program at `path` and wait for it to exit. Returns its exit
-/// status (0-255; 255 if the kernel killed it), or an error if it couldn't
-/// be started.
+/// status (0-255; 255 if a signal ended it, a fault included), or an error
+/// if it couldn't be started: of `fork`, or of `execve` in the child.
 pub fn run(path: [*:0]const u8) u64 {
-    return syscall(Sys.myos_run, @intFromPtr(path), 0, 0);
+    return runArgs(path, null, null);
 }
 
 // --- Startup ---------------------------------------------------------------
@@ -231,8 +231,42 @@ pub fn auxValue(key: usize) ?usize {
 /// Start the program at `path` with the arguments `arg_list` and the
 /// environment `env_list` (each a NULL-terminated array of strings, or null)
 /// and wait for it to exit. Returns as `run` does.
+///
+/// `fork`, `execve` in the child and `wait4` in the parent, as a C
+/// library's `posix_spawn` does it: an `execve` that fails writes its
+/// error to a pipe that closes itself on a successful one.
 pub fn runArgs(path: [*:0]const u8, arg_list: ?[*]const ?[*:0]const u8, env_list: ?[*]const ?[*:0]const u8) u64 {
-    return syscall(Sys.myos_run, @intFromPtr(path), @intFromPtr(arg_list), @intFromPtr(env_list));
+    var pfd: [2]i32 = undefined;
+    const piped = syscall(Sys.pipe2, @intFromPtr(&pfd), abi.O.CLOEXEC, 0);
+    if (isError(piped)) return piped;
+    const pid = syscall(Sys.fork, 0, 0, 0);
+    if (isError(pid)) {
+        _ = close(@intCast(pfd[0]));
+        _ = close(@intCast(pfd[1]));
+        return pid;
+    }
+    if (pid == 0) {
+        const only = [_:null]?[*:0]const u8{path};
+        const none = [_:null]?[*:0]const u8{};
+        const argv_ptr: usize = if (arg_list) |a| @intFromPtr(a) else @intFromPtr(&only);
+        const envp_ptr: usize = if (env_list) |e| @intFromPtr(e) else @intFromPtr(&none);
+        const rc = syscall(Sys.execve, @intFromPtr(path), argv_ptr, envp_ptr);
+        _ = syscall(Sys.write, @intCast(pfd[1]), @intFromPtr(&rc), @sizeOf(u64));
+        _ = syscall(Sys.exit_group, 127, 0, 0);
+        unreachable;
+    }
+    _ = close(@intCast(pfd[1]));
+    var failure: u64 = 0;
+    const n = read(@intCast(pfd[0]), std.mem.asBytes(&failure));
+    _ = close(@intCast(pfd[0]));
+    var status: u32 = 0;
+    while (true) {
+        const rc = syscall6(Sys.wait4, pid, @intFromPtr(&status), 0, 0, 0, 0);
+        if (!isError(rc) or rc != err(.INTR)) break;
+    }
+    if (n == @sizeOf(u64)) return failure; // `execve` said why it could not
+    if (status & 0x7F != 0) return 255; // a signal ended it
+    return (status >> 8) & 0xFF;
 }
 
 /// Format `args` with `fmt` and write the result to the console. Output

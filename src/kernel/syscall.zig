@@ -235,85 +235,6 @@ fn sysExecve(f: *arch.Frame, dirfd: u64, ptr: u64, argv: u64, envp: u64) u64 {
     return 0; // the new program's RAX, which `proc.execve` cleared too
 }
 
-/// `myos_run`: spawn the program at the user path `ptr` as a child process,
-/// with the arguments `argv` and the environment `envp` (user arrays as for
-/// `execve`; null for none), and block until it exits. Returns the child's
-/// exit status (0-255), or an error: those of `Path.from`, `ENOENT` (no such
-/// file), `ENOEXEC` (not a loadable program), `E2BIG` (arguments and
-/// environment too long), `EFAULT`, `ENOMEM` (no memory, or the program is
-/// larger than the caller's memory limit) or `EAGAIN` (the caller, or a
-/// process above it, has as many descendants as it may).
-fn sysRun(ptr: u64, argv: u64, envp: u64) u64 {
-    const child = switch (startChild(ptr, argv, envp)) {
-        .child => |c| c,
-        .fail => |e| return e,
-    };
-    const me = thread.current().process.?;
-    // The child has the terminal while it runs: Ctrl+C ends it, not this
-    // process. Whether it is still running or already gone. If this
-    // process is ended meanwhile, the child runs on with nobody waiting.
-    // A reference of its own for that, so that it is not freed while the
-    // terminal still points at it.
-    proc.retain(child);
-    const handover = proc.giveForeground(me, child);
-    const status = proc.waitKillable(child);
-    proc.takeForegroundBack(me, child, handover);
-    if (status != null) proc.reap(child); // collected here, not by wait4
-    proc.release(child);
-    // A program that changed the terminal's settings and ended without
-    // changing them back leaves them to the next one: the shell, which
-    // took the terminal from nobody, puts them back.
-    if (handover == .from_nobody) tty.restoreSettings();
-    return status orelse {
-        proc.release(child);
-        return err(.INTR);
-    };
-}
-
-/// The start half of `myos_run`: the program at the path, started as a
-/// child of the calling process, or the system call's error. Everything it
-/// needs (the path, the copied arguments and environment) is freed when it
-/// returns, before the caller waits: a chain of programs starting programs
-/// would otherwise hold all of it for as long as the chain is.
-fn startChild(ptr: u64, argv: u64, envp: u64) union(enum) { child: *proc.Process, fail: u64 } {
-    var given = switch (Path.from(CWD, ptr)) {
-        .path => |p| p,
-        .fail => |e| return .{ .fail = e },
-    };
-    defer given.deinit();
-    const path = given.text;
-    var bytes_left: usize = abi.ARG_MAX;
-    var count_left: usize = abi.ARG_COUNT_MAX;
-    const args = switch (copyStringList(argv, &bytes_left, &count_left)) {
-        .list => |l| l,
-        .fail => |e| return .{ .fail = e },
-    };
-    defer args.deinit();
-    const env = switch (copyStringList(envp, &bytes_left, &count_left)) {
-        .list => |l| l,
-        .fail => |e| return .{ .fail = e },
-    };
-    defer env.deinit();
-    // The child starts in the directory this process is in now.
-    const me = thread.current().process.?;
-    const cwd = blk: {
-        const held = me.files_lock.acquire();
-        defer me.files_lock.release(held);
-        break :blk heap.allocator.dupe(u8, me.cwd);
-    } catch return .{ .fail = err(.NOMEM) };
-    defer heap.allocator.free(cwd);
-    const child = proc.spawnPath(path, .{ .parent = me, .argv = args.items(), .envp = env.items(), .cwd = cwd }) catch |e| return .{
-        .fail = switch (e) {
-            error.FileNotFound => err(.NOENT),
-            error.OutOfMemory, error.TooLarge => err(.NOMEM),
-            error.TooManyProcesses => err(.AGAIN),
-            error.ArgumentsTooLong => err(.@"2BIG"),
-            else => err(.NOEXEC), // unreadable, or refused by the ELF loader
-        },
-    };
-    return .{ .child = child };
-}
-
 /// `write`: print `count` bytes at the user address `ptr` to the console.
 /// Only descriptors 1 and 2 can be written; anything else is `EBADF` (files
 /// are read-only). Returns the number of bytes written, which is short if a
@@ -417,12 +338,9 @@ fn sysPipe(fds_ptr: u64, flags: u64) u64 {
 /// each other: the end is looked at and written to in two steps.
 fn fileWrite(of: *OpenFile, ptr: u64, len: u64, at: ?u64) u64 {
     if (!user_range.valid(ptr, len)) return err(.FAULT);
-    const p = thread.current().process.?;
     var offset = at orelse blk: {
         if (of.append) break :blk vfs.sizeOf(&of.node);
-        const held = p.files_lock.acquire();
-        defer p.files_lock.release(held);
-        break :blk of.offset;
+        break :blk open_file.getOffset(of);
     };
     var chunk: [CHUNK]u8 = undefined;
     var done: u64 = 0;
@@ -444,11 +362,7 @@ fn fileWrite(of: *OpenFile, ptr: u64, len: u64, at: ?u64) u64 {
             break;
         }
     }
-    if (at == null) {
-        const held = p.files_lock.acquire();
-        defer p.files_lock.release(held);
-        of.offset = offset;
-    }
+    if (at == null) open_file.setOffset(of, offset);
     return if (done == 0) failure orelse 0 else done;
 }
 
@@ -997,20 +911,13 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
         .console => return consoleRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
         .pipe_write => return err(.BADF),
     }
-    const p = thread.current().process.?;
-    const start = blk: {
-        const held = p.files_lock.acquire();
-        defer p.files_lock.release(held);
-        break :blk of.offset;
-    };
+    const start = open_file.getOffset(of);
     const done = readAt(of, start, ptr, @min(count, abi.MAX_RW_COUNT));
     if (abi.isError(done)) return done;
-    // Two threads reading one descriptor at once each get data, and the
-    // offset moves by both amounts; which of them gets which part is not
-    // defined, as on Linux.
-    const held = p.files_lock.acquire();
-    defer p.files_lock.release(held);
-    of.offset += done;
+    // Two threads (or processes) reading one open file at once each get
+    // data, and the offset moves by both amounts; which of them gets which
+    // part is not defined, as on Linux.
+    _ = open_file.advance(of, done);
     return done;
 }
 
@@ -1030,31 +937,30 @@ fn sysPread(fd: u64, ptr: u64, count: u64, offset: u64) u64 {
 fn sysLseek(fd: u64, offset: u64, whence: u64) u64 {
     const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
-    const p = thread.current().process.?;
     if (of.kind == .directory) {
         // A listing can be started again, and that is all.
         if (whence != abi.SEEK.SET or offset != 0) return err(.INVAL);
-        const held = p.files_lock.acquire();
-        defer p.files_lock.release(held);
-        of.offset = 0;
+        open_file.setOffset(of, 0);
         return 0;
     }
     if (of.kind != .file) return err(.SPIPE);
     // The size is asked for before the lock is taken: a filesystem may
     // sleep to answer.
     const end: i64 = if (whence == abi.SEEK.END) @intCast(vfs.sizeOf(&of.node)) else 0;
-    const held = p.files_lock.acquire();
-    defer p.files_lock.release(held);
-    const base: i64 = switch (whence) {
-        abi.SEEK.SET => 0,
-        abi.SEEK.CUR => @intCast(of.offset),
-        abi.SEEK.END => end,
-        else => return err(.INVAL),
-    };
-    const new = std.math.add(i64, base, @bitCast(offset)) catch return err(.INVAL);
-    if (new < 0) return err(.INVAL);
-    of.offset = @intCast(new);
-    return of.offset;
+    if (whence != abi.SEEK.SET and whence != abi.SEEK.CUR and whence != abi.SEEK.END) return err(.INVAL);
+    // From the current offset: compared and swapped, so that a read or
+    // seek through another descriptor meanwhile is not lost.
+    var current = open_file.getOffset(of);
+    while (true) {
+        const base: i64 = switch (whence) {
+            abi.SEEK.SET => 0,
+            abi.SEEK.CUR => @intCast(current),
+            else => end,
+        };
+        const new = std.math.add(i64, base, @bitCast(offset)) catch return err(.INVAL);
+        if (new < 0) return err(.INVAL);
+        current = @cmpxchgWeak(u64, &of.offset, current, @intCast(new), .monotonic, .monotonic) orelse return @intCast(new);
+    }
 }
 
 /// `fstat`: what kind of thing `fd` is and, for a file, how large. The
@@ -1368,15 +1274,10 @@ fn sysGetdents64(fd: u64, buf: u64, count: u64) u64 {
     const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
     if (of.kind != .directory) return err(.NOTDIR);
-    const p = thread.current().process.?;
     const len = @min(count, abi.MAX_RW_COUNT);
     if (!user_range.valid(buf, len)) return err(.FAULT);
 
-    var position = blk: {
-        const held = p.files_lock.acquire();
-        defer p.files_lock.release(held);
-        break :blk of.offset;
-    };
+    var position = open_file.getOffset(of);
     var done: u64 = 0;
     var name_buf: [vfs.NAME_MAX]u8 = undefined;
     var record: [abi.DIRENT_HEADER + vfs.NAME_MAX + 8]u8 align(8) = undefined;
@@ -1402,9 +1303,7 @@ fn sysGetdents64(fd: u64, buf: u64, count: u64) u64 {
         uaccess.copyToUser(buf + done, record[0..size]) catch return err(.FAULT);
         done += size;
     }
-    const held = p.files_lock.acquire();
-    defer p.files_lock.release(held);
-    of.offset = position;
+    open_file.setOffset(of, position);
     return done;
 }
 
@@ -2622,7 +2521,6 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.exit => proc.exitThread(abi.exitStatus(f.rdi)),
         Sys.exit_group => proc.exit(abi.exitStatus(f.rdi)),
         Sys.gettid => thread.id(),
-        Sys.myos_run => sysRun(f.rdi, f.rsi, f.rdx),
         else => unknown(f.rax),
     };
 }

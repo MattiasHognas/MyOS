@@ -178,9 +178,11 @@ Notes:
 - QEMU starts in real mode. GDB shows `0x000000000000fff0 in ?? ()` until the
   kernel runs; that is expected.
 - With KVM, use hardware breakpoints only. With `--no-kvm` (TCG) both kinds work.
-- To debug a user program, add its symbols: `add-symbol-file zig-out/bin/sh.elf`
-  (user programs are linked at fixed, distinct addresses, and keep their debug
-  info in Debug builds), e.g. also `add-symbol-file zig-out/bin/hello.elf`.
+- To debug a test program, add its symbols: `add-symbol-file zig-out/bin/test-files.elf`
+  (they are linked at fixed addresses and keep their debug info in Debug
+  builds), or `add-symbol-file zig-out/bin/hello.elf`. MyOS's own programs
+  (`bin-*`) are built stripped, to keep the image small; build one without
+  `.strip = true` in `build.zig` to debug it.
 
 ## Debugging in VS Code
 

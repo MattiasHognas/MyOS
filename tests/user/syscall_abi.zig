@@ -66,7 +66,8 @@ pub fn main() noreturn {
     expect(checked.call3(Sys.close, fd, 0, 0, .{ .flags = 0x11 }) == 0); // 13
     expect(checked.call3(Sys.write, 1, @intFromPtr("syscall_abi\n"), 12, .{ .flags = all, .misalign = 3 }) == 12); // 14
     expect(checked.call3(Sys.sched_yield, 0, 0, 0, .{ .flags = all }) == 0); // 15
-    expect(checked.call3(Sys.myos_run, @intFromPtr("/test/entry_regs"), 0, 0, .{ .flags = 0x4D5 }) == 0); // 16
+    const nap: lib.abi.TimeSpec = .{ .sec = 0, .nsec = 5_000_000 }; // the caller blocks, others run
+    expect(checked.call3(Sys.nanosleep, @intFromPtr(&nap), 0, 0, .{ .flags = 0x4D5 }) == 0); // 16
 
     lib.exit(0);
 }

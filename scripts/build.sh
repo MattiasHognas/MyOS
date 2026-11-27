@@ -54,8 +54,12 @@ ln -s usr/bin "$initrd/sbin"
 ln -s usr/lib "$initrd/lib"
 ln -s usr/lib64 "$initrd/lib64"
 
-cp zig-out/bin/sh.elf "$initrd/usr/bin/sh"
 cp zig-out/bin/hello.elf "$initrd/usr/bin/hello"
+# MyOS's own programs, Linux programs built with Zig's standard library.
+for f in zig-out/bin/bin-*; do
+    name=$(basename "$f")
+    cp "$f" "$initrd/usr/bin/${name#bin-}"
+done
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
 # The C library dynamically linked Linux programs expect on the system:
 # the loader and shared libraries of scripts/fetch-sysroot.sh, fetched the

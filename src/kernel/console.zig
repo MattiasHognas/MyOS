@@ -2,10 +2,17 @@
 //!
 //! Renders characters with a PSF1/PSF2 bitmap font embedded at compile time,
 //! wraps at the right edge and scrolls when the cursor passes the last row.
+//!
+//! The few escape sequences of a VT100 that programs use most are
+//! understood (`ansi_core.zig` parses them): moving the cursor (`ESC[H`,
+//! `ESC[<row>;<col>H`, `ESC[<n>A` to `D`), erasing the screen and the line
+//! (`ESC[2J`, `ESC[J`, `ESC[K`), and carriage return. Colours and the rest
+//! are swallowed, not drawn.
 
 const std = @import("std");
 
 const limine = @import("../boot/limine.zig");
+const ansi = @import("ansi_core.zig");
 
 var fb: [*]u32 = undefined;
 var stride: usize = 0; // pixels per row
@@ -85,6 +92,15 @@ fn scroll() void {
 /// cursor one cell left without erasing. Lines wrap at the right edge and the
 /// screen scrolls at the bottom. Requires `init` (check `ready`).
 pub fn putc(c: u8) void {
+    switch (escape.feed(c)) {
+        .print => {},
+        .swallow => return,
+        .command => |cmd| return run(cmd),
+    }
+    if (c == '\r') {
+        col = 0;
+        return;
+    }
     if (c == 0x08) {
         if (col > 0) col -= 1;
         return;
@@ -103,6 +119,38 @@ pub fn putc(c: u8) void {
     if (row == rows) {
         scroll();
         row = rows - 1;
+    }
+}
+
+/// The escape sequence being read, if any.
+var escape: ansi.Parser = .{};
+
+/// Do what an escape sequence asks.
+fn run(cmd: ansi.Command) void {
+    switch (cmd) {
+        .cursor_to => |at| {
+            row = @min(at.row, rows - 1);
+            col = @min(at.col, cols - 1);
+        },
+        .cursor_up => |n| row -|= n,
+        .cursor_down => |n| row = @min(row + n, rows - 1),
+        .cursor_right => |n| col = @min(col + n, cols - 1),
+        .cursor_left => |n| col -|= n,
+        .erase_screen => @memset(fb[0 .. stride * font.h * rows], bg),
+        .erase_below => {
+            eraseCells(row, col, cols);
+            if (row + 1 < rows) @memset(fb[(row + 1) * stride * font.h .. stride * font.h * rows], bg);
+        },
+        .erase_line_right => eraseCells(row, col, cols),
+        .erase_line => eraseCells(row, 0, cols),
+    }
+}
+
+/// Clear the cells `[from, to)` of text row `r`.
+fn eraseCells(r: usize, from: usize, to: usize) void {
+    for (0..font.h) |y| {
+        const line = fb + (r * font.h + y) * stride;
+        @memset(line[from * font.w .. to * font.w], bg);
     }
 }
 

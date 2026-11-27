@@ -627,51 +627,9 @@ const NO_REQUEST = std.math.maxInt(u64);
 /// until it has taken it back.
 var foreground: ?*Process = null;
 
-/// What `giveForeground` did.
-pub const Handover = enum {
-    /// Another program has the terminal: nothing changed.
-    not_given,
-    /// Nobody had it; now `to` does.
-    from_nobody,
-    /// The caller had it; now `to` does.
-    from_caller,
-};
-
-/// Give the terminal to `to`, a program `from` has started and waits
-/// for, if `from` has the terminal or nobody has. A program that does not
-/// have it cannot take it from the one that does (two programs started at
-/// once by two others: the first keeps it). The caller holds a reference
-/// to `to` until `takeForegroundBack`.
-pub fn giveForeground(from: *Process, to: *Process) Handover {
-    const held = tree_lock.acquire();
-    defer tree_lock.release(held);
-    if (foreground == null) {
-        foreground = to;
-        return .from_nobody;
-    }
-    if (foreground == from) {
-        foreground = to;
-        return .from_caller;
-    }
-    return .not_given;
-}
-
-/// Undo `giveForeground` once `to` has ended: the terminal goes back to
-/// `from` or to nobody, whichever had it, unless `to` passed it on and the
-/// program it went to still has it (which cannot happen once `to` has
-/// waited for that program).
-pub fn takeForegroundBack(from: *Process, to: *Process, handover: Handover) void {
-    const held = tree_lock.acquire();
-    defer tree_lock.release(held);
-    if (foreground != to) return;
-    foreground = switch (handover) {
-        .not_given => return,
-        .from_nobody => null,
-        .from_caller => from,
-    };
-}
-
-/// Make `p` the foreground program, or nobody: for tests.
+/// Make `p` the foreground program (null: none), the one Ctrl+C sends
+/// `SIGINT` to while no process group has the terminal. For the kernel's
+/// tests, which have no shell. Returns the previous one.
 pub fn setForeground(p: ?*Process) ?*Process {
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
@@ -689,7 +647,7 @@ pub fn terminateForeground(code: u64) bool {
     defer tree_lock.release(held);
     // SIGINT, which ends them unless they handle or ignore it: to the
     // terminal's foreground process group, if a shell has set one; else to
-    // the program the private `myos_run` started.
+    // the foreground program a kernel test set (`setForeground`).
     if (foreground_group != 0) return signalGroupLocked(foreground_group, signal.SIG.INT) != 0;
     const p = foreground orelse return false;
     signal.sendProcessLocked(p, signal.SIG.INT);
@@ -993,8 +951,8 @@ fn cloneStart() void {
 }
 
 /// Collect `child`, which the caller has waited for and holds a reference
-/// to, from its parent's list if it is still there as a zombie (the
-/// private `myos_run`, which collects it itself).
+/// to, from its parent's list if it is still there as a zombie: for the
+/// kernel's own code that starts and waits for a child of a process.
 pub fn reap(child: *Process) void {
     const drop = blk: {
         const held = tree_lock.acquire();
@@ -1315,24 +1273,6 @@ pub fn wait(p: *Process) u64 {
     return code;
 }
 
-/// `wait` for a thread of a program, which may itself be told to end
-/// while it waits: then this returns null, and the caller still has its
-/// reference to `p`.
-pub fn waitKillable(p: *Process) ?u64 {
-    const code = blk: {
-        const held = tree_lock.acquire();
-        defer tree_lock.release(held);
-        while (p.exit_code == null) {
-            // Not ended by a signal: the child runs already, and the call
-            // could not be made again.
-            if (!p.exited.waitUnlessEnding(&tree_lock)) return null;
-        }
-        break :blk p.exit_code.?;
-    };
-    release(p);
-    return code;
-}
-
 /// Take another reference to `p`, for a second thread that will `wait` for
 /// it or look at it. The caller must already hold one.
 pub fn retain(p: *Process) void {
@@ -1625,10 +1565,9 @@ pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []cons
     // but the stack pointer and the instruction pointer.
     frame.* = std.mem.zeroes(arch_syscall.Frame);
     frame.rip = img.entry;
-    frame.rcx = img.entry;
     frame.rsp = img.entry_rsp;
     frame.rflags = 0x202;
-    frame.r11 = 0x202;
+    me.return_by_iret = true; // RCX and R11 zero too, as on Linux
     frame.cs = @import("../arch/x86_64/sysret.zig").USER_CS;
     frame.ss = @import("../arch/x86_64/sysret.zig").USER_SS;
 }

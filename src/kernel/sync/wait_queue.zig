@@ -122,7 +122,7 @@ pub const WaitQueue = struct {
 
     /// Like `waitKillable`, but only the end of the calling thread's
     /// process ends the wait early, not a signal: for a wait that cannot
-    /// be made again from the start (`myos_run`, whose child is running
+    /// be made again from the start (`vfork`, whose child is running
     /// already).
     pub fn waitUnlessEnding(self: *WaitQueue, lock: *SpinLock) bool {
         assertOnlyLock(lock);

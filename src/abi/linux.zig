@@ -249,13 +249,10 @@ pub const Sys = struct {
     /// (under 500) and below the x32 bit (0x4000_0000). Milestone 6 replaces
     /// the private calls with Linux ones.
     pub const PRIVATE_BASE = 0x4D59_00; // "MY"
-    // PRIVATE_BASE + 0 was `myos_getchar`: keys come through `read` on
-    // descriptor 0 now. The number stays unused.
-    /// `run(path, argv, envp) -> exit status`: start the program at the
-    /// NUL-terminated `path` and wait for it to exit. `argv` and `envp` are
-    /// NULL-terminated arrays of NUL-terminated strings, as for `execve`;
-    /// either may be NULL (no environment; the path as the only argument).
-    pub const myos_run = PRIVATE_BASE + 1;
+    // PRIVATE_BASE + 0 was `myos_getchar` (keys come through `read` on
+    // descriptor 0 now), + 1 `myos_run` (programs are started with `fork`
+    // and `execve`). The numbers stay unused. The test kernel answers a
+    // few above + 0x100 of its own.
 };
 
 /// Error numbers. A failing syscall returns the negated value in RAX.

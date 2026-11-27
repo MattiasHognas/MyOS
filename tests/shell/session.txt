@@ -1,0 +1,36 @@
+# Typed over the serial line in the "shell" scenario (scripts/test-qemu.sh):
+# a line is a line typed and Enter, after a pause; "#wait N" waits N
+# seconds; \xNN is a control character (printf %b). Lines starting with
+# "# " are comments.
+#wait 6
+echo hello world
+ls /bin | wc -l
+cat /etc/motd | wc -c
+echo one two three | wc -w
+head -n 2 /test/data
+pwd
+cd /tmp; pwd
+echo hi > f; echo there >> f; cat f
+cat < f | head -n 1
+ls /nonexistent
+echo status $?
+nosuch
+mkdir -p a/b && ls a && rm -r a && ls
+false || echo or-branch
+true && echo and-branch
+echo 'single $HOME' "double $HOME"
+ps | head -n 1
+echo helx\x7flo editing
+garbage\x15echo after-kill
+sleep 30
+#wait 3
+\x03
+#wait 1
+echo after-ctrl-c $?
+/fixtures/musl-hello-static from-shell
+exit 5
+#wait 4
+echo second shell
+#wait 1
+\x04
+#wait 4

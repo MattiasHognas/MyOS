@@ -348,7 +348,7 @@ with a definite answer: must they contend? The calls that exist today:
 | `sched_yield` on different CPUs | Yes | Scheduler lock | To fix: per-CPU ready queues (3.4 decides) |
 | `exit` of unrelated processes | Yes | Process-tree lock, scheduler lock, page-allocator and heap locks when the thread is freed | Allocators: 3.4. The tree lock stays one until `fork` or `wait4` make it hot |
 | `exit` of a child and of its parent | No: who inherits the grandchildren | Process-tree lock | Cannot be avoided |
-| `myos_run` in different processes | Yes | All of the above, and the kernel-stack lock | As `exit`; `myos_run` goes away with `fork` and `execve` (6) |
+| `fork` or `execve` in different processes | Yes | All of the above, the kernel-stack lock, and for `fork` the parent's address-space lock while its pages are copied | As `exit`; copy-on-write (13) would shorten the copy |
 
 Not system calls, but on every CPU all the time: the timer tick takes the
 timer lock, and a thread switch the scheduler lock. Both are global to begin

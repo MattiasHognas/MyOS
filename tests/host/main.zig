@@ -16,13 +16,14 @@ test {
     std.testing.refAllDecls(@import("raw_spinlock_test.zig"));
     std.testing.refAllDecls(@import("lock_order_test.zig"));
     std.testing.refAllDecls(@import("startup_stack_test.zig"));
-    std.testing.refAllDecls(@import("cmdline_test.zig"));
+    std.testing.refAllDecls(@import("sh_words_test.zig"));
     std.testing.refAllDecls(@import("vm_regions_test.zig"));
     std.testing.refAllDecls(@import("tar_test.zig"));
     std.testing.refAllDecls(@import("alloc_test.zig"));
     std.testing.refAllDecls(@import("ramfs_test.zig"));
     std.testing.refAllDecls(@import("tty_test.zig"));
     std.testing.refAllDecls(@import("signal_frame_test.zig"));
+    std.testing.refAllDecls(@import("ansi_test.zig"));
     std.testing.refAllDecls(@import("timer_queue_test.zig"));
     std.testing.refAllDecls(@import("random_core_test.zig"));
     std.testing.refAllDecls(@import("meltdown_rule_test.zig"));

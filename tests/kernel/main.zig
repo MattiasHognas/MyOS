@@ -10,6 +10,7 @@
 const std = @import("std");
 const root = @import("root");
 const pmm = root.kernel.pmm;
+const process = root.kernel.process;
 const serial = root.drivers.serial;
 const assert = root.kernel.debug.assert;
 const panicFmt = root.kernel.debug.panic.panicFmt;
@@ -1729,6 +1730,22 @@ fn missingFile() TestError!void {
     try check(helpers.fileSize("/missing") == null);
 }
 
+/// Integration-test scenario "shell": the system as it boots for a user,
+/// `init` and the shell, with every CPU taking threads; the host types a
+/// session over the serial line (`scripts/test-qemu.sh`). `init` restarts
+/// the shell once, then ends with the second shell's status, which ends
+/// the run.
+fn scenarioShell() noreturn {
+    _ = helpers.setOthersParked(false);
+    const init = process.spawnPath("/sbin/init", .{ .argv = &.{ "init", "--restarts", "1" } }) catch |e|
+        panicFmt("shell scenario: cannot start /sbin/init: {s}", .{@errorName(e)});
+    process.setInit(init);
+    const code = process.wait(init);
+    var line: [64]u8 = undefined;
+    serial.puts(std.fmt.bufPrint(&line, "MYOS_SHELL_DONE status={d}\n", .{code}) catch unreachable);
+    qemu_exit.exit(if (code == 0) 0 else 1);
+}
+
 /// Integration-test scenario "panic": fail a subsystem assertion two calls
 /// deep, so the panic output must contain a symbolized backtrace through
 /// these functions.
@@ -1835,6 +1852,7 @@ pub fn run() noreturn {
     if (std.mem.eql(u8, scenario, "panic_smp")) scenarioPanicSmp();
     if (std.mem.eql(u8, scenario, "lock_order")) scenarioLockOrder();
     if (std.mem.eql(u8, scenario, "sleep_with_lock")) scenarioSleepWithLock();
+    if (std.mem.eql(u8, scenario, "shell")) scenarioShell();
     expect_fxsave = std.mem.eql(u8, scenario, "tests_fxsave");
     const smp_run = std.mem.eql(u8, scenario, "tests_smp");
     expect_cpus = if (smp_run) 4 else 1; // as `scripts/test-qemu.sh` starts QEMU

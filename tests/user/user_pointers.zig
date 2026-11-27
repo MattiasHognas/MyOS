@@ -81,9 +81,9 @@ export fn userPointersMain(entry_rsp: u64) callconv(.c) noreturn {
     expect(lib.syscall(Sys.open, 0, 0, 0) == EFAULT); // 10
     expect(lib.syscall(Sys.open, UNMAPPED, 0, 0) == EFAULT); // 11
     expect(lib.syscall(Sys.open, STACK_TOP - 4, 0, 0) == EFAULT); // 12
-    expect(lib.syscall(Sys.myos_run, 0, 0, 0) == EFAULT); // 13
-    expect(lib.syscall(Sys.myos_run, UNMAPPED, 0, 0) == EFAULT); // 14
-    expect(lib.syscall(Sys.myos_run, STACK_TOP - 4, 0, 0) == EFAULT); // 15
+    expect(lib.syscall(Sys.execve, 0, 0, 0) == EFAULT); // 13
+    expect(lib.syscall(Sys.execve, UNMAPPED, 0, 0) == EFAULT); // 14
+    expect(lib.syscall(Sys.execve, STACK_TOP - 4, 0, 0) == EFAULT); // 15
     // A path that ends exactly at the last mapped byte is fine: the kernel
     // does not read past the NUL into the unmapped page.
     const at_end: *[path.len + 1]u8 = @ptrFromInt(STACK_TOP - (path.len + 1));

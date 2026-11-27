@@ -2,7 +2,8 @@
 //!
 //! Declares the Limine boot requests, brings up every subsystem in order in
 //! `kmain` (CPU tables, memory, ACPI/APIC/timers, PCI, syscalls, the initrd)
-//! and finally starts `/bin/sh` as the first user process. Also provides the
+//! and finally starts `/sbin/init` as the first user process, which starts
+//! the shell. Also provides the
 //! kernel-wide `print`, `halt` and panic handler that other modules reach via
 //! `@import("root")`. The test kernel (`kernel-test.elf`) hands control to
 //! `tests/kernel/` after boot instead of starting the shell.
@@ -422,8 +423,11 @@ fn kmainOnStack() callconv(.c) noreturn {
     if (comptime build_options.is_test) @import("kernel_tests").run();
 
     keyboard.init();
-    // Nobody waits for the shell: give up the reference right away.
-    if (process.spawnPath("/bin/sh", .{})) |shell| process.release(shell) else |e| log.err("failed to start /bin/sh: {s}", .{@errorName(e)});
+    // The first program, which starts the shell and adopts orphans. It
+    // keeps its reference for as long as the kernel runs.
+    if (process.spawnPath("/sbin/init", .{ .argv = &.{"init"} })) |init| {
+        process.setInit(init);
+    } else |e| log.err("failed to start /sbin/init: {s}", .{@errorName(e)});
     print("Boot complete.\n", .{});
     if (thread.recordStackUsage()) |bytes| log.debug("boot used {d} of {d} bytes of kernel stack", .{ bytes, kstack.STACK_SIZE });
     // The boot thread has nothing left to do. It does not become an idle

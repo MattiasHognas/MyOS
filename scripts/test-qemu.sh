@@ -33,6 +33,10 @@
 #   lock_order  take two spinlocks against the lock order; must panic,
 #          naming both
 #   sleep_with_lock  sleep while holding a spinlock; must panic
+#   shell  the system as a user boots it: init starts the shell, and a
+#          session is typed over the serial line (tests/shell/session.txt):
+#          commands, pipelines with Zig and C programs, redirection, line
+#          editing, Ctrl+C, a shell that ends and is started again
 #
 # After the scenarios, the addresses the kernel was loaded at are compared:
 # with KASLR they must not be the same in every boot.
@@ -55,13 +59,15 @@ timeout_s="${MYOS_QEMU_TIMEOUT:-180}"
 
 # Boot one scenario on the CPU model $2 (default: max, every feature QEMU
 # emulates; "host" runs on the host's CPU with KVM) with $3 CPUs (default:
-# 1). $4 is the scenario name the kernel is told (default: $1). Leaves the QEMU exit status in $status and the CR-stripped log
-# path in $log.
+# 1). $4 is the scenario name the kernel is told (default: $1); $5, if
+# given, a file to type over the serial line (`type_session`). Leaves the
+# QEMU exit status in $status and the CR-stripped log path in $log.
 boot() {
     local scenario="$1"
     local cpu="${2:-max}"
     local cpus="${3:-1}"
     local told="${4:-$scenario}"
+    local session="${5:-}"
     local accel=()
     [[ "$cpu" == host ]] && accel=(-enable-kvm)
     local dir="$out/$scenario"
@@ -77,6 +83,44 @@ boot() {
         dd of="$disk" conv=notrunc status=none
 
     set +e
+    if [[ -n "$session" ]]; then
+        type_session "$session" | run_qemu
+        local codes=("${PIPESTATUS[@]}")
+        status=${codes[1]}
+    else
+        run_qemu </dev/null
+        status=$?
+    fi
+    set -e
+
+    # Normalize serial CRLF line endings for log validation.
+    tr -d '\r' <"$raw" >"$log"
+}
+
+# Type the session file $1: each line, then Enter (CR, as a terminal
+# sends it), with a pause after it; "#wait N" pauses N seconds, "# "
+# lines are comments; \xNN in a line is a control character.
+type_session() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            "#wait "*) sleep "${line#\#wait }" ;;
+            "# "* | "#") ;;
+            *)
+                # A line that is only a control character is sent alone.
+                if [[ "$line" =~ ^\\x[0-9a-fA-F]{2}$ ]]; then
+                    printf '%b' "$line"
+                else
+                    printf '%b\r' "$line"
+                fi
+                sleep "${MYOS_TYPE_PAUSE:-1.5}"
+                ;;
+        esac
+    done <"$1"
+}
+
+# The QEMU of `boot`, with its variables.
+run_qemu() {
     timeout --foreground "${timeout_s}s" qemu-system-x86_64 \
         -machine q35 "${accel[@]}" -cpu "$cpu" -smp "$cpus" -m 256M \
         -cdrom "$iso" -boot d \
@@ -87,11 +131,6 @@ boot() {
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
         -fw_cfg name=opt/myos/scenario,string="$told" \
         >"$raw" 2>&1
-    status=$?
-    set -e
-
-    # Normalize serial CRLF line endings for log validation.
-    tr -d '\r' <"$raw" >"$log"
 }
 
 failures=()
@@ -142,6 +181,7 @@ run_scenario() {
         # Without XSAVE there is no AVX either (and nothing that builds on it).
         tests_fxsave) boot "$scenario" max,xsave=off ;;
         tests_smp | panic_smp) boot "$scenario" max 4 ;;
+        shell) boot "$scenario" max 2 shell tests/shell/session.txt ;;
         *) boot "$scenario" ;;
     esac
     local before=${#failures[@]}
@@ -326,6 +366,34 @@ run_scenario() {
             expect_line '^  #[0-9]+ 0x[0-9a-f]{16} [^ ]*recurseForever\+0x'
             if grep -q 'was not caught' "$log"; then fail "the kernel survived a stack overflow"; fi
             ;;
+        shell)
+            expect_status 1
+            expect_line '^MYOS_SHELL_DONE status=0$'
+            expect_line '^hello world$'
+            expect_line '^ +[1-9][0-9]*$' # ls /bin | wc -l
+            expect_line '^ +17$' # the motd's bytes, counted by a C program in a pipeline
+            expect_line '^ +3$' # words
+            expect_line '^1$'
+            expect_line '^/root$'
+            expect_line '^/tmp$'
+            expect_line '^there$'
+            expect_line "^ls: cannot access '/nonexistent': No such file or directory$"
+            expect_line '^status 2$'
+            expect_line '^sh: nosuch: command not found$'
+            expect_line '^b$'
+            expect_line '^or-branch$'
+            expect_line '^and-branch$'
+            expect_line '^single \$HOME double /root$'
+            expect_line '^  PID  PPID S CMD$'
+            expect_line '^hello editing$'
+            expect_line '^after-kill$'
+            expect_line '^after-ctrl-c 130$'
+            expect_line '^argv\[1\]=from-shell$'
+            expect_line '^init: the shell ended \(status 5\); starting a new one$'
+            expect_line '^second shell$'
+            expect_line '^init: the shell ended \(status 0\); done$'
+            if grep -q 'garbage' "$log" && ! grep -q 'garbage.*echo after-kill' "$log"; then fail "Ctrl+U did not take the line back"; fi
+            ;;
         use_after_free)
             expect_status 3
             expect_line '^PANIC: heap: freed memory at 0x[0-9a-f]+ was written to \(0x42 at offset 64 of a 128-byte block\)$'
@@ -378,7 +446,7 @@ run_scenario() {
 }
 
 scenarios=("$@")
-((${#scenarios[@]})) || scenarios=(tests tests_fxsave tests_smp tests_kvm panic panic_smp fault smap smep double_fault stack_overflow use_after_free relro text_alias lock_order sleep_with_lock)
+((${#scenarios[@]})) || scenarios=(tests tests_fxsave tests_smp tests_kvm panic panic_smp fault smap smep double_fault stack_overflow use_after_free relro text_alias lock_order sleep_with_lock shell)
 for s in "${scenarios[@]}"; do run_scenario "$s"; done
 
 # KASLR: the kernel reports where it was loaded in every boot. Seeing the

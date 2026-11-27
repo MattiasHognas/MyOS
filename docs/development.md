@@ -163,11 +163,13 @@ qemu-system-x86_64 -M q35 -m 2G -cdrom os.iso \
 ```
 
 Kernel output goes to both the serial port (your terminal) and the QEMU
-window. Keyboard input only comes from the QEMU window (the kernel has a PS/2
-keyboard driver, not serial input), so click into the window to type. The
-shell (`/bin/sh`) runs `/bin/<name>` for a typed name, or a path containing
-`/`; `exit` leaves it. Quit QEMU by closing the window or pressing Ctrl+C in
-the terminal.
+window. Keys come from the QEMU window (PS/2 keyboard) and from the serial
+line (your terminal). `init` starts the shell (`/bin/sh`): pipelines,
+redirection, `;`, `&&`, `||`, quotes and `$VARIABLES`; `cd`, `pwd`,
+`export` and `exit` built in, and `ls`, `cat`, `echo`, `mkdir`, `rm`,
+`ps`, `wc`, `head` and the rest in `/usr/bin` (`app/bin/`, `app/c/`). When
+the shell ends, `init` starts a new one. Quit QEMU by closing the window,
+or with Ctrl+A X on the serial line.
 
 ## Project layout
 

@@ -51,10 +51,10 @@ no `errno` variable in the kernel ABI; a libc builds one from this.
 | Error | Number | When |
 | --- | --- | --- |
 | `ENOENT` | 2 | No file at the path; empty path |
-| `ENOEXEC` | 8 | `myos_run`: the file is not a program MyOS can load |
+| `ENOEXEC` | 8 | `execve`: the file is not a program MyOS can load |
 | `EBADF` | 9 | Descriptor not open, or not open for this use |
-| `EAGAIN` | 11 | `myos_run`: the caller, or a process above it, has as many descendants as it may |
-| `ENOMEM` | 12 | Out of memory; `myos_run`: the program is larger than the memory limit |
+| `EAGAIN` | 11 | `fork`: the caller, or a process above it, has as many descendants as it may |
+| `ENOMEM` | 12 | Out of memory; `execve`: the program is larger than the memory limit |
 | `EFAULT` | 14 | A pointer is outside user space, not mapped, or (for output) not writable |
 | `EINVAL` | 22 | Invalid argument (reserved; no call returns it yet) |
 | `EMFILE` | 24 | The process has as many descriptors as its limit allows |
@@ -118,7 +118,7 @@ Linux calls, with Linux's numbers:
 | 76 | `truncate(path, length)` | `ftruncate` by path. |
 | 77 | `ftruncate(fd, length)` | A file open for writing: cut short, or grown with zeroes that take no memory. `EINVAL` otherwise; `EFBIG` past 1 GiB. |
 | 79 | `getcwd(buf, size)` | The working directory, with its NUL; returns the length including it. `ERANGE` if it does not fit. |
-| 80 | `chdir(path)` | `ENOTDIR` for what is no directory. A program started with `myos_run` starts in the directory of the one that started it. |
+| 80 | `chdir(path)` | `ENOTDIR` for what is no directory. A child starts in its parent's directory. |
 | 81 | `fchdir(fd)` | To the directory a descriptor is open on. |
 | 82 | `rename(old, new)` | A file or a directory with all in it; a file of the new name, or an empty directory, is replaced. Within one filesystem (`EXDEV`); `EINVAL` into itself; `EBUSY` for a mount point. |
 | 83 | `mkdir(path, mode)` | `EEXIST`, `ENOENT`, `ENOTDIR`, `EROFS`. |
@@ -194,20 +194,17 @@ Linux calls, with Linux's numbers:
 | 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`. |
 | 441 | `epoll_pwait2(epfd, events, max, timeout_ts, sigmask, size)` | `epoll_pwait` with the timeout as a `timespec`. |
 
-MyOS calls with no Linux equivalent yet. Their numbers start at
-`0x4D5900`, far above Linux's (which end below 500) and below the x32 bit
-(`0x40000000`). Milestone 6 replaces them with Linux calls.
-
-| Number | Call | Notes |
-| --- | --- | --- |
-| `0x4D5901` | `myos_run(path, argv, envp)` | Start the program at `path` with the arguments and environment given as for `execve` (either may be null: then the path is the only argument, and the environment is empty), and wait for it. Returns its exit status (0-255; 255 if the kernel killed it), or an error; `E2BIG` if arguments and environment do not fit. |
+There are no calls of MyOS's own any more: the two there were
+(`myos_getchar` and `myos_run`, at `0x4D5900` and `0x4D5901`) gave way to
+`read` on the terminal and to `fork` and `execve`, and their numbers stay
+unused. The test kernel answers a few numbers above `0x4D5A00` of its own.
 
 Every other number returns `ENOSYS`.
 
 ### Differences from Linux to know about
 
-- **Paths** are NUL-terminated strings of at most 255 bytes (`PATH_MAX` is
-  256 here, 4096 on Linux). They are absolute; there is no current directory.
+- **Paths** are as on Linux: at most 4095 bytes (`PATH_MAX` 4096), a name
+  at most 255, relative to the working directory or to a descriptor.
 - **Threads** share their process's address space, descriptors and signal
   handlers, and each has its own registers, FS and GS base and signal
   mask. `getpid` is the same in all of them, `gettid` different.
@@ -215,8 +212,9 @@ Every other number returns `ENOSYS`.
   starts with 32 slots and doubles as higher ones are used. It starts
   with 0, 1 and 2 open on the
   console; they can be closed, duplicated and replaced like any other.
-  `open`, `dup` and `pipe2` return the lowest free one. Descriptors are
-  not inherited by programs started with `myos_run`.
+  `open`, `dup` and `pipe2` return the lowest free one. A child made by
+  `fork` gets copies of them, on the same open files (and their offsets);
+  `execve` closes those marked close-on-exec and keeps the others.
 - **The terminal.** Descriptors 0, 1 and 2 start out on it. Keys come
   from the keyboard and the serial line. With line editing on (the
   default) a line is shown as it is typed and handed over on Enter;
