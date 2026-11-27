@@ -187,13 +187,23 @@ pub fn map(root: u64, virt: u64, phys: u64, flags: u64, huge: bool) MapError!voi
     var created: [3]*u64 = undefined;
     var created_len: usize = 0;
     const kernel_half = virt >= KERNEL_BASE and kernel_root != 0 and root == kernel_root;
-    errdefer while (created_len > 0) {
-        created_len -= 1;
-        const entry = created[created_len];
-        pmm.free(entry.* & ADDR_MASK);
-        entry.* = 0;
-        if (kernel_half and counting_tables) _ = kernel_table_pages.fetchSub(1, .monotonic);
-    };
+    errdefer {
+        // Out of the tree first, innermost first; then a flush, since a
+        // CPU may have walked into them meanwhile; then freed (see `unmap`).
+        var gone: [3]u64 = undefined;
+        const n = created_len;
+        while (created_len > 0) {
+            created_len -= 1;
+            const entry = created[created_len];
+            gone[created_len] = entry.* & ADDR_MASK;
+            entry.* = 0;
+            if (kernel_half and counting_tables) _ = kernel_table_pages.fetchSub(1, .monotonic);
+        }
+        if (n > 0) {
+            flushEverywhere(root, virt, 1);
+            for (gone[0..n]) |t| pmm.free(t);
+        }
+    }
 
     var t = table(root);
     var level: u6 = 3; // 3 = PML4, 2 = PDPT, 1 = PD, 0 = PT
@@ -232,27 +242,33 @@ fn clearLeaf(root: u64, virt: u64) ?u64 {
     return e & ADDR_MASK;
 }
 
-/// Free the page tables on the way to `virt` that have become empty: the
-/// PT, then the PD, then (for user addresses only) the PDPT, but never the
-/// tables the kernel half of every address space shares. The last step of
-/// an unmap: no CPU may still have these tables cached.
-fn pruneTables(root: u64, virt: u64) void {
+/// Take the page tables on the way to `virt` that have become empty out of
+/// the tree: the PT, then the PD, then (for user addresses only) the PDPT,
+/// but never the tables the kernel half of every address space shares.
+/// Their pages are put in `out` (at most 3; returns how many), for the
+/// caller to free once every CPU has flushed: until then a CPU may still
+/// hold a pointer to them from a walk it made, and a page freed sooner
+/// could be handed out again and read as a page table.
+fn detachTables(root: u64, virt: u64, out: *[3]u64) usize {
     var tables: [4]*[512]u64 = undefined;
     tables[3] = table(root);
     var level: u6 = 3;
     while (level > 0) : (level -= 1) {
         const e = tables[level][index(virt, level)];
-        if (e & PRESENT == 0 or e & HUGE != 0) return; // freed already, with a neighbour
+        if (e & PRESENT == 0 or e & HUGE != 0) return 0; // detached already, with a neighbour
         tables[level - 1] = table(e & ADDR_MASK);
     }
     const top: u6 = if (virt < USER_END) 3 else 2;
+    var n: usize = 0;
     level = 0;
     while (level < top and isEmpty(tables[level])) : (level += 1) {
         const parent = &tables[level + 1][index(virt, level + 1)];
-        pmm.free(parent.* & ADDR_MASK);
+        out[n] = parent.* & ADDR_MASK;
+        n += 1;
         parent.* = 0;
         if (virt >= KERNEL_BASE and root == kernel_root) _ = kernel_table_pages.fetchSub(1, .monotonic);
     }
+    return n;
 }
 
 /// Flush `pages` pages from `start` out of this CPU's TLB, together with
@@ -298,15 +314,21 @@ fn flushEverywhere(root: u64, start: u64, pages: u64) void {
 /// 4 KiB page.
 ///
 /// The order is what makes this safe with several CPUs: the entry is
-/// cleared; then the address is flushed from the TLB of every CPU that may
-/// have it, which also drops their cached pointers to the page tables; and
-/// only then are page tables that became empty given back, and the page
-/// handed to the caller. Until the flush another CPU can still use the
-/// page through its TLB, or walk the tables.
+/// cleared, and page tables that became empty are taken out of the tree;
+/// then the address is flushed from the TLB of every CPU that may have
+/// it, which also drops their cached pointers to the page tables; and
+/// only then are those tables' pages freed, and the page handed to the
+/// caller. Until the flush another CPU can still use the page through its
+/// TLB, or walk the tables: so nothing a walk can reach is freed before
+/// it, and nothing can be reached anew after it. (Freeing the tables
+/// after the flush but detaching them only then, as this did at first,
+/// let a CPU walk into a table between the two and keep the pointer.)
 pub fn unmap(root: u64, virt: u64) ?u64 {
     const phys = clearLeaf(root, virt) orelse return null;
+    var tables: [3]u64 = undefined;
+    const n = detachTables(root, virt, &tables);
     flushEverywhere(root, virt, 1);
-    pruneTables(root, virt);
+    for (tables[0..n]) |t| pmm.free(t);
     return phys;
 }
 
@@ -315,8 +337,20 @@ pub fn unmap(root: u64, virt: u64) ?u64 {
 /// to, or null if it was not mapped. Otherwise as `unmap`.
 pub fn unmapRange(root: u64, virt: u64, phys: []?u64) void {
     for (phys, 0..) |*p, i| p.* = clearLeaf(root, virt + i * pmm.PAGE_SIZE);
+    // Detached tables wait in `pending` for the flush; when it is full,
+    // there is a flush in between.
+    var pending: [48]u64 = undefined;
+    var n: usize = 0;
+    for (0..phys.len) |i| {
+        if (n + 3 > pending.len) {
+            flushEverywhere(root, virt, phys.len);
+            for (pending[0..n]) |t| pmm.free(t);
+            n = 0;
+        }
+        n += detachTables(root, virt + i * pmm.PAGE_SIZE, pending[n..][0..3]);
+    }
     flushEverywhere(root, virt, phys.len);
-    for (0..phys.len) |i| pruneTables(root, virt + i * pmm.PAGE_SIZE);
+    for (pending[0..n]) |t| pmm.free(t);
 }
 
 /// `map` for a page a running program is given, which also says how many
@@ -349,10 +383,37 @@ fn span(level: u6) u64 {
 
 /// What `walkUserRange` does to each mapped page.
 const RangeAction = union(enum) {
-    /// Remove the mapping and free the page.
-    unmap,
+    /// Remove the mapping; the page, and tables left empty, go to the
+    /// gatherer, which frees them once every CPU has flushed.
+    unmap: *Gather,
     /// Replace the permission bits of the entry (`USER`, `WRITABLE`, `NX`).
     protect: u64,
+};
+
+/// Pages taken out of an address space that wait to be freed until every
+/// CPU that may know them has flushed (Linux calls this `mmu_gather`). No
+/// page, and no page table, is freed while a CPU can still reach it
+/// through its TLB or through a pointer to a table it walked; and once
+/// they are out of the tree and flushed, none can be reached anew.
+const Gather = struct {
+    root: u64,
+    start: u64,
+    pages: u64,
+    buf: []u64,
+    n: usize = 0,
+
+    fn add(g: *Gather, phys: u64) void {
+        if (g.n == g.buf.len) g.flush();
+        g.buf[g.n] = phys;
+        g.n += 1;
+    }
+
+    fn flush(g: *Gather) void {
+        if (g.n == 0) return;
+        flushEverywhere(g.root, g.start, g.pages);
+        for (g.buf[0..g.n]) |phys| pmm.free(phys);
+        g.n = 0;
+    }
 };
 
 /// Apply `action` to every mapped 4 KiB page of `[start, end)` under the
@@ -375,9 +436,9 @@ fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: 
         if (e & PRESENT == 0 or e & HUGE != 0) continue;
         if (level == 0) {
             switch (action) {
-                .unmap => {
+                .unmap => |g| {
                     t[i] = 0;
-                    pmm.free(e & ADDR_MASK);
+                    g.add(e & ADDR_MASK);
                     freed += 1;
                 },
                 .protect => |bits| {
@@ -390,7 +451,7 @@ fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: 
             freed += walkUserRange(e & ADDR_MASK, level - 1, entry_base, start, end, action, &child_empty);
             if (child_empty) {
                 t[i] = 0;
-                pmm.free(e & ADDR_MASK);
+                action.unmap.add(e & ADDR_MASK);
                 freed += 1;
             }
         }
@@ -408,15 +469,23 @@ fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: 
 pub fn unmapUserRange(root: u64, start: u64, end: u64) usize {
     assert.check(.vmm, start <= end and end <= USER_END and start % pmm.PAGE_SIZE == 0 and end % pmm.PAGE_SIZE == 0, "unmapping the user range 0x{x}-0x{x}", .{ start, end });
     if (start == end) return 0;
-    // Two passes, so that nothing is freed before it is flushed: clear the
-    // entries of the range first (remembering nothing: the pages are found
-    // again through the tables, which are only freed afterwards)...
+    // Entries are cleared and empty tables taken out of the tree as the
+    // walk goes; what they pointed to is gathered, and freed in batches,
+    // each after a flush. The batch is a page if there is one to be had
+    // (512 at a time), a few on the stack otherwise.
+    var small: [16]u64 = undefined;
+    const batch_page = pmm.alloc();
+    defer if (batch_page) |b| pmm.free(b);
+    var gather: Gather = .{
+        .root = root,
+        .start = start,
+        .pages = (end - start) / pmm.PAGE_SIZE,
+        .buf = if (batch_page) |b| @as([*]u64, @ptrCast(@alignCast(pmm.physToVirt(b))))[0 .. pmm.PAGE_SIZE / 8] else &small,
+    };
     var unused = false;
-    const mapped = walkUserRange(root, 3, 0, start, end, .{ .protect = 0 }, &unused); // no user access from here on
-    if (mapped == 0) return 0; // nothing was ever touched there: nothing to flush or free
-    flushEverywhere(root, start, (end - start) / pmm.PAGE_SIZE);
-    // ...then free the pages and the tables.
-    return walkUserRange(root, 3, 0, start, end, .unmap, &unused);
+    const freed = walkUserRange(root, 3, 0, start, end, .{ .unmap = &gather }, &unused);
+    gather.flush();
+    return freed;
 }
 
 /// Give every mapped page of the user range `[start, end)` the permission
