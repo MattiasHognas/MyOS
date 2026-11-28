@@ -63,6 +63,54 @@ fn eql(s: [*:0]const u8, want: []const u8) bool {
     return std.mem.eql(u8, std.mem.span(s), want);
 }
 
+/// The status of the child `pid`, once it has ended.
+fn waitFor(pid: u64) u32 {
+    var status: u32 = 0xFFFF;
+    _ = lib.syscall6(Sys.wait4, pid, @intFromPtr(&status), 0, 0, 0, 0);
+    return status;
+}
+
+/// `MADV_DONTFORK` and `MADV_DOFORK`: a child made by `fork` has nothing
+/// where the parent's mapping was left out (the address is free in it),
+/// and has the rest as always. Kept through `mprotect` and `mremap`.
+fn dontFork() void {
+    const m = lib.mmap(0, 3 * PAGE, RW, MAP.PRIVATE | MAP.ANONYMOUS);
+    expect(!lib.isError(m), 120);
+    bytes(m, 1)[0] = 1;
+    bytes(m + PAGE, 1)[0] = 2;
+    bytes(m + 2 * PAGE, 1)[0] = 3;
+    expect(lib.syscall(Sys.madvise, m + PAGE, PAGE, abi.MADV.DONTFORK) == 0, 121);
+    expect(lib.syscall(Sys.mprotect, m + PAGE, PAGE, PROT.READ) == 0, 122); // keeps it
+    // Outside any mapping: as the other advice, ENOMEM.
+    expect(lib.syscall(Sys.madvise, 0x7000_0000_0000, PAGE, abi.MADV.DONTFORK) == lib.err(.NOMEM), 123);
+    const child = lib.syscall(Sys.fork, 0, 0, 0);
+    if (child == 0) {
+        // The pages around it as before; nothing in the middle: a mapping
+        // there that may not replace one succeeds, and finds zeroes.
+        if (bytes(m, 1)[0] != 1 or bytes(m + 2 * PAGE, 1)[0] != 3) lib.exit(1);
+        if (lib.syscall(Sys.madvise, m + PAGE, PAGE, abi.MADV.DONTNEED) != lib.err(.NOMEM)) lib.exit(2);
+        if (lib.mmap(m + PAGE, PAGE, RW, MAP.PRIVATE | MAP.ANONYMOUS | MAP.FIXED_NOREPLACE) != m + PAGE) lib.exit(3);
+        if (bytes(m + PAGE, 1)[0] != 0) lib.exit(4);
+        lib.exit(0);
+    }
+    expect(waitFor(child) == 0, 124);
+    expect(bytes(m + PAGE, 1)[0] == 2, 125); // the parent's own is untouched
+    // Moved by mremap: still left out, at its new place.
+    const moved = lib.syscall6(Sys.mremap, m + PAGE, PAGE, 2 * PAGE, abi.MREMAP.MAYMOVE, 0, 0);
+    expect(!lib.isError(moved) and bytes(moved, 1)[0] == 2, 126);
+    const second = lib.syscall(Sys.fork, 0, 0, 0);
+    if (second == 0) {
+        lib.exit(if (lib.syscall(Sys.madvise, moved, 2 * PAGE, abi.MADV.DONTNEED) == lib.err(.NOMEM)) 0 else 5);
+    }
+    expect(waitFor(second) == 0, 127);
+    // MADV_DOFORK: a child has it again, with the parent's contents.
+    expect(lib.syscall(Sys.madvise, moved, 2 * PAGE, abi.MADV.DOFORK) == 0, 128);
+    const third = lib.syscall(Sys.fork, 0, 0, 0);
+    if (third == 0) lib.exit(if (bytes(moved, 1)[0] == 2) 0 else 6);
+    expect(waitFor(third) == 0, 129);
+    expect(lib.munmap(m, PAGE) == 0 and lib.munmap(m + 2 * PAGE, PAGE) == 0 and lib.munmap(moved, 2 * PAGE) == 0, 130);
+}
+
 pub fn main() noreturn {
     const args = lib.argv();
     if (args.len > 1) {
@@ -292,6 +340,8 @@ pub fn main() noreturn {
 
     // --- The stack grows as it is used.
     expect(recurse(512) < 512 * 256, 80); // half a megabyte
+
+    dontFork();
 
     lib.exit(0);
 }

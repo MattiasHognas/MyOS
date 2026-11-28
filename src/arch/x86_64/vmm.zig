@@ -488,12 +488,21 @@ pub fn splitHugeIn(root: u64, start: u64, end: u64, all: bool) error{OutOfMemory
 /// and page tables `to` took. On `error.OutOfMemory`, what was copied so
 /// far stays in `to`, for the caller to destroy with it. Whoever holds the
 /// lock of `from`'s mappings must hold it throughout.
-pub fn copyUserSpace(from: u64, to: u64) MapError!usize {
+pub fn copyUserSpace(from: u64, to: u64, skip: ?Skip) MapError!usize {
     var taken: usize = 0;
     defer flushAllUser(from); // its pages are read-only now, copy-on-write
-    try copyLevel(table(from), to, 3, 0, &taken);
+    try copyLevel(table(from), to, 3, 0, &taken, skip);
     return taken;
 }
+
+/// Ranges `copyUserSpace` leaves out (`MADV_DONTFORK`): how much of
+/// `[start, end)` is to be left out.
+pub const Skip = struct {
+    ctx: *const anyopaque,
+    in: *const fn (ctx: *const anyopaque, start: u64, end: u64) Share,
+
+    pub const Share = enum { none, all, part };
+};
 
 /// Forget every user translation of `root` on every CPU that has it
 /// loaded: after its entries lost write permission all over (`fork`).
@@ -501,11 +510,19 @@ pub fn flushAllUser(root: u64) void {
     flushEverywhere(root, 0, USER_END / pmm.PAGE_SIZE);
 }
 
-fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapError!void {
+fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize, skip: ?Skip) MapError!void {
     const n: usize = if (level == 3) 256 else 512; // the user half only
     for (t[0..n], 0..) |e, i| {
         if (e & PRESENT == 0) continue;
         const virt = base + i * span(level);
+        // What is under this entry: left out, partly (looked at further
+        // down), or not at all (no more looking).
+        var below = skip;
+        if (skip) |s| switch (s.in(s.ctx, virt, virt + span(level))) {
+            .all => continue,
+            .none => below = null,
+            .part => {},
+        };
         if (level == 0 and e & SHARED != 0) {
             // A page all address spaces share: the same page, not a copy.
             var tables: usize = 0;
@@ -548,12 +565,13 @@ fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapErro
             };
             taken.* += 1 + tables;
         } else if (e & HUGE == 0) {
-            try copyLevel(table(e & ADDR_MASK), to, level - 1, virt, taken);
+            try copyLevel(table(e & ADDR_MASK), to, level - 1, virt, taken, below);
         } else if (level == 1) {
             // A 2 MiB page, copied as 512 small ones: the copy need not find
             // 2 MiB in one piece, and is the same memory to the program.
             const flags = e & ~ADDR_MASK & ~PRESENT & ~HUGE;
             for (0..512) |k| {
+                if (below) |s| if (s.in(s.ctx, virt + k * pmm.PAGE_SIZE, virt + (k + 1) * pmm.PAGE_SIZE) == .all) continue;
                 const page = pmm.alloc() orelse return error.OutOfMemory;
                 @memcpy(pmm.physToVirt(page)[0..pmm.PAGE_SIZE], pmm.physToVirt((e & ADDR_MASK) + k * pmm.PAGE_SIZE)[0..pmm.PAGE_SIZE]);
                 var tables: usize = 0;

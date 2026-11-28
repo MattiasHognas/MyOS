@@ -1651,12 +1651,16 @@ noinline fn copyMemory(parent: *Process, root: u64, mem: *user_memory.UserMemory
             if (mem.regions.list.capacity >= parent.mem.regions.list.items.len) {
                 mem.regions.list.clearRetainingCapacity();
                 mem.regions.list.appendSliceAssumeCapacity(parent.mem.regions.list.items);
+                // What `MADV_DONTFORK` left out is not the child's at all.
+                const leave_out = mem.regions.anyDontFork();
+                if (leave_out) mem.regions.dropDontFork();
                 mem.regions.holdAll(); // the child's regions hold what the parent's do (memory objects)
                 mem.brk_start = parent.mem.brk_start;
                 mem.brk_end = parent.mem.brk_end;
                 mem.mmap_top = parent.mem.mmap_top;
                 // (An empty space has nothing mapped already.)
-                return vmm.copyUserSpace(parent.root, root) catch error.OutOfMemory;
+                const skip: ?vmm.Skip = if (leave_out) .{ .ctx = &parent.mem.regions, .in = user_memory.dontForkIn } else null;
+                return vmm.copyUserSpace(parent.root, root, skip) catch error.OutOfMemory;
             }
             room = parent.mem.regions.list.items.len + 8;
         }

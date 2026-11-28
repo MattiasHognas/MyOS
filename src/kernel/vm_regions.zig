@@ -105,6 +105,9 @@ pub const Region = struct {
     kind: Kind,
     /// For `kind == .file`.
     backing: Backing = .{},
+    /// Left out of a child made by `fork` (`MADV_DONTFORK`; Linux's
+    /// `VM_DONTCOPY`). Kept through `mprotect`, as there.
+    dont_fork: bool = false,
 
     /// The file offset of the page at `addr`, which is in this region.
     /// Whether the region has a file offset: a file's or an object's.
@@ -122,7 +125,7 @@ pub const Region = struct {
 
     fn mergeable(a: Region, b: Region) bool {
         // Only anonymous memory: the others are known by their extent.
-        return a.end == b.start and a.kind == .anon and b.kind == .anon and a.prot.eql(b.prot);
+        return a.end == b.start and a.kind == .anon and b.kind == .anon and a.prot.eql(b.prot) and a.dont_fork == b.dont_fork;
     }
 };
 
@@ -306,6 +309,54 @@ pub const Regions = struct {
             self.list.items[i].prot = prot;
         }
         self.mergeAround(first -| 1, i);
+    }
+
+    /// Mark `[start, start + len)` as left out of `fork`'s copy, or not
+    /// (`MADV_DONTFORK`, `MADV_DOFORK`). All of it must be in regions
+    /// (`error.NotMapped` otherwise, and nothing changes).
+    pub fn setDontFork(self: *Regions, gpa: std.mem.Allocator, start: u64, len: u64, on: bool) Error!void {
+        const end = try checkRange(start, len);
+        if (!self.isCovered(start, len)) return error.NotMapped;
+        try self.splitAt(gpa, start);
+        try self.splitAt(gpa, end);
+        var i = self.lowerBound(start);
+        const first = i;
+        while (i < self.list.items.len and self.list.items[i].start < end) : (i += 1) {
+            self.list.items[i].dont_fork = on;
+        }
+        self.mergeAround(first -| 1, i);
+    }
+
+    /// How much of `[start, end)` is in regions left out of `fork`.
+    pub const Share = enum { none, all, part };
+
+    pub fn dontForkIn(self: *const Regions, start: u64, end: u64) Share {
+        var covered: u64 = 0;
+        var i = self.lowerBound(start);
+        while (i < self.list.items.len and self.list.items[i].start < end) : (i += 1) {
+            const r = self.list.items[i];
+            if (r.dont_fork) covered += @min(r.end, end) - @max(r.start, start);
+        }
+        return if (covered == 0) .none else if (covered == end - start) .all else .part;
+    }
+
+    /// True if any region is left out of `fork`.
+    pub fn anyDontFork(self: *const Regions) bool {
+        for (self.list.items) |r| if (r.dont_fork) return true;
+        return false;
+    }
+
+    /// Take out the regions left out of `fork`, without letting go of
+    /// what they hold: for a copy of another space's list, before
+    /// `holdAll`.
+    pub fn dropDontFork(self: *Regions) void {
+        var kept: usize = 0;
+        for (self.list.items) |r| {
+            if (r.dont_fork) continue;
+            self.list.items[kept] = r;
+            kept += 1;
+        }
+        self.list.shrinkRetainingCapacity(kept);
     }
 
     /// Merge neighbours that have become alike, among the regions with

@@ -557,6 +557,8 @@ pub const MAP = struct {
 pub const MADV = struct {
     pub const DONTNEED = 4;
     pub const FREE = 8;
+    pub const DONTFORK = 10;
+    pub const DOFORK = 11;
 };
 
 /// Signal numbers go from 1 to this.

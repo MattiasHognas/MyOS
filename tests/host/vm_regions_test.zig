@@ -142,6 +142,42 @@ test "protect needs the whole range mapped, and splits at its ends" {
     try expectRegions(&r, &.{ .{ 10, 14 }, .{ 16, 18 } });
 }
 
+test "dontFork: marked by range, kept through protect, never merged with unmarked" {
+    var r: Regions = .{};
+    defer r.deinit(gpa);
+    try r.add(gpa, 10 * P, 6 * P, Prot.rw, .anon);
+    try r.setDontFork(gpa, 12 * P, 2 * P, true);
+    try expectRegions(&r, &.{ .{ 10, 12 }, .{ 12, 14 }, .{ 14, 16 } });
+    try expect(r.items()[1].dont_fork and !r.items()[0].dont_fork and !r.items()[2].dont_fork);
+    try expectEqual(Regions.Share.all, r.dontForkIn(12 * P, 14 * P));
+    try expectEqual(Regions.Share.part, r.dontForkIn(11 * P, 13 * P));
+    try expectEqual(Regions.Share.none, r.dontForkIn(10 * P, 12 * P));
+    try expectEqual(Regions.Share.none, r.dontForkIn(0, 10 * P)); // nothing there at all
+    // mprotect leaves it as it is.
+    try r.protect(gpa, 12 * P, P, ro);
+    try expect(r.items()[1].dont_fork and r.items()[2].dont_fork);
+    // An anonymous neighbour added next to it does not join it.
+    try r.add(gpa, 16 * P, P, Prot.rw, .anon);
+    try expect(r.anyDontFork());
+    // Put back: neighbours alike again become one.
+    try r.protect(gpa, 12 * P, P, Prot.rw);
+    try r.setDontFork(gpa, 12 * P, 2 * P, false);
+    try expectRegions(&r, &.{.{ 10, 17 }});
+    try expect(!r.anyDontFork());
+    try expectError(error.NotMapped, r.setDontFork(gpa, 30 * P, P, true));
+}
+
+test "dropDontFork leaves the other regions" {
+    var r: Regions = .{};
+    defer r.deinit(gpa);
+    try r.add(gpa, 10 * P, 2 * P, Prot.rw, .anon);
+    try r.add(gpa, 20 * P, 2 * P, ro, .image);
+    try r.add(gpa, 30 * P, 2 * P, rx, .image);
+    try r.setDontFork(gpa, 20 * P, 2 * P, true);
+    r.dropDontFork();
+    try expectRegions(&r, &.{ .{ 10, 12 }, .{ 30, 32 } });
+}
+
 test "findFree places top down, in the highest gap that fits" {
     var r: Regions = .{};
     defer r.deinit(gpa);

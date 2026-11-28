@@ -513,6 +513,8 @@ pub fn mremap(p: *Process, addr: u64, old_length: u64, new_length: u64, flags: u
                 b.offset = region.fileOffset(tail);
                 p.mem.regions.addBacked(heap.allocator, tail, more, region.prot, region.kind, b) catch |e| return mapError(e);
             } else p.mem.regions.add(heap.allocator, tail, more, region.prot, .anon) catch |e| return mapError(e);
+            // (Exactly the new region: nothing to split, nothing can fail.)
+            if (region.dont_fork) p.mem.regions.setDontFork(heap.allocator, tail, more, true) catch {};
             return addr;
         }
         if (!may_move) return abi.err(.NOMEM);
@@ -538,6 +540,7 @@ fn moveLocked(p: *Process, region: vm_regions.Region, addr: u64, old_len: u64, n
         b.offset = region.fileOffset(addr);
         p.mem.regions.addBacked(heap.allocator, to, new_len, region.prot, region.kind, b) catch |e| return mapError(e);
     } else p.mem.regions.add(heap.allocator, to, new_len, region.prot, .anon) catch |e| return mapError(e);
+    if (region.dont_fork) p.mem.regions.setDontFork(heap.allocator, to, new_len, true) catch {};
 
     // The pages that are there, one by one; on running out of memory (for
     // page tables at the new place), the moved ones go back, which needs
@@ -684,9 +687,21 @@ pub fn mprotect(p: *Process, addr: u64, length: u64, prot_bits: u64) u64 {
     return 0;
 }
 
+/// For `vmm.copyUserSpace`: how much of `[start, end)` the regions `ctx`
+/// leave out of `fork`.
+pub fn dontForkIn(ctx: *const anyopaque, start: u64, end: u64) vmm.Skip.Share {
+    const regions: *const vm_regions.Regions = @ptrCast(@alignCast(ctx));
+    return switch (regions.dontForkIn(start, end)) {
+        .none => .none,
+        .all => .all,
+        .part => .part,
+    };
+}
+
 /// `madvise`: `MADV_DONTNEED` and `MADV_FREE` give the pages back (they
-/// read as zeroes when touched again); other advice is accepted and
-/// ignored, as it may be.
+/// read as zeroes when touched again); `MADV_DONTFORK` leaves the range
+/// out of a child made by `fork` (it has nothing there), `MADV_DOFORK`
+/// puts it back; other advice is accepted and ignored, as it may be.
 pub fn madvise(p: *Process, addr: u64, length: u64, advice: u64) u64 {
     if (addr % PAGE != 0 or length > MAP_MAX) return abi.err(.INVAL);
     if (length == 0) return 0;
@@ -707,6 +722,12 @@ pub fn madvise(p: *Process, addr: u64, length: u64, advice: u64) u64 {
                 if (region.kind != .image) releasePages(p, at, end);
                 at = end;
             }
+        },
+        abi.MADV.DONTFORK, abi.MADV.DOFORK => {
+            // The 2 MiB pages it cuts through first: the copy leaves out
+            // whole small pages.
+            splitFor(p, addr, addr + len, false) catch return abi.err(.NOMEM);
+            p.mem.regions.setDontFork(heap.allocator, addr, len, advice == abi.MADV.DONTFORK) catch |e| return mapError(e);
         },
         else => {},
     }
