@@ -70,6 +70,14 @@ const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
 var mode: Mode = .fxsave;
+/// Save a thread's state with `XSAVEOPT` when switching away from it
+/// (where the CPU has it, in XSAVE mode): components in their initial
+/// state, or not changed since they were loaded from the same area, are
+/// not written. The kernel writes a thread's area only right before
+/// loading from it (`initArea` then a restore), which is what lets the
+/// CPU skip what it loaded unchanged. Not for copies that software reads
+/// (a signal frame's FP image): an unwritten component's bytes are old.
+var use_xsaveopt = false;
 var area_size: usize = FXSAVE_SIZE;
 var xcr0: u64 = 0;
 
@@ -156,6 +164,7 @@ pub fn init() void {
     if (mode == .xsave) {
         if (size < FXSAVE_SIZE + 64 or size > MAX_AREA_SIZE) @panic("fpu: unexpected XSAVE area size");
         area_size = size;
+        use_xsaveopt = cpu.cpuid(0xD, 1).eax & 1 != 0;
     }
     {
         // The CPU says in a saved image which MXCSR bits it has.
@@ -174,6 +183,7 @@ pub fn init() void {
         }),
         .fxsave => log.info("extended state: FXSAVE, {d} bytes (no XSAVE; AVX off)", .{area_size}),
     }
+    if (use_xsaveopt) log.info("extended state: saved with XSAVEOPT on thread switches", .{});
 }
 
 /// Enable on this CPU what `init` chose on the boot CPU. Must run on every
@@ -272,6 +282,15 @@ fn restore(area: [*]align(AREA_ALIGN) const u8) void {
 /// state: nothing is saved for it, and the registers keep the last user
 /// thread's values until the next user thread is loaded. Interrupts must be off.
 pub fn switchState(prev: ?[*]align(AREA_ALIGN) u8, next: ?[*]align(AREA_ALIGN) const u8) void {
-    if (prev) |area| save(area);
+    if (prev) |area| {
+        if (use_xsaveopt) {
+            asm volatile (".byte 0x48, 0x0f, 0xae, 0x37" // xsaveopt64 (%rdi)
+                :
+                : [area] "{rdi}" (area),
+                  [lo] "{eax}" (@as(u32, 0xFFFF_FFFF)),
+                  [hi] "{edx}" (@as(u32, 0xFFFF_FFFF)),
+                : .{ .memory = true });
+        } else save(area);
+    }
     if (next) |area| restore(area);
 }
