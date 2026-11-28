@@ -88,6 +88,14 @@ pub const Ops = struct {
     /// The file's size now, for a file whose size changes (`Node.size`
     /// is what it was when the node was made).
     size: ?*const fn (node: *const Node) u64 = null,
+    /// For a file a shared mapping can map (`MAP_SHARED`): the page at
+    /// `offset`, with one more owner taken for the mapping's entry
+    /// (`pmm.share`); `error.PastEnd` beyond the file. Called with the
+    /// address-space lock held: takes no lock that sleeps.
+    map_page: ?*const fn (node: *const Node, offset: u64) MapError!u64 = null,
+    /// A region of a mapping of it comes (`take`) or goes: it holds the
+    /// file meanwhile. `may_write`: a shared mapping that may write.
+    hold_map: ?*const fn (node: *const Node, take: bool, may_write: bool) void = null,
     /// Its times and number of names, for `stat`; null for a file whose
     /// times are not kept (those of the image: the boot time is given).
     meta: ?*const fn (node: *const Node) Meta = null,
@@ -101,6 +109,13 @@ pub const Ops = struct {
     retain: ?*const fn (node: *const Node) void = null,
     release: ?*const fn (node: *const Node) void = null,
 };
+
+pub const MapError = error{ PastEnd, OutOfMemory };
+
+/// Whether a shared mapping can map the file's pages themselves.
+pub fn canMapShared(node: *const Node) bool {
+    return node.ops.map_page != null;
+}
 
 /// What `stat` tells about a file besides its size.
 pub const Meta = struct { atime: i64, mtime: i64, ctime: i64, nlink: u32 };

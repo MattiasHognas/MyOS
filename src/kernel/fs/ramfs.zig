@@ -366,6 +366,19 @@ pub fn RamFs(comptime Blocks: type) type {
             return n;
         }
 
+        /// The block at `index` of `f`, made (zeroed) if there is none
+        /// yet: for a mapping of the file, which writes it directly.
+        pub fn blockAt(self: *Self, f: *File, index: usize) Error!*[BLOCK]u8 {
+            try self.reach(f, index);
+            if (f.blocks.items[index]) |b| return b;
+            if (self.blocks_used >= self.blocks_max) return error.NoSpace;
+            const new = Blocks.alloc() orelse return error.NoSpace;
+            @memset(new, 0);
+            self.blocks_used += 1;
+            f.blocks.items[index] = new;
+            return new;
+        }
+
         /// Make sure the block table of `f` reaches block `index`.
         fn reach(self: *Self, f: *File, index: usize) Error!void {
             if (index < f.blocks.items.len) return;

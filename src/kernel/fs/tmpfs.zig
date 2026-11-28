@@ -1,11 +1,12 @@
 //! The filesystem in memory as the kernel mounts it (at `/tmp`):
 //! `ramfs.zig` with pages for its blocks and one lock around it.
 //!
-//! The lock is a mutex: an operation here may allocate and copy, and the
-//! threads that wait for it sleep. So none of this may be called with a
-//! spinlock held or from an interrupt handler; system calls and process
-//! start are where it is called from. A file's pages cannot be mapped
-//! into a program (`mmap`): a page fault is handled under a spinlock.
+//! The lock is a spinlock (rank `memory_object`): what is done under it
+//! allocates and copies within the kernel and never waits, and a page
+//! fault of a mapping of a file here takes it. A file's blocks are pages
+//! of the page allocator: a shared mapping maps them themselves (one
+//! more owner each, `pmm.share`), so a block freed by the file stays
+//! while a mapping has it.
 //!
 //! It may hold half of the machine's memory, as Linux's tmpfs does by
 //! default. What it holds is not charged to any process yet.
@@ -13,7 +14,7 @@
 const std = @import("std");
 
 const heap = @import("../heap.zig");
-const Mutex = @import("../sync/mutex.zig").Mutex;
+const SpinLock = @import("../sync/spinlock.zig").SpinLock;
 const pmm = @import("../pmm.zig");
 const ramfs = @import("ramfs.zig");
 const vfs = @import("../vfs.zig");
@@ -31,13 +32,18 @@ const PageBlocks = struct {
     }
 
     pub fn free(block: *[ramfs.BLOCK]u8) void {
-        pmm.free(pmm.virtToPhys(@intFromPtr(block)));
+        // One owner less: a shared mapping may have it still.
+        pmm.release(pmm.virtToPhys(@intFromPtr(block)));
     }
 };
 
 const Fs = ramfs.RamFs(PageBlocks);
 
-var lock: Mutex = .{};
+/// A spinlock, not a mutex: a page fault of a shared mapping of a file
+/// here takes it (under the address-space lock), and nothing done under
+/// it sleeps (it allocates and copies within the kernel). The rank of a
+/// memory object's lock, which it is to a mapping; the two never nest.
+var lock: SpinLock = .{ .rank = .memory_object };
 var fs: Fs = undefined;
 
 const ops = vfs.Ops{
@@ -49,7 +55,28 @@ const ops = vfs.Ops{
     .release = release,
     .meta = meta,
     .set_times = setTimes,
+    .map_page = mapPage,
+    .hold_map = holdMap,
 };
+
+/// The block at `offset` of the file, as a page for a shared mapping:
+/// made (zeroed) where there is none, with one more owner for the
+/// mapping. Past the end (rounded up to a page): `error.PastEnd`.
+fn mapPage(node: *const vfs.Node, offset: u64) vfs.MapError!u64 {
+    const held = lock.acquire();
+    defer lock.release(held);
+    const f = fileOf(node);
+    if (offset >= std.mem.alignForward(u64, f.size, ramfs.BLOCK)) return error.PastEnd;
+    const block = fs.blockAt(f, @intCast(offset / ramfs.BLOCK)) catch return error.OutOfMemory;
+    const phys = pmm.virtToPhys(@intFromPtr(block));
+    if (!pmm.share(phys)) return error.OutOfMemory;
+    return phys;
+}
+
+/// A mapping's region holds the file as an open file does.
+fn holdMap(node: *const vfs.Node, take: bool, _: bool) void {
+    if (take) retain(node) else release(node);
+}
 
 /// The filesystem, empty, to be mounted. Call once.
 pub fn init() vfs.Fs {
@@ -74,8 +101,8 @@ pub fn init() vfs.Fs {
 
 /// Blocks in use, for tests.
 pub fn blocksUsed() usize {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.blocks_used;
 }
 
@@ -101,21 +128,21 @@ fn toVfs(e: ramfs.Error) vfs.Error {
 }
 
 fn lookup(_: *anyopaque, path: []const u8) ?vfs.Node {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return nodeOf(fs.open(path) catch return null);
 }
 
 fn isDirectory(_: *anyopaque, path: []const u8) bool {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const info = fs.info(path) orelse return false;
     return info.kind == .directory;
 }
 
 fn next(_: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?vfs.DirEntry {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const entry = fs.next(dir, cookie, name_buf) orelse return null;
     return .{ .name = entry.name, .kind = switch (entry.kind) {
         .directory => .directory,
@@ -126,8 +153,8 @@ fn next(_: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?vfs.DirEn
 }
 
 fn create(_: *anyopaque, path: []const u8) vfs.Error!vfs.Node {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const f = fs.create(path) catch |e| return toVfs(e);
     const t = now();
     f.atime = t;
@@ -137,8 +164,8 @@ fn create(_: *anyopaque, path: []const u8) vfs.Error!vfs.Node {
 }
 
 fn readLink(_: *anyopaque, path: []const u8, buf: []u8) ?usize {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const target = fs.readlink(path) orelse return null;
     const n = @min(target.len, buf.len);
     @memcpy(buf[0..n], target[0..n]); // copied under the lock: the link may go after
@@ -146,28 +173,28 @@ fn readLink(_: *anyopaque, path: []const u8, buf: []u8) ?usize {
 }
 
 fn symlink(_: *anyopaque, path: []const u8, target: []const u8) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.symlink(path, target) catch |e| toVfs(e);
 }
 
 fn link(_: *anyopaque, old: []const u8, new: []const u8) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const f = fs.link(old, new) catch |e| return toVfs(e);
     f.ctime = now();
 }
 
 fn meta(node: *const vfs.Node) vfs.Meta {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const f = fileOf(node);
     return .{ .atime = f.atime, .mtime = f.mtime, .ctime = f.ctime, .nlink = f.nlink };
 }
 
 fn setTimes(node: *const vfs.Node, atime: ?i64, mtime: ?i64) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const f = fileOf(node);
     if (atime) |t| f.atime = t;
     if (mtime) |t| f.mtime = t;
@@ -175,51 +202,51 @@ fn setTimes(node: *const vfs.Node, atime: ?i64, mtime: ?i64) vfs.Error!void {
 }
 
 fn fifoAt(_: *anyopaque, path: []const u8) ?u64 {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.fifoAt(path);
 }
 
 fn mkfifo(_: *anyopaque, path: []const u8, id: u64) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.mkfifo(path, id) catch |e| toVfs(e);
 }
 
 fn mkdir(_: *anyopaque, path: []const u8) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.mkdir(path) catch |e| toVfs(e);
 }
 
 fn unlink(_: *anyopaque, path: []const u8) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     if (fs.fileAt(path)) |f| f.ctime = now(); // one name fewer
     return fs.unlink(path) catch |e| toVfs(e);
 }
 
 fn rmdir(_: *anyopaque, path: []const u8) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.rmdir(path) catch |e| toVfs(e);
 }
 
 fn rename(_: *anyopaque, old: []const u8, new: []const u8) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.rename(old, new) catch |e| toVfs(e);
 }
 
 fn read(node: *const vfs.Node, offset: u64, buf: []u8) usize {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fs.read(fileOf(node), offset, buf);
 }
 
 fn write(node: *const vfs.Node, offset: u64, data: []const u8) vfs.Error!usize {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const f = fileOf(node);
     const n = fs.write(f, offset, data) catch |e| return toVfs(e);
     const t = now();
@@ -229,8 +256,8 @@ fn write(node: *const vfs.Node, offset: u64, data: []const u8) vfs.Error!usize {
 }
 
 fn truncate(node: *const vfs.Node, new_size: u64) vfs.Error!void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     const f = fileOf(node);
     fs.truncate(f, new_size) catch |e| return toVfs(e);
     const t = now();
@@ -239,19 +266,19 @@ fn truncate(node: *const vfs.Node, new_size: u64) vfs.Error!void {
 }
 
 fn size(node: *const vfs.Node) u64 {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     return fileOf(node).size;
 }
 
 fn retain(node: *const vfs.Node) void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     fs.retain(fileOf(node));
 }
 
 fn release(node: *const vfs.Node) void {
-    lock.lock();
-    defer lock.unlock();
+    const held = lock.acquire();
+    defer lock.release(held);
     fs.release(fileOf(node));
 }

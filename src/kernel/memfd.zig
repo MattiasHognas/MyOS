@@ -131,7 +131,20 @@ pub const ops = vfs.Ops{
     .size = nodeSize,
     .retain = nodeRetain,
     .release = nodeRelease,
+    .map_page = nodeMapPage,
+    .hold_map = nodeHoldMap,
 };
+
+fn nodeMapPage(n: *const vfs.Node, offset: u64) vfs.MapError!u64 {
+    return pageForMapping(of(n), offset) catch |e| switch (e) {
+        error.PastEnd => error.PastEnd,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn nodeHoldMap(n: *const vfs.Node, take: bool, may_write: bool) void {
+    holdRegion(of(n), take, may_write);
+}
 
 /// The node for `o`; the caller's hold becomes the node's.
 pub fn node(o: *Object) vfs.Node {

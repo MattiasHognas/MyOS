@@ -108,6 +108,55 @@ pub fn main() noreturn {
     }
     expect(wait(other) == 0, 7);
 
+    // --- A file of /tmp, mapped shared by two processes that open it
+    // each (how .NET keeps a named mutex): one memory, one futex.
+    {
+        var path_buf: [40]u8 = undefined;
+        const text = std.fmt.bufPrint(path_buf[0..39], "/tmp/shm-{d}", .{lib.syscall(Sys.getpid, 0, 0, 0)}) catch unreachable;
+        path_buf[text.len] = 0;
+        const path: [*:0]const u8 = @ptrCast(&path_buf);
+        const tf = lib.syscall(Sys.open, @intFromPtr(path), abi.O.RDWR | abi.O.CREAT, 0o600);
+        expect(!lib.isError(tf) and lib.syscall(Sys.ftruncate, tf, 4096, 0) == 0, 20);
+        const m = mmap(0, 4096, 0x01, @intCast(tf));
+        expect(!lib.isError(m), 21);
+        const flag: *u32 = @ptrFromInt(m + 128);
+        flag.* = 0;
+        const peer = lib.syscall(Sys.fork, 0, 0, 0);
+        if (peer == 0) {
+            // Its own open file and mapping of it, not the inherited ones.
+            _ = lib.syscall(Sys.munmap, m, 4096, 0);
+            const cf = lib.syscall(Sys.open, @intFromPtr(path), abi.O.RDWR, 0);
+            const cm = mmap(0, 4096, 0x01, @intCast(cf));
+            if (lib.isError(cm)) lib.exit(46);
+            const data: [*]u8 = @ptrFromInt(cm);
+            @memcpy(data[0..5], "hello");
+            const cflag: *u32 = @ptrFromInt(cm + 128);
+            sleepMs(20);
+            @atomicStore(u32, cflag, 1, .seq_cst);
+            for (0..100) |_| {
+                if (futex(cflag, FUTEX_WAKE, 1, null) != 0) break;
+                sleepMs(1);
+            }
+            lib.exit(0);
+        }
+        const r = futex(flag, FUTEX_WAIT, 0, null); // woken from the other process
+        expect(r == 0 or r == lib.err(.AGAIN), 22);
+        expect(wait(peer) == 0 and flag.* == 1, 23);
+        const data: [*]const u8 = @ptrFromInt(m);
+        expect(std.mem.eql(u8, data[0..5], "hello"), 24); // the child's write, in this mapping
+        var back: [5]u8 = undefined;
+        expect(lib.syscall6(Sys.pread64, tf, @intFromPtr(&back), 5, 0, 0, 0) == 5 and std.mem.eql(u8, &back, "hello"), 25); // and in the file
+        // A private mapping of it: its writes are its own.
+        const pm = mmap(0, 4096, 0x02, @intCast(tf)); // MAP_PRIVATE
+        expect(!lib.isError(pm), 26);
+        @as(*u8, @ptrFromInt(pm)).* = 'J';
+        expect(data[0] == 'h', 27);
+        _ = lib.syscall(Sys.munmap, pm, 4096, 0);
+        _ = lib.syscall(Sys.munmap, m, 4096, 0);
+        _ = lib.syscall(Sys.close, tf, 0, 0);
+        expect(lib.syscall(Sys.unlink, @intFromPtr(path), 0, 0) == 0, 28);
+    }
+
     // --- A robust mutex whose owner dies: marked, and its waiter woken.
     // In shared memory: the list head and an entry, and two futex words
     // 64 bytes after their entries.

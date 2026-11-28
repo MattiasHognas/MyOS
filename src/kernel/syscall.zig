@@ -3453,7 +3453,9 @@ fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, 
             // fault is handled where its filesystem's lock cannot be taken.
             // A memory object can (`memfd.zig`): it has a lock of its own.
             if (of.kind != .file or of.generated != null) break :blk err(.NODEV);
-            if (vfs.isCounted(&of.node) and memfd.fromNode(&of.node) == null) break :blk err(.NODEV);
+            // (Counted files can be mapped where their filesystem holds
+            // them for a mapping: memory files and `/tmp`'s.)
+            if (vfs.isCounted(&of.node) and of.node.ops.hold_map == null) break :blk err(.NODEV);
             if (!of.readable) break :blk err(.ACCES);
             break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, .{ .node = of.node, .offset = f.r9, .writable = of.writable });
         },

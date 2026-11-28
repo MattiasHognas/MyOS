@@ -167,8 +167,9 @@ pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
     // more owner of it; counted against the process like any it maps.
     if (region.kind == .shared) {
         if (p.pages + 1 > p.limits.max_pages) return error.OutOfMemory;
-        const object: *memfd.Object = @ptrFromInt(region.backing.file[1]);
-        const phys = memfd.pageForMapping(object, region.fileOffset(page)) catch |e| return switch (e) {
+        const node = nodeOf(region.backing);
+        const map_page = node.ops.map_page.?; // only such files are mapped shared
+        const phys = map_page(&node, region.fileOffset(page)) catch |e| return switch (e) {
             error.PastEnd => error.BadAccess,
             error.OutOfMemory => error.OutOfMemory,
         };
@@ -343,32 +344,40 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fil
     if (sharing == 0 or sharing == (abi.MAP.SHARED | abi.MAP.PRIVATE)) return abi.err(.INVAL);
     const anonymous = flags & abi.MAP.ANONYMOUS != 0;
     const shared = sharing == abi.MAP.SHARED;
-    var object: ?*memfd.Object = null; // what a shared or counted mapping holds
+    // The file a shared mapping maps the pages of (`vfs.Ops.map_page`: a
+    // memory file, a file of `/tmp`), and whether it may write them.
+    var share_node: ?vfs.Node = null;
+    var may_write = false;
     if (!anonymous) {
         const f = file orelse return abi.err(.BADF);
         if (f.offset % PAGE != 0) return abi.err(.INVAL);
         if (f.offset > MAP_MAX or len > MAP_MAX - f.offset) return abi.err(.INVAL); // Linux: EOVERFLOW
-        object = memfd.fromNode(&f.node);
-        if (object) |o| {
-            // A shared mapping that may write needs a descriptor open
-            // for writing, and no seal against it.
-            if (shared and prot.write and !f.writable) return abi.err(.ACCES);
-            if (shared and f.writable and !memfd.mayMapWritable(o)) {
-                if (prot.write) return abi.err(.PERM);
+        if (shared and vfs.canMapShared(&f.node)) {
+            // One that may write needs a descriptor open for writing, and
+            // (a memory file) no seal against it.
+            if (prot.write and !f.writable) return abi.err(.ACCES);
+            may_write = f.writable;
+            if (memfd.fromNode(&f.node)) |o| {
+                if (f.writable and !memfd.mayMapWritable(o)) {
+                    if (prot.write) return abi.err(.PERM);
+                    may_write = false;
+                }
             }
+            share_node = f.node;
         } else if (shared and prot.write) {
             // Other files cannot be written: a shared mapping may only be
             // read, and is then the same as a private one.
             return abi.err(.ACCES);
         }
     }
-    // Shared anonymous memory is an object of its own, which the mapping
-    // (and its copies in children) hold.
+    // Shared anonymous memory is a memory object of its own, which the
+    // mapping (and its copies in children) hold.
     var anon_object: ?*memfd.Object = null;
     defer if (anon_object) |o| memfd.release(o); // the region took its own hold
     if (anonymous and shared) {
         anon_object = memfd.createAnonymous(len) catch return abi.err(.NOMEM);
-        object = anon_object;
+        share_node = memfd.node(anon_object.?);
+        may_write = true;
     }
     const fixed = flags & (abi.MAP.FIXED | abi.MAP.FIXED_NOREPLACE) != 0;
 
@@ -391,12 +400,10 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fil
         else
             placeFree(p, len, anonymous) orelse return abi.err(.NOMEM);
     }
-    if (shared and object != null) {
-        // The object's own pages (`memfd.zig`), from where in it the file
-        // offset says (0 for anonymous memory).
-        const o = object.?;
-        const may_write = if (file) |f| f.writable and memfd.mayMapWritable(o) else true;
-        const backing: vm_regions.Backing = .{ .file = .{ 0, @intFromPtr(o), 0 }, .offset = if (file) |f| f.offset else 0, .counted = true, .may_write = may_write };
+    if (share_node) |n| {
+        // The file's own pages, from where in it the offset says (0 for
+        // anonymous memory).
+        const backing: vm_regions.Backing = .{ .file = .{ n.size, n.ctx, @intFromPtr(n.ops) }, .offset = if (file) |f| f.offset else 0, .counted = true, .may_write = may_write };
         p.mem.regions.addBacked(heap.allocator, addr, len, prot, .shared, backing) catch |e| return mapError(e);
     } else if (anonymous) {
         p.mem.regions.add(heap.allocator, addr, len, prot, .anon) catch |e| return mapError(e);
@@ -405,7 +412,7 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fil
         // A memory object's mapping holds it, so that it is there to be
         // read from while the mapping is.
         const f = file.?;
-        const backing: vm_regions.Backing = .{ .file = .{ f.node.size, f.node.ctx, @intFromPtr(f.node.ops) }, .offset = f.offset, .counted = object != null };
+        const backing: vm_regions.Backing = .{ .file = .{ f.node.size, f.node.ctx, @intFromPtr(f.node.ops) }, .offset = f.offset, .counted = f.node.ops.hold_map != null };
         p.mem.regions.addBacked(heap.allocator, addr, len, prot, .file, backing) catch |e| return mapError(e);
     }
     return addr;
@@ -429,8 +436,8 @@ pub fn futexKey(p: *Process, addr: u64, private: bool) @import("futex.zig").Key 
 /// mapping's (the object in `file[1]`) and a private mapping of one (its
 /// node's `ctx`, also `file[1]`).
 fn holdBacking(backing: vm_regions.Backing, take: bool) void {
-    const o: *memfd.Object = @ptrFromInt(backing.file[1]);
-    memfd.holdRegion(o, take, backing.may_write);
+    const node = nodeOf(backing);
+    if (node.ops.hold_map) |hold| hold(&node, take, backing.may_write);
 }
 
 /// Let the region lists hold memory objects (`vm_regions.hold`). At boot,
@@ -592,7 +599,7 @@ pub fn describe(p: *Process) error{OutOfMemory}![]u8 {
             defer p.mem.lock.release(held);
             for (p.mem.regions.items()) |r| {
                 if (buf.len - len < LINE) break :blk false;
-                const object_name = if (r.kind == .shared) memfd.name(@ptrFromInt(r.backing.file[1])) else "";
+                const object_name = if (r.kind == .shared and nodeOf(r.backing).ops == &memfd.ops) memfd.name(@ptrFromInt(r.backing.file[1])) else "";
                 const line = std.fmt.bufPrint(buf[len..], "{x:0>8}-{x:0>8} {c}{c}{c}{c} {x:0>8} 00:00 0 {s}{s}{s}\n", .{
                     r.start,
                     r.end,
@@ -606,11 +613,11 @@ pub fn describe(p: *Process) error{OutOfMemory}![]u8 {
                         .heap => "                         [heap]",
                         .vvar => "                         [vvar]",
                         .vdso => "                         [vdso]",
-                        .shared => if (object_name.len != 0) "                         /" else "                         /dev/zero",
+                        .shared => if (object_name.len != 0) "                         /" else if (nodeOf(r.backing).ops == &memfd.ops) "                         /dev/zero" else "",
                         .image, .anon, .file => "",
                     },
                     object_name,
-                    if (r.kind == .shared) " (deleted)" else "",
+                    if (r.kind == .shared and nodeOf(r.backing).ops == &memfd.ops) " (deleted)" else "",
                 }) catch break :blk false;
                 len += line.len;
             }

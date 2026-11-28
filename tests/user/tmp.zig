@@ -148,7 +148,11 @@ pub fn main() noreturn {
     expect(stat("note").?.size == 11 and std.mem.eql(u8, listing("."), "note"), 29);
     const ro = open("note", O.RDONLY);
     expect(write(ro, "x") == lib.err(.BADF) and lib.syscall(Sys.ftruncate, ro, 0, 0) == lib.err(.INVAL), 30);
-    expect(lib.syscall6(Sys.mmap, 0, 4096, abi.PROT.READ, abi.MAP.PRIVATE, ro, 0) == lib.err(.NODEV), 31); // cannot be mapped
+    // It can be mapped (`/test/robust` maps one shared between processes).
+    const mapped = lib.syscall6(Sys.mmap, 0, 4096, abi.PROT.READ, abi.MAP.PRIVATE, ro, 0);
+    expect(!lib.isError(mapped) and @as(*const u8, @ptrFromInt(mapped)).* == contents("note")[0], 31);
+    _ = lib.syscall(Sys.munmap, mapped, 4096, 0);
+    expect(lib.syscall6(Sys.mmap, 0, 4096, abi.PROT.READ | abi.PROT.WRITE, abi.MAP.SHARED, ro, 0) == lib.err(.ACCES), 117); // writable shared: needs writing
     _ = lib.close(ro);
 
     // Offsets: in the middle, past the end (the gap is zeroes), at a place
