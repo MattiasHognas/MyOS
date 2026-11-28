@@ -106,7 +106,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: sysroot
-          key: sysroot-${{ hashFiles('scripts/fetch-sysroot.sh') }}
+          key: sysroot-${{ hashFiles('scripts/fetch-sysroot.sh', 'tools/add-glibc/fetch.sh', 'tools/add-glibc/packages.txt') }}
 
       - name: Fetch sysroot
         run: scripts/fetch-sysroot.sh
@@ -184,6 +184,12 @@ jobs:
         run: zig build test-qemu -Doptimize=${{ matrix.optimize }}
         env:
           MYOS_SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
+
+      # A release image, the C library added to it as a user adds it, and
+      # a dynamically linked program run in both.
+      - name: add-glibc on a release image
+        if: matrix.optimize == 'Debug'
+        run: tools/add-glibc/test.sh
 
       - name: Build documentation
         if: matrix.optimize == 'Debug'
@@ -302,6 +308,13 @@ jobs:
             echo
             echo '```'
             echo "qemu-system-x86_64 -machine q35 -cpu max -m 256M -serial stdio -cdrom myos-$VERSION.iso"
+            echo '```'
+            echo
+            echo "The image has no C library, so programs built for Linux run if they are linked statically. For dynamically linked ones (the ordinary output of gcc, cargo and dotnet publish), add Debian's glibc to the image on your machine; it is fetched from Debian and checked:"
+            echo
+            echo '```'
+            echo "tar -xzf myos-$VERSION-add-glibc.tar.gz"
+            echo "add-glibc/add-glibc.sh myos-$VERSION.iso    # writes myos-$VERSION-glibc.iso"
             echo '```'
             echo
             echo "\`myos-$VERSION-kernel.elf\` is the kernel with symbols, for symbolizing backtraces. Verify downloads with \`sha256sum -c SHA256SUMS\`."

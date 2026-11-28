@@ -1,0 +1,4 @@
+# Debian 13's C library and C++ runtime, pinned: <file in Debian's pool> <sha256>
+pool/main/g/glibc/libc6_2.41-12+deb13u5_amd64.deb b59b0625cd1a791375d40dab23a4d5d3d0641e3d0a773501becdc3725b7f99cf
+pool/main/g/gcc-14/libgcc-s1_14.2.0-19_amd64.deb 3c71917b490d1a17aed43196a2787a256ecf060526cdb20216a74bedc061b150
+pool/main/g/gcc-14/libstdc++6_14.2.0-19_amd64.deb ab1fa05837aa7a92aae748fd07a18a35f7d18bb4a71c4724fe2bbf0e32089de0

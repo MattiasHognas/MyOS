@@ -142,6 +142,9 @@ limine bios-install "$out_dir/$iso_name"
 
 if [[ "$mode" == --release ]]; then
     cp "$kernel" "$out_dir/myos-$version-kernel.elf"
+    # The tool a user adds the C library with (tools/add-glibc):
+    # myos-<version>-add-glibc.tar.gz, unpacking to add-glibc/.
+    tar -czf "$out_dir/myos-$version-add-glibc.tar.gz" -C tools add-glibc/add-glibc.sh add-glibc/fetch.sh add-glibc/packages.txt
     rm -rf "$iso_root" "$initrd" # only the release files stay in $out_dir
     (cd "$out_dir" && sha256sum myos-* >SHA256SUMS)
     echo "release files in $out_dir:"

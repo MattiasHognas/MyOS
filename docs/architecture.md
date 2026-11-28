@@ -193,8 +193,11 @@ so MyOS uses those names rather than names of its own.
 | `/test`, `/fixtures` | Test images only: MyOS's test programs, and programs built for Linux by `tests/fixtures/build.sh` |
 
 glibc is in development and test images (`scripts/fetch-sysroot.sh`), not
-in release images: it is to be installed on a running MyOS once there is
-a disk and a network, so that it comes from Debian to whoever installs it.
+in release images, so that it comes from Debian to whoever installs it.
+A release has the tool for that beside the image
+(`myos-<version>-add-glibc.tar.gz`, from `tools/add-glibc/`): run on the
+user's machine, it fetches the pinned packages and writes a new image with
+them. Installing it on a running MyOS waits for a disk and a network.
 
 ## What is tested, and how
 

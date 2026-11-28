@@ -78,7 +78,17 @@ expect (`/lib64/ld-linux-x86-64.so.2`, `/lib/x86_64-linux-gnu/`). `scripts/build
 everything still builds and statically linked programs run, dynamically
 linked ones do not start, and the kernel tests for them report that they
 were skipped. Release images are built without them: they are other projects'
-binaries under the LGPL, and passing them on has terms of its own.
+binaries under the LGPL, and passing them on has terms of its own. A user
+adds them to a release image with the tool released beside it:
+
+```sh
+tar -xzf myos-<version>-add-glibc.tar.gz
+add-glibc/add-glibc.sh myos-<version>.iso       # writes myos-<version>-glibc.iso
+```
+
+It is `tools/add-glibc/` (the pinned packages are in its `packages.txt`,
+which `scripts/fetch-sysroot.sh` uses too); `tools/add-glibc/test.sh`
+checks it on a release image with a dynamically linked program in it.
 
 It copies kbd's `default8x16` font from `/usr/share/kbd/consolefonts/` to
 `src/assets/font.psf`, or downloads the same file (checksum verified) if kbd
@@ -107,6 +117,7 @@ scripts/run-qemu.sh   # boots into the shell; type "hello", or "exit"
 | `zig build test-qemu` | Package a test ISO and run the QEMU scenarios (listed in [testing](testing.md#qemu-integration-test-scenarios)). |
 | `zig build test` | Host tests, the model checks, the stack frame and syscall dispatch checks and QEMU scenarios. |
 | `zig build coverage` | Host tests under kcov; report in `zig-out/coverage/`. |
+| `tools/add-glibc/test.sh` | Build a release image, add the C library to it with `tools/add-glibc/add-glibc.sh` and boot both: a dynamically linked program must run in the second only. |
 | `tools/bench/run.sh [--cpus N] [--save]` | The benchmark (`tools/bench/bench.zig`) in a Linux guest (the host's kernel, with and without mitigations) and a MyOS guest under the same QEMU and KVM; prints the medians side by side. `--save` keeps them in `tools/bench/results/<commit>.csv`. Needs KVM. |
 
 Build options (they apply to the test commands too):
@@ -193,7 +204,7 @@ or with Ctrl+A X on the serial line.
 | `tests/user/` | Ring 3 test programs, packaged as `/test/<name>` in the test initrd |
 | `tests/support/` | QEMU exit device helper for the test kernel |
 | `tests/models/` | Models of the blocking protocols, checked in every order of their steps (see [testing](testing.md#model-checks)) |
-| `tools/` | Tools that are not part of the OS. `tools/modelcheck/` is the model checker; `tools/syscall-survey/` measures which system calls a Linux program needs (`docs/linux-programs.md`) |
+| `tools/` | Tools that are not part of the OS. `tools/modelcheck/` is the model checker; `tools/syscall-survey/` measures which system calls a Linux program needs (`docs/linux-programs.md`); `tools/add-glibc/` adds the C library to a release image; `tools/bench/` compares speed with Linux |
 | `scripts/` | Build, run, test, release, CI install scripts and the GDB setup |
 | `VERSION` | `<major>.<minor>` of the next release (see [releases](#releases)) |
 | `linker.ld`, `limine.conf` | Kernel link layout (a position-independent executable linked at 0xffffffff80000000) and boot menu, which turns on KASLR |
