@@ -140,6 +140,7 @@ pub fn main() noreturn {
         // Counters and descriptor sets made here would be waited on with
         // nothing to end the wait.
         if (nr == Sys.eventfd or nr == Sys.eventfd2 or nr == Sys.epoll_create or nr == Sys.epoll_create1) continue;
+        if (nr == Sys.inotify_init or nr == Sys.inotify_init1) continue; // its reads wait for a change
         if (nr == Sys.epoll_wait or nr == Sys.epoll_pwait or nr == Sys.epoll_pwait2) continue;
         // New processes (a fork bomb, or children waited for with nothing
         // to end them), and signals to everyone (`kill(-1)`).

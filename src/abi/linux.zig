@@ -96,6 +96,12 @@ pub const Sys = struct {
     pub const wait4 = 61;
     /// `waitid(idtype, id, info, options, rusage)`: `wait4` with a `siginfo`.
     pub const waitid = 247;
+    /// `inotify_init()`, `inotify_init1(flags)`, `inotify_add_watch(fd,
+    /// path, mask)`, `inotify_rm_watch(fd, wd)`: being told of changes.
+    pub const inotify_init = 253;
+    pub const inotify_add_watch = 254;
+    pub const inotify_rm_watch = 255;
+    pub const inotify_init1 = 294;
     /// `link(old, new)`, `linkat(olddirfd, old, newdirfd, new, flags)`:
     /// a second name for a file; `symlink(target, path)`,
     /// `symlinkat(target, dirfd, path)`: a symbolic link.

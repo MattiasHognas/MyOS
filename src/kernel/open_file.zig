@@ -58,6 +58,8 @@ pub const OpenFile = struct {
     epoll: *epoll.Epoll = undefined,
     /// The pipe, for the two pipe kinds.
     pipe: *pipe.Pipe = undefined,
+    /// The instance, for an inotify descriptor.
+    inotify: *@import("inotify.zig").Instance = undefined,
     /// The signals a signalfd is for; changed by `signalfd` on it, so read
     /// and written atomically.
     signal_mask: u64 = 0,
@@ -119,6 +121,8 @@ pub const Kind = enum {
     epoll,
     /// Signals of a set, read as `signalfd_siginfo` records (`signalfd`).
     signalfd,
+    /// An `inotify` instance: events of watched files, read as records.
+    inotify,
 };
 
 /// A node for a file that is `text` in memory.
@@ -146,8 +150,13 @@ pub fn destroy(of: *OpenFile) void {
     switch (of.kind) {
         .pipe_read => pipe.closeEnd(of.pipe, .read),
         .pipe_write => pipe.closeEnd(of.pipe, .write),
-        .file => if (of.generated == null) vfs.release(&of.node),
+        .file => {
+            // The last descriptor of a file written through: watchers hear it.
+            if (of.writable and of.path.len != 0) @import("inotify.zig").notify(of.path, @import("inotify.zig").IN.CLOSE_WRITE, 0, false);
+            if (of.generated == null) vfs.release(&of.node);
+        },
         .eventfd => epoll.destroyEventFd(of.eventfd),
+        .inotify => @import("inotify.zig").destroy(of.inotify),
         .epoll => epoll.destroyEpoll(of.epoll),
         .console, .null_device, .random_device, .directory, .signalfd => {},
     }

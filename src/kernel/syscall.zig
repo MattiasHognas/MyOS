@@ -7,6 +7,7 @@
 //! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
 const std = @import("std");
+const kinotify = @import("inotify.zig");
 const reclock = @import("reclock.zig");
 const kfifo = @import("fifo.zig");
 const memfd = @import("memfd.zig");
@@ -372,6 +373,7 @@ fn fileWrite(of: *OpenFile, ptr: u64, len: u64, at: ?u64) u64 {
         }
     }
     if (at == null) open_file.setOffset(of, offset);
+    if (done != 0 and of.path.len != 0) kinotify.notify(of.path, kinotify.IN.MODIFY, 0, false);
     return if (done == 0) failure orelse 0 else done;
 }
 
@@ -396,6 +398,7 @@ fn sysFtruncate(fd: u64, length: u64) u64 {
     defer putFile(of);
     if (of.kind != .file or !of.writable or length > std.math.maxInt(i64)) return err(.INVAL);
     vfs.truncate(&of.node, length) catch |e| return vfsError(e);
+    if (of.path.len != 0) kinotify.notify(of.path, kinotify.IN.MODIFY, 0, false);
     return 0;
 }
 
@@ -415,6 +418,7 @@ fn sysTruncate(path_ptr: u64, length: u64) u64 {
     const node = fileAt(given.text) orelse return err(.NOENT);
     defer vfs.release(&node);
     vfs.truncate(&node, length) catch |e| return vfsError(e);
+    kinotify.notify(given.text, kinotify.IN.MODIFY, 0, false);
     return 0;
 }
 
@@ -428,6 +432,7 @@ fn sysMkdir(dirfd: u64, path_ptr: u64) u64 {
     defer given.deinit();
     if (named(given.text) != .none) return err(.EXIST);
     vfs.mkdir(given.text) catch |e| return vfsError(e);
+    kinotify.notify(given.text, kinotify.IN.CREATE, 0, true);
     return 0;
 }
 
@@ -454,6 +459,7 @@ fn sysUnlink(dirfd: u64, path_ptr: u64, flags: u64) u64 {
         else => return err(.PERM),
     }
     (if (directory) vfs.rmdir(given.text) else vfs.unlink(given.text)) catch |e| return vfsError(e);
+    kinotify.notify(given.text, kinotify.IN.DELETE, 0, directory);
     return 0;
 }
 
@@ -474,12 +480,17 @@ fn sysRename(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: 
         .fail => |e| return e,
     };
     defer new.deinit();
-    switch (named(old.text)) {
+    const is_dir = switch (named(old.text)) {
         .none => return missing(old.text),
-        .file, .directory, .symlink, .fifo => {},
+        .directory => true,
+        .file, .symlink, .fifo => false,
         else => return err(.PERM),
-    }
+    };
     vfs.rename(old.text, new.text) catch |e| return vfsError(e);
+    // The two halves of the move, one cookie for both.
+    const cookie = kinotify.newCookie();
+    kinotify.notify(old.text, kinotify.IN.MOVED_FROM, cookie, is_dir);
+    kinotify.notify(new.text, kinotify.IN.MOVED_TO, cookie, is_dir);
     return 0;
 }
 
@@ -522,6 +533,7 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
             },
             .eventfd => return eventFdWrite(of, ptr, count),
             .pipe_read, .directory, .epoll => return err(.BADF),
+            .inotify => return err(.INVAL),
             .signalfd => return err(.INVAL),
         }
     }
@@ -827,6 +839,7 @@ noinline fn openNamed(given: *const Path, flags: u64) u64 {
             opened.readable = access != abi.O.WRONLY;
             opened.writable = access != abi.O.RDONLY;
             opened.append = flags & abi.O.APPEND != 0;
+            kinotify.notify(path, kinotify.IN.CREATE, 0, false);
         },
         .directory => {
             if (access != abi.O.RDONLY) return err(.ISDIR);
@@ -886,14 +899,25 @@ noinline fn openNamed(given: *const Path, flags: u64) u64 {
                 opened.readable = access != abi.O.WRONLY;
                 opened.writable = access != abi.O.RDONLY;
                 opened.append = flags & abi.O.APPEND != 0;
-                if (flags & abi.O.TRUNC != 0 and opened.writable) vfs.truncate(&opened.node, 0) catch |e| {
-                    vfs.release(&opened.node);
-                    return vfsError(e);
-                };
+                if (flags & abi.O.TRUNC != 0 and opened.writable) {
+                    vfs.truncate(&opened.node, 0) catch |e| {
+                        vfs.release(&opened.node);
+                        return vfsError(e);
+                    };
+                    kinotify.notify(path, kinotify.IN.MODIFY, 0, false);
+                }
             }
         },
     }
     opened.nonblock = flags & abi.O.NONBLOCK != 0;
+    // A file open for writing keeps its path: what it is changed through
+    // is told to watchers by it (`inotify`), and its closing too.
+    if (opened.kind == .file and opened.writable and opened.generated == null and opened.comm_target == null) {
+        opened.path = heap.allocator.dupe(u8, path) catch {
+            vfs.release(&opened.node);
+            return err(.NOMEM);
+        };
+    }
 
     // Allocated before the table is locked, and freed again if it is full.
     const of = heap.allocator.create(OpenFile) catch {
@@ -1026,6 +1050,7 @@ fn sysRead(fd: u64, ptr: u64, count: u64) u64 {
         .directory => return err(.ISDIR),
         .eventfd => return eventFdRead(of, ptr, count),
         .signalfd => return signalfdRead(of, ptr, count),
+        .inotify => return inotifyRead(of, ptr, count),
         .epoll => return err(.INVAL),
         .console => return consoleRead(of, ptr, @min(count, abi.MAX_RW_COUNT)),
         .pipe_write => return err(.BADF),
@@ -1296,6 +1321,7 @@ fn writeKernel(of: *OpenFile, data: []const u8, at: ?u64) u64 {
             const offset = at orelse if (of.append) vfs.sizeOf(&of.node) else open_file.getOffset(of);
             const n = vfs.write(&of.node, offset, data) catch |e| return vfsError(e);
             if (at == null) open_file.setOffset(of, offset + n);
+            if (n != 0 and of.path.len != 0) kinotify.notify(of.path, kinotify.IN.MODIFY, 0, false);
             return n;
         },
         .pipe_write => return switch (kpipe.write(of.pipe, data, nonblocking(of))) {
@@ -1386,6 +1412,7 @@ fn sysCopyFileRange(in_fd: u64, off_in_ptr: u64, out_fd: u64, off_out_ptr: u64, 
     if (off_out_ptr != 0) {
         if (!toUser(off_out_ptr, off_out)) return err(.FAULT);
     } else open_file.setOffset(out, off_out);
+    if (done != 0 and out.path.len != 0) kinotify.notify(out.path, kinotify.IN.MODIFY, 0, false);
     return done;
 }
 
@@ -1408,6 +1435,7 @@ fn sysSymlink(target_ptr: u64, dirfd: u64, path_ptr: u64) u64 {
     defer given.deinit();
     if (named(given.text) != .none) return err(.EXIST);
     vfs.symlink(given.text, target) catch |e| return vfsError(e);
+    kinotify.notify(given.text, kinotify.IN.CREATE, 0, false);
     return 0;
 }
 
@@ -1439,6 +1467,8 @@ fn sysLink(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: u6
         error.Invalid => err(.PERM),
         else => vfsError(e),
     };
+    kinotify.notify(new.text, kinotify.IN.CREATE, 0, false);
+    kinotify.notify(old.text, kinotify.IN.ATTRIB, 0, false); // one more name
     return 0;
 }
 
@@ -1473,6 +1503,7 @@ fn sysUtimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, flags: u64) u64 {
         defer putFile(of);
         if (of.kind != .file or of.generated != null) return err(.ROFS);
         vfs.setTimes(&of.node, atime, mtime) catch |e| return vfsError(e);
+        if (of.path.len != 0) kinotify.notify(of.path, kinotify.IN.ATTRIB, 0, false);
         return 0;
     }
     var given = switch (Path.from(dirfd, path_ptr)) {
@@ -1487,6 +1518,7 @@ fn sysUtimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, flags: u64) u64 {
     };
     defer vfs.release(&node);
     vfs.setTimes(&node, atime, mtime) catch |e| return vfsError(e);
+    kinotify.notify(given.text, kinotify.IN.ATTRIB, 0, false);
     return 0;
 }
 
@@ -1586,11 +1618,16 @@ fn sysMknod(dirfd: u64, path_ptr: u64, mode: u64) u64 {
     const S_IFMT = 0o170000;
     return switch (mode & S_IFMT) {
         // A FIFO (`mkfifo`): a name whose pipe is the kernel's.
-        0o010000 => if (vfs.makeFifo(given.text, kfifo.newId())) 0 else |e| vfsError(e),
+        0o010000 => blk: {
+            vfs.makeFifo(given.text, kfifo.newId()) catch |e| break :blk vfsError(e);
+            kinotify.notify(given.text, kinotify.IN.CREATE, 0, false);
+            break :blk 0;
+        },
         // A regular file, as `open` with `O_CREAT | O_EXCL` makes one.
         0, 0o100000 => blk: {
             const node = vfs.create(given.text) catch |e| break :blk vfsError(e);
             vfs.release(&node);
+            kinotify.notify(given.text, kinotify.IN.CREATE, 0, false);
             break :blk 0;
         },
         // Devices cannot be made; sockets come with networking.
@@ -1928,7 +1965,7 @@ fn statFd(fd: u64) StatResult {
         .null_device, .random_device => st = deviceStat(),
         .directory => st = directoryStat(),
         // No file of any kind: what Linux says of its anonymous files.
-        .eventfd, .epoll, .signalfd => st.mode = 0o600,
+        .eventfd, .epoll, .signalfd, .inotify => st.mode = 0o600,
         .file => st = fileStat(of.node),
     }
     return .{ .stat = st };
@@ -2015,7 +2052,7 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
         3 => { // F_GETFL
             const access: u64 = switch (of.kind) {
                 .console, .null_device, .random_device, .eventfd => abi.O.RDWR,
-                .epoll, .signalfd => abi.O.RDONLY,
+                .epoll, .signalfd, .inotify => abi.O.RDONLY,
                 .file => (if (!of.readable) @as(u64, abi.O.WRONLY) else if (of.writable) @as(u64, abi.O.RDWR) else abi.O.RDONLY) |
                     (if (of.append) @as(u64, abi.O.APPEND) else 0),
                 .pipe_read => abi.O.RDONLY,
@@ -2298,6 +2335,7 @@ fn pollState(of: *OpenFile, events: i16) i16 {
             if (st.writable) r |= events & abi.POLL.OUT;
             return r;
         },
+        .inotify => return if (kinotify.state(of.inotify).readable) events & abi.POLL.IN else 0,
         // Ready when one of what it watches is; that is for `epoll_wait`
         // to find out, and nothing waits on an epoll inside another yet.
         .epoll => return 0,
@@ -2505,6 +2543,75 @@ fn sysMemfdCreate(name_ptr: u64, flags: u64) u64 {
     };
 }
 
+/// `inotify_init1` (and `inotify_init`, with no flags): a new instance
+/// (`inotify.zig`). `IN_NONBLOCK`, `IN_CLOEXEC`; `EINVAL` for others.
+fn sysInotifyInit(flags: u64) u64 {
+    const IN_NONBLOCK = 0o4000;
+    const IN_CLOEXEC = 0o2000000;
+    if (flags & ~@as(u64, IN_NONBLOCK | IN_CLOEXEC) != 0) return err(.INVAL);
+    const p = thread.current().process orelse return err(.BADF);
+    const inst = kinotify.create() catch return err(.NOMEM);
+    const of = heap.allocator.create(OpenFile) catch {
+        kinotify.destroy(inst);
+        return err(.NOMEM);
+    };
+    of.* = .{ .kind = .inotify, .inotify = inst, .readable = true, .nonblock = flags & IN_NONBLOCK != 0 };
+    return installFileFlags(p, of, 0, flags & IN_CLOEXEC != 0) orelse {
+        open_file.destroy(of);
+        return err(.MFILE);
+    };
+}
+
+/// `inotify_add_watch`: watch what `path` names (following a link unless
+/// `IN_DONT_FOLLOW`; a directory only, with `IN_ONLYDIR`) for the events
+/// of `mask`. Returns the watch descriptor. `ENOENT`, `ENOTDIR`,
+/// `EEXIST` (`IN_MASK_CREATE` on a path watched already), `EINVAL` for a
+/// mask with no event or a descriptor that is not an instance, `ENOSPC`
+/// past the watches an instance may have.
+fn sysInotifyAddWatch(fd: u64, path_ptr: u64, mask_arg: u64) u64 {
+    const mask: u32 = @truncate(mask_arg);
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind != .inotify) return err(.INVAL);
+    var given = switch (if (mask & kinotify.IN.DONT_FOLLOW != 0) Path.fromNoFollow(CWD, path_ptr) else Path.from(CWD, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    const what = named(given.text);
+    if (what == .none) return missing(given.text);
+    if (mask & kinotify.IN.ONLYDIR != 0 and what != .directory) return err(.NOTDIR);
+    const wd = kinotify.addWatch(of.inotify, given.text, mask) catch |e| return switch (e) {
+        error.OutOfMemory => err(.NOMEM),
+        error.TooMany => err(.NOSPC),
+        error.Exists => err(.EXIST),
+        error.Invalid => err(.INVAL),
+    };
+    return @intCast(wd);
+}
+
+/// `inotify_rm_watch`. `EINVAL` for a watch the instance does not have.
+fn sysInotifyRmWatch(fd: u64, wd: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind != .inotify) return err(.INVAL);
+    return if (kinotify.removeWatch(of.inotify, @truncate(@as(i64, @bitCast(wd))))) 0 else err(.INVAL);
+}
+
+/// `read` of an inotify instance: whole `struct inotify_event` records,
+/// waiting for one unless non-blocking (`EAGAIN`). `EINVAL` if the first
+/// does not fit, `EINTR`.
+fn inotifyRead(of: *OpenFile, ptr: u64, count: u64) u64 {
+    var buf: [512]u8 = undefined; // records are copied out through it
+    const want: usize = @intCast(@min(count, buf.len));
+    return switch (kinotify.read(of.inotify, buf[0..want], nonblocking(of))) {
+        .bytes => |n| if (uaccess.copyToUser(ptr, buf[0..n])) |_| n else |_| err(.FAULT),
+        .again => err(.AGAIN),
+        .too_small => err(.INVAL),
+        .interrupted => err(.INTR),
+    };
+}
+
 fn sysEventFd(initial: u64, flags: u64) u64 {
     if (flags & ~@as(u64, abi.EFD.SEMAPHORE | abi.EFD.NONBLOCK | abi.EFD.CLOEXEC) != 0) return err(.INVAL);
     const p = thread.current().process orelse return err(.BADF);
@@ -2690,6 +2797,7 @@ fn objectVersion(of: *OpenFile) u64 {
         .pipe_read, .pipe_write => kpipe.version(of.pipe),
         .console => tty.changeCount(),
         .eventfd => kepoll.eventVersion(of.eventfd),
+        .inotify => kinotify.state(of.inotify).version,
         .signalfd => if (thread.current().process) |p| p.signal_version.load(.monotonic) else 0,
         else => 0,
     };
@@ -3468,6 +3576,10 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.vfork => newProcess(f, .{ .flags = proc.CLONE.VM | proc.CLONE.VFORK, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
         Sys.wait4 => sysWait4(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.waitid => sysWaitid(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        Sys.inotify_init => sysInotifyInit(0),
+        Sys.inotify_init1 => sysInotifyInit(f.rdi),
+        Sys.inotify_add_watch => sysInotifyAddWatch(f.rdi, f.rsi, f.rdx),
+        Sys.inotify_rm_watch => sysInotifyRmWatch(f.rdi, f.rsi),
         Sys.symlink => sysSymlink(f.rdi, CWD, f.rsi),
         Sys.symlinkat => sysSymlink(f.rdi, f.rsi, f.rdx),
         Sys.link => sysLink(CWD, f.rdi, CWD, f.rsi, 0),

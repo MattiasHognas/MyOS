@@ -77,6 +77,7 @@ pub const kernel = struct {
     pub const memfd = @import("kernel/memfd.zig");
     pub const fifo = @import("kernel/fifo.zig");
     pub const reclock = @import("kernel/reclock.zig");
+    pub const inotify = @import("kernel/inotify.zig");
     pub const random_core = @import("kernel/random_core.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");
