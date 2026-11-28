@@ -16,16 +16,18 @@ A dependency-ordered roadmap for building a small x86-64 operating system in Zig
 
 ## Order of work from here
 
-Decided 2026-11-27, after milestone 8 and most of 6:
+Decided 2026-11-27, after milestone 8 and most of 6; updated 2026-11-28 (4a, 8, the version). Before each task, its area in `design-beyond-linux.md` and `research.md` is looked at (see 9.3).
 
 1. Finish 9.1.
 2. Research: what MyOS could do better than Linux, given what it has and what is planned. The aim is not to build Linux again. Includes the ABI the .NET runtime needs, from its sources and documentation rather than from traces alone. Done: `design-beyond-linux.md`, with three decisions for the owner (views and rights before networking; completion inside the I/O core and a TCP of MyOS's own; a native copy-on-write filesystem, FAT32 for interchange only).
 3. Finish 9.2, and the open task of 3.4 (CPU affinity and load balancing, which comes with per-CPU run queues).
 4. Finish 9.3.
+4a. Per-CPU ready queues and the one-shot timer (9.2's open task, decided 2026-11-28 to come here, before 12.0): the network needs its locality, and the per-object wait lists of 12.0 wake onto these queues.
 5. Before networking: per-process views and rights on descriptors (`design-beyond-linux.md`, decision 1), and per-object wait lists for `epoll` (decision 2). Tasks in 12.0.
 6. Networking (12).
-7. Persistent storage (11).
-8. A second long research session before any work on graphics (10): whose programs run there (unmodified Linux programs through Wayland, MyOS's own, or both), what a terminal is (pseudo-terminals; foot, then Ghostty, as goals to weigh), and what drives the screen.
+7. Persistent storage (11). Then the version becomes 0.1.0 (milestone 9, networking and storage done).
+8. Before graphics: profiles applied by the launcher, Landlock and seccomp onto views and rights (10.0, decision 1).
+9. A second long research session before any work on graphics (10): whose programs run there (unmodified Linux programs through Wayland, MyOS's own, or both), what a terminal is (pseudo-terminals; foot, then Ghostty, as goals to weigh), and what drives the screen.
 
 ## Current foundation
 
