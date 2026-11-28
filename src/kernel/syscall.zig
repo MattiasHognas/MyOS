@@ -2489,13 +2489,104 @@ fn sysWait4(pid_arg: u64, status_ptr: u64, options: u64, rusage_ptr: u64) u64 {
     })) {
         .exited => |x| blk: {
             if (status_ptr != 0 and !toUser(status_ptr, @as(i32, @bitCast(x.status)))) break :blk err(.FAULT);
-            if (rusage_ptr != 0 and !toUser(rusage_ptr, std.mem.zeroes([18]u64))) break :blk err(.FAULT);
+            if (rusage_ptr != 0 and !toUser(rusage_ptr, rusageOf(x.run_cycles, 0, x.max_pages))) break :blk err(.FAULT);
             break :blk x.pid;
         },
         .none_yet => 0,
         .no_child => err(.CHILD),
         .interrupted => err(.INTR),
     };
+}
+
+/// `struct rusage` for `cycles` of CPU time (all of it counted as user
+/// time: the kernel does not tell the two apart), `slices` time slices and
+/// at most `pages` pages of memory.
+fn rusageOf(cycles: u64, slices: u64, pages: u64) abi.RUsage {
+    const hz = kclock.cycleHz();
+    const us: u64 = if (hz == 0) 0 else @intCast(@as(u128, cycles) * 1_000_000 / hz);
+    return .{
+        .utime = .{ .sec = @intCast(us / 1_000_000), .usec = @intCast(us % 1_000_000) },
+        .maxrss = @intCast(pages * 4), // in KiB
+        .nvcsw = @intCast(slices),
+    };
+}
+
+/// `waitid`: `wait4`, with what happened told in a `siginfo` (`SIGCHLD`,
+/// `si_code` `CLD_EXITED`, `KILLED`, `STOPPED` or `CONTINUED`, the child's
+/// ID and status). `P_ALL`, `P_PID`, `P_PGID` (0: the caller's group);
+/// `WEXITED`, `WSTOPPED`, `WCONTINUED` (at least one), `WNOHANG` (then
+/// `si_pid` 0 if nothing is ready), `WNOWAIT` (the child can be waited
+/// for again). `EINVAL` for other flags or `P_PIDFD` (no pidfds yet).
+fn sysWaitid(idtype: u64, id: u64, info_ptr: u64, options: u64, rusage_ptr: u64) u64 {
+    const known = abi.WNOHANG | abi.WSTOPPED | abi.WEXITED | abi.WCONTINUED | abi.WNOWAIT;
+    if (options & ~@as(u64, known) != 0) return err(.INVAL);
+    if (options & (abi.WEXITED | abi.WSTOPPED | abi.WCONTINUED) == 0) return err(.INVAL);
+    if (thread.current().process == null) return err(.CHILD);
+    const pid: i64 = switch (idtype) {
+        abi.P.ALL => -1,
+        abi.P.PID => if (id == 0 or id > std.math.maxInt(i32)) return err(.INVAL) else @intCast(id),
+        abi.P.PGID => if (id == 0) 0 else if (id > std.math.maxInt(i32)) return err(.INVAL) else -@as(i64, @intCast(id)),
+        else => return err(.INVAL),
+    };
+    const result = proc.waitChild(pid, .{
+        .nohang = options & abi.WNOHANG != 0,
+        .exited = options & abi.WEXITED != 0,
+        .stopped = options & abi.WSTOPPED != 0,
+        .continued = options & abi.WCONTINUED != 0,
+        .nowait = options & abi.WNOWAIT != 0,
+    });
+    var info = std.mem.zeroes([128]u8);
+    switch (result) {
+        .exited => |x| {
+            const code: i32, const status: i32 = switch (x.how) {
+                .exited => .{ abi.CLD.EXITED, @intCast((x.status >> 8) & 0xFF) },
+                .killed => .{ abi.CLD.KILLED, @intCast(x.status & 0x7F) },
+                .stopped => .{ abi.CLD.STOPPED, @intCast((x.status >> 8) & 0xFF) },
+                .continued => .{ abi.CLD.CONTINUED, 18 }, // SIGCONT
+            };
+            std.mem.writeInt(i32, info[0..4], 17, .little); // SIGCHLD
+            std.mem.writeInt(i32, info[8..12], code, .little);
+            std.mem.writeInt(i32, info[16..20], @intCast(x.pid), .little);
+            std.mem.writeInt(i32, info[24..28], status, .little);
+            if (rusage_ptr != 0 and !toUser(rusage_ptr, rusageOf(x.run_cycles, 0, x.max_pages))) return err(.FAULT);
+        },
+        .none_yet => {}, // all zero: si_pid 0 says nothing was ready
+        .no_child => return err(.CHILD),
+        .interrupted => return err(.INTR),
+    }
+    if (info_ptr != 0) uaccess.copyToUser(info_ptr, &info) catch return err(.FAULT);
+    return 0;
+}
+
+/// `getrusage`: CPU time (as user time) and the most memory used, of the
+/// calling process (`RUSAGE_SELF`; `RUSAGE_THREAD` reports the same) or
+/// of its children that were waited for (`RUSAGE_CHILDREN`). `EINVAL`
+/// for another `who`.
+fn sysGetrusage(who: u64, ptr: u64) u64 {
+    const p = thread.current().process orelse return err(.NOSYS);
+    const w: i64 = @bitCast(who);
+    const u = switch (w) {
+        abi.RUSAGE.SELF, abi.RUSAGE.THREAD => proc.usage(p, false),
+        abi.RUSAGE.CHILDREN => proc.usage(p, true),
+        else => return err(.INVAL),
+    };
+    return if (toUser(ptr, rusageOf(u.run_cycles, u.slices, u.max_pages))) 0 else err(.FAULT);
+}
+
+/// `getpriority` and `setpriority` for a process (`PRIO_PROCESS`; `who`
+/// 0 is the caller): its nice value, which is kept and reported (as
+/// `20 - nice`, the system call's form) but does not change how the
+/// scheduler treats it. `ESRCH` for no such process; `EINVAL` for
+/// process groups and users, which are not offered.
+fn sysGetpriority(which: u64, who: u64) u64 {
+    if (which != abi.PRIO.PROCESS) return err(.INVAL);
+    const nice = proc.getNice(who) orelse return err(.SRCH);
+    return @intCast(20 - @as(i64, nice));
+}
+
+fn sysSetpriority(which: u64, who: u64, prio: u64) u64 {
+    if (which != abi.PRIO.PROCESS) return err(.INVAL);
+    return if (proc.setNice(who, @as(i32, @truncate(@as(i64, @bitCast(prio)))))) 0 else err(.SRCH);
 }
 
 /// The thread a scheduling call is about: `tid` 0 is the caller, anything
@@ -2924,6 +3015,10 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.fork => newProcess(f, .{ .flags = 0, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
         Sys.vfork => newProcess(f, .{ .flags = proc.CLONE.VM | proc.CLONE.VFORK, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
         Sys.wait4 => sysWait4(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.waitid => sysWaitid(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        Sys.getrusage => sysGetrusage(f.rdi, f.rsi),
+        Sys.getpriority => sysGetpriority(f.rdi, f.rsi),
+        Sys.setpriority => sysSetpriority(f.rdi, f.rsi, f.rdx),
         Sys.execve => sysExecve(f, CWD, f.rdi, f.rsi, f.rdx),
         Sys.execveat => if (f.r8 != 0) err(.INVAL) else sysExecve(f, f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getppid => if (thread.current().process) |me| proc.parentPid(me) else err(.NOSYS),

@@ -94,6 +94,13 @@ pub const Sys = struct {
     pub const execve = 59;
     /// `wait4(pid, status, options, rusage) -> pid`: collect a child that ended.
     pub const wait4 = 61;
+    /// `waitid(idtype, id, info, options, rusage)`: `wait4` with a `siginfo`.
+    pub const waitid = 247;
+    /// `getrusage(who, usage)`: CPU time and memory used.
+    pub const getrusage = 98;
+    /// `getpriority(which, who)` and `setpriority(which, who, prio)`: nice values.
+    pub const getpriority = 140;
+    pub const setpriority = 141;
     /// `getppid() -> pid` of the parent.
     pub const getppid = 110;
     /// Process groups and sessions.
@@ -877,6 +884,60 @@ pub const HWCAP2 = struct {
 pub const WNOHANG = 1;
 pub const WUNTRACED = 2;
 pub const WCONTINUED = 8;
+/// `waitid`'s options: what to report (`WSTOPPED` is `WUNTRACED`), and
+/// to leave the child to be waited for again.
+pub const WSTOPPED = 2;
+pub const WEXITED = 4;
+pub const WNOWAIT = 0x0100_0000;
+/// `waitid`'s `idtype`.
+pub const P = struct {
+    pub const ALL = 0;
+    pub const PID = 1;
+    pub const PGID = 2;
+    pub const PIDFD = 3;
+};
+/// `si_code` of a `SIGCHLD` report (`waitid`).
+pub const CLD = struct {
+    pub const EXITED = 1;
+    pub const KILLED = 2;
+    pub const DUMPED = 3;
+    pub const STOPPED = 5;
+    pub const CONTINUED = 6;
+};
+/// `getpriority`/`setpriority`: what `who` is.
+pub const PRIO = struct {
+    pub const PROCESS = 0;
+    pub const PGRP = 1;
+    pub const USER = 2;
+};
+/// `getrusage`'s `who`.
+pub const RUSAGE = struct {
+    pub const SELF: i64 = 0;
+    pub const CHILDREN: i64 = -1;
+    pub const THREAD: i64 = 1;
+};
+/// `struct timeval`.
+pub const TimeVal = extern struct { sec: i64 = 0, usec: i64 = 0 };
+
+/// `struct rusage`.
+pub const RUsage = extern struct {
+    utime: TimeVal = .{},
+    stime: TimeVal = .{},
+    maxrss: i64 = 0,
+    ixrss: i64 = 0,
+    idrss: i64 = 0,
+    isrss: i64 = 0,
+    minflt: i64 = 0,
+    majflt: i64 = 0,
+    nswap: i64 = 0,
+    inblock: i64 = 0,
+    oublock: i64 = 0,
+    msgsnd: i64 = 0,
+    msgrcv: i64 = 0,
+    nsignals: i64 = 0,
+    nvcsw: i64 = 0,
+    nivcsw: i64 = 0,
+};
 
 /// `struct statx_timestamp`.
 pub const StatxTimestamp = extern struct {

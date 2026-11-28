@@ -282,6 +282,80 @@ pub fn main() noreturn {
         expect(settid.tid == 0, 83);
     }
 
+    // --- waitid: what wait4 says, in a siginfo; WNOWAIT leaves it there.
+    {
+        var info: [128]u8 = undefined;
+        const W_EXITED = 4;
+        const W_NOWAIT = 0x0100_0000;
+        const W_NOHANG = 1;
+        const field = struct {
+            fn at(siginfo: *const [128]u8, off: usize) i32 {
+                return std.mem.readInt(i32, siginfo[off..][0..4], .little);
+            }
+        }.at;
+        expect(lib.syscall6(Sys.waitid, 0, 0, @intFromPtr(&info), 0, 0, 0) == lib.err(.INVAL), 84); // nothing asked for
+        expect(lib.syscall6(Sys.waitid, 3, 0, @intFromPtr(&info), W_EXITED, 0, 0) == lib.err(.INVAL), 85); // P_PIDFD
+        const c = lib.syscall(Sys.fork, 0, 0, 0);
+        if (c == 0) lib.exit(5);
+        expect(lib.syscall6(Sys.waitid, 1, c, @intFromPtr(&info), W_EXITED | W_NOWAIT, 0, 0) == 0, 86);
+        expect(field(&info, 0) == 17 and field(&info, 8) == 1 and field(&info, 16) == @as(i32, @intCast(c)) and field(&info, 24) == 5, 87); // SIGCHLD, CLD_EXITED
+        @memset(&info, 0xAA);
+        expect(lib.syscall6(Sys.waitid, 0, 0, @intFromPtr(&info), W_EXITED, 0, 0) == 0 and field(&info, 16) == @as(i32, @intCast(c)), 88); // still there: collected now
+        expect(wait4(@intCast(c), &status, 0) == lib.err(.CHILD), 89);
+        // A running child: WNOHANG says nothing is ready with si_pid 0.
+        const spinner = lib.syscall(Sys.fork, 0, 0, 0);
+        if (spinner == 0) while (true) {
+            _ = lib.syscall(Sys.sched_yield, 0, 0, 0);
+        };
+        @memset(&info, 0xAA);
+        expect(lib.syscall6(Sys.waitid, 1, spinner, @intFromPtr(&info), W_EXITED | W_NOHANG, 0, 0) == 0 and field(&info, 16) == 0, 90);
+        _ = lib.syscall(Sys.kill, spinner, 9, 0);
+        expect(lib.syscall6(Sys.waitid, 1, spinner, @intFromPtr(&info), W_EXITED, 0, 0) == 0, 91);
+        expect(field(&info, 8) == 2 and field(&info, 24) == 9, 92); // CLD_KILLED by SIGKILL
+    }
+
+    // --- getrusage: CPU time and memory, its own and its children's.
+    {
+        var ru: abi.RUsage = .{};
+        const burn = struct {
+            fn ms(n: u64) void {
+                var t0: abi.TimeSpec = undefined;
+                _ = lib.syscall(Sys.clock_gettime, 1, @intFromPtr(&t0), 0);
+                while (true) {
+                    var t: abi.TimeSpec = undefined;
+                    _ = lib.syscall(Sys.clock_gettime, 1, @intFromPtr(&t), 0);
+                    const el = (t.sec - t0.sec) * 1000 + @divTrunc(t.nsec - t0.nsec, 1_000_000);
+                    if (el >= n) return;
+                }
+            }
+        };
+        burn.ms(30);
+        expect(lib.syscall(Sys.getrusage, 0, @intFromPtr(&ru), 0) == 0, 93);
+        expect(ru.utime.sec * 1_000_000 + ru.utime.usec >= 20_000 and ru.maxrss > 0, 94);
+        expect(lib.syscall(Sys.getrusage, 1, @intFromPtr(&ru), 0) == 0, 95); // RUSAGE_THREAD
+        expect(lib.syscall(Sys.getrusage, 5, @intFromPtr(&ru), 0) == lib.err(.INVAL), 96);
+        const before_children = blk: {
+            _ = lib.syscall(Sys.getrusage, @bitCast(@as(i64, -1)), @intFromPtr(&ru), 0);
+            break :blk ru.utime.sec * 1_000_000 + ru.utime.usec;
+        };
+        const worker = lib.syscall(Sys.fork, 0, 0, 0);
+        if (worker == 0) {
+            burn.ms(30);
+            lib.exit(0);
+        }
+        expect(wait4(@intCast(worker), &status, 0) == worker, 97);
+        expect(lib.syscall(Sys.getrusage, @bitCast(@as(i64, -1)), @intFromPtr(&ru), 0) == 0, 98);
+        expect(ru.utime.sec * 1_000_000 + ru.utime.usec >= before_children + 20_000, 99);
+    }
+
+    // --- Nice values: kept and told, not used by the scheduler.
+    expect(lib.syscall(Sys.getpriority, 0, 0, 0) == 20, 100); // nice 0, in the call's form
+    expect(lib.syscall(Sys.setpriority, 0, 0, 5) == 0 and lib.syscall(Sys.getpriority, 0, 0, 0) == 15, 101);
+    expect(lib.syscall(Sys.setpriority, 0, 0, 100) == 0 and lib.syscall(Sys.getpriority, 0, me, 0) == 1, 102); // clamped to 19
+    expect(lib.syscall(Sys.getpriority, 0, 999_999, 0) == lib.err(.SRCH), 103);
+    expect(lib.syscall(Sys.getpriority, 2, 0, 0) == lib.err(.INVAL), 104); // PRIO_USER
+    _ = lib.syscall(Sys.setpriority, 0, 0, 0);
+
     // --- Limits (prlimit64, getrlimit, setrlimit), in a child so that
     // this process keeps its own; the child's are inherited.
     const RLIMIT_DATA = 2;

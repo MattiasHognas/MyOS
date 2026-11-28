@@ -31,6 +31,16 @@ var base_tsc: u64 = 0;
 var base_ns: u64 = 0;
 var mult: u64 = 0;
 var tsc_hz: u64 = 0;
+/// The TSC's rate as measured at boot, even where it is not the clock.
+var cycle_hz: u64 = 0;
+
+/// The TSC's rate as measured at boot, for turning counted cycles (CPU
+/// time, `getrusage`) into time; 0 if it could not be measured. Where the
+/// TSC is not invariant this is only roughly right, as Linux's accounting
+/// is then too.
+pub fn cycleHz() u64 {
+    return cycle_hz;
+}
 
 /// Nanoseconds from 1970 to the moment the monotonic clock read 0.
 var wall_offset_ns: u64 = 0;
@@ -61,23 +71,27 @@ fn invariantTsc() bool {
 /// Calibrate the TSC against the HPET (over 50 ms), and read the RTC.
 /// Once, on the boot CPU, after `hpet.init`.
 pub fn init() void {
-    if (invariantTsc()) {
+    {
         const t0 = rdtsc();
         const h0 = hpet.nanos();
         hpet.sleepNs(50_000_000);
         const t1 = rdtsc();
         const h1 = hpet.nanos();
-        const ticks = t1 - t0;
+        const ticks = t1 -% t0;
         const ns = h1 - h0;
-        if (ticks > 0 and ns > 0) {
+        // The rate, whether or not the TSC can be the clock: what the
+        // counters of CPU time, kept in TSC cycles, are turned into time
+        // with (`cycleHz`).
+        if (ticks > 0 and ns > 0) cycle_hz = @intCast(@as(u128, ticks) * NS_PER_SEC / ns);
+        if (invariantTsc() and ticks > 0 and ns > 0) {
             tsc_hz = @intCast(@as(u128, ticks) * NS_PER_SEC / ns);
             mult = @intCast((@as(u128, ns) << SHIFT) / ticks);
             base_tsc = t1;
             base_ns = h1;
             use_tsc.store(true, .release);
             log.info("TSC: invariant, {d} MHz, the monotonic clock", .{tsc_hz / 1_000_000});
-        }
-    } else log.info("TSC: not invariant; the monotonic clock is the HPET", .{});
+        } else log.info("TSC: not invariant; the monotonic clock is the HPET", .{});
+    }
 
     const now_ns = nanos();
     const secs = rtc.readUnixSeconds() orelse blk: {

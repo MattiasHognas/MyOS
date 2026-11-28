@@ -336,6 +336,20 @@ pub const Process = struct {
     /// The signal that ended the process, 0 if it ended by itself or by
     /// the kernel without one: what `wait4` reports.
     term_signal: std.atomic.Value(u32) = .init(0),
+    /// CPU time (TSC cycles) of its threads that have ended, and of its
+    /// children that were waited for, with theirs; the largest memory one
+    /// of those children had (pages). For `getrusage`. Under the tree lock.
+    dead_run_cycles: u64 = 0,
+    dead_slices: u64 = 0,
+    children_run_cycles: u64 = 0,
+    children_slices: u64 = 0,
+    children_max_pages: u64 = 0,
+    /// The most pages it has had (`getrusage`'s `ru_maxrss`), kept at
+    /// least as high as `pages` when it is looked at and when it ends.
+    max_pages: u64 = 0,
+    /// Its nice value (`setpriority`), -20 to 19. The scheduler does not
+    /// look at it: every thread gets the same share.
+    nice: i8 = 0,
     /// Its process group and session (`setpgid`, `setsid`): a process
     /// starts in its parent's, or in its own if it has no parent. Under the
     /// tree lock.
@@ -437,6 +451,39 @@ pub fn describe(p: *Process) struct { state: u8, ppid: u64, pgid: u64, sid: u64,
 /// What `/proc/<pid>/schedstat` says of `p`: time running and ready but
 /// waiting, in TSC cycles, and time slices, over all its threads alive
 /// now.
+/// What `getrusage` reports for `p` itself (`children`: for its children
+/// that were waited for): CPU time in TSC cycles, time slices, and the
+/// most pages it (or one of them) had.
+pub fn usage(p: *Process, children: bool) struct { run_cycles: u64, slices: u64, max_pages: u64 } {
+    if (!children) {
+        const t = schedTotals(p);
+        const held = tree_lock.acquire();
+        defer tree_lock.release(held);
+        p.max_pages = @max(p.max_pages, p.pages);
+        return .{ .run_cycles = t.run + p.dead_run_cycles, .slices = t.slices + p.dead_slices, .max_pages = p.max_pages };
+    }
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    return .{ .run_cycles = p.children_run_cycles, .slices = p.children_slices, .max_pages = p.children_max_pages };
+}
+
+/// The nice value of the process `pid` (0: the caller), or null if there
+/// is none.
+pub fn getNice(pid: u64) ?i8 {
+    const p = if (pid == 0) thread.current().process.? else findRetained(pid) orelse return null;
+    defer if (pid != 0) release(p);
+    return @atomicLoad(i8, &p.nice, .monotonic);
+}
+
+/// Set the nice value of the process `pid` (0: the caller), clamped to
+/// -20..19 as on Linux. False if there is no such process.
+pub fn setNice(pid: u64, nice: i64) bool {
+    const p = if (pid == 0) thread.current().process.? else findRetained(pid) orelse return false;
+    defer if (pid != 0) release(p);
+    @atomicStore(i8, &p.nice, @intCast(std.math.clamp(nice, -20, 19)), .monotonic);
+    return true;
+}
+
 pub fn schedTotals(p: *Process) struct { run: u64, wait: u64, slices: u64 } {
     const held = tree_lock.acquire();
     defer tree_lock.release(held);
@@ -759,6 +806,13 @@ fn unlinkThread(p: *Process, t: *thread.Thread) void {
         link.* = t.proc_next;
         t.proc_next = null;
         p.thread_count -= 1;
+        // Its time stays the process's (`getrusage`), the slice it is in
+        // included.
+        const since = @atomicLoad(u64, &t.run_since, .monotonic);
+        const slice_now = if (@atomicLoad(bool, &t.on_cpu, .monotonic) and since != 0) @import("stats.zig").rdtsc() -% since else 0;
+        p.dead_run_cycles += @atomicLoad(u64, &t.run_cycles, .monotonic) + slice_now;
+        p.dead_slices += @atomicLoad(u64, &t.slices, .monotonic);
+        p.max_pages = @max(p.max_pages, p.pages);
         signal.dropThreadQueue(p, t); // signals for it alone go with it
         return;
     }
@@ -1245,6 +1299,10 @@ pub fn reap(child: *Process) void {
 pub const WaitFor = struct {
     /// Report `none_yet` instead of waiting (`WNOHANG`).
     nohang: bool = false,
+    /// Children that ended (what `wait4` always reports; `waitid`'s `WEXITED`).
+    exited: bool = true,
+    /// Leave what is reported to be reported again (`waitid`'s `WNOWAIT`).
+    nowait: bool = false,
     /// Children that stopped (`WUNTRACED`).
     stopped: bool = false,
     /// Children that were continued (`WCONTINUED`).
@@ -1256,7 +1314,7 @@ pub const WaitResult = union(enum) {
     /// A child that ended, stopped or was continued: its process ID and
     /// the status `wait4` reports (`(code << 8)`, the signal that ended
     /// it, `(sig << 8) | 0x7f` for a stop, `0xffff` for a continue).
-    exited: struct { pid: usize, status: u32 },
+    exited: struct { pid: usize, status: u32, how: How = .exited, run_cycles: u64 = 0, max_pages: u64 = 0 },
     /// Children there are, and none has ended (`WNOHANG`).
     none_yet,
     /// No child matches.
@@ -1264,6 +1322,9 @@ pub const WaitResult = union(enum) {
     /// The thread was interrupted (a signal, or its process is ending).
     interrupted,
 };
+
+/// How a reported child got there (`waitid`'s `si_code`).
+pub const How = enum { exited, killed, stopped, continued };
 
 /// `wait4`: wait for a child of the calling process to end and collect
 /// it, or, as `how` asks, to stop or be continued. `pid` -1 means any
@@ -1282,19 +1343,31 @@ pub fn waitChild(pid: i64, how: WaitFor) WaitResult {
                 if (pid > 0 and child.pid != @as(u64, @intCast(pid))) continue;
                 if (group) |g| if (child.pgid != g) continue;
                 any = true;
-                if (child.exit_code != null) {
+                if (how.exited and child.exit_code != null) {
+                    if (how.nowait) {
+                        const sig = child.term_signal.load(.acquire);
+                        return .{ .exited = .{
+                            .pid = child.pid,
+                            .status = if (sig != 0) sig else @as(u32, @intCast(child.exit_code.? & 0xFF)) << 8,
+                            .how = if (sig != 0) .killed else .exited,
+                        } };
+                    }
                     unlinkChild(child);
                     setParentLocked(child, null);
+                    // What it used, and what its children did, is ours now.
+                    me.children_run_cycles += child.dead_run_cycles + child.children_run_cycles;
+                    me.children_slices += child.dead_slices + child.children_slices;
+                    me.children_max_pages = @max(me.children_max_pages, @max(child.max_pages, child.children_max_pages));
                     break :blk child;
                 }
                 if (how.stopped and child.stop_report != 0) {
                     const sig = child.stop_report;
-                    child.stop_report = 0;
-                    return .{ .exited = .{ .pid = child.pid, .status = (sig << 8) | 0x7f } };
+                    if (!how.nowait) child.stop_report = 0;
+                    return .{ .exited = .{ .pid = child.pid, .status = (sig << 8) | 0x7f, .how = .stopped } };
                 }
                 if (how.continued and child.continued_report) {
-                    child.continued_report = false;
-                    return .{ .exited = .{ .pid = child.pid, .status = 0xffff } };
+                    if (!how.nowait) child.continued_report = false;
+                    return .{ .exited = .{ .pid = child.pid, .status = 0xffff, .how = .continued } };
                 }
             }
             if (!any) return .no_child;
@@ -1305,8 +1378,10 @@ pub fn waitChild(pid: i64, how: WaitFor) WaitResult {
     const sig = found.term_signal.load(.acquire);
     const status: u32 = if (sig != 0) sig else @as(u32, @intCast(found.exit_code.? & 0xFF)) << 8;
     const child_pid = found.pid;
+    const used = found.dead_run_cycles + found.children_run_cycles;
+    const most = @max(found.max_pages, found.children_max_pages);
     release(found); // the list's reference
-    return .{ .exited = .{ .pid = child_pid, .status = status } };
+    return .{ .exited = .{ .pid = child_pid, .status = status, .how = if (sig != 0) .killed else .exited, .run_cycles = used, .max_pages = most } };
 }
 
 /// The parent's process ID, or 0 for a process with none.
