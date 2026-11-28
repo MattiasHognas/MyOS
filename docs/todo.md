@@ -364,7 +364,7 @@ The per-CPU structure and the `swapgs` transitions come from 2.5.
   - A CPU that halted with nothing to run is interrupted when another CPU makes a thread ready or wakes the thread it idles in.
   - Requests that every other CPU must carry out before the sender goes on (TLB flushes, letting go of an address space). They cannot deadlock against a CPU that has interrupts off: every loop that waits with interrupts off looks for a pending request and does it.
   - A CPU that reports a panic or a kernel fault halts the others first, with a non-maskable interrupt, so the report comes out whole (QEMU scenario `panic_smp`).
-- [ ] Add CPU affinity/load balancing if needed. Not needed with one queue; comes back with per-CPU queues.
+- [ ] Add CPU affinity/load balancing if needed. Not needed with one queue; comes back with per-CPU queues (done with the per-CPU queue task of 9.2, after 9.3 and before 12.0).
 - [x] Synchronize PMM, heap, page tables, and drivers: each has its lock (3.1), and all are used from every CPU at once by the stress test below.
   - The NVMe driver, which polls and has no lock, is used by its test only; its lock is a task in 11.2.
 - [x] Implement cross-CPU TLB shootdowns.
@@ -667,7 +667,7 @@ Order from the research of 2026-11-27 (`design-beyond-linux.md`, section 5): the
   - Timers are a sorted list, linear to arm (2.8).
   - Any change to a pipe, the terminal or an eventfd wakes every thread in `poll` or `epoll_wait`, which then look at all they watch again (`readiness.zig`); per-object wake lists would wake only those watching it.
   - The kernel heap never gives pages back to the page allocator: memory it grew by for one large allocation stays with it.
-- [ ] Per-CPU ready queues with stealing, wake-up on the waker's CPU when that helps, and a one-shot TSC-deadline timer instead of the 10 ms tick (no tick when idle), as section 5 of `docs/design-beyond-linux.md` orders them; with it the open task of 3.4 (affinity, load balancing). Before 12: the network's locality (interrupt, protocol work and woken thread on one CPU) needs it.
+- [ ] (Done after 9.3, before 12.0: order of work, 4a.) Per-CPU ready queues with stealing, wake-up on the waker's CPU when that helps, and a one-shot TSC-deadline timer instead of the 10 ms tick (no tick when idle), as section 5 of `docs/design-beyond-linux.md` orders them; with it the open task of 3.4 (affinity, load balancing). Before 12: the network's locality (interrupt, protocol work and woken thread on one CPU) needs it.
 - [ ] `MADV_DONTNEED` as section 5 of `docs/design-beyond-linux.md` has it (the path Go and .NET give memory back on; not yet looked at against it, found 2026-11-28): its TLB shootdowns batched per call, and zeroed pages kept ready so that the next touch need not clear one. Measured with a `tools/bench` case that frees and touches again.
 - [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
 
@@ -837,6 +837,10 @@ Off the critical path (programs can ship in the initrd). It does not depend on m
 - [ ] Run read/write regressions in CI, never against real user disks.
 
 **Milestone 11 done when:** A .NET program's files persist across reboots on the native filesystem, and survive every crash point the replay test tries; a FAT32 volume can be read and written for exchanging files.
+
+
+### 11.10 Version 0.1.0
+- [ ] Bump the version to 0.1.0 once milestone 9, networking (12) and persistent storage (11) are all done (decided 2026-11-28): the first release in which stock .NET apps run, serve over the network and keep their data.
 
 ---
 
