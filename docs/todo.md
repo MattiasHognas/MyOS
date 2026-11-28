@@ -670,6 +670,10 @@ Order from the research of 2026-11-27 (`design-beyond-linux.md`, section 5): the
 
 ### 9.3 Dynamic linking and the JIT runtime
 Gates the milestone: what the ordinary .NET tools produce is dynamically linked.
+
+Order of what is left (decided 2026-11-28): deadlock detection for record locks; then the picture of a user and the execute bit (both from a check against `docs/design-beyond-linux.md`); then the FIFO opened `O_RDWR`; then the rest. What waits for a disk or a network (a writable home, installing the C library) stays open until 11 and 12.
+
+How each task is done (decided 2026-11-28): before a task is built, what `docs/design-beyond-linux.md` and `docs/research.md` say about its area is looked at. Linux's way is followed for what programs can see (the ABI); what is behind it follows the research where it has something better, and where it is built the simple way for now, a task in this file says what is to replace it and when.
 - [x] Load position-independent executables (`ET_DYN`, 4.1) and the ELF interpreter named by `PT_INTERP`, with `AT_BASE`, `AT_PHDR` and `AT_ENTRY` in the auxiliary vector, so dynamically linked programs run with the unmodified loader and shared libraries from the filesystem. The interpreter goes where `mmap` would put it, the highest free place below the stack; one that names an interpreter itself is refused, as on Linux. Tested with a C program standing in for the loader; malformed `PT_INTERP` headers on the host, missing and unusable interpreters in the kernel tests.
 - [x] File-backed `mmap` (5), private, with the permissions of each segment: a page is read from the file when it is first touched and is the program's own from then on (`user_memory.zig`, regions of kind `file`). Read-only shared mappings are the same thing; writable shared ones are refused, files being read-only.
   - Open: pages of a file that nobody has written are copied per process instead of shared. Sharing them (a page cache, copy-on-write) saves the memory of one C library per process; it is in 13.
