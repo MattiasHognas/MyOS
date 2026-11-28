@@ -1455,6 +1455,7 @@ pub const Footprint = struct {
 };
 
 pub fn footprint() Footprint {
+    settle();
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const h = heap.stats();
@@ -1466,6 +1467,21 @@ pub fn footprint() Footprint {
         .heap_bytes = h.bytes_in_use,
         .stacks = kstack.inUse(),
     };
+}
+
+/// Wait until every thread that has exited has been freed too: one that
+/// ended in an earlier test may wait to be reaped until the CPU it ended
+/// on next switches threads, which a virtual CPU the host holds up does
+/// late. Counted then, its memory would be gone by the next count and
+/// look like a difference. Bounded by time (10 s) and, for a caller with
+/// interrupts off, by tries.
+fn settle() void {
+    const deadline = timer.now() + 10 * timer.HZ;
+    var tries: usize = 0;
+    while (thread.exitedCount() != thread.reapedCount()) : (tries += 1) {
+        if (tries >= 100_000 and (timer.now() >= deadline or tries >= 20_000_000)) return;
+        thread.yield();
+    }
 }
 
 const VM_A: u64 = 0x40_0000;
@@ -1990,7 +2006,6 @@ pub fn quiesce() void {
     }
 }
 
-/// Let other threads run until `count` returns `n`. False if it never happens.
 /// A request to switch threads that came for a thread which then blocked
 /// (`thread.preemptForWoken`, the interrupt not taken yet) must not keep
 /// the idle CPU from taking interrupts: it did, and on the boot CPU, whose
@@ -2010,6 +2025,7 @@ pub fn idleWithPreemptRequest() u32 {
     return 0;
 }
 
+/// Let other threads run until `count` returns `n`. False if it never happens.
 fn untilCount(comptime count: fn () usize, n: usize) bool {
     // Bounded by time, not by a number of yields: with the other virtual
     // CPUs held up by the host, a program may take many yields to start.

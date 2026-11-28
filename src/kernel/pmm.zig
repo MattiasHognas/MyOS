@@ -163,19 +163,25 @@ pub fn init(mm: *const limine.MemmapResponse, hhdm_offset: u64) void {
     const total: usize = top / PAGE_SIZE;
     const bytes = page_bitmap.PageBitmap.bytesFor(total);
 
-    // 2. Store the three in the first usable region large enough.
+    // 2. Store the three, and the share counts (2 bytes a page), in the
+    //    first usable region large enough.
+    const share_bytes = std.mem.alignForward(usize, total * 2, 8);
+    const need = 3 * bytes + share_bytes;
     var storage: []u8 = &.{};
     for (entries) |e| {
-        if (e.type == limine.MEMMAP_USABLE and e.length >= 3 * bytes) {
-            storage = physToVirt(e.base)[0 .. 3 * bytes];
+        if (e.type == limine.MEMMAP_USABLE and e.length >= need) {
+            storage = physToVirt(e.base)[0..need];
             break;
         }
     }
     if (storage.len == 0) @panic("no room for the PMM bitmaps");
     pages = .init(storage[0..bytes], storage[bytes .. 2 * bytes], total);
-    const cached_bytes = storage[2 * bytes ..];
+    const cached_bytes = storage[2 * bytes .. 3 * bytes];
     @memset(cached_bytes, 0);
     cached = @as([*]u64, @ptrCast(@alignCast(cached_bytes.ptr)))[0 .. bytes / 8];
+    const share_slice = storage[3 * bytes ..];
+    @memset(share_slice, 0);
+    shares = @as([*]u16, @ptrCast(@alignCast(share_slice.ptr)))[0..total];
 
     // 3. Only usable regions are memory to hand out.
     //    (Limine guarantees usable entries are page-aligned.)
@@ -330,6 +336,41 @@ pub fn freeHuge(phys: u64) void {
     inCriticalSection();
     pages.free512(first) catch |e| panicFmt("PMM: bad free of the 2 MiB page at 0x{x}: {s}", .{ phys, @errorName(e) });
     addFree(512);
+}
+
+/// For each page, how many owners it has besides the first (a page of a
+/// program shared copy-on-write by processes made by `fork`): 0 for
+/// almost every page. Changed atomically.
+var shares: []u16 = &.{};
+
+/// Give the page at `phys` one more owner (`fork` sharing it). False if
+/// it has as many as can be counted: the caller copies it instead.
+pub fn share(phys: u64) bool {
+    if (phys / PAGE_SIZE >= shares.len) return false; // not memory this allocator has
+    const s = &shares[@intCast(phys / PAGE_SIZE)];
+    var now = @atomicLoad(u16, s, .acquire);
+    while (now < std.math.maxInt(u16)) {
+        now = @cmpxchgWeak(u16, s, now, now + 1, .acq_rel, .acquire) orelse return true;
+    }
+    return false;
+}
+
+/// Whether the page at `phys` has more than one owner now.
+pub fn isShared(phys: u64) bool {
+    if (phys / PAGE_SIZE >= shares.len) return false;
+    return @atomicLoad(u16, &shares[@intCast(phys / PAGE_SIZE)], .acquire) != 0;
+}
+
+/// One owner of the page at `phys` lets go of it: freed if it was the
+/// last. What every unmapping of a program's page does.
+pub fn release(phys: u64) void {
+    if (phys / PAGE_SIZE >= shares.len) return free(phys);
+    const s = &shares[@intCast(phys / PAGE_SIZE)];
+    var now = @atomicLoad(u16, s, .acquire);
+    while (now != 0) {
+        now = @cmpxchgWeak(u16, s, now, now - 1, .acq_rel, .acquire) orelse return; // others have it still
+    }
+    free(phys);
 }
 
 /// Free the physical page at `phys`, or say why it cannot be freed. On an

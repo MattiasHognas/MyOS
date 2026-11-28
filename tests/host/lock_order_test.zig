@@ -10,7 +10,7 @@ const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
 
 test "the ranks are in the order docs/locking.md gives" {
-    const order = [_]Rank{ .process_tree, .address_space, .descriptor_table, .condition, .readiness, .timer, .scheduler, .heap_cache, .kernel_region, .page_cache, .page_allocator, .random, .console };
+    const order = [_]Rank{ .process_tree, .address_space, .descriptor_table, .condition, .condition_nested, .readiness, .timer, .scheduler, .heap_cache, .kernel_region, .page_cache, .page_allocator, .random, .console };
     try expectEqual(std.enums.values(Rank).len, order.len); // a new rank must be placed here too
     for (order[0 .. order.len - 1], order[1..]) |outer, inner| {
         try expect(@backingInt(outer) < @backingInt(inner));

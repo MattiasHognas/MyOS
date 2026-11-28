@@ -1551,10 +1551,16 @@ noinline fn copyDescriptors(parent: *Process) error{OutOfMemory}!struct { files:
 
 /// Write `value` at the user address `addr` of the address space `root`,
 /// which need not be loaded: through the kernel's mapping of the page.
-/// Nothing is written if the page is not there or not writable.
+/// Nothing is written if the page is not there or not writable. A page
+/// shared copy-on-write (the child of a `fork`, before it runs) gets its
+/// own copy first; nothing else uses `root` yet.
 fn writeInto(root: u64, addr: u64, value: u32) void {
     if (addr % 4 != 0 or addr >= vmm.USER_END) return;
-    const e = vmm.leafEntry(root, addr) orelse return;
+    var e = vmm.leafEntry(root, addr) orelse return;
+    if (e & vmm.COW != 0 and e & vmm.USER != 0) {
+        _ = vmm.breakCow(root, addr) catch return;
+        e = vmm.leafEntry(root, addr) orelse return;
+    }
     if (e & vmm.WRITABLE == 0 or e & vmm.USER == 0) return;
     const phys = vmm.translate(root, addr) orelse return;
     @as(*u32, @ptrCast(@alignCast(pmm.physToVirt(phys)))).* = value;

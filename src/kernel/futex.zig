@@ -12,14 +12,21 @@
 //!
 //! Waiters are found by the address they wait on, in the address space
 //! they are in. They hang in a hash table, each as a record on its own
-//! kernel stack. One spinlock covers the table: taking it is what makes
-//! "compare and sleep" atomic against "wake", and it lets one call move
-//! waiters from one address to another (`requeue`, which condition
-//! variables use so that a broadcast does not wake every thread only for
-//! all but one to sleep again on the mutex). One lock for all futexes is
-//! the first thing to split when lock-heavy programs run on many cores.
+//! kernel stack, and each bucket has a spinlock of its own (as Linux's
+//! hash buckets do), so threads waiting on different futexes do not meet
+//! on one lock. Taking the bucket's lock is what makes "compare and sleep"
+//! atomic against "wake".
 //!
-//! The word is read under that lock, with page faults off: a fault would
+//! `requeue` moves waiters from one address to another (condition
+//! variables use it, so that a broadcast does not wake every thread only
+//! for all but one to sleep again on the mutex), from one bucket to
+//! another, holding both locks (the one at the lower address first; the
+//! second is `condition_nested` in the lock order), so that a wake on the
+//! new address cannot miss them on the way. A waiter's bucket can change
+//! while it sleeps (`Waiter.bucket`): it always locks the one it is
+//! recorded in, and looks again once it has the lock.
+//!
+//! The word is read under the bucket's lock, with page faults off: a fault would
 //! need the address-space lock, which ranks before this one. So `wait`
 //! reads the word once without the lock first, which brings the page in,
 //! and tries again in the rare case that it is gone a moment later.
@@ -41,10 +48,18 @@ const uaccess = @import("uaccess.zig");
 /// A bit set that matches every waiter.
 pub const ANY: u32 = 0xFFFF_FFFF;
 
-const BUCKETS = 64;
+const BUCKETS = 256;
+
+const Bucket = struct {
+    lock: SpinLock = .{ .rank = .condition },
+    head: ?*Waiter = null,
+};
 
 /// One sleeping thread, on its own kernel stack.
 const Waiter = struct {
+    /// The bucket it is in; changed under the locks of both buckets
+    /// (`requeue`), read atomically.
+    bucket: *Bucket = undefined,
     /// The address space (a `Process`, by address) and the address waited on.
     space: usize,
     addr: u64,
@@ -56,30 +71,43 @@ const Waiter = struct {
     next: ?*Waiter = null,
 };
 
-/// Protects the table and every `Waiter` in it.
-var lock: SpinLock = .{ .rank = .condition };
-var table: [BUCKETS]?*Waiter = @splat(null);
+/// Each bucket's lock protects its list and every `Waiter` in it.
+var table: [BUCKETS]Bucket = @splat(.{});
 
-fn bucket(space: usize, addr: u64) *?*Waiter {
-    const h = (addr >> 2) *% 0x9E37_79B9_7F4A_7C15 +% space;
-    return &table[@intCast(h >> 58)];
+fn bucket(space: usize, addr: u64) *Bucket {
+    const h = ((addr >> 2) +% space *% 31) *% 0x9E37_79B9_7F4A_7C15;
+    return &table[@intCast(h >> 56)];
 }
 
 comptime {
-    std.debug.assert(BUCKETS == 64); // the top six bits of the hash
+    std.debug.assert(BUCKETS == 256); // the top eight bits of the hash
 }
 
-fn insert(w: *Waiter) void {
-    // At the end: waiters are woken in the order they came.
-    var link = bucket(w.space, w.addr);
+/// Put `w` at the end of `b` (waiters are woken in the order they came).
+/// `b`'s lock held.
+fn insert(b: *Bucket, w: *Waiter) void {
+    var link = &b.head;
     while (link.*) |other| link = &other.next;
     w.next = null;
+    @atomicStore(*Bucket, &w.bucket, b, .release);
     link.* = w;
 }
 
-/// Take `w` out of the table. False if it is not in it (a waker took it).
-fn remove(w: *Waiter) bool {
-    var link = bucket(w.space, w.addr);
+/// Lock the bucket `w` is in (or moving to): it may change until its lock
+/// is held, so look again then.
+fn lockOwn(w: *Waiter) *Bucket {
+    while (true) {
+        const b = @atomicLoad(*Bucket, &w.bucket, .acquire);
+        b.lock.take();
+        if (@atomicLoad(*Bucket, &w.bucket, .acquire) == b) return b;
+        b.lock.drop();
+    }
+}
+
+/// Take `w` out of its bucket, whose lock is held. False if it is not in
+/// it (a waker took it).
+fn remove(b: *Bucket, w: *Waiter) bool {
+    var link = &b.head;
     while (link.*) |other| : (link = &other.next) {
         if (other != w) continue;
         link.* = w.next;
@@ -114,43 +142,49 @@ fn readWord(addr: u64) ?u32 {
 pub fn wait(p: *Process, addr: u64, expected: u32, bitset: u32, ticks: ?u64) WaitError!void {
     if (addr % 4 != 0) return error.Fault;
     const me = thread.current();
-    var waiter: Waiter = .{ .space = @intFromPtr(p), .addr = addr, .bitset = bitset, .thread = me };
+    const space = @intFromPtr(p);
+    var waiter: Waiter = .{ .space = space, .addr = addr, .bitset = bitset, .thread = me };
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
         // Bring the page in, and save a sleep that is not wanted anyway.
         if ((readWord(addr) orelse return error.Fault) != expected) return error.Again;
 
-        const held = lock.acquire();
+        const home = bucket(space, addr);
+        const flags = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(flags);
+        home.lock.take();
         me.no_fault = true;
         const now = readWord(addr);
         me.no_fault = false;
         if (now == null) {
             // The page went away in between (unmapped, or given back with
             // `madvise`). Rare: start over, which faults it in or fails.
-            lock.release(held);
+            home.lock.drop();
             if (attempts == 8) return error.Fault;
             continue;
         }
         if (now.? != expected) {
-            lock.release(held);
+            home.lock.drop();
             return error.Again;
         }
-        defer lock.release(held);
 
-        insert(&waiter);
+        insert(home, &waiter);
         var timeout = timer.WakeTimer.init(me);
         // One tick more than asked for: the first tick may be about to
         // happen, and a wait must not end before its time.
         if (ticks) |n| timer.add(&timeout.timer, n + 1);
+        var b = home;
         while (!waiter.woken and !timeout.hasFired() and !thread.interrupted()) {
-            lock.drop();
+            b.lock.drop();
             thread.block();
-            lock.take();
+            b = lockOwn(&waiter);
         }
         if (ticks != null) timeout.finish();
         // Woken and out of time at once counts as woken: the waker counted
         // this thread among those it woke.
-        if (!remove(&waiter)) return;
+        const was_there = remove(b, &waiter);
+        b.lock.drop();
+        if (!was_there) return;
         return if (timeout.hasFired()) error.TimedOut else error.Interrupted;
     }
 }
@@ -159,14 +193,16 @@ pub fn wait(p: *Process, addr: u64, expected: u32, bitset: u32, ticks: ?u64) Wai
 /// address space of `p` whose bit set has a bit in common with `bitset`,
 /// longest waiter first. Returns how many were woken.
 pub fn wake(p: *Process, addr: u64, count: u32, bitset: u32) u32 {
-    const held = lock.acquire();
-    defer lock.release(held);
-    return wakeLocked(@intFromPtr(p), addr, count, bitset);
+    const b = bucket(@intFromPtr(p), addr);
+    const held = b.lock.acquire();
+    defer b.lock.release(held);
+    return wakeLocked(b, @intFromPtr(p), addr, count, bitset);
 }
 
-fn wakeLocked(space: usize, addr: u64, count: u32, bitset: u32) u32 {
+/// `wake` in the bucket `b`, whose lock is held.
+fn wakeLocked(b: *Bucket, space: usize, addr: u64, count: u32, bitset: u32) u32 {
     var woken: u32 = 0;
-    var link = bucket(space, addr);
+    var link = &b.head;
     while (link.*) |w| {
         if (woken == count) break;
         if (w.space != space or w.addr != addr or w.bitset & bitset == 0) {
@@ -194,21 +230,33 @@ pub fn requeue(p: *Process, addr: u64, wake_count: u32, move_count: u32, to: u64
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
         if (expected != null and readWord(addr) == null) return error.Fault;
-        const held = lock.acquire();
-        defer lock.release(held);
+        const from = bucket(space, addr);
+        const dest = bucket(space, to);
+        const flags = cpu.saveAndDisableInterrupts();
+        defer cpu.restoreInterrupts(flags);
+        // Both buckets, the lower address first, so that two requeues
+        // between the same two never wait for each other.
+        const first = if (@intFromPtr(from) <= @intFromPtr(dest)) from else dest;
+        const second = if (first == from) dest else from;
+        first.lock.take();
+        if (second != first) second.lock.takeNested(.condition_nested);
+        defer {
+            if (second != first) second.lock.dropNested(.condition_nested);
+            first.lock.drop();
+        }
         if (expected) |want| {
             me.no_fault = true;
             const now = readWord(addr);
             me.no_fault = false;
             if (now == null) {
                 if (attempts == 8) return error.Fault;
-                continue; // releases the lock
+                continue; // releases the locks
             }
             if (now.? != want) return error.Again;
         }
-        const woken = wakeLocked(space, addr, wake_count, ANY);
+        const woken = wakeLocked(from, space, addr, wake_count, ANY);
         var moved: u32 = 0;
-        var link = bucket(space, addr);
+        var link = &from.head;
         while (link.*) |w| {
             if (moved == move_count) break;
             if (w.space != space or w.addr != addr) {
@@ -217,7 +265,7 @@ pub fn requeue(p: *Process, addr: u64, wake_count: u32, move_count: u32, to: u64
             }
             link.* = w.next;
             w.addr = to;
-            insert(w);
+            insert(dest, w);
             moved += 1;
         }
         return woken + moved;
@@ -227,11 +275,11 @@ pub fn requeue(p: *Process, addr: u64, wake_count: u32, move_count: u32, to: u64
 /// Number of threads waiting on any futex of the address space of `p`.
 /// For tests.
 pub fn waiting(p: *const Process) usize {
-    const held = lock.acquire();
-    defer lock.release(held);
     var n: usize = 0;
-    for (table) |head| {
-        var w = head;
+    for (&table) |*b| {
+        const held = b.lock.acquire();
+        defer b.lock.release(held);
+        var w = b.head;
         while (w) |waiter| : (w = waiter.next) {
             if (waiter.space == @intFromPtr(p)) n += 1;
         }

@@ -103,12 +103,17 @@ pub const SpinLock = struct {
 
     /// Take the lock with interrupts already off; they stay off.
     pub fn take(self: *SpinLock) void {
-        assert.check(.spinlock, cpu.readFlags() & (1 << 9) == 0, "taking a {t} lock with interrupts on", .{self.rank});
-        self.noteTaken();
+        self.takeAs(self.rank);
+    }
+
+    /// `take`, recorded in the lock order as `rank`.
+    fn takeAs(self: *SpinLock, rank: Rank) void {
+        assert.check(.spinlock, cpu.readFlags() & (1 << 9) == 0, "taking a {t} lock with interrupts on", .{rank});
+        noteTakenAs(rank);
         if (self.raw.tryLock()) return;
         // It has to wait: counted, with how long (`stats.zig`).
         const waited_from = stats.rdtsc();
-        defer stats.contended(self.rank, stats.rdtsc() - waited_from);
+        defer stats.contended(rank, stats.rdtsc() - waited_from);
         var spins: usize = 0;
         while (!self.raw.tryLock()) {
             // Only read the flag while waiting, so the cache line is not
@@ -124,10 +129,23 @@ pub const SpinLock = struct {
         }
     }
 
+    /// `take`, recorded in the lock order as `as` instead of the lock's own
+    /// rank: for a second lock of a kind taken while one of them is held,
+    /// in an order the caller keeps itself (two futex buckets, by address).
+    pub fn takeNested(self: *SpinLock, as: lock_order.Rank) void {
+        self.takeAs(as);
+    }
+
+    /// The other half of `takeNested`.
+    pub fn dropNested(self: *SpinLock, as: lock_order.Rank) void {
+        noteDroppedAs(as);
+        self.raw.unlock();
+    }
+
     /// Release the lock and leave interrupts off. The other half of `take`,
     /// or of an `acquire` whose interrupt state the caller restores later.
     pub fn drop(self: *SpinLock) void {
-        self.noteDropped();
+        noteDroppedAs(self.rank);
         self.raw.unlock();
     }
 
@@ -139,21 +157,25 @@ pub const SpinLock = struct {
     /// Record the lock in this CPU's list, checking the order first: a
     /// lock taken out of order is reported before the CPU spins on it.
     fn noteTaken(self: *SpinLock) void {
+        noteTakenAs(self.rank);
+    }
+
+    fn noteTakenAs(rank: Rank) void {
         if (!assert.enabled or !checking) return;
         const c = percpu.currentIfReady() orelse return;
-        c.locks.push(self.rank) catch |e| switch (e) {
-            error.OutOfOrder => panicFmt("spinlock: taking a {t} lock while holding a {t} lock (docs/locking.md, lock order)", .{ self.rank, c.locks.innermost().? }),
+        c.locks.push(rank) catch |e| switch (e) {
+            error.OutOfOrder => panicFmt("spinlock: taking a {t} lock while holding a {t} lock (docs/locking.md, lock order)", .{ rank, c.locks.innermost().? }),
             error.TooDeep => panicFmt("spinlock: more than {d} locks held", .{lock_order.Stack.capacity}),
         };
     }
 
-    fn noteDropped(self: *SpinLock) void {
+    fn noteDroppedAs(rank: Rank) void {
         if (!assert.enabled or !checking) return;
         const c = percpu.currentIfReady() orelse return;
-        c.locks.pop(self.rank) catch {
+        c.locks.pop(rank) catch {
             if (c.locks.innermost()) |inner|
-                panicFmt("spinlock: releasing a {t} lock while a {t} lock taken after it is held", .{ self.rank, inner });
-            panicFmt("spinlock: releasing a {t} lock this CPU does not hold", .{self.rank});
+                panicFmt("spinlock: releasing a {t} lock while a {t} lock taken after it is held", .{ rank, inner });
+            panicFmt("spinlock: releasing a {t} lock this CPU does not hold", .{rank});
         };
     }
 };

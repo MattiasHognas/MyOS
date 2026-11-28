@@ -164,6 +164,9 @@ fn send(r: Request, only_root: ?u64) void {
                 @atomicStore(bool, &c.tlb_stale, true, .seq_cst);
                 if (@atomicLoad(bool, &c.tlb_lazy, .seq_cst)) continue;
             }
+            // A barrier for a process: a halted CPU runs none of its
+            // threads, and passes a barrier (an interrupt) before it does.
+            if (r == .barrier and @atomicLoad(bool, &c.tlb_lazy, .seq_cst)) continue;
         }
         asked[i / 64] |= @as(u64, 1) << @intCast(i % 64);
         @atomicStore(bool, &c.ipi_pending, true, .release);

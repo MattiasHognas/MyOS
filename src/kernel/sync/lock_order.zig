@@ -21,6 +21,9 @@ pub const Rank = enum(u8) {
     /// A condition some thread waits for, with the wait queue for it: the
     /// keyboard buffer, a mutex's owner. The default.
     condition,
+    /// A second condition lock taken while one is held, in an order the
+    /// caller keeps (by address): the second futex bucket of a `requeue`.
+    condition_nested,
     /// The pollers' wait queue (`readiness.zig`), which objects tell of
     /// changes holding their own condition lock.
     readiness,

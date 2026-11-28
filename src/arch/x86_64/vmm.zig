@@ -64,6 +64,13 @@ pub const GLOBAL: u64 = 1 << 8;
 /// them (the vDSO's, `kernel/vdso.zig`): never freed with a mapping, never
 /// copied by `fork`, never made writable. A bit the CPU leaves to software.
 pub const SHARED: u64 = 1 << 9;
+/// A user page of a writable region shared copy-on-write with other
+/// address spaces (`fork`): mapped read-only; the first write to it
+/// faults, and gets a copy of its own (`user_memory.handleFault`), or the
+/// page itself if nobody else has it any more. A shared page of a region
+/// that cannot be written is only read-only, and gets this bit if the
+/// region is made writable (`protect`). Another bit for software.
+pub const COW: u64 = 1 << 10;
 /// Page table entry flag: instruction fetches are not allowed (requires EFER.NXE).
 pub const NX: u64 = 1 << 63;
 /// Page table entry flag: write-through caching.
@@ -155,7 +162,7 @@ fn freeTable(phys: u64, level: u6) void {
     for (table(phys)) |e| {
         if (e & PRESENT == 0) continue;
         if (level == 0) {
-            if (e & SHARED == 0) pmm.free(e & ADDR_MASK);
+            if (e & SHARED == 0) pmm.release(e & ADDR_MASK); // freed if nobody else has it (`fork`)
         } else if (level == 1 and e & HUGE != 0) {
             freeHugePages(e & ADDR_MASK);
         } else freeTable(e & ADDR_MASK, level - 1);
@@ -478,8 +485,15 @@ pub fn splitHugeIn(root: u64, start: u64, end: u64, all: bool) error{OutOfMemory
 /// lock of `from`'s mappings must hold it throughout.
 pub fn copyUserSpace(from: u64, to: u64) MapError!usize {
     var taken: usize = 0;
+    defer flushAllUser(from); // its pages are read-only now, copy-on-write
     try copyLevel(table(from), to, 3, 0, &taken);
     return taken;
+}
+
+/// Forget every user translation of `root` on every CPU that has it
+/// loaded: after its entries lost write permission all over (`fork`).
+pub fn flushAllUser(root: u64) void {
+    flushEverywhere(root, 0, USER_END / pmm.PAGE_SIZE);
 }
 
 fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapError!void {
@@ -493,10 +507,26 @@ fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapErro
             try mapCounting(to, virt, e & ADDR_MASK, e & ~ADDR_MASK & ~PRESENT, &tables);
             taken.* += tables;
         } else if (level == 0) {
+            // Shared, read-only in both and marked copy-on-write: copied
+            // only when one of them writes to it. A page with as many
+            // owners as can be counted is copied now.
+            if (pmm.share(e & ADDR_MASK)) {
+                const ro = if (e & (WRITABLE | COW) != 0) (e & ~WRITABLE) | COW else e;
+                var tables: usize = 0;
+                mapCounting(to, virt, e & ADDR_MASK, ro & ~ADDR_MASK & ~PRESENT, &tables) catch |err| {
+                    pmm.release(e & ADDR_MASK);
+                    return err;
+                };
+                t[i] = ro; // the caller flushes the old, writable entries
+                taken.* += 1 + tables;
+                continue;
+            }
             const page = pmm.alloc() orelse return error.OutOfMemory;
             @memcpy(pmm.physToVirt(page)[0..pmm.PAGE_SIZE], pmm.physToVirt(e & ADDR_MASK)[0..pmm.PAGE_SIZE]);
             var tables: usize = 0;
-            mapCounting(to, virt, page, e & ~ADDR_MASK & ~PRESENT, &tables) catch |err| {
+            // (A copy-on-write page copied is the child's own: writable.)
+            const own = if (e & COW != 0) (e & ~COW) | WRITABLE else e;
+            mapCounting(to, virt, page, own & ~ADDR_MASK & ~PRESENT, &tables) catch |err| {
                 pmm.free(page);
                 return err;
             };
@@ -582,7 +612,9 @@ const Gather = struct {
         flushEverywhere(g.root, g.start, g.pages);
         for (g.buf[0..g.n]) |entry| {
             // Bit 0 (never set in a page's address) marks a 2 MiB page.
-            if (entry & 1 != 0) freeWholeHuge(entry & ~@as(u64, 1)) else pmm.free(entry);
+            // A small page may be shared copy-on-write: let go of, freed if
+            // it was the last owner's.
+            if (entry & 1 != 0) freeWholeHuge(entry & ~@as(u64, 1)) else pmm.release(entry);
         }
         g.n = 0;
     }
@@ -635,8 +667,17 @@ fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: 
                     }
                 },
                 .protect => |bits| {
-                    // A shared page is never made writable.
-                    t[i] = (e & ~(USER | WRITABLE | NX)) | (if (e & SHARED != 0) bits & ~WRITABLE else bits);
+                    // A page shared by every process is never made
+                    // writable; one shared with other processes since a
+                    // `fork` is made copy-on-write instead, and gets that on
+                    // its first write fault.
+                    const keep = e & ~(USER | WRITABLE | NX | COW);
+                    t[i] = if (e & SHARED != 0)
+                        keep | (bits & ~WRITABLE)
+                    else if (bits & WRITABLE != 0 and (e & COW != 0 or pmm.isShared(e & ADDR_MASK)))
+                        keep | (bits & ~WRITABLE) | COW
+                    else
+                        keep | bits;
                     freed += 1; // counted, though nothing is freed: see the callers
                 },
             }
@@ -707,6 +748,34 @@ pub fn leafEntry(root: u64, virt: u64) ?u64 {
         if (level == 0 or (level == 1 and e & HUGE != 0)) return e;
         t = table(e & ADDR_MASK);
     }
+}
+
+/// Give the copy-on-write page mapped at `virt` under `root` (`COW`) to that
+/// address space alone, writable: the page itself if nobody else has it
+/// any more, else a copy. False if there is no such page there. Out of
+/// memory if a copy is needed and there is no page for it. The caller holds
+/// the address space's lock; a copy is flushed from every CPU that has
+/// `root` loaded, so that none of them reads the old page after the new
+/// one was written to.
+pub fn breakCow(root: u64, virt: u64) error{OutOfMemory}!bool {
+    const slot = leafEntryPtr(root, virt) orelse return false;
+    const e = slot.*;
+    if (e & PRESENT == 0 or e & COW == 0) return false;
+    const old = e & ADDR_MASK;
+    if (!pmm.isShared(old)) {
+        // Only this address space has it: the same page, writable now. A
+        // CPU that still has the read-only entry faults once more, and
+        // finds it right (`user_memory.handleFault`).
+        @atomicStore(u64, slot, (e & ~COW) | WRITABLE, .release);
+        flushLocal(virt & ~@as(u64, pmm.PAGE_SIZE - 1), 1);
+        return true;
+    }
+    const page = pmm.alloc() orelse return error.OutOfMemory;
+    @memcpy(pmm.physToVirt(page)[0..pmm.PAGE_SIZE], pmm.physToVirt(old)[0..pmm.PAGE_SIZE]);
+    @atomicStore(u64, slot, page | (e & ~ADDR_MASK & ~COW) | WRITABLE, .release);
+    flushEverywhere(root, virt & ~@as(u64, pmm.PAGE_SIZE - 1), 1);
+    pmm.release(old);
+    return true;
 }
 
 /// The 4 KiB leaf entry of `virt` under `root`, to change in place, or null

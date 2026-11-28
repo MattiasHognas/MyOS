@@ -2578,19 +2578,22 @@ fn sysSigSuspend(mask_ptr: u64, size: u64) u64 {
     return err(.INTR);
 }
 
-/// `membarrier`: have every CPU pass a memory barrier before the call
-/// returns, so that a thread of this process on another CPU has seen what
-/// the caller wrote before it. Runtimes with a garbage collector use it
-/// instead of making every thread pay for a barrier of its own. Every
-/// other CPU is interrupted, which is more than asked for and correct.
-/// `EINVAL` for a command that is not offered.
+/// `membarrier`: have every CPU that runs a thread of this process pass a
+/// memory barrier before the call returns, so that such a thread has seen
+/// what the caller wrote before it. Runtimes with a garbage collector use
+/// it instead of making every thread pay for a barrier of its own (.NET's
+/// collector on every collection). Only the CPUs that have the process's
+/// address space loaded and are not idle are interrupted, as on Linux: a
+/// CPU that loads it later passes a barrier on the way (CR3 is
+/// serializing). `EINVAL` for a command that is not offered.
 fn sysMembarrier(command: u64, flags: u64) u64 {
     if (flags != 0) return err(.INVAL);
     return switch (command) {
         abi.MEMBARRIER.QUERY => abi.MEMBARRIER.PRIVATE_EXPEDITED | abi.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED,
         abi.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED => 0,
         abi.MEMBARRIER.PRIVATE_EXPEDITED => blk: {
-            ipi.broadcast(.barrier);
+            const p = thread.current().process orelse break :blk err(.NOSYS);
+            ipi.broadcastTo(.barrier, p.root);
             break :blk 0;
         },
         else => err(.INVAL),

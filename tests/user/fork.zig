@@ -1,5 +1,6 @@
 //! `/test/fork`: new processes as Linux makes them. `fork` gives a child
-//! with a copy of the memory and the same open files; `wait4` collects it
+//! with a copy of the memory (shared copy-on-write until one side writes)
+//! and the same open files; `wait4` collects it
 //! with its status, by process ID or any, waiting or not; a child that a
 //! signal ended is reported as such; `vfork` holds the parent until the
 //! child is gone; `clone` without `CLONE_THREAD` with a stack of its own;
@@ -216,6 +217,70 @@ pub fn main() noreturn {
     // The terminal's foreground group: this program's, as nobody set one.
     var fg: i32 = 0;
     expect(lib.syscall(Sys.ioctl, 0, 0x540F, @intFromPtr(&fg)) == 0 and fg == @as(i32, @intCast(me)), 44); // TIOCGPGRP
+
+    // --- Copy-on-write: after a fork both share the pages until one of
+    // them writes, and a write is never seen by the other.
+    {
+        const PAGE = 4096;
+        const len = 3 * PAGE;
+        const m = lib.syscall6(Sys.mmap, 0, len, 3, 0x22, @bitCast(@as(i64, -1)), 0); // rw, private anonymous
+        expect(!lib.isError(m), 70);
+        const pages: [*]volatile u64 = @ptrFromInt(m);
+        for (0..3) |i| pages[i * PAGE / 8] = 0xA0 + i;
+        // A page of a region that cannot be written, shared as well.
+        const ro = lib.syscall6(Sys.mmap, 0, PAGE, 3, 0x22, @bitCast(@as(i64, -1)), 0);
+        expect(!lib.isError(ro), 71);
+        @as(*volatile u64, @ptrFromInt(ro)).* = 0x5A;
+        expect(lib.syscall(Sys.mprotect, ro, PAGE, 1) == 0, 72);
+        var sync: [2]i32 = undefined;
+        expect(lib.syscall(Sys.pipe2, @intFromPtr(&sync), 0, 0) == 0, 73);
+        const c = lib.syscall(Sys.fork, 0, 0, 0);
+        if (c == 0) {
+            if (pages[0] != 0xA0 or pages[PAGE / 8] != 0xA1) lib.exit(110);
+            pages[0] = 0xB0; // its own copy
+            if (pages[0] != 0xB0 or pages[PAGE / 8] != 0xA1) lib.exit(111);
+            // Made writable after the fork: still not the parent's page.
+            if (lib.syscall(Sys.mprotect, ro, PAGE, 3) != 0) lib.exit(112);
+            @as(*volatile u64, @ptrFromInt(ro)).* = 0x5B;
+            // The kernel writing into a shared page (read into it).
+            if (lib.syscall(Sys.write, @intCast(sync[1]), @intFromPtr("xyz"), 3) != 3) lib.exit(113);
+            var into: [*]u8 = @ptrFromInt(m + 2 * PAGE);
+            if (lib.read(@intCast(sync[0]), into[0..3]) != 3 or into[0] != 'x') lib.exit(114);
+            // The parent's write after the fork is not seen here.
+            var go: [1]u8 = undefined;
+            if (lib.read(@intCast(sync[0]), &go) != 1) lib.exit(115);
+            if (pages[PAGE / 8] != 0xA1) lib.exit(116);
+            lib.exit(0);
+        }
+        expect(!lib.isError(c), 74);
+        pages[PAGE / 8] = 0xC1; // the parent writes one the child has not
+        // Let the child read its own three bytes first, then tell it.
+        var settle: lib.abi.TimeSpec = .{ .sec = 0, .nsec = 20_000_000 };
+        _ = lib.syscall(Sys.nanosleep, @intFromPtr(&settle), 0, 0);
+        expect(lib.syscall(Sys.write, @intCast(sync[1]), @intFromPtr("g"), 1) == 1, 75);
+        expect(wait4(@intCast(c), &status, 0) == c and exited(status) == 0, 76);
+        expect(pages[0] == 0xA0 and pages[PAGE / 8] == 0xC1, 77); // the child's writes stay its own
+        expect(@as(u32, @truncate(pages[2 * PAGE / 8])) == 0xA2, 78);
+        expect(@as(*volatile u64, @ptrFromInt(ro)).* == 0x5A, 79);
+        // Alone with the pages now: a write keeps working.
+        pages[0] = 0xD0;
+        expect(pages[0] == 0xD0, 80);
+        _ = lib.syscall(Sys.close, @intCast(sync[0]), 0, 0);
+        _ = lib.syscall(Sys.close, @intCast(sync[1]), 0, 0);
+        _ = lib.syscall(Sys.munmap, m, len, 0);
+        _ = lib.syscall(Sys.munmap, ro, PAGE, 0);
+
+        // CLONE_CHILD_SETTID writes into the child's copy only.
+        const settid = struct {
+            var tid: u32 = 0;
+        };
+        settid.tid = 0;
+        const c2 = lib.syscall6(Sys.clone, 0x1000000 | 17, 0, 0, @intFromPtr(&settid.tid), 0, 0); // CHILD_SETTID | SIGCHLD
+        if (c2 == 0) lib.exit(if (settid.tid == @as(u32, @truncate(lib.syscall(Sys.gettid, 0, 0, 0)))) 0 else 117);
+        expect(!lib.isError(c2), 81);
+        expect(wait4(@intCast(c2), &status, 0) == c2 and exited(status) == 0, 82);
+        expect(settid.tid == 0, 83);
+    }
 
     // --- Limits (prlimit64, getrlimit, setrlimit), in a child so that
     // this process keeps its own; the child's are inherited.

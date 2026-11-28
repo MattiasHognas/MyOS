@@ -89,15 +89,16 @@ above it.
 1. Process-tree lock
 2. A process's address-space lock, then its descriptor-table lock
 3. A condition's lock (including a mutex's internal lock)
-4. The pollers' lock (`readiness.zig`)
-5. Timer lock
-6. Scheduler lock
-7. A CPU's heap-cache lock (never two of them)
-8. Heap lock, kernel-stack lock or device-window lock (never two of them)
-9. A CPU's page-cache lock (never two of them)
-10. Page-allocator lock
-11. Random-generator lock
-12. Console lock
+4. A second futex bucket's lock, taken by `requeue` while it holds the first, the one at the lower address first (`condition_nested`)
+5. The pollers' lock (`readiness.zig`)
+6. Timer lock
+7. Scheduler lock
+8. A CPU's heap-cache lock (never two of them)
+9. Heap lock, kernel-stack lock or device-window lock (never two of them)
+10. A CPU's page-cache lock (never two of them)
+11. Page-allocator lock
+12. Random-generator lock
+13. Console lock
 
 Two locks of the same rank are never held together either: not two
 conditions' locks, not two regions' locks.

@@ -147,6 +147,12 @@ pub fn handleFault(p: *Process, addr: u64, access: Access) FaultError!void {
         // it between the fault and now, or this CPU's TLB still had the
         // entry from before the permissions were widened. Run it again.
         const entry = vmm.leafEntry(p.root, page) orelse return error.BadAccess;
+        // A write to a page shared copy-on-write since a `fork`: a page of
+        // its own now (or the same one, if the others let go of it).
+        if (access.write and entry & vmm.COW != 0) {
+            _ = vmm.breakCow(p.root, page) catch return error.OutOfMemory;
+            return;
+        }
         const want = pteFlags(region.prot);
         if (entry & (vmm.USER | vmm.WRITABLE) == want & (vmm.USER | vmm.WRITABLE)) {
             vmm.flushLocal(page, 1);
