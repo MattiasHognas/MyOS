@@ -56,6 +56,8 @@ pub fn init() vfs.Fs {
         .unlink = unlink,
         .rmdir = rmdir,
         .rename = rename,
+        .fifo_at = fifoAt,
+        .mkfifo = mkfifo,
     };
 }
 
@@ -104,13 +106,29 @@ fn next(_: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?vfs.DirEn
     lock.lock();
     defer lock.unlock();
     const entry = fs.next(dir, cookie, name_buf) orelse return null;
-    return .{ .name = entry.name, .kind = if (entry.kind == .directory) .directory else .file };
+    return .{ .name = entry.name, .kind = switch (entry.kind) {
+        .directory => .directory,
+        .file => .file,
+        .fifo => .fifo,
+    } };
 }
 
 fn create(_: *anyopaque, path: []const u8) vfs.Error!vfs.Node {
     lock.lock();
     defer lock.unlock();
     return nodeOf(fs.create(path) catch |e| return toVfs(e));
+}
+
+fn fifoAt(_: *anyopaque, path: []const u8) ?u64 {
+    lock.lock();
+    defer lock.unlock();
+    return fs.fifoAt(path);
+}
+
+fn mkfifo(_: *anyopaque, path: []const u8, id: u64) vfs.Error!void {
+    lock.lock();
+    defer lock.unlock();
+    return fs.mkfifo(path, id) catch |e| toVfs(e);
 }
 
 fn mkdir(_: *anyopaque, path: []const u8) vfs.Error!void {

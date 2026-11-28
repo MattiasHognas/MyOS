@@ -283,3 +283,32 @@ fn scenario(fs: *Fs) bool {
     std.debug.assert(fs.info("/e/f") != null and fs.info("/d") == null);
     return true;
 }
+
+test "ramfs: FIFOs are names with a number, neither files nor directories" {
+    var fs = newFs();
+    defer fs.deinit();
+    var out: [128]u8 = undefined;
+    try fs.mkdir("/d");
+    try fs.mkfifo("/d/pipe", 7);
+    try expectEqual(@as(?u64, 7), fs.fifoAt("/d/pipe"));
+    try expectEqual(@as(?u64, null), fs.fifoAt("/d"));
+    try expectEqual(ramfs.Kind.fifo, fs.info("/d/pipe").?.kind);
+    try testing.expectEqualStrings("pipe", names(&fs, "/d", &out));
+    try expectError(error.Exists, fs.mkfifo("/d/pipe", 8));
+    try expectError(error.Exists, fs.mkdir("/d/pipe"));
+    try expectError(error.NotDirectory, fs.mkfifo("/d/pipe/x", 9)); // not a directory to be in
+    try expectError(error.Invalid, fs.open("/d/pipe")); // opened through its owner
+    try expectError(error.NotDirectory, fs.rmdir("/d/pipe"));
+    try expectError(error.NotEmpty, fs.rmdir("/d"));
+    // Renamed like a file, and replaced like one by a file renamed onto it.
+    try fs.rename("/d/pipe", "/d/p2");
+    try expectEqual(@as(?u64, 7), fs.fifoAt("/d/p2"));
+    try put(&fs, "/d/f", "x");
+    try fs.rename("/d/f", "/d/p2");
+    try expectEqual(@as(?u64, null), fs.fifoAt("/d/p2"));
+    try fs.mkfifo("/d/q", 10);
+    try fs.unlink("/d/q");
+    try expectEqual(@as(?u64, null), fs.fifoAt("/d/q"));
+    try fs.unlink("/d/p2");
+    try fs.rmdir("/d");
+}

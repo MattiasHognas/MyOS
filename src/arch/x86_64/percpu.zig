@@ -116,8 +116,8 @@ pub const PerCpu = extern struct {
     /// `*stats.SyscallTable`, made the first time it is needed), and per
     /// lock class the acquisitions that waited and the cycles they waited.
     syscall_stats: ?*anyopaque = null,
-    lock_contended: [16]u64 = @splat(0),
-    lock_wait_cycles: [16]u64 = @splat(0),
+    lock_contended: [LOCK_CLASSES]u64 = @splat(0),
+    lock_wait_cycles: [LOCK_CLASSES]u64 = @splat(0),
     /// Halted with nothing to run, and so not interrupted for a flush of
     /// the user addresses it has loaded (Linux's lazy TLB): whoever would
     /// have sets `tlb_stale` instead, and the CPU flushes them all when it
@@ -139,6 +139,9 @@ comptime {
     std.debug.assert(@offsetOf(PerCpu, "user_rsp") == 16);
     std.debug.assert(@offsetOf(PerCpu, "thread") == 24);
 }
+
+/// Lock classes counted per CPU: one for each rank of the lock order.
+pub const LOCK_CLASSES = @as(usize, @intFromEnum(@import("../../kernel/sync/lock_order.zig").Rank.console)) + 1; // the last rank
 
 /// The boot CPU's state.
 var boot_cpu: PerCpu = .{ .self = undefined, .runs_threads = true };

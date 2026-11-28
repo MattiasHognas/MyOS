@@ -75,6 +75,7 @@ pub const kernel = struct {
     pub const vdso = @import("kernel/vdso.zig");
     pub const user_memory = @import("kernel/user_memory.zig");
     pub const memfd = @import("kernel/memfd.zig");
+    pub const fifo = @import("kernel/fifo.zig");
     pub const random_core = @import("kernel/random_core.zig");
     pub const syscall = @import("kernel/syscall.zig");
     pub const thread = @import("kernel/thread.zig");

@@ -21,6 +21,8 @@ pub const Rank = enum(u8) {
     /// A memory object's (`memfd.zig`): taken in a page fault, under the
     /// address-space lock.
     memory_object,
+    /// The FIFO table (`fifo.zig`): taken before a pipe's lock.
+    fifo_table,
     /// A condition some thread waits for, with the wait queue for it: the
     /// keyboard buffer, a mutex's owner. The default.
     condition,

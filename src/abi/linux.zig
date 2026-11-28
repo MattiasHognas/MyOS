@@ -287,6 +287,9 @@ pub const E = enum(u16) {
     /// Input/output error (a read of the terminal from the background
     /// that cannot be stopped for it).
     IO = 5,
+    /// No such device or address: a FIFO opened for writing, without
+    /// waiting, that nobody reads.
+    NXIO = 6,
     /// Argument list too long.
     @"2BIG" = 7,
     /// Exec format error: not a program MyOS can load.
@@ -382,6 +385,7 @@ pub const PATH_MAX = 4096;
 /// types.
 pub const DIRENT_HEADER = 19;
 pub const DT = struct {
+    pub const FIFO = 1;
     pub const CHR = 2;
     pub const DIR = 4;
     pub const REG = 8;

@@ -42,6 +42,9 @@ pub const Pipe = struct {
     /// Moves on whenever what `state` says may have changed: for
     /// edge-triggered `epoll`.
     version: u64 = 0,
+    /// The FIFO this is the pipe of (`fifo.zig`), 0 for a plain pipe.
+    /// Set before anyone else can see the pipe.
+    fifo_id: u64 = 0,
 };
 
 /// The pipe's state may have changed: tell its pollers. With the lock.
@@ -82,8 +85,66 @@ pub fn create() error{OutOfMemory}!*Pipe {
     return p;
 }
 
+/// A pipe with no end open yet, for a FIFO (`fifo.zig`), which opens
+/// them one by one.
+pub fn createEmpty() error{OutOfMemory}!*Pipe {
+    const p = try heap.allocator.create(Pipe);
+    p.* = .{ .readers = 0, .writers = 0 };
+    return p;
+}
+
+/// Free a pipe nobody can reach (no end open): `createEmpty`'s, unused or
+/// with its last end closed by `closeEndKeep`.
+pub fn destroyUnused(p: *Pipe) void {
+    heap.allocator.destroy(p);
+}
+
+pub fn setFifo(p: *Pipe, id: u64) void {
+    p.fifo_id = id;
+}
+
+/// One more open file for `end` (a FIFO opened again).
+pub fn openEnd(p: *Pipe, end: End) void {
+    const held = p.lock.acquire();
+    defer p.lock.release(held);
+    switch (end) {
+        .read => p.readers += 1,
+        .write => p.writers += 1,
+    }
+    moved(p);
+}
+
+/// How many open files each end has.
+pub fn ends(p: *Pipe) struct { readers: u32, writers: u32 } {
+    const held = p.lock.acquire();
+    defer p.lock.release(held);
+    return .{ .readers = p.readers, .writers = p.writers };
+}
+
+/// `closeEnd` without freeing: true if that was the last end, and the
+/// caller frees the pipe (`destroyUnused`). For a FIFO's pipe, which its
+/// table frees under its own lock.
+pub fn closeEndKeep(p: *Pipe, end: End) bool {
+    const held = p.lock.acquire();
+    defer p.lock.release(held);
+    switch (end) {
+        .read => {
+            p.readers -= 1;
+            if (p.readers == 0) _ = p.writable.wakeAll();
+        },
+        .write => {
+            p.writers -= 1;
+            if (p.writers == 0) _ = p.readable.wakeAll();
+        },
+    }
+    moved(p);
+    return p.readers == 0 and p.writers == 0;
+}
+
 /// An open file for `end` was closed for the last time.
 pub fn closeEnd(p: *Pipe, end: End) void {
+    // A FIFO's pipe goes through its table, which others open it from.
+    if (p.fifo_id != 0) return @import("fifo.zig").closeEnd(p, p.fifo_id, end);
     const gone = blk: {
         const held = p.lock.acquire();
         defer p.lock.release(held);

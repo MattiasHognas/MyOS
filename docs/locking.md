@@ -88,17 +88,18 @@ above it.
 
 1. Process-tree lock
 2. A process's address-space lock, then its descriptor-table lock, then a memory object's lock (`memfd.zig`; a page fault of a shared mapping takes it)
-3. A condition's lock (including a mutex's internal lock)
-4. A second futex bucket's lock, taken by `requeue` while it holds the first, the one at the lower address first (`condition_nested`)
-5. The pollers' lock (`readiness.zig`)
-6. Timer lock
-7. Scheduler lock
-8. A CPU's heap-cache lock (never two of them)
-9. Heap lock, kernel-stack lock or device-window lock (never two of them)
-10. A CPU's page-cache lock (never two of them)
-11. Page-allocator lock
-12. Random-generator lock
-13. Console lock
+3. The FIFO table's lock (`fifo.zig`), before a pipe's
+4. A condition's lock (including a mutex's internal lock)
+5. A second futex bucket's lock, taken by `requeue` while it holds the first, the one at the lower address first (`condition_nested`)
+6. The pollers' lock (`readiness.zig`)
+7. Timer lock
+8. Scheduler lock
+9. A CPU's heap-cache lock (never two of them)
+10. Heap lock, kernel-stack lock or device-window lock (never two of them)
+11. A CPU's page-cache lock (never two of them)
+12. Page-allocator lock
+13. Random-generator lock
+14. Console lock
 
 Two locks of the same rank are never held together either: not two
 conditions' locks, not two regions' locks.

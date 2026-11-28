@@ -7,6 +7,7 @@
 //! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
 const std = @import("std");
+const kfifo = @import("fifo.zig");
 const memfd = @import("memfd.zig");
 const rseq = @import("rseq.zig");
 const root = @import("root");
@@ -446,6 +447,8 @@ fn sysUnlink(dirfd: u64, path_ptr: u64, flags: u64) u64 {
         .file => if (directory or given.directory_wanted) return err(.NOTDIR),
         .directory => if (!directory) return err(.ISDIR),
         .symlink => if (directory) return err(.NOTDIR), // the link goes, not what it points to
+        // A FIFO's name goes; its pipe stays with whoever has it open.
+        .fifo => if (directory or given.directory_wanted) return err(.NOTDIR),
         // What this kernel itself puts into /proc and /dev stays.
         else => return err(.PERM),
     }
@@ -472,7 +475,7 @@ fn sysRename(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: 
     defer new.deinit();
     switch (named(old.text)) {
         .none => return missing(old.text),
-        .file, .directory, .symlink => {},
+        .file, .directory, .symlink, .fifo => {},
         else => return err(.PERM),
     }
     vfs.rename(old.text, new.text) catch |e| return vfsError(e);
@@ -778,6 +781,21 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
             if (directory_wanted) return err(.NOTDIR);
             opened.kind = kind; // may be opened for writing: what is written is thrown away
         },
+        .fifo => |id| {
+            if (directory_wanted) return err(.NOTDIR);
+            // One end of its pipe, after the other end has come
+            // (`fifo.zig`); not both at once.
+            if (access == abi.O.RDWR) return err(.INVAL);
+            const end: kpipe.End = if (access == abi.O.RDONLY) .read else .write;
+            opened.pipe = kfifo.open(id, end, flags & abi.O.NONBLOCK != 0) catch |e| return switch (e) {
+                error.NoReader => err(.NXIO),
+                error.Interrupted => err(.INTR),
+                error.OutOfMemory => err(.NOMEM),
+            };
+            opened.kind = if (end == .read) .pipe_read else .pipe_write;
+            opened.readable = end == .read;
+            opened.writable = end == .write;
+        },
         .file, .exe_link, .generated => {
             if (directory_wanted) return err(.NOTDIR);
             if (what == .generated) {
@@ -1011,6 +1029,8 @@ const Named = union(enum) {
     generated: struct { file: procfs.File, pid: u64, arg: u8 = 0 },
     /// `/dev/null`, `/dev/urandom`, `/dev/random`.
     device: open_file.Kind,
+    /// A FIFO (named pipe), by its number (`fifo.zig`).
+    fifo: u64,
 };
 
 /// What `path` (absolute) names, without following a link at its end. The
@@ -1028,6 +1048,7 @@ fn named(path: []const u8) Named {
     if (std.mem.eql(u8, path, "/dev/null")) return .{ .device = .null_device };
     if (std.mem.eql(u8, path, "/dev/urandom") or std.mem.eql(u8, path, "/dev/random")) return .{ .device = .random_device };
     if (std.mem.eql(u8, std.mem.trimEnd(u8, path, "/"), "/dev")) return .directory;
+    if (vfs.fifoAt(path)) |id| return .{ .fifo = id };
     if (vfs.lookup(path)) |node| {
         vfs.release(&node); // only asked whether it is there
         return .file;
@@ -1084,7 +1105,7 @@ fn fileAt(path: []const u8) ?vfs.Node {
     return switch (named(path)) {
         .file => vfs.lookup(path), // null if it was removed just now
         .exe_link => vfs.lookup(thread.current().process.?.name),
-        .none, .directory, .generated, .device, .symlink => null,
+        .none, .directory, .generated, .device, .symlink, .fifo => null,
     };
 }
 
@@ -1176,6 +1197,14 @@ fn statPath(dirfd: u64, path_ptr: u64, flags: u64) StatResult {
         },
         .generated => generatedStat(),
         .device => deviceStat(),
+        .fifo => |id| blk: {
+            var fifo_st: abi.Stat = .{};
+            fifo_st.mode = abi.S.IFIFO | 0o644;
+            fifo_st.dev = 3;
+            fifo_st.ino = id;
+            fifo_st.blksize = 4096;
+            break :blk fifo_st;
+        },
         // Only seen with AT_SYMLINK_NOFOLLOW: the link itself.
         .symlink => blk: {
             var link: abi.Stat = .{};
@@ -1205,14 +1234,29 @@ fn statPath(dirfd: u64, path_ptr: u64, flags: u64) StatResult {
 /// `mknodat`: devices and FIFOs cannot be made anywhere: `EROFS` where
 /// nothing can be made at all, `EPERM` otherwise (after the errors of
 /// the path, and `EEXIST`).
-fn sysMknod(dirfd: u64, path_ptr: u64) u64 {
+fn sysMknod(dirfd: u64, path_ptr: u64, mode: u64) u64 {
     var given = switch (Path.fromNoFollow(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
     };
     defer given.deinit();
     if (named(given.text) != .none) return err(.EXIST);
-    return if (vfs.isWritablePath(given.text)) err(.PERM) else err(.ROFS);
+    if (!vfs.isWritablePath(given.text)) return err(.ROFS);
+    const S_IFMT = 0o170000;
+    return switch (mode & S_IFMT) {
+        // A FIFO (`mkfifo`): a name whose pipe is the kernel's.
+        0o010000 => if (vfs.makeFifo(given.text, kfifo.newId())) 0 else |e| vfsError(e),
+        // A regular file, as `open` with `O_CREAT | O_EXCL` makes one.
+        0, 0o100000 => blk: {
+            const node = vfs.create(given.text) catch |e| break :blk vfsError(e);
+            vfs.release(&node);
+            break :blk 0;
+        },
+        // Devices cannot be made; sockets come with networking.
+        0o020000, 0o060000 => err(.PERM),
+        0o140000 => err(.OPNOTSUPP),
+        else => err(.INVAL),
+    };
 }
 
 /// `access`, `faccessat` and `faccessat2`: files can be read and run,
@@ -1242,7 +1286,7 @@ fn sysReadlink(dirfd: u64, path_ptr: u64, buf: u64, size: u64) u64 {
     const path = given.text;
     const target = switch (named(path)) {
         .none => return missing(path),
-        .file, .directory, .generated, .device => return err(.INVAL),
+        .file, .directory, .generated, .device, .fifo => return err(.INVAL),
         .symlink => vfs.readLink(path) orelse return err(.NOENT),
         // The name can change under another thread's feet only by the
         // process ending, and then this thread ends too.
@@ -1447,6 +1491,7 @@ fn nextEntry(dir: []const u8, position: *u64, name_buf: []u8) ?ListEntry {
             .directory => abi.DT.DIR,
             .file => abi.DT.REG,
             .symlink => abi.DT.LNK,
+            .fifo => abi.DT.FIFO,
         } };
     }
     return null;
@@ -2809,7 +2854,7 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.rename => sysRename(CWD, f.rdi, CWD, f.rsi, 0),
         Sys.renameat => sysRename(f.rdi, f.rsi, f.rdx, f.r10, 0),
         Sys.renameat2 => sysRename(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
-        Sys.mknodat => sysMknod(f.rdi, f.rsi),
+        Sys.mknodat => sysMknod(f.rdi, f.rsi, f.rdx),
         Sys.fchmod => sysFchmod(f.rdi),
         Sys.pwrite64 => sysPwrite(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.readv => sysReadv(f.rdi, f.rsi, f.rdx),

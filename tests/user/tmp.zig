@@ -257,7 +257,8 @@ pub fn main() noreturn {
     // The mount point itself stays what and where it is.
     expect(call1(Sys.rmdir, "/tmp") == lib.err(.BUSY) and call1(Sys.unlink, "/tmp") == lib.err(.ISDIR), 93);
     expect(rename("/tmp", "/tmp2") == lib.err(.BUSY) and call1(Sys.mkdir, "/tmp") == lib.err(.EXIST), 94);
-    expect(lib.syscall6(Sys.mknodat, CWD, @intFromPtr("fifo"), S.IFIFO | 0o600, 0, 0, 0) == lib.err(.PERM), 95);
+    // A FIFO can be made here (`/test/fifo` uses one), and removed again.
+    expect(lib.syscall6(Sys.mknodat, CWD, @intFromPtr("fifo"), S.IFIFO | 0o600, 0, 0, 0) == 0 and call1(Sys.unlink, "fifo") == 0, 95);
 
     // --- A program copied here runs from here.
     const src = open("/bin/hello", O.RDONLY);

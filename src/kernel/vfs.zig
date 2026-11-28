@@ -62,7 +62,7 @@ var mounts: [MAX_MOUNTS]?Mount = @splat(null);
 pub const DirEntry = struct {
     /// In the buffer the caller gave.
     name: []const u8,
-    kind: enum { file, directory, symlink },
+    kind: enum { file, directory, symlink, fifo },
 };
 
 /// A file as the rest of the kernel sees it.
@@ -123,7 +123,28 @@ pub const Fs = struct {
     unlink: ?*const fn (ctx: *anyopaque, path: []const u8) Error!void = null,
     rmdir: ?*const fn (ctx: *anyopaque, path: []const u8) Error!void = null,
     rename: ?*const fn (ctx: *anyopaque, old: []const u8, new: []const u8) Error!void = null,
+    /// FIFOs (named pipes): the number of the one at `path`, null if that
+    /// is not one; and making one known by `id`. Their pipes are the
+    /// kernel's (`fifo.zig`).
+    fifo_at: ?*const fn (ctx: *anyopaque, path: []const u8) ?u64 = null,
+    mkfifo: ?*const fn (ctx: *anyopaque, path: []const u8, id: u64) Error!void = null,
 };
+
+/// The number of the FIFO at `path` (normalized, absolute), or null if
+/// there is none.
+pub fn fifoAt(path: []const u8) ?u64 {
+    const at = resolve(path) orelse return null;
+    const f = at.fs.fifo_at orelse return null;
+    return f(at.fs.ctx, at.rest);
+}
+
+/// Make a FIFO at `path`, known as `id`. `error.ReadOnly` on a filesystem
+/// that cannot have one.
+pub fn makeFifo(path: []const u8, id: u64) Error!void {
+    const at = resolve(path) orelse return error.NotFound;
+    const f = at.fs.mkfifo orelse return error.ReadOnly;
+    return f(at.fs.ctx, at.rest, id);
+}
 
 /// Mount `fs` as the root filesystem, replacing any previous one. The
 /// kernel calls this once during boot.

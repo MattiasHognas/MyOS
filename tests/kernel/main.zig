@@ -937,6 +937,20 @@ fn memoryFiles() TestError!void {
     try expectFootprint(memory);
 }
 
+/// FIFOs from ring 3 (made in `/tmp`, opened end by end with and without
+/// waiting, a wait ended by a signal), two copies at once; no FIFO's
+/// pipe and nothing else left behind.
+fn namedPipes() TestError!void {
+    _ = helpers.runProgram("/test/fifo"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/fifo") orelse return error.Failed;
+    if (code != 0) report("/test/fifo failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/fifo"));
+    try check(root.kernel.fifo.count() == 0);
+    try expectFootprint(memory);
+}
+
 /// Restartable sequences from ring 3 (the CPU kept in the area, a
 /// critical section aborted by a signal, a forked child's registration),
 /// two copies at once; nothing left behind.
@@ -2116,6 +2130,7 @@ fn runCases() noreturn {
         .{ .name = "flock: shared, exclusive, waiting, given up on close (ring 3)", .func = fileLocks },
         .{ .name = "rseq and getcpu: the CPU in the area, a critical section aborted, kept by fork (ring 3)", .func = restartableSequences },
         .{ .name = "memfd_create and shared mappings: two views of one file, the JIT's W^X, fork, seals (ring 3)", .func = memoryFiles },
+        .{ .name = "FIFOs: mknod in /tmp, each end waiting for the other, ENXIO, EINTR (ring 3)", .func = namedPipes },
         .{ .name = "2 MiB pages: given, split, copied, moved (ring 3)", .func = hugePages },
         .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
         .{ .name = "clocks: TSC or HPET, in step on every CPU; sleeps; the wall clock from the RTC", .func = clocks },

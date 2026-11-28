@@ -34,7 +34,7 @@ pub const Error = error{
     TooLarge,
 };
 
-pub const Kind = enum { file, directory };
+pub const Kind = enum { file, directory, fifo };
 
 /// What a path names: the kind, and for a file its size.
 pub const Info = struct { kind: Kind, size: u64 };
@@ -65,8 +65,19 @@ pub fn RamFs(comptime Blocks: type) type {
         const Entry = struct {
             /// Owned. Not "/": the root is not in the table.
             path: []u8,
-            /// Null for a directory.
+            /// Null for a directory or a FIFO.
             file: ?*File,
+            /// For a FIFO (a named pipe, `mkfifo`): the number its owner
+            /// knows it by, never 0. Its pipe is not here: the kernel's.
+            fifo: u64 = 0,
+
+            fn isDir(e: Entry) bool {
+                return e.file == null and e.fifo == 0;
+            }
+
+            fn kind(e: Entry) Kind {
+                return if (e.file != null) .file else if (e.fifo != 0) .fifo else .directory;
+            }
         };
 
         fn find(self: *const Self, path: []const u8) ?usize {
@@ -85,7 +96,7 @@ pub fn RamFs(comptime Blocks: type) type {
         pub fn info(self: *const Self, path: []const u8) ?Info {
             if (path.len == 1) return .{ .kind = .directory, .size = 0 };
             const e = self.entries.items[self.find(path) orelse return null];
-            return if (e.file) |f| .{ .kind = .file, .size = f.size } else .{ .kind = .directory, .size = 0 };
+            return if (e.file) |f| .{ .kind = .file, .size = f.size } else .{ .kind = e.kind(), .size = 0 };
         }
 
         /// The directory a new entry at `path` would go into must be one.
@@ -106,6 +117,7 @@ pub fn RamFs(comptime Blocks: type) type {
         pub fn open(self: *Self, path: []const u8) Error!*File {
             if (path.len == 1) return error.IsDirectory;
             const e = self.entries.items[self.find(path) orelse return error.NotFound];
+            if (e.fifo != 0) return error.Invalid; // opened through its owner
             const f = e.file orelse return error.IsDirectory;
             f.refs += 1;
             return f;
@@ -130,6 +142,21 @@ pub fn RamFs(comptime Blocks: type) type {
             if (path.len == 1 or self.find(path) != null) return error.Exists;
             try self.checkParent(path);
             try self.addEntry(path, null);
+        }
+
+        /// Make a FIFO at `path`, known as `id` (not 0).
+        pub fn mkfifo(self: *Self, path: []const u8, id: u64) Error!void {
+            if (path.len == 1 or self.find(path) != null) return error.Exists;
+            try self.checkParent(path);
+            try self.addEntry(path, null);
+            self.entries.items[self.entries.items.len - 1].fifo = id;
+        }
+
+        /// The number of the FIFO at `path`, or null if it is not one.
+        pub fn fifoAt(self: *const Self, path: []const u8) ?u64 {
+            if (path.len == 1) return null;
+            const e = self.entries.items[self.find(path) orelse return null];
+            return if (e.fifo != 0) e.fifo else null;
         }
 
         /// One more holder of `f`.
@@ -164,10 +191,10 @@ pub fn RamFs(comptime Blocks: type) type {
             if (path.len == 1) return error.IsDirectory;
             const i = self.find(path) orelse return error.NotFound;
             const e = self.entries.items[i];
-            const f = e.file orelse return error.IsDirectory;
+            if (e.isDir()) return error.IsDirectory;
             _ = self.entries.swapRemove(i);
             self.gpa.free(e.path);
-            self.release(f);
+            if (e.file) |f| self.release(f); // a FIFO's pipe is its owner's
             self.trim();
         }
 
@@ -193,7 +220,7 @@ pub fn RamFs(comptime Blocks: type) type {
         pub fn rmdir(self: *Self, path: []const u8) Error!void {
             if (path.len == 1) return error.Invalid;
             const i = self.find(path) orelse return error.NotFound;
-            if (self.entries.items[i].file != null) return error.NotDirectory;
+            if (!self.entries.items[i].isDir()) return error.NotDirectory;
             if (self.hasChildren(path)) return error.NotEmpty;
             self.gpa.free(self.entries.swapRemove(i).path);
             self.trim();
@@ -207,11 +234,11 @@ pub fn RamFs(comptime Blocks: type) type {
             if (old.len == 1 or new.len == 1) return error.Invalid;
             const from = self.find(old) orelse return error.NotFound;
             if (std.mem.eql(u8, old, new)) return;
-            const moving_dir = self.entries.items[from].file == null;
+            const moving_dir = self.entries.items[from].isDir();
             if (moving_dir and isBelow(new, old)) return error.Invalid;
             try self.checkParent(new);
             if (self.find(new)) |to| {
-                const target_dir = self.entries.items[to].file == null;
+                const target_dir = self.entries.items[to].isDir();
                 if (moving_dir and !target_dir) return error.NotDirectory;
                 if (!moving_dir and target_dir) return error.IsDirectory;
                 if (target_dir and self.hasChildren(new)) return error.NotEmpty;
@@ -259,7 +286,7 @@ pub fn RamFs(comptime Blocks: type) type {
                 const name = e.path[(if (dir.len == 1) 1 else dir.len + 1)..];
                 if (std.mem.indexOfScalar(u8, name, '/') != null or name.len > name_buf.len) continue;
                 @memcpy(name_buf[0..name.len], name);
-                return .{ .name = name_buf[0..name.len], .kind = if (e.file == null) .directory else .file };
+                return .{ .name = name_buf[0..name.len], .kind = e.kind() };
             }
             return null;
         }

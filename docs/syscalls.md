@@ -168,7 +168,7 @@ Linux calls, with Linux's numbers:
 | 239 | `get_mempolicy(mode, nodemask, maxnode, addr, flags)` | One memory node, the default policy: mode 0 and an empty mask. No flags. |
 | 257 | `openat(dirfd, path, flags, mode)` | `open` with a relative path starting at the directory `dirfd` is open on, or at the working directory for `AT_FDCWD`. `ENOTDIR` if `dirfd` is open on something else, `EBADF` if it is not open; neither matters for an absolute path. |
 | 258 | `mkdirat(dirfd, path, mode)` | As `mkdir`. |
-| 259 | `mknodat(dirfd, path, mode, dev)` | Devices and FIFOs cannot be made: `EPERM`, or `EROFS` where nothing can. |
+| 259 | `mknodat(dirfd, path, mode, dev)` | `S_IFIFO` makes a FIFO (named pipe, `fifo.zig`) in `/tmp`: opening it for reading waits for a writer and for writing waits for a reader, as on Linux (with `O_NONBLOCK` a reader opens alone and a writer nobody reads gets `ENXIO`), a signal ends the wait (`EINTR`), and the ends are a pipe's; `O_RDWR` on one is refused (`EINVAL`; Linux allows it). `stat` says `S_IFIFO`, listings `DT_FIFO`; `unlink` and `rename` work on it. `S_IFREG` (or no type) makes an empty file. Devices cannot be made (`EPERM`), sockets not yet (`EOPNOTSUPP`); `EROFS` where nothing can be made. |
 | 262 | `newfstatat(dirfd, path, statbuf, flags)` | `stat` by path, relative as for `openat`; of the descriptor itself with an empty path and `AT_EMPTY_PATH`. Files, directories, the `/proc` and `/dev` entries; `AT_SYMLINK_NOFOLLOW` shows `/proc/self/exe` as the link it is. |
 | 263 | `unlinkat(dirfd, path, flags)` | `unlink`, or `rmdir` with `AT_REMOVEDIR`. |
 | 264 | `renameat(olddirfd, old, newdirfd, new)` | As `rename`. |
