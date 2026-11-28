@@ -49,7 +49,7 @@ mkdir -p "$out"
 zig build -Doptimize=ReleaseSafe
 # The test kernel only for its "bench" scenario: built as a release kernel
 # is (no poisoning, no stack measuring), so MyOS is measured as it ships.
-zig build test-kernel -Doptimize=ReleaseSafe -Dbench=true
+zig build test-kernel -Doptimize=ReleaseSafe -Dbench=true ${BENCH_KERNEL_FLAGS:-}
 # The .NET workload, ahead of time and static (as the fixture
 # dotnet-hello-static is built), if there is a .NET SDK.
 extra="$out/extra"

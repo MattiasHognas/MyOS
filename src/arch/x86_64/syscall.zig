@@ -194,7 +194,11 @@ export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     assert.check(.syscall, @intFromPtr(f) % 16 == 0, "syscall frame at 0x{x} is not 16-byte aligned", .{@intFromPtr(f)});
     asm volatile ("sti"); // long syscalls may be preempted
     const number = f.rax;
-    if (comptime replaceable) handler(f) else dispatcher.dispatch(f);
+    // A kernel built to be benchmarked (`-Dbench`, `build_options.profile`)
+    // calls it directly, as the normal kernel does: the pointer the tests
+    // replace cost 7 ns a call, which no shipped kernel pays. (It runs no
+    // test that replaces it.)
+    if (comptime replaceable and !build_options.profile) handler(f) else dispatcher.dispatch(f);
     return leave(f, number);
 }
 
