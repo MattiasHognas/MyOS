@@ -7,6 +7,7 @@
 //! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
 const std = @import("std");
+const memfd = @import("memfd.zig");
 const rseq = @import("rseq.zig");
 const root = @import("root");
 
@@ -144,6 +145,7 @@ fn vfsError(e: vfs.Error) u64 {
         error.TooLarge => err(.FBIG),
         error.Busy => err(.BUSY),
         error.CrossDevice => err(.XDEV),
+        error.NotPermitted => err(.PERM),
     };
 }
 
@@ -1610,6 +1612,18 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
             open_file.setNonblocking(of, arg & abi.O.NONBLOCK != 0);
             return 0;
         },
+        abi.F_ADD_SEALS, abi.F_GET_SEALS => {
+            // Only a memory object has seals (Linux: EINVAL for others).
+            const o = (if (of.kind == .file) memfd.fromNode(&of.node) else null) orelse return err(.INVAL);
+            if (command == abi.F_GET_SEALS) return memfd.getSeals(o);
+            if (!of.writable) return err(.PERM);
+            memfd.addSeals(o, @truncate(arg)) catch |e| return switch (e) {
+                error.NotPermitted => err(.PERM),
+                error.Busy => err(.BUSY),
+                error.Invalid => err(.INVAL),
+            };
+            return 0;
+        },
         else => return err(.INVAL),
     }
 }
@@ -1966,6 +1980,34 @@ fn signalfdRead(of: *OpenFile, ptr: u64, len: u64) u64 {
 
 /// `eventfd` and `eventfd2`: a new counter, starting at `initial`.
 /// `EFD_SEMAPHORE`, `EFD_NONBLOCK`, `EFD_CLOEXEC`.
+/// `memfd_create`: a file in memory only (`memfd.zig`), open for reading
+/// and writing, which can be mapped shared. `EINVAL` for unknown flags,
+/// `MFD_HUGETLB` (no large pages for it) or a name longer than 249 bytes;
+/// `EFAULT` for a name that cannot be read.
+fn sysMemfdCreate(name_ptr: u64, flags: u64) u64 {
+    const known = abi.MFD.CLOEXEC | abi.MFD.ALLOW_SEALING | abi.MFD.HUGETLB | abi.MFD.NOEXEC_SEAL | abi.MFD.EXEC;
+    if (flags & ~known != 0 or flags & abi.MFD.HUGETLB != 0) return err(.INVAL);
+    const p = thread.current().process orelse return err(.BADF);
+    var name_buf: [250]u8 = undefined;
+    const len = uaccess.copyStringFromUser(&name_buf, name_ptr) catch |e| return switch (e) {
+        error.Fault => err(.FAULT),
+        error.TooLong => err(.INVAL),
+    };
+    // `MFD_NOEXEC_SEAL` seals the file (and allows sealing) as Linux does
+    // (there are no execute permissions to take away).
+    const sealable = flags & (abi.MFD.ALLOW_SEALING | abi.MFD.NOEXEC_SEAL) != 0;
+    const o = memfd.create(name_buf[0..len], sealable) catch return err(.NOMEM);
+    const of = heap.allocator.create(OpenFile) catch {
+        memfd.release(o);
+        return err(.NOMEM);
+    };
+    of.* = .{ .kind = .file, .node = memfd.node(o), .readable = true, .writable = true };
+    return installFileFlags(p, of, 0, flags & abi.MFD.CLOEXEC != 0) orelse {
+        open_file.destroy(of);
+        return err(.MFILE);
+    };
+}
+
 fn sysEventFd(initial: u64, flags: u64) u64 {
     if (flags & ~@as(u64, abi.EFD.SEMAPHORE | abi.EFD.NONBLOCK | abi.EFD.CLOEXEC) != 0) return err(.INVAL);
     const p = thread.current().process orelse return err(.BADF);
@@ -2694,9 +2736,11 @@ fn memory(comptime call: enum { mmap, mprotect, munmap, mremap, brk, madvise }, 
             defer putFile(of); // the mapping keeps the file, not the descriptor
             // A file that can change or go away cannot be mapped: a page
             // fault is handled where its filesystem's lock cannot be taken.
-            if (of.kind != .file or of.generated != null or vfs.isCounted(&of.node)) break :blk err(.NODEV);
+            // A memory object can (`memfd.zig`): it has a lock of its own.
+            if (of.kind != .file or of.generated != null) break :blk err(.NODEV);
+            if (vfs.isCounted(&of.node) and memfd.fromNode(&of.node) == null) break :blk err(.NODEV);
             if (!of.readable) break :blk err(.ACCES);
-            break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, .{ .node = of.node, .offset = f.r9 });
+            break :blk user_memory.mmap(p, f.rdi, f.rsi, f.rdx, f.r10, .{ .node = of.node, .offset = f.r9, .writable = of.writable });
         },
         .mprotect => user_memory.mprotect(p, f.rdi, f.rsi, f.rdx),
         .munmap => user_memory.munmap(p, f.rdi, f.rsi),
@@ -2783,7 +2827,7 @@ fn dispatchCall(f: *arch.Frame) void {
         // Not offered yet; a runtime that wants one for mapping its
         // compiled code twice (writable here, executable there) maps it
         // once instead.
-        Sys.memfd_create => err(.NOSYS),
+        Sys.memfd_create => sysMemfdCreate(f.rdi, f.rsi),
         Sys.access => sysAccess(CWD, f.rdi, f.rsi),
         Sys.faccessat => sysAccess(f.rdi, f.rsi, f.rdx),
         // Its flags: AT_EACCESS (no users: the same), AT_SYMLINK_NOFOLLOW,

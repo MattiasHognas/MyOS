@@ -262,7 +262,8 @@ pub fn main() noreturn {
         row(Sys.getrandom, .{ b, 8, 0 }, .{ .is = 8 }),
         row(Sys.getrandom, .{ b, 8, 1 }, .{ .is = 8 }), // GRND_NONBLOCK
         row(Sys.socket, .{ 2, 1, 0 }, .{ .e = .AFNOSUPPORT }),
-        row(Sys.memfd_create, .{ @intFromPtr("x"), 0 }, .{ .e = .NOSYS }),
+        row(Sys.memfd_create, .{ @intFromPtr("x"), 0x100 }, .{ .e = .INVAL }), // an unknown flag
+        row(Sys.memfd_create, .{ KERNEL, 0 }, .{ .e = .FAULT }),
         row(Sys.flock, .{ BAD_FD, abi.LOCK.SH }, .{ .e = .BADF }),
         row(Sys.flock, .{ file, 0 }, .{ .e = .INVAL }),
         row(Sys.rt_sigtimedwait, .{ @intFromPtr(&zero_mask), 0, 0, 4 }, .{ .e = .INVAL }),

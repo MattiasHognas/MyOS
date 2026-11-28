@@ -87,7 +87,7 @@ Outermost first. Holding a lock, code may take any lock below it and none
 above it.
 
 1. Process-tree lock
-2. A process's address-space lock, then its descriptor-table lock
+2. A process's address-space lock, then its descriptor-table lock, then a memory object's lock (`memfd.zig`; a page fault of a shared mapping takes it)
 3. A condition's lock (including a mutex's internal lock)
 4. A second futex bucket's lock, taken by `requeue` while it holds the first, the one at the lower address first (`condition_nested`)
 5. The pollers' lock (`readiness.zig`)

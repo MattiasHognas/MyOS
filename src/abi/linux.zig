@@ -149,8 +149,7 @@ pub const Sys = struct {
     pub const fchmod = 91;
     /// `mknodat(dirfd, path, mode, dev)`: no devices or FIFOs can be made.
     pub const mknodat = 259;
-    /// `memfd_create(name, flags)`: files that exist only in memory are
-    /// not offered yet (`ENOSYS`).
+    /// `memfd_create(name, flags)`: a file that exists only in memory.
     pub const memfd_create = 319;
     /// `chdir(path)` and `fchdir(fd)`: the working directory.
     pub const chdir = 80;
@@ -910,3 +909,23 @@ pub const Statx = extern struct {
 comptime {
     if (@sizeOf(Statx) != 256) @compileError("struct statx is 256 bytes");
 }
+
+/// `memfd_create` flags.
+pub const MFD = struct {
+    pub const CLOEXEC: u64 = 0x1;
+    pub const ALLOW_SEALING: u64 = 0x2;
+    pub const HUGETLB: u64 = 0x4;
+    pub const NOEXEC_SEAL: u64 = 0x8;
+    pub const EXEC: u64 = 0x10;
+};
+
+/// `fcntl` commands for seals, and the seals.
+pub const F_ADD_SEALS: u64 = 1033;
+pub const F_GET_SEALS: u64 = 1034;
+pub const F_SEAL = struct {
+    pub const SEAL: u64 = 0x1;
+    pub const SHRINK: u64 = 0x2;
+    pub const GROW: u64 = 0x4;
+    pub const WRITE: u64 = 0x8;
+    pub const FUTURE_WRITE: u64 = 0x10;
+};

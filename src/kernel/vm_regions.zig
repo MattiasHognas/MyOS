@@ -66,6 +66,9 @@ pub const Kind = enum(u8) {
     /// first touch and never the process's own (`kernel/vdso.zig`).
     vvar,
     vdso,
+    /// A shared mapping of a memory object (`MAP_SHARED`, `memfd.zig`):
+    /// its pages are the object's own, the same for every mapping of it.
+    shared,
 };
 
 /// Where a file-backed region reads its pages from.
@@ -75,7 +78,23 @@ pub const Backing = struct {
     file: [3]u64 = .{ 0, 0, 0 },
     /// Offset in the file of the region's first byte. Page aligned.
     offset: u64 = 0,
+    /// The region holds what `file` names (a memory object), through
+    /// `hold`: one hold for each region, taken as it is made or cut in
+    /// two and given up as it goes.
+    counted: bool = false,
+    /// For `hold`: a shared mapping that may be made writable.
+    may_write: bool = false,
 };
+
+/// What takes and gives up a counted region's hold on its backing
+/// (`Backing.counted`), set by the kernel (`memfd.zig`); none in the host
+/// tests.
+pub var hold: ?*const fn (backing: Backing, take: bool) void = null;
+
+fn holdOf(r: Region, take: bool) void {
+    if (!r.backing.counted) return;
+    if (hold) |f| f(r.backing, take);
+}
 
 pub const Region = struct {
     /// First address, page aligned.
@@ -88,6 +107,11 @@ pub const Region = struct {
     backing: Backing = .{},
 
     /// The file offset of the page at `addr`, which is in this region.
+    /// Whether the region has a file offset: a file's or an object's.
+    pub fn hasOffset(r: Region) bool {
+        return r.kind == .file or r.kind == .shared;
+    }
+
     pub fn fileOffset(r: Region, addr: u64) u64 {
         return r.backing.offset + (addr - r.start);
     }
@@ -121,8 +145,15 @@ pub const Regions = struct {
     list: std.ArrayListUnmanaged(Region) = .empty,
 
     pub fn deinit(self: *Regions, gpa: std.mem.Allocator) void {
+        for (self.list.items) |r| holdOf(r, false);
         self.list.deinit(gpa);
         self.* = .{};
+    }
+
+    /// Take a hold for every counted region: for a copy of another
+    /// address space's list (`fork`), which holds them as well.
+    pub fn holdAll(self: *const Regions) void {
+        for (self.list.items) |r| holdOf(r, true);
     }
 
     /// The regions, in order of address.
@@ -227,6 +258,7 @@ pub const Regions = struct {
         } else {
             if (list.len >= MAX_REGIONS) return error.TooManyRegions;
             self.list.insert(gpa, i, new) catch return error.OutOfMemory;
+            holdOf(new, true); // (a counted region never merges)
         }
     }
 
@@ -240,9 +272,10 @@ pub const Regions = struct {
         if (self.list.items.len >= MAX_REGIONS) return error.TooManyRegions;
         var upper = r;
         upper.start = addr;
-        if (r.kind == .file) upper.backing.offset = r.fileOffset(addr);
+        if (r.hasOffset()) upper.backing.offset = r.fileOffset(addr);
         self.list.insert(gpa, i + 1, upper) catch return error.OutOfMemory;
         self.list.items[i].end = addr;
+        holdOf(upper, true); // two regions now, each holding
     }
 
     /// Remove `[start, start + len)` from whatever regions it is in; parts
@@ -256,6 +289,7 @@ pub const Regions = struct {
         const first = self.lowerBound(start);
         var last = first;
         while (last < self.list.items.len and self.list.items[last].start < end) last += 1;
+        for (self.list.items[first..last]) |r| holdOf(r, false);
         self.list.replaceRangeAssumeCapacity(first, last - first, &.{});
     }
 

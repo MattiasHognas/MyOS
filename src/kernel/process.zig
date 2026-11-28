@@ -1501,6 +1501,7 @@ noinline fn copyMemory(parent: *Process, root: u64, mem: *user_memory.UserMemory
             if (mem.regions.list.capacity >= parent.mem.regions.list.items.len) {
                 mem.regions.list.clearRetainingCapacity();
                 mem.regions.list.appendSliceAssumeCapacity(parent.mem.regions.list.items);
+                mem.regions.holdAll(); // the child's regions hold what the parent's do (memory objects)
                 mem.brk_start = parent.mem.brk_start;
                 mem.brk_end = parent.mem.brk_end;
                 mem.mmap_top = parent.mem.mmap_top;

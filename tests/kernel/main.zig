@@ -924,6 +924,19 @@ fn hugePages() TestError!void {
     try expectFootprint(memory);
 }
 
+/// Memory files and shared mappings from ring 3 (two mappings of one
+/// file, code run from one written through the other, `fork`, seals),
+/// two copies at once; nothing left behind.
+fn memoryFiles() TestError!void {
+    _ = helpers.runProgram("/test/memfd"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/memfd") orelse return error.Failed;
+    if (code != 0) report("/test/memfd failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/memfd"));
+    try expectFootprint(memory);
+}
+
 /// Restartable sequences from ring 3 (the CPU kept in the area, a
 /// critical section aborted by a signal, a forked child's registration),
 /// two copies at once; nothing left behind.
@@ -2102,6 +2115,7 @@ fn runCases() noreturn {
         .{ .name = "real-time signals, rt_sigtimedwait, signalfd (ring 3)", .func = queuedSignals },
         .{ .name = "flock: shared, exclusive, waiting, given up on close (ring 3)", .func = fileLocks },
         .{ .name = "rseq and getcpu: the CPU in the area, a critical section aborted, kept by fork (ring 3)", .func = restartableSequences },
+        .{ .name = "memfd_create and shared mappings: two views of one file, the JIT's W^X, fork, seals (ring 3)", .func = memoryFiles },
         .{ .name = "2 MiB pages: given, split, copied, moved (ring 3)", .func = hugePages },
         .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
         .{ .name = "clocks: TSC or HPET, in step on every CPU; sleeps; the wall clock from the RTC", .func = clocks },

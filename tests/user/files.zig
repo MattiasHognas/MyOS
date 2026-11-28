@@ -430,9 +430,9 @@ pub fn main() noreturn {
     const motd = lib.open("/etc/motd");
     expect(lib.syscall(Sys.fchmod, motd, 0o600, 0) == lib.err(.ROFS) and lib.syscall(Sys.fchmod, 99, 0o600, 0) == lib.err(.BADF), 75);
     expect(lib.syscall(Sys.ftruncate, motd, 0, 0) == lib.err(.INVAL) and lib.syscall(Sys.ftruncate, 99, 0, 0) == lib.err(.BADF), 76);
-    // No networking, no files in memory only.
+    // No networking.
     expect(lib.syscall(Sys.socket, 1, 1, 0) == lib.err(.AFNOSUPPORT), 77);
-    expect(lib.syscall(Sys.memfd_create, @intFromPtr("x"), 0, 0) == lib.err(.NOSYS), 78);
+    expect(lib.syscall(Sys.memfd_create, @intFromPtr("x"), 0x100, 0) == lib.err(.INVAL), 78); // offered (`/test/memfd`); not with an unknown flag
 
     // --- The descriptor table grows: to a descriptor far up, and back.
     expect(lib.syscall(Sys.dup2, motd, 700, 0) == 700, 80);

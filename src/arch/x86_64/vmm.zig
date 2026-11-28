@@ -71,6 +71,11 @@ pub const SHARED: u64 = 1 << 9;
 /// that cannot be written is only read-only, and gets this bit if the
 /// region is made writable (`protect`). Another bit for software.
 pub const COW: u64 = 1 << 10;
+/// A page of a shared mapping of a memory object (`memfd.zig`): the same
+/// page in every mapping of it, each entry one of its owners. `fork` maps
+/// it into the child as it is, writable or not, never copy-on-write.
+/// Another bit for software.
+pub const SHARED_MAP: u64 = 1 << 11;
 /// Page table entry flag: instruction fetches are not allowed (requires EFER.NXE).
 pub const NX: u64 = 1 << 63;
 /// Page table entry flag: write-through caching.
@@ -506,6 +511,17 @@ fn copyLevel(t: *[512]u64, to: u64, level: u6, base: u64, taken: *usize) MapErro
             var tables: usize = 0;
             try mapCounting(to, virt, e & ADDR_MASK, e & ~ADDR_MASK & ~PRESENT, &tables);
             taken.* += tables;
+        } else if (level == 0 and e & SHARED_MAP != 0) {
+            // A page of a shared mapping: the child's mapping is the same
+            // page, one more owner of it (copied only if it has as many
+            // as can be counted, which no program reaches).
+            if (!pmm.share(e & ADDR_MASK)) return error.OutOfMemory;
+            var tables: usize = 0;
+            mapCounting(to, virt, e & ADDR_MASK, e & ~ADDR_MASK & ~PRESENT, &tables) catch |err| {
+                pmm.release(e & ADDR_MASK);
+                return err;
+            };
+            taken.* += 1 + tables;
         } else if (level == 0) {
             // Shared, read-only in both and marked copy-on-write: copied
             // only when one of them writes to it. A page with as many
@@ -674,6 +690,8 @@ fn walkUserRange(phys: u64, level: u6, base: u64, start: u64, end: u64, action: 
                     const keep = e & ~(USER | WRITABLE | NX | COW);
                     t[i] = if (e & SHARED != 0)
                         keep | (bits & ~WRITABLE)
+                    else if (e & SHARED_MAP != 0)
+                        keep | bits // a shared mapping's page: as asked
                     else if (bits & WRITABLE != 0 and (e & COW != 0 or pmm.isShared(e & ADDR_MASK)))
                         keep | (bits & ~WRITABLE) | COW
                     else

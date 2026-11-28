@@ -18,6 +18,9 @@ pub const Rank = enum(u8) {
     address_space,
     /// One process's open files.
     descriptor_table,
+    /// A memory object's (`memfd.zig`): taken in a page fault, under the
+    /// address-space lock.
+    memory_object,
     /// A condition some thread waits for, with the wait queue for it: the
     /// keyboard buffer, a mutex's owner. The default.
     condition,

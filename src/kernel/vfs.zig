@@ -40,6 +40,8 @@ pub const Error = error{
     Busy,
     /// A rename from one filesystem to another.
     CrossDevice,
+    /// Forbidden for this file (a sealed memory object: `memfd.zig`).
+    NotPermitted,
 };
 
 /// Longest name of one file or directory, as on Linux.
