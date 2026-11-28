@@ -1,0 +1,26 @@
+# 2026-11-28T05:05Z commit b201977, 4 CPUs under KVM (AMD Ryzen 9 9950X3D 16-Core Processor)
+name,copies,linux_ns,linux_nomit_ns,myos_ns,myos_vs_linux
+clock_gettime,1,15.1,15.1,16.1,1.07
+clock_gettime_syscall,1,53.4,53.4,50.6,0.95
+dotnet_alloc,1,2.2,2.2,2.3,1.05
+dotnet_alloc,2,2.9,2.9,3.1,1.07
+dotnet_alloc,4,3.6,3.7,4.0,1.11
+dotnet_cpu,1,1.1,1.1,1.1,1.00
+dotnet_cpu,2,1.1,1.1,1.1,1.00
+dotnet_cpu,4,1.1,1.1,1.1,1.00
+dotnet_threadpool,1,70.1,60.8,61.4,0.88
+dotnet_threadpool,2,101.4,98.2,112.5,1.11
+dotnet_threadpool,4,212.2,203.0,212.6,1.00
+fork_wait,1,13803.0,14055.6,16025.0,1.16
+futex_pingpong,1,959.0,937.5,81.8,0.09
+getppid,1,30.2,29.6,38.6,1.28
+getppid,2,29.9,30.3,37.6,1.26
+getppid,4,30.4,30.3,38.0,1.25
+mmap_churn,1,1118.6,1121.0,775.4,0.69
+mmap_churn,2,20306.8,17868.4,3685.3,0.18
+mmap_churn,4,28994.8,30203.6,23120.9,0.80
+page_fault,1,35.6,35.6,38.4,1.08
+page_fault,2,65.5,65.3,57.5,0.88
+page_fault,4,86.3,93.3,82.0,0.95
+pipe_pingpong,1,1032.2,1035.3,393.9,0.38
+thread_create,1,31605.3,31543.0,29982.1,0.95

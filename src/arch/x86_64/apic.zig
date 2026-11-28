@@ -4,6 +4,14 @@
 //! APIC and masks every I/O APIC input. `route` then unmasks individual legacy
 //! IRQs, and `timerInit` calibrates the LAPIC timer against the HPET and starts
 //! it in periodic mode.
+//!
+//! **x2APIC.** Where the CPU has it, every local APIC runs in x2APIC mode,
+//! with its registers as MSRs instead of a page of memory, as Linux runs
+//! them: an interrupt to another CPU is one write instead of two writes and
+//! a polled read, and under a hypervisor each of those memory accesses can
+//! be an exit from the guest, where the MSRs have a fast path. The end of
+//! every interrupt is a register write too. `x2apic` says which mode; the
+//! register functions below pick the access.
 
 const hpet = @import("../../drivers/hpet.zig");
 const acpi = @import("../../firmware/acpi.zig");
@@ -25,9 +33,27 @@ var ioapic: usize = 0;
 var ioapic_gsi_base: u32 = 0;
 var ioapic_entries: u32 = 0;
 
-/// Return a pointer to the local APIC register at byte offset `off`.
+/// Whether the local APICs run in x2APIC mode (decided on the boot CPU,
+/// before any other is up, from `cpuid`).
+pub var x2apic = false;
+
+/// Return a pointer to the local APIC register at byte offset `off`
+/// (xAPIC mode).
 fn lapicReg(off: usize) *volatile u32 {
     return @ptrFromInt(lapic + off);
+}
+
+/// The MSR of the register at byte offset `off`, in x2APIC mode.
+fn msrOf(off: usize) u32 {
+    return 0x800 + @as(u32, @intCast(off >> 4));
+}
+
+fn readReg(off: usize) u32 {
+    return if (x2apic) @truncate(cpu.rdmsr(msrOf(off))) else lapicReg(off).*;
+}
+
+fn writeReg(off: usize, value: u32) void {
+    if (x2apic) cpu.wrmsr(msrOf(off), value) else lapicReg(off).* = value;
 }
 
 /// Read I/O APIC register `reg`. The register index is selected through
@@ -61,7 +87,7 @@ fn disablePic() void {
 
 /// Signal end-of-interrupt to the local APIC so it can deliver the next interrupt.
 pub fn eoi() void {
-    lapicReg(0xB0).* = 0;
+    writeReg(0xB0, 0);
 }
 
 /// True once the local APIC is mapped and enabled on the boot CPU.
@@ -84,23 +110,30 @@ pub fn sendNmi(apic_id: u32) void {
 /// Write the interrupt command register and wait until the local APIC has
 /// sent the interrupt.
 fn sendCommand(apic_id: u32, low: u32) void {
+    if (x2apic) {
+        // One write of both halves; x2APIC has no delivery status to wait on.
+        cpu.wrmsr(0x830, (@as(u64, apic_id) << 32) | low);
+        return;
+    }
     lapicReg(0x310).* = apic_id << 24;
     lapicReg(0x300).* = low;
     while (lapicReg(0x300).* & (1 << 12) != 0) {} // delivery status: pending
 }
 
-/// Return the local APIC ID of the calling CPU.
-pub fn id() u8 {
-    return @truncate(lapicReg(0x20).* >> 24);
+/// Return the local APIC ID of the calling CPU (32 bits in x2APIC mode).
+pub fn id() u32 {
+    if (x2apic) return @truncate(cpu.rdmsr(0x802));
+    return lapicReg(0x20).* >> 24;
 }
 
 /// Enable this CPU's local APIC: globally (MSR), accepting all priorities,
 /// software-enabled with the spurious vector. Every CPU runs this as it
 /// comes up; the boot CPU from `init`.
 pub fn initCpu() void {
-    cpu.wrmsr(0x1B, cpu.rdmsr(0x1B) | (1 << 11));
-    lapicReg(0x80).* = 0; // task priority: accept everything
-    lapicReg(0xF0).* = 0x100 | @as(u32, SPURIOUS); // bit 8 = enable
+    // Bit 11 enables the APIC, bit 10 (with it) puts it in x2APIC mode.
+    cpu.wrmsr(0x1B, cpu.rdmsr(0x1B) | (1 << 11) | (if (x2apic) @as(u64, 1 << 10) else 0));
+    writeReg(0x80, 0); // task priority: accept everything
+    writeReg(0xF0, 0x100 | @as(u32, SPURIOUS)); // bit 8 = enable
 }
 
 /// Initialize the interrupt controllers.
@@ -111,8 +144,10 @@ pub fn initCpu() void {
 pub fn init() void {
     if (acpi.has_8259) disablePic();
 
-    // Local APIC: map it (every CPU reaches its own at the same address), enable.
+    // Local APIC: map it (every CPU reaches its own at the same address),
+    // enable, in x2APIC mode where the CPU has it (CPUID.1:ECX bit 21).
     lapic = vmm.mapMmio(acpi.lapic_addr, 0x1000);
+    x2apic = cpu.cpuid(1, 0).ecx & (1 << 21) != 0;
     initCpu();
 
     // I/O APIC: map, read how many inputs it has, start with all masked.
@@ -144,7 +179,7 @@ pub fn route(irq: u8, vector: u8) void {
     if (((flags >> 2) & 0b11) == 0b11) low |= 1 << 15; // level triggered
 
     const idx = gsi - ioapic_gsi_base;
-    ioWrite(0x11 + 2 * idx, @as(u32, id()) << 24); // destination LAPIC
+    ioWrite(0x11 + 2 * idx, (id() & 0xFF) << 24); // destination LAPIC (8 bits: the I/O APIC's)
     ioWrite(0x10 + 2 * idx, low); // write low last: unmasks it
 }
 
@@ -154,13 +189,13 @@ pub fn route(irq: u8, vector: u8) void {
 /// stores the result in `ticks_per_ms`, then switches it to periodic mode.
 /// Requires `init` and `hpet.init` to have run.
 pub fn timerInit(hz: u32) void {
-    lapicReg(0x3E0).* = 0x3; // divide the bus clock by 16
-    lapicReg(0x320).* = 1 << 16; // masked, one-shot: measure only
-    lapicReg(0x380).* = 0xFFFF_FFFF; // start counting down
+    writeReg(0x3E0, 0x3); // divide the bus clock by 16
+    writeReg(0x320, 1 << 16); // masked, one-shot: measure only
+    writeReg(0x380, 0xFFFF_FFFF); // start counting down
 
     hpet.sleepNs(10_000_000); // 10 ms
 
-    const elapsed = 0xFFFF_FFFF - lapicReg(0x390).*;
+    const elapsed = 0xFFFF_FFFF - readReg(0x390);
     ticks_per_ms = elapsed / 10;
 
     timerStart(hz);
@@ -170,7 +205,7 @@ pub fn timerInit(hz: u32) void {
 /// at the rate `timerInit` measured on the boot CPU: the timers of all CPUs
 /// count the same clock.
 pub fn timerStart(hz: u32) void {
-    lapicReg(0x3E0).* = 0x3; // divide the bus clock by 16
-    lapicReg(0x320).* = @as(u32, TIMER_VECTOR) | (1 << 17); // periodic, unmasked
-    lapicReg(0x380).* = @intCast(@as(u64, ticks_per_ms) * 1000 / hz);
+    writeReg(0x3E0, 0x3); // divide the bus clock by 16
+    writeReg(0x320, @as(u32, TIMER_VECTOR) | (1 << 17)); // periodic, unmasked
+    writeReg(0x380, @intCast(@as(u64, ticks_per_ms) * 1000 / hz));
 }
