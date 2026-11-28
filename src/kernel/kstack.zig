@@ -106,6 +106,10 @@ fn unmapPages(low: usize, count: usize) void {
     for (pages[0..count]) |phys| pmm.free(phys orelse @panic("kstack: stack page not mapped"));
 }
 
+/// (`allocSized`, `free` and `trim` are not inlined: each has locals of
+/// its own, and inlined together into one caller they would make its stack
+/// frame large on the deepest paths.)
+///
 /// Allocate a kernel stack: reserve a slot and map fresh pages (writable,
 /// not executable) above its guard page. Returns the stack's memory; the
 /// initial stack pointer is its end. The contents are not zeroed. Returns
@@ -118,7 +122,7 @@ pub fn alloc() ?[]u8 {
 /// stack whose use is known and small: an emergency stack. It takes a slot
 /// like any other and has the top `pages` pages of it; everything below
 /// stays unmapped, so it is guarded just the same. Free it with `free`.
-pub fn allocSized(pages: usize) ?[]u8 {
+pub noinline fn allocSized(pages: usize) ?[]u8 {
     assert.check(.kstack, pages >= 1 and pages <= STACK_PAGES, "a kernel stack of {d} pages", .{pages});
     const held = lock.acquire();
     defer lock.release(held);
@@ -188,7 +192,7 @@ pub fn peak() usize {
 
 /// Free a stack returned by `alloc`: unmap its pages, give them back to the
 /// PMM and release the slot for reuse. No thread may be running on it.
-pub fn free(stack: []u8) void {
+pub noinline fn free(stack: []u8) void {
     const low = @intFromPtr(stack.ptr);
     assert.check(.kstack, owns(stack), "freeing 0x{x}+{d}, which is not a kernel stack", .{ low, stack.len });
     const slot = (low - REGION_START) / SLOT_SIZE;
@@ -209,7 +213,7 @@ pub fn free(stack: []u8) void {
 /// Give every kept stack back (unmapped, its pages and slot free): for
 /// code that has to see stacks come and go exactly (tests), or wants their
 /// memory. Interrupts on or off.
-pub fn trim() void {
+pub noinline fn trim() void {
     while (true) {
         const held = lock.acquire();
         defer lock.release(held);
