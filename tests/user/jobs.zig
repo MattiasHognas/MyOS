@@ -144,9 +144,12 @@ pub fn main() noreturn {
     // SIGCONT continues it, and the SIGTERM then ends it.
     const chld_mid = chld_count.load(.monotonic);
     kill(a, SIGCONT);
-    expect(wait4(a, &status, abi.WCONTINUED) == a and status == 0xffff, 11);
+    // Reported as continued, unless it has died of the SIGTERM already by
+    // the time this asks: then that is what is reported (as on Linux,
+    // where a child that ended is reported first).
+    expect(wait4(a, &status, abi.WCONTINUED) == a and (status == 0xffff or status == SIGTERM), 11);
     expect(chld_count.load(.monotonic) > chld_mid, 12);
-    expect(wait4(a, &status, 0) == a and status == SIGTERM, 13);
+    if (status == 0xffff) expect(wait4(a, &status, 0) == a and status == SIGTERM, 13);
 
     // --- SIGKILL ends a stopped process.
     const b = lib.syscall(Sys.fork, 0, 0, 0);

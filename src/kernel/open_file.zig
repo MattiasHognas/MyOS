@@ -139,7 +139,10 @@ fn readMemory(node: *const vfs.Node, offset: u64, buf: []u8) usize {
 /// Free an open file whose last reference is gone, and tell what it was
 /// open on.
 pub fn destroy(of: *OpenFile) void {
-    if (@atomicLoad(bool, &of.locked, .acquire)) flock.releaseAll(id(of));
+    if (@atomicLoad(bool, &of.locked, .acquire)) {
+        flock.releaseAll(id(of));
+        @import("reclock.zig").releaseOwner(.{ .open_file = id(of) }, null); // its OFD locks
+    }
     switch (of.kind) {
         .pipe_read => pipe.closeEnd(of.pipe, .read),
         .pipe_write => pipe.closeEnd(of.pipe, .write),

@@ -973,6 +973,7 @@ fn fileLocks() TestError!void {
     try check(code == 0);
     try check(helpers.runPair("/test/flock"));
     try check(root.kernel.flock.count() == 0);
+    try check(root.kernel.reclock.count() == 0);
     try expectFootprint(memory);
 }
 

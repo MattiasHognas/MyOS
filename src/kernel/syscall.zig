@@ -7,6 +7,7 @@
 //! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
 const std = @import("std");
+const reclock = @import("reclock.zig");
 const kfifo = @import("fifo.zig");
 const memfd = @import("memfd.zig");
 const rseq = @import("rseq.zig");
@@ -979,7 +980,10 @@ fn sysDup2(old: u64, new: u64, same_is_error: bool, cloexec: bool) u64 {
         p.fd_cloexec[at] = cloexec;
         break :blk before;
     };
-    if (replaced) |r| putFile(r);
+    if (replaced) |r| {
+        proc.descriptorClosed(p, r);
+        putFile(r);
+    }
     return new;
 }
 
@@ -2024,6 +2028,8 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
             open_file.setNonblocking(of, arg & abi.O.NONBLOCK != 0);
             return 0;
         },
+        5, 6, 7 => return recordLock(p, of, arg, command == 5, command == 7, false), // F_GETLK, F_SETLK, F_SETLKW
+        36, 37, 38 => return recordLock(p, of, arg, command == 36, command == 38, true), // the F_OFD_ forms
         abi.F_ADD_SEALS, abi.F_GET_SEALS => {
             // Only a memory object has seals (Linux: EINVAL for others).
             const o = (if (of.kind == .file) memfd.fromNode(&of.node) else null) orelse return err(.INVAL);
@@ -2040,6 +2046,84 @@ fn sysFcntl(fd: u64, command: u64, arg: u64) u64 {
     }
 }
 
+/// `struct flock`, of the record-lock commands of `fcntl`.
+const Flock = extern struct {
+    type: i16,
+    whence: i16,
+    _pad: u32 = 0,
+    start: i64,
+    len: i64,
+    pid: i32,
+    _pad2: u32 = 0,
+};
+
+/// The record-lock commands of `fcntl` (`reclock.zig`): `F_GETLK` says
+/// what is in the way of a lock (`l_type` `F_UNLCK` if nothing), `F_SETLK`
+/// sets or removes one without waiting (`EAGAIN`), `F_SETLKW` waits
+/// (`EINTR`). POSIX locks are the process's; the `F_OFD_` forms' are the
+/// open file's (`l_pid` must be 0, and `F_GETLK` reports -1 for them).
+/// The range is `l_start` from `l_whence` for `l_len` bytes (0: to the
+/// end, however it grows; negative: before `l_start`). A read lock needs
+/// the file open for reading and a write lock for writing (`EBADF`).
+/// `EINVAL` for a range before 0, a bad type or whence, or a file that is
+/// not one (a pipe).
+fn recordLock(p: *proc.Process, of: *OpenFile, arg: u64, get: bool, wait: bool, ofd: bool) u64 {
+    var fl = fromUser(Flock, arg) orelse return err(.FAULT);
+    if (of.kind != .file) return err(.INVAL);
+    if (ofd and fl.pid != 0) return err(.INVAL);
+    const base: i64 = switch (fl.whence) {
+        0 => 0, // SEEK_SET
+        1 => std.math.cast(i64, open_file.getOffset(of)) orelse return err(.OVERFLOW),
+        2 => std.math.cast(i64, vfs.sizeOf(&of.node)) orelse return err(.OVERFLOW),
+        else => return err(.INVAL),
+    };
+    // In signed arithmetic, every bound checked before it becomes an offset.
+    var start = std.math.add(i64, base, fl.start) catch return err(.OVERFLOW);
+    var end_signed: ?i64 = null; // null: to the end
+    if (fl.len > 0) {
+        end_signed = std.math.add(i64, start, fl.len) catch return err(.OVERFLOW);
+    } else if (fl.len < 0) {
+        end_signed = start;
+        start = std.math.add(i64, start, fl.len) catch return err(.INVAL);
+    }
+    if (start < 0) return err(.INVAL);
+    const s: u64 = @intCast(start);
+    const end: u64 = if (end_signed) |e| @intCast(e) else reclock.TO_END; // e > start >= 0
+    const owner: reclock.Owner = if (ofd) .{ .open_file = open_file.id(of) } else .{ .process = p.pid };
+    const key: reclock.Key = .{ .a = @intFromPtr(of.node.ops), .b = of.node.ctx };
+    const F_RDLCK = 0;
+    const F_WRLCK = 1;
+    const F_UNLCK = 2;
+    if (fl.type != F_RDLCK and fl.type != F_WRLCK and fl.type != F_UNLCK) return err(.INVAL);
+    if (get) {
+        if (fl.type == F_UNLCK) return err(.INVAL);
+        if (reclock.test_(key, owner, s, end, fl.type == F_WRLCK)) |c| {
+            fl.type = if (c.write) F_WRLCK else F_RDLCK;
+            fl.whence = 0;
+            fl.start = @intCast(c.start);
+            fl.len = if (c.end == reclock.TO_END) 0 else @intCast(c.end - c.start);
+            fl.pid = switch (c.owner) {
+                .process => |pid| @intCast(pid),
+                .open_file => -1,
+            };
+        } else fl.type = F_UNLCK;
+        return if (toUser(arg, fl)) 0 else err(.FAULT);
+    }
+    if (fl.type == F_RDLCK and !of.readable) return err(.BADF);
+    if (fl.type == F_WRLCK and !of.writable) return err(.BADF);
+    if (ofd) @atomicStore(bool, &of.locked, true, .release) else p.record_locks.store(true, .release);
+    reclock.set(key, owner, s, end, switch (fl.type) {
+        F_RDLCK => .read,
+        F_WRLCK => .write,
+        else => .unlock,
+    }, !wait) catch |e| return switch (e) {
+        error.WouldBlock => err(.AGAIN),
+        error.Interrupted => err(.INTR),
+        error.NoLocks => err(.NOLCK),
+    };
+    return 0;
+}
+
 /// `close`: make descriptor `fd` free again. What it referred to goes
 /// when its last descriptor does. Returns 0, or `EBADF` if `fd` is not open.
 fn sysClose(fd: u64) u64 {
@@ -2053,6 +2137,7 @@ fn sysClose(fd: u64) u64 {
         slot.* = null;
         break :blk of;
     };
+    proc.descriptorClosed(p, of);
     putFile(of); // the descriptor's reference; a call in flight keeps its own
     return 0;
 }

@@ -364,17 +364,19 @@ pub const E = enum(u16) {
     NOLCK = 37,
     /// Function not implemented: unknown syscall number.
     NOSYS = 38,
-    /// Illegal seek: the descriptor has no position.
     /// File too large.
     FBIG = 27,
     /// No space left on the device.
     NOSPC = 28,
+    /// Illegal seek: the descriptor has no position.
     SPIPE = 29,
     /// Broken pipe: nobody is left to read what is written.
     PIPE = 32,
-    /// The time ran out.
+    /// A value too large for its type (a lock range past the largest offset).
+    OVERFLOW = 75,
     /// Operation not supported (`EOPNOTSUPP`).
     OPNOTSUPP = 95,
+    /// The time ran out.
     TIMEDOUT = 110,
 };
 

@@ -347,6 +347,9 @@ pub const Process = struct {
     /// The most pages it has had (`getrusage`'s `ru_maxrss`), kept at
     /// least as high as `pages` when it is looked at and when it ends.
     max_pages: u64 = 0,
+    /// Set once it has taken a record lock (`reclock.zig`): closing a
+    /// descriptor then gives up its locks on that file, as POSIX has it.
+    record_locks: std.atomic.Value(bool) = .init(false),
     /// Its nice value (`setpriority`), -20 to 19. The scheduler does not
     /// look at it: every thread gets the same share.
     nice: i8 = 0,
@@ -1764,6 +1767,7 @@ var live: usize = 0;
 /// Close every open file of `p` and free its descriptor table. Nothing
 /// else uses them: the caller is the process's last thread.
 fn closeFiles(p: *Process) void {
+    if (p.record_locks.load(.acquire)) @import("reclock.zig").releaseOwner(.{ .process = p.pid }, null);
     for (p.files) |*slot| {
         if (slot.*) |of| open_file.unref(of);
         slot.* = null;
@@ -2111,8 +2115,17 @@ fn closeOnExec(p: *Process) void {
             }
             return;
         };
+        descriptorClosed(p, of);
         open_file.unref(of); // outside the lock: it may free a pipe
     }
+}
+
+/// `p` has closed a descriptor of `of` (`close`, `dup2` over it,
+/// close-on-exec): its POSIX record locks on that file go, as POSIX has
+/// it, whatever other descriptors of it it still has.
+pub fn descriptorClosed(p: *Process, of: *open_file.OpenFile) void {
+    if (!p.record_locks.load(.acquire) or of.kind != .file) return;
+    @import("reclock.zig").releaseOwner(.{ .process = p.pid }, .{ .a = @intFromPtr(of.node.ops), .b = of.node.ctx });
 }
 
 /// A program file `execve` is to run: its contents, and for a script the

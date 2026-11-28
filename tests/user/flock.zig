@@ -86,6 +86,84 @@ pub fn main() noreturn {
     // Its lock went with its open file.
     expect(flock(a, LOCK.EX | LOCK.NB) == 0, 25);
 
+    // --- Record locks (fcntl): byte ranges, per process or per open file.
+    {
+        const F_GETLK = 5;
+        const F_SETLK = 6;
+        const F_SETLKW = 7;
+        const F_OFD_SETLK = 37;
+        const RD = 0;
+        const WR = 1;
+        const UN = 2;
+        const Flock = extern struct { type: i16, whence: i16 = 0, _pad: u32 = 0, start: i64, len: i64, pid: i32 = 0, _pad2: u32 = 0 };
+        const op = struct {
+            fn lk(fd: u64, cmd: u64, t: i16, start: i64, len: i64) u64 {
+                var fl: Flock = .{ .type = t, .start = start, .len = len };
+                return lib.syscall(Sys.fcntl, fd, cmd, @intFromPtr(&fl));
+            }
+            fn get(fd: u64, t: i16, start: i64, len: i64) Flock {
+                var fl: Flock = .{ .type = t, .start = start, .len = len };
+                _ = lib.syscall(Sys.fcntl, fd, F_GETLK, @intFromPtr(&fl));
+                return fl;
+            }
+        };
+        const me: i32 = @intCast(lib.syscall(Sys.getpid, 0, 0, 0));
+        const f = lib.syscall(Sys.open, @intFromPtr(name.ptr), abi.O.RDWR, 0);
+        expect(op.lk(f, F_SETLK, WR, 0, 10) == 0, 30);
+        expect(op.get(f, WR, 0, 10).type == UN, 31); // its own locks are never in its way
+        // Another process: told who is in its way, refused without waiting.
+        const c1 = lib.syscall(Sys.fork, 0, 0, 0);
+        if (c1 == 0) {
+            const g = op.get(f, WR, 5, 1);
+            if (g.type != WR or g.start != 0 or g.len != 10 or g.pid != me) lib.exit(50);
+            if (op.lk(f, F_SETLK, RD, 5, 1) != lib.err(.AGAIN)) lib.exit(51);
+            if (op.lk(f, F_SETLK, WR, 20, 0) != 0) lib.exit(52); // to the end: free
+            lib.exit(0);
+        }
+        expect(lib.syscall6(Sys.wait4, c1, @intFromPtr(&status), 0, 0, 0, 0) == c1 and status == 0, 32);
+        // Part of it given up: that part is free, the rest still held.
+        expect(op.lk(f, F_SETLK, UN, 0, 5) == 0, 33);
+        // Waiting (F_SETLKW) until it is given up.
+        const c2 = lib.syscall(Sys.fork, 0, 0, 0);
+        if (c2 == 0) {
+            if (op.lk(f, F_SETLK, WR, 0, 5) != 0) lib.exit(53); // the part given up
+            if (op.lk(f, F_SETLK, WR, 5, 1) != lib.err(.AGAIN)) lib.exit(54);
+            if (op.lk(f, F_SETLKW, WR, 5, 1) != 0) lib.exit(55); // waits for the parent
+            lib.exit(0);
+        }
+        sleepMs(30);
+        expect(op.lk(f, F_SETLK, UN, 0, 0) == 0, 34);
+        expect(lib.syscall6(Sys.wait4, c2, @intFromPtr(&status), 0, 0, 0, 0) == c2 and status == 0, 35);
+        // Closing any descriptor of the file gives the process's locks up.
+        expect(op.lk(f, F_SETLK, WR, 0, 1) == 0, 36);
+        const other = lib.syscall(Sys.open, @intFromPtr(name.ptr), abi.O.RDONLY, 0);
+        _ = lib.close(other);
+        const c3 = lib.syscall(Sys.fork, 0, 0, 0);
+        if (c3 == 0) lib.exit(if (op.get(f, WR, 0, 1).type == UN) 0 else 56);
+        expect(lib.syscall6(Sys.wait4, c3, @intFromPtr(&status), 0, 0, 0, 0) == c3 and status == 0, 37);
+        // OFD locks: two open files of one process are two owners.
+        const x = lib.syscall(Sys.open, @intFromPtr(name.ptr), abi.O.RDWR, 0);
+        const y = lib.syscall(Sys.open, @intFromPtr(name.ptr), abi.O.RDWR, 0);
+        expect(op.lk(x, F_OFD_SETLK, WR, 0, 5) == 0, 38);
+        expect(op.lk(y, F_OFD_SETLK, WR, 0, 5) == lib.err(.AGAIN), 39);
+        _ = lib.close(x); // its locks go with it
+        expect(op.lk(y, F_OFD_SETLK, WR, 0, 5) == 0, 40);
+        // What is refused.
+        expect(op.lk(f, F_SETLK, 9, 0, 1) == lib.err(.INVAL), 41);
+        expect(op.lk(f, F_SETLK, WR, -5, 1) == lib.err(.INVAL), 42);
+        // Ranges at the edges of what fits: refused, the kernel unharmed.
+        expect(op.lk(f, F_SETLK, WR, std.math.maxInt(i64), 1) == lib.err(.OVERFLOW), 45);
+        expect(op.lk(f, F_SETLK, WR, 0, std.math.minInt(i64)) == lib.err(.INVAL), 46);
+        expect(op.lk(f, F_SETLK, WR, 10, -11) == lib.err(.INVAL), 47); // before 0
+        expect(op.lk(f, F_SETLK, WR, 20, -10) == 0 and op.lk(f, F_SETLK, UN, 10, 10) == 0, 48); // [10, 20), clear of y's
+        const ro = lib.open(name);
+        expect(op.lk(ro, F_SETLK, WR, 0, 1) == lib.err(.BADF), 43); // a write lock on a file open for reading
+        var p: [2]i32 = undefined;
+        _ = lib.syscall(Sys.pipe2, @intFromPtr(&p), 0, 0);
+        expect(op.lk(@intCast(p[0]), F_SETLK, RD, 0, 1) == lib.err(.INVAL), 44);
+        for ([_]u64{ f, y, ro, @intCast(p[0]), @intCast(p[1]) }) |fd| _ = lib.close(fd);
+    }
+
     for ([_]u64{ a, a2, @intCast(pfd[0]), @intCast(pfd[1]) }) |fd| _ = lib.close(fd);
     _ = lib.syscall(Sys.unlink, @intFromPtr(name.ptr), 0, 0);
     lib.exit(0);
