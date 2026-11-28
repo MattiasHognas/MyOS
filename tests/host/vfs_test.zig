@@ -379,10 +379,13 @@ const LinkFs = struct {
     list: ListFs,
     links: []const [2][]const u8,
 
-    fn readlink(ctx: *anyopaque, path: []const u8) ?[]const u8 {
+    fn readlink(ctx: *anyopaque, path: []const u8, buf: []u8) ?usize {
         const self: *LinkFs = @ptrCast(@alignCast(ctx));
         for (self.links) |l| {
-            if (std.mem.eql(u8, l[0], path)) return l[1];
+            if (!std.mem.eql(u8, l[0], path)) continue;
+            const n = @min(l[1].len, buf.len);
+            @memcpy(buf[0..n], l[1][0..n]);
+            return l[1].len;
         }
         return null;
     }
@@ -457,8 +460,13 @@ test "VFS: symbolic links are followed in every part of a path" {
     var small_out: [8]u8 = undefined;
     var small_scratch: [8]u8 = undefined;
     try std.testing.expectError(error.NameTooLong, vfs.followLinks(&small_out, &small_scratch, "/bin/sh", true));
-    try std.testing.expectEqual(@as(?[]const u8, "usr/bin"), vfs.readLink("/bin"));
-    try std.testing.expectEqual(@as(?[]const u8, null), vfs.readLink("/etc/motd"));
+    var target: [16]u8 = undefined;
+    const len = vfs.readLink("/bin", &target);
+    try std.testing.expectEqual(@as(?usize, 7), len);
+    try std.testing.expectEqualStrings("usr/bin", target[0..7]);
+    try std.testing.expectEqual(@as(?usize, 7), vfs.readLink("/bin", target[0..2])); // the whole length, what fits copied
+    try std.testing.expectEqual(@as(?usize, null), vfs.readLink("/etc/motd", &target));
+    try std.testing.expect(vfs.isLink("/bin") and !vfs.isLink("/etc/motd"));
 }
 
 test "VFS: a link may lead into another filesystem" {

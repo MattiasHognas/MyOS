@@ -1044,7 +1044,7 @@ fn named(path: []const u8) Named {
         .directory => .directory,
         .file => |f| .{ .generated = .{ .file = f.file, .pid = 0, .arg = f.arg } },
     };
-    if (vfs.readLink(path) != null) return .symlink;
+    if (vfs.isLink(path)) return .symlink;
     if (std.mem.eql(u8, path, "/dev/null")) return .{ .device = .null_device };
     if (std.mem.eql(u8, path, "/dev/urandom") or std.mem.eql(u8, path, "/dev/random")) return .{ .device = .random_device };
     if (std.mem.eql(u8, std.mem.trimEnd(u8, path, "/"), "/dev")) return .directory;
@@ -1152,7 +1152,257 @@ fn fileStat(node: vfs.Node) abi.Stat {
     // loader tells by them whether it has a library already.
     st.dev = 1;
     st.ino = node.ctx;
+    // Its times where its filesystem keeps them (`/tmp`); those of the
+    // image are when the system started.
+    if (vfs.metaOf(&node)) |m| {
+        st.atime = timeSpecOf(m.atime);
+        st.mtime = timeSpecOf(m.mtime);
+        st.ctime = timeSpecOf(m.ctime);
+        st.nlink = m.nlink;
+    } else {
+        const boot: i64 = @intCast(kclock.wallNanos() -| kclock.nanos());
+        st.atime = timeSpecOf(boot);
+        st.mtime = st.atime;
+        st.ctime = st.atime;
+    }
     return st;
+}
+
+fn timeSpecOf(ns: i64) abi.TimeSpec {
+    return .{ .sec = @divFloor(ns, 1_000_000_000), .nsec = @mod(ns, 1_000_000_000) };
+}
+
+/// `fallocate`: make room for `[offset, offset + len)` of a file open for
+/// writing. Files here are in memory and take memory as they are written,
+/// so this only makes the file at least that long (mode 0), or nothing
+/// (`FALLOC_FL_KEEP_SIZE`). `EOPNOTSUPP` for punching holes and the other
+/// modes, `EBADF`, `ESPIPE` for a pipe, `EINVAL`, `EFBIG`.
+fn sysFallocate(fd: u64, mode: u64, offset: u64, len: u64) u64 {
+    const KEEP_SIZE = 0x01;
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind == .pipe_read or of.kind == .pipe_write) return err(.SPIPE);
+    if (of.kind != .file or !of.writable) return err(.BADF);
+    if (len == 0 or offset > std.math.maxInt(i64) or len > std.math.maxInt(i64)) return err(.INVAL);
+    if (mode & ~@as(u64, KEEP_SIZE) != 0) return err(.OPNOTSUPP);
+    const end = std.math.add(u64, offset, len) catch return err(.FBIG);
+    if (mode & KEEP_SIZE != 0) return 0;
+    if (end > vfs.sizeOf(&of.node)) vfs.truncate(&of.node, end) catch |e| return vfsError(e);
+    return 0;
+}
+
+/// `posix_fadvise` (`fadvise64`): advice on how a file will be read,
+/// checked and taken (it changes nothing: files are in memory). `EINVAL`
+/// for unknown advice, `ESPIPE` for a pipe, `EBADF`.
+fn sysFadvise(fd: u64, advice: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    if (of.kind == .pipe_read or of.kind == .pipe_write) return err(.SPIPE);
+    return if (advice <= 5) 0 else err(.INVAL); // NORMAL, RANDOM, SEQUENTIAL, WILLNEED, DONTNEED, NOREUSE
+}
+
+/// Write `data` from the kernel to `of` (a file at `at`, or its offset; a
+/// pipe; the console; /dev/null): what `sendfile` and `copy_file_range`
+/// write with. Returns the bytes written or an error value.
+fn writeKernel(of: *OpenFile, data: []const u8, at: ?u64) u64 {
+    switch (of.kind) {
+        .file => {
+            if (!of.writable) return err(.BADF);
+            const offset = at orelse if (of.append) vfs.sizeOf(&of.node) else open_file.getOffset(of);
+            const n = vfs.write(&of.node, offset, data) catch |e| return vfsError(e);
+            if (at == null) open_file.setOffset(of, offset + n);
+            return n;
+        },
+        .pipe_write => return switch (kpipe.write(of.pipe, data, nonblocking(of))) {
+            .bytes => |n| n,
+            .again => err(.AGAIN),
+            .broken => blk: {
+                const me = thread.current();
+                _ = proc.withThread(me.process.?, me.id, signal.sendThreadLocked, 13); // SIGPIPE
+                break :blk err(.PIPE);
+            },
+            .killed => err(.INTR),
+        },
+        .console => {
+            root.print("{s}", .{data});
+            return data.len;
+        },
+        .null_device => return data.len,
+        else => return err(.BADF),
+    }
+}
+
+/// `sendfile`: copy up to `count` bytes from the file `in_fd` (from its
+/// offset, which moves; or from `*offset_ptr`, which moves instead) to
+/// `out_fd` (a file, a pipe, the console), in the kernel. Returns the
+/// bytes copied. `EINVAL` if `in_fd` is not a file, `EBADF`, `EFAULT`.
+fn sysSendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64) u64 {
+    const in = getFile(in_fd) orelse return err(.BADF);
+    defer putFile(in);
+    const out = getFile(out_fd) orelse return err(.BADF);
+    defer putFile(out);
+    if (in.kind != .file or !in.readable) return err(.INVAL);
+    var offset: u64 = if (offset_ptr != 0) fromUser(u64, offset_ptr) orelse return err(.FAULT) else open_file.getOffset(in);
+    const total = @min(count, abi.MAX_RW_COUNT);
+    var chunk: [CHUNK]u8 = undefined;
+    var done: u64 = 0;
+    while (done < total) {
+        const n = vfs.read(&in.node, offset, chunk[0..@intCast(@min(CHUNK, total - done))]);
+        if (n == 0) break;
+        const w = writeKernel(out, chunk[0..n], null);
+        if (abi.isError(w)) {
+            if (done == 0) return w;
+            break;
+        }
+        done += w;
+        offset += w;
+        if (w < n) break;
+    }
+    if (offset_ptr != 0) {
+        if (!toUser(offset_ptr, offset)) return err(.FAULT);
+    } else open_file.setOffset(in, offset);
+    return done;
+}
+
+/// `copy_file_range`: copy up to `len` bytes from one file to another in
+/// the kernel, each from its offset (which moves) or from the offset
+/// given (which moves instead). `flags` must be 0. `EINVAL` for a pipe
+/// or the same file with ranges that overlap, `EBADF`, `EFAULT`.
+fn sysCopyFileRange(in_fd: u64, off_in_ptr: u64, out_fd: u64, off_out_ptr: u64, len: u64, flags: u64) u64 {
+    if (flags != 0) return err(.INVAL);
+    const in = getFile(in_fd) orelse return err(.BADF);
+    defer putFile(in);
+    const out = getFile(out_fd) orelse return err(.BADF);
+    defer putFile(out);
+    if (in.kind != .file or out.kind != .file) return err(.INVAL);
+    if (!in.readable or !out.writable) return err(.BADF);
+    if (out.append) return err(.BADF);
+    var off_in: u64 = if (off_in_ptr != 0) fromUser(u64, off_in_ptr) orelse return err(.FAULT) else open_file.getOffset(in);
+    var off_out: u64 = if (off_out_ptr != 0) fromUser(u64, off_out_ptr) orelse return err(.FAULT) else open_file.getOffset(out);
+    const total = @min(len, abi.MAX_RW_COUNT);
+    if (in.node.ctx == out.node.ctx and in.node.ops == out.node.ops and off_in < off_out + total and off_out < off_in + total) return err(.INVAL);
+    var chunk: [CHUNK]u8 = undefined;
+    var done: u64 = 0;
+    while (done < total) {
+        const n = vfs.read(&in.node, off_in, chunk[0..@intCast(@min(CHUNK, total - done))]);
+        if (n == 0) break;
+        const w = vfs.write(&out.node, off_out, chunk[0..n]) catch |e| {
+            if (done == 0) return vfsError(e);
+            break;
+        };
+        done += w;
+        off_in += w;
+        off_out += w;
+        if (w < n) break;
+    }
+    if (off_in_ptr != 0) {
+        if (!toUser(off_in_ptr, off_in)) return err(.FAULT);
+    } else open_file.setOffset(in, off_in);
+    if (off_out_ptr != 0) {
+        if (!toUser(off_out_ptr, off_out)) return err(.FAULT);
+    } else open_file.setOffset(out, off_out);
+    return done;
+}
+
+/// `symlink` and `symlinkat`: a symbolic link at `path` to `target`,
+/// stored as given (it need not exist). `EEXIST`, `ENOENT` or `ENOTDIR`
+/// for where it goes, `EROFS` outside `/tmp`, `ENAMETOOLONG`.
+fn sysSymlink(target_ptr: u64, dirfd: u64, path_ptr: u64) u64 {
+    // On the heap: a path's worth of bytes is too much for a kernel stack.
+    const target_buf = heap.allocator.alloc(u8, abi.PATH_MAX) catch return err(.NOMEM);
+    defer heap.allocator.free(target_buf);
+    const target = target_buf[0 .. uaccess.copyStringFromUser(target_buf, target_ptr) catch |e| return switch (e) {
+        error.Fault => err(.FAULT),
+        error.TooLong => err(.NAMETOOLONG),
+    }];
+    if (target.len == 0) return err(.NOENT);
+    var given = switch (Path.fromNoFollow(dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    if (named(given.text) != .none) return err(.EXIST);
+    vfs.symlink(given.text, target) catch |e| return vfsError(e);
+    return 0;
+}
+
+/// `link` and `linkat`: a second name `new` for the file `old` (a hard
+/// link), in the same filesystem (`EXDEV`). `EPERM` for a directory or a
+/// FIFO; `AT_SYMLINK_FOLLOW` makes a link to what a symbolic link points
+/// to (without it, Linux links the link itself: refused here, `EPERM`).
+/// `EEXIST`, `ENOENT`, `EROFS`, `EINVAL` for other flags.
+fn sysLink(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, abi.AT_SYMLINK_FOLLOW | abi.AT_EMPTY_PATH) != 0) return err(.INVAL);
+    var old = switch (if (flags & abi.AT_SYMLINK_FOLLOW != 0) Path.from(old_dirfd, old_ptr) else Path.fromNoFollow(old_dirfd, old_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer old.deinit();
+    var new = switch (Path.fromNoFollow(new_dirfd, new_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer new.deinit();
+    switch (named(old.text)) {
+        .none => return missing(old.text),
+        .file => {},
+        .directory, .fifo, .symlink => return err(.PERM),
+        else => return err(.XDEV), // what the kernel itself provides
+    }
+    if (named(new.text) != .none) return err(.EXIST);
+    vfs.link(old.text, new.text) catch |e| return switch (e) {
+        error.Invalid => err(.PERM),
+        else => vfsError(e),
+    };
+    return 0;
+}
+
+/// `utimensat` (and `futimens`, which is it with a null path): set a
+/// file's access and modification times, to now if `times` is null, or
+/// as the two `timespec`s say (`UTIME_NOW`, `UTIME_OMIT` for one of them).
+/// `AT_SYMLINK_NOFOLLOW` is accepted (links have no times of their own
+/// here). `EROFS` for a file whose times are not kept (the image's),
+/// `EINVAL` for a bad nanosecond value or flag, `ENOENT`, `EFAULT`.
+fn sysUtimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, abi.AT_SYMLINK_NOFOLLOW | abi.AT_EMPTY_PATH) != 0) return err(.INVAL);
+    const now: i64 = @intCast(kclock.wallNanos());
+    var atime: ?i64 = now;
+    var mtime: ?i64 = now;
+    if (times_ptr != 0) {
+        var ts: [2]abi.TimeSpec = undefined;
+        uaccess.copyFromUser(std.mem.sliceAsBytes(&ts), times_ptr) catch return err(.FAULT);
+        const pick = struct {
+            fn one(t: abi.TimeSpec, current: i64) error{Invalid}!?i64 {
+                if (t.nsec == abi.UTIME_OMIT) return null;
+                if (t.nsec == abi.UTIME_NOW) return current;
+                if (t.nsec < 0 or t.nsec >= 1_000_000_000) return error.Invalid;
+                return t.sec *| 1_000_000_000 +| t.nsec;
+            }
+        };
+        atime = pick.one(ts[0], now) catch return err(.INVAL);
+        mtime = pick.one(ts[1], now) catch return err(.INVAL);
+    }
+    // A null path: the descriptor itself (`futimens`).
+    if (path_ptr == 0) {
+        const of = getFile(dirfd) orelse return err(.BADF);
+        defer putFile(of);
+        if (of.kind != .file or of.generated != null) return err(.ROFS);
+        vfs.setTimes(&of.node, atime, mtime) catch |e| return vfsError(e);
+        return 0;
+    }
+    var given = switch (Path.from(dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    const node = switch (named(given.text)) {
+        .none => return missing(given.text),
+        .file, .exe_link => fileAt(given.text) orelse return err(.NOENT),
+        else => return err(.ROFS), // directories, devices, /proc: no times kept
+    };
+    defer vfs.release(&node);
+    vfs.setTimes(&node, atime, mtime) catch |e| return vfsError(e);
+    return 0;
 }
 
 /// `newfstatat`: `stat` of the file at a path, or of the descriptor
@@ -1208,11 +1458,10 @@ fn statPath(dirfd: u64, path_ptr: u64, flags: u64) StatResult {
         // Only seen with AT_SYMLINK_NOFOLLOW: the link itself.
         .symlink => blk: {
             var link: abi.Stat = .{};
-            const target = vfs.readLink(path) orelse "";
             link.mode = abi.S.IFLNK | 0o777;
-            link.size = @intCast(target.len);
+            link.size = @intCast(vfs.readLink(path, &.{}) orelse 0);
             link.dev = 1;
-            link.ino = @intFromPtr(target.ptr) | 1;
+            link.ino = std.hash.Wyhash.hash(0, path) | 1; // the same link, the same number
             break :blk link;
         },
         .exe_link => blk: {
@@ -1284,15 +1533,25 @@ fn sysReadlink(dirfd: u64, path_ptr: u64, buf: u64, size: u64) u64 {
     };
     defer given.deinit();
     const path = given.text;
+    if (size == 0) return err(.INVAL);
+    var target_buf: [512]u8 = undefined; // most targets; longer ones on the heap
+    var heap_buf: ?[]u8 = null;
+    defer if (heap_buf) |h| heap.allocator.free(h);
     const target = switch (named(path)) {
         .none => return missing(path),
         .file, .directory, .generated, .device, .fifo => return err(.INVAL),
-        .symlink => vfs.readLink(path) orelse return err(.NOENT),
+        .symlink => blk: {
+            const len = vfs.readLink(path, &target_buf) orelse return err(.NOENT);
+            if (len <= target_buf.len) break :blk target_buf[0..len];
+            const big = heap.allocator.alloc(u8, len) catch return err(.NOMEM);
+            heap_buf = big;
+            const again = vfs.readLink(path, big) orelse return err(.NOENT);
+            break :blk big[0..@min(again, big.len)];
+        },
         // The name can change under another thread's feet only by the
         // process ending, and then this thread ends too.
         .exe_link => thread.current().process.?.name,
     };
-    if (size == 0) return err(.INVAL);
     const n = @min(target.len, size);
     uaccess.copyToUser(buf, target[0..n]) catch return err(.FAULT);
     return n;
@@ -3016,6 +3275,15 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.vfork => newProcess(f, .{ .flags = proc.CLONE.VM | proc.CLONE.VFORK, .stack = 0, .parent_tid = 0, .child_tid = 0, .tls = 0 }, abi.SIGCHLD),
         Sys.wait4 => sysWait4(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.waitid => sysWaitid(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        Sys.symlink => sysSymlink(f.rdi, CWD, f.rsi),
+        Sys.symlinkat => sysSymlink(f.rdi, f.rsi, f.rdx),
+        Sys.link => sysLink(CWD, f.rdi, CWD, f.rsi, 0),
+        Sys.linkat => sysLink(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        Sys.utimensat => sysUtimensat(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.fallocate => sysFallocate(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.fadvise64 => sysFadvise(f.rdi, f.r10),
+        Sys.sendfile => sysSendfile(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.copy_file_range => sysCopyFileRange(f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9),
         Sys.getrusage => sysGetrusage(f.rdi, f.rsi),
         Sys.getpriority => sysGetpriority(f.rdi, f.rsi),
         Sys.setpriority => sysSetpriority(f.rdi, f.rsi, f.rdx),

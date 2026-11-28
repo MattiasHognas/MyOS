@@ -17,6 +17,12 @@ const Mutex = @import("../sync/mutex.zig").Mutex;
 const pmm = @import("../pmm.zig");
 const ramfs = @import("ramfs.zig");
 const vfs = @import("../vfs.zig");
+const clock = @import("../clock.zig");
+
+/// The wall clock, for files' times.
+fn now() i64 {
+    return @intCast(clock.wallNanos());
+}
 
 const PageBlocks = struct {
     pub fn alloc() ?*[ramfs.BLOCK]u8 {
@@ -41,6 +47,8 @@ const ops = vfs.Ops{
     .size = size,
     .retain = retain,
     .release = release,
+    .meta = meta,
+    .set_times = setTimes,
 };
 
 /// The filesystem, empty, to be mounted. Call once.
@@ -58,6 +66,9 @@ pub fn init() vfs.Fs {
         .rename = rename,
         .fifo_at = fifoAt,
         .mkfifo = mkfifo,
+        .readlink = readLink,
+        .symlink = symlink,
+        .link = link,
     };
 }
 
@@ -110,13 +121,57 @@ fn next(_: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?vfs.DirEn
         .directory => .directory,
         .file => .file,
         .fifo => .fifo,
+        .symlink => .symlink,
     } };
 }
 
 fn create(_: *anyopaque, path: []const u8) vfs.Error!vfs.Node {
     lock.lock();
     defer lock.unlock();
-    return nodeOf(fs.create(path) catch |e| return toVfs(e));
+    const f = fs.create(path) catch |e| return toVfs(e);
+    const t = now();
+    f.atime = t;
+    f.mtime = t;
+    f.ctime = t;
+    return nodeOf(f);
+}
+
+fn readLink(_: *anyopaque, path: []const u8, buf: []u8) ?usize {
+    lock.lock();
+    defer lock.unlock();
+    const target = fs.readlink(path) orelse return null;
+    const n = @min(target.len, buf.len);
+    @memcpy(buf[0..n], target[0..n]); // copied under the lock: the link may go after
+    return target.len;
+}
+
+fn symlink(_: *anyopaque, path: []const u8, target: []const u8) vfs.Error!void {
+    lock.lock();
+    defer lock.unlock();
+    return fs.symlink(path, target) catch |e| toVfs(e);
+}
+
+fn link(_: *anyopaque, old: []const u8, new: []const u8) vfs.Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const f = fs.link(old, new) catch |e| return toVfs(e);
+    f.ctime = now();
+}
+
+fn meta(node: *const vfs.Node) vfs.Meta {
+    lock.lock();
+    defer lock.unlock();
+    const f = fileOf(node);
+    return .{ .atime = f.atime, .mtime = f.mtime, .ctime = f.ctime, .nlink = f.nlink };
+}
+
+fn setTimes(node: *const vfs.Node, atime: ?i64, mtime: ?i64) vfs.Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const f = fileOf(node);
+    if (atime) |t| f.atime = t;
+    if (mtime) |t| f.mtime = t;
+    f.ctime = now();
 }
 
 fn fifoAt(_: *anyopaque, path: []const u8) ?u64 {
@@ -140,6 +195,7 @@ fn mkdir(_: *anyopaque, path: []const u8) vfs.Error!void {
 fn unlink(_: *anyopaque, path: []const u8) vfs.Error!void {
     lock.lock();
     defer lock.unlock();
+    if (fs.fileAt(path)) |f| f.ctime = now(); // one name fewer
     return fs.unlink(path) catch |e| toVfs(e);
 }
 
@@ -164,13 +220,22 @@ fn read(node: *const vfs.Node, offset: u64, buf: []u8) usize {
 fn write(node: *const vfs.Node, offset: u64, data: []const u8) vfs.Error!usize {
     lock.lock();
     defer lock.unlock();
-    return fs.write(fileOf(node), offset, data) catch |e| toVfs(e);
+    const f = fileOf(node);
+    const n = fs.write(f, offset, data) catch |e| return toVfs(e);
+    const t = now();
+    f.mtime = t;
+    f.ctime = t;
+    return n;
 }
 
 fn truncate(node: *const vfs.Node, new_size: u64) vfs.Error!void {
     lock.lock();
     defer lock.unlock();
-    return fs.truncate(fileOf(node), new_size) catch |e| toVfs(e);
+    const f = fileOf(node);
+    fs.truncate(f, new_size) catch |e| return toVfs(e);
+    const t = now();
+    f.mtime = t;
+    f.ctime = t;
 }
 
 fn size(node: *const vfs.Node) u64 {

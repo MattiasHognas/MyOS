@@ -54,8 +54,11 @@ fn nextEntry(_: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?vfs.
 }
 
 /// `vfs.Fs.readlink` implementation.
-fn readLink(_: *anyopaque, path: []const u8) ?[]const u8 {
-    return tar.linkTarget(archive, tar.normalize(path));
+fn readLink(_: *anyopaque, path: []const u8, buf: []u8) ?usize {
+    const target = tar.linkTarget(archive, tar.normalize(path)) orelse return null;
+    const n = @min(target.len, buf.len);
+    @memcpy(buf[0..n], target[0..n]);
+    return target.len;
 }
 
 /// `vfs.Ops.read` implementation: copy up to `buf.len` bytes starting at

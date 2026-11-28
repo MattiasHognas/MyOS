@@ -103,6 +103,7 @@ Linux calls, with Linux's numbers:
 | 34 | `pause()` | Waits for a signal to be handled; `EINTR`. |
 | 35 | `nanosleep(req, rem)` | Whole timer ticks (10 ms) while more than a tick is left, so a sleep ends at most a tick late; under 2 ms left the CPU goes to others until the deadline, so short sleeps are short. A signal ends it with `EINTR`, and what was left is written at `rem`. |
 | 39 | `getpid()` | The ID of the process's first thread. |
+| 40 | `sendfile(out_fd, in_fd, offset, count)` | Copies from a file (from its offset, which moves, or from `*offset`, which moves instead) to a file, pipe or the console, in the kernel. `EINVAL` if `in_fd` is not a file. |
 | 41 | `socket(domain, type, protocol)` | No networking yet: `EAFNOSUPPORT`. |
 | 56 | `clone(flags, stack, ptid, ctid, tls)` | With `CLONE_THREAD` a new thread (it must come with `CLONE_VM` and `CLONE_SIGHAND`): `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` are honoured. Without it, a new process as `fork` makes, the low byte of `flags` the signal its parent gets when it ends; `CLONE_VFORK` holds the caller until the child calls `execve` or ends. `CLONE_VM` without `CLONE_THREAD` gets a copy of the memory, not the same memory (Linux shares it; `vfork` and `posix_spawn` work either way, but what the child writes before `execve` stays its own). `EINVAL` for sharing the descriptor table or the signal actions between processes. |
 | 57 | `fork()` | A new process: a copy of the caller's memory (every page copied: no copy-on-write yet), the same open files (descriptors and their close-on-exec flags copied), working directory, signal actions, mask and alternate stack, and limits; one thread with the caller's registers, returning 0. The parent gets the child's ID, and `SIGCHLD` when it ends. `EAGAIN` past the descendant limit, `ENOMEM`. |
@@ -124,7 +125,9 @@ Linux calls, with Linux's numbers:
 | 82 | `rename(old, new)` | A file or a directory with all in it; a file of the new name, or an empty directory, is replaced. Within one filesystem (`EXDEV`); `EINVAL` into itself; `EBUSY` for a mount point. |
 | 83 | `mkdir(path, mode)` | `EEXIST`, `ENOENT`, `ENOTDIR`, `EROFS`. |
 | 84 | `rmdir(path)` | An empty directory: `ENOTEMPTY`, `ENOTDIR`, `EBUSY` for a mount point. |
+| 86 | `link(old, new)` | A second name for a file of `/tmp` (a hard link: `stat` says `st_nlink` 2, the same `st_ino`). `EPERM` for a directory, FIFO or symbolic link, `EXDEV` across filesystems, `EROFS`, `EEXIST`. |
 | 87 | `unlink(path)` | Takes the name away; the file lives while it is open. `EISDIR`, `EROFS`, `ENOENT`. |
+| 88 | `symlink(target, path)` | A symbolic link in `/tmp`, stored as given (the target need not exist); followed by every call that follows links, read with `readlink`. `EROFS` elsewhere, `EEXIST`. |
 | 89 | `readlink(path, buf, size)` | What a symbolic link points to, cut to `size`: the links of the image (`/bin` and the rest) and `/proc/self/exe`. `EINVAL` for anything else that exists, `ENOENT` otherwise. |
 | 91 | `fchmod(fd, mode)` | No permissions exist: accepted for a file that can be written, `EROFS` otherwise. |
 | 96 | `gettimeofday(tv, tz)` | |
@@ -162,6 +165,7 @@ Linux calls, with Linux's numbers:
 | 204 | `sched_getaffinity(pid, size, mask)` | Every CPU that is up; 8 bytes. `EINVAL` for a size below 8, `ESRCH` for a thread not of the caller's process. |
 | 217 | `getdents64(fd, buf, count)` | The next entries of a directory as `struct linux_dirent64`, "." and ".." first; 0 at the end. `EINVAL` if not one entry fits. |
 | 218 | `set_tid_address(ptr)` | Returns the thread ID. When the thread exits, zero is written to `ptr` and one futex waiter on it is woken. |
+| 221 | `fadvise64(fd, offset, len, advice)` | `posix_fadvise`: advice checked (`EINVAL` beyond `POSIX_FADV_NOREUSE`) and taken; files are in memory, so it changes nothing. `ESPIPE` for a pipe. |
 | 228 | `clock_gettime(clock, ts)` | `CLOCK_MONOTONIC` (and `_RAW`, `_COARSE`, `CLOCK_BOOTTIME`): time since boot, from the TSC where it is invariant and the HPET otherwise. `CLOCK_REALTIME` (and `_COARSE`): the RTC's date at boot plus that. The CPU-time clocks give time since boot, an upper bound: CPU time is not counted yet. `EINVAL` for other clocks. |
 | 230 | `clock_nanosleep(clock, flags, req, rem)` | With `TIMER_ABSTIME` too. |
 | 231 | `exit_group(status)` | Ends the process: every thread, wherever it is. |
@@ -176,12 +180,16 @@ Linux calls, with Linux's numbers:
 | 262 | `newfstatat(dirfd, path, statbuf, flags)` | `stat` by path, relative as for `openat`; of the descriptor itself with an empty path and `AT_EMPTY_PATH`. Files, directories, the `/proc` and `/dev` entries; `AT_SYMLINK_NOFOLLOW` shows `/proc/self/exe` as the link it is. |
 | 263 | `unlinkat(dirfd, path, flags)` | `unlink`, or `rmdir` with `AT_REMOVEDIR`. |
 | 264 | `renameat(olddirfd, old, newdirfd, new)` | As `rename`. |
+| 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | `link` relative to descriptors; `AT_SYMLINK_FOLLOW` links what a link points to (without it a link to a link is refused, `EPERM`). |
+| 266 | `symlinkat(target, dirfd, path)` | `symlink` relative to a descriptor. |
 | 267 | `readlinkat(dirfd, path, buf, size)` | As `readlink`. |
 | 269 | `faccessat(dirfd, path, mode)` | As `access`. |
 | 273 | `set_robust_list(head, size)` | Accepted and not used: a thread that dies takes its process with it. |
+| 280 | `utimensat(dirfd, path, times, flags)` | A file's access and modification times: now (null `times`), as given, `UTIME_NOW`, `UTIME_OMIT`; a null path is the descriptor (`futimens`). Files of `/tmp` keep their times (set by writing too; the change time follows); those of the image report when the system started and cannot be changed (`EROFS`). |
 | 281 | `epoll_pwait(epfd, events, max, timeout, sigmask, size)` | `epoll_wait` with `sigmask` blocked meanwhile. |
 | 282 | `signalfd(fd, mask, size)` | See `signalfd4`. |
 | 284 | `eventfd(initval)` | See `eventfd2`. |
+| 285 | `fallocate(fd, mode, offset, len)` | Makes the file at least `offset + len` long (mode 0), or nothing (`FALLOC_FL_KEEP_SIZE`); files take memory as written. `EOPNOTSUPP` for punching holes and other modes. |
 | 289 | `signalfd4(fd, mask, size, flags)` | A descriptor for the signals of `mask` (`fd` -1), or a new mask for the signalfd `fd`. A read takes the reader's pending signals of the mask as `rt_sigtimedwait` does, a `signalfd_siginfo` record (128 bytes) for each, as many as fit (`EINVAL` for less than one); it waits unless `SFD_NONBLOCK`. Readable to `poll` and `epoll` while one is pending. `SFD_CLOEXEC`. |
 | 290 | `eventfd2(initval, flags)` | A 64-bit counter: a write adds, a read takes all (one with `EFD_SEMAPHORE`) and waits while it is zero unless `EFD_NONBLOCK`. |
 | 291 | `epoll_create1(flags)` | A new instance; `epoll_create(size)` (213) the same. |
@@ -196,6 +204,7 @@ Linux calls, with Linux's numbers:
 | 319 | `memfd_create(name, flags)` | A file in memory only (`memfd.zig`), open for reading and writing, of size 0: written, read, sized with `ftruncate`, mapped (shared or private); it goes when its last descriptor and mapping do. `MFD_CLOEXEC`, `MFD_ALLOW_SEALING` (without it the file comes sealed against seals), `MFD_NOEXEC_SEAL` and `MFD_EXEC` are accepted; `EINVAL` for `MFD_HUGETLB`, other flags, or a name over 249 bytes. `/proc/self/maps` shows its mappings as `/memfd:NAME (deleted)`. Shrinking a file leaves pages already mapped past the new end in their mappings (Linux takes them out). |
 | 322 | `execveat(dirfd, path, argv, envp, flags)` | `execve` with `path` relative to `dirfd`; `flags` must be 0. |
 | 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts the CPUs that run the caller's address space. What a garbage collector uses to stop paying for barriers in every thread. |
+| 326 | `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` | Copies between two files in the kernel, each from its offset or the one given. `flags` must be 0; `EINVAL` for pipes and overlapping ranges of one file. |
 | 327 | `preadv2(fd, iov, count, offset, flags)` | `preadv`, or `readv` with offset -1; `flags` must be 0 (`EOPNOTSUPP`). |
 | 328 | `pwritev2(fd, iov, count, offset, flags)` | The same for writing. |
 | 332 | `statx(dirfd, path, flags, mask, buf)` | What `newfstatat` says, in `struct statx`, every basic field filled whatever `mask` asks (no birth time). The Zig standard library uses it. |

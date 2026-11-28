@@ -88,6 +88,12 @@ pub const Ops = struct {
     /// The file's size now, for a file whose size changes (`Node.size`
     /// is what it was when the node was made).
     size: ?*const fn (node: *const Node) u64 = null,
+    /// Its times and number of names, for `stat`; null for a file whose
+    /// times are not kept (those of the image: the boot time is given).
+    meta: ?*const fn (node: *const Node) Meta = null,
+    /// Set its access and modification times (null: leave it; nanoseconds
+    /// since 1970); the change time becomes now.
+    set_times: ?*const fn (node: *const Node, atime: ?i64, mtime: ?i64) Error!void = null,
     /// A file that can go away while someone uses it is counted: every
     /// node `Fs.lookup` or `Fs.create` hands out holds the file until it
     /// is given to `release`; `retain` makes a second holder of one. Null
@@ -95,6 +101,21 @@ pub const Ops = struct {
     retain: ?*const fn (node: *const Node) void = null,
     release: ?*const fn (node: *const Node) void = null,
 };
+
+/// What `stat` tells about a file besides its size.
+pub const Meta = struct { atime: i64, mtime: i64, ctime: i64, nlink: u32 };
+
+/// The file's times and names, if its filesystem keeps them.
+pub fn metaOf(node: *const Node) ?Meta {
+    return if (node.ops.meta) |f| f(node) else null;
+}
+
+/// Set the file's times (`utimensat`). `error.ReadOnly` for a file whose
+/// times are not kept.
+pub fn setTimes(node: *const Node, atime: ?i64, mtime: ?i64) Error!void {
+    const f = node.ops.set_times orelse return error.ReadOnly;
+    return f(node, atime, mtime);
+}
 
 /// A mounted filesystem: turns paths into nodes.
 pub const Fs = struct {
@@ -112,9 +133,11 @@ pub const Fs = struct {
     /// filesystem without the function has only empty directories.
     next: ?*const fn (ctx: *anyopaque, dir: []const u8, cookie: *u64, name_buf: []u8) ?DirEntry = null,
     /// What the symbolic link `path` points to, as it was stored (absolute,
-    /// or relative to the directory the link is in); null if `path` is
-    /// not a link. A filesystem without the function has none.
-    readlink: ?*const fn (ctx: *anyopaque, path: []const u8) ?[]const u8 = null,
+    /// or relative to the directory the link is in), copied into `buf` as
+    /// far as it fits; its whole length is returned. Null if `path` is not
+    /// a link. A filesystem without the function has none. Copied, not
+    /// lent: a link of a filesystem that changes can go meanwhile.
+    readlink: ?*const fn (ctx: *anyopaque, path: []const u8, buf: []u8) ?usize = null,
     /// The functions that change the filesystem; all null for one that
     /// cannot be changed. `create` makes an empty file and returns its
     /// node (to be released, like one from `lookup`).
@@ -128,7 +151,27 @@ pub const Fs = struct {
     /// kernel's (`fifo.zig`).
     fifo_at: ?*const fn (ctx: *anyopaque, path: []const u8) ?u64 = null,
     mkfifo: ?*const fn (ctx: *anyopaque, path: []const u8, id: u64) Error!void = null,
+    /// A symbolic link at `path` to `target`; a second name `new` for the
+    /// file at `old` (a hard link: `error.Invalid` for what is not a file).
+    symlink: ?*const fn (ctx: *anyopaque, path: []const u8, target: []const u8) Error!void = null,
+    link: ?*const fn (ctx: *anyopaque, old: []const u8, new: []const u8) Error!void = null,
 };
+
+/// Make a symbolic link at `path` to `target` (stored as given).
+pub fn symlink(path: []const u8, target: []const u8) Error!void {
+    const at = resolve(path) orelse return error.NotFound;
+    const f = at.fs.symlink orelse return error.ReadOnly;
+    return f(at.fs.ctx, at.rest, target);
+}
+
+/// Give the file at `old` the second name `new`, in the same filesystem.
+pub fn link(old: []const u8, new: []const u8) Error!void {
+    const from = resolve(old) orelse return error.NotFound;
+    const to = resolve(new) orelse return error.NotFound;
+    if (from.fs.ctx != to.fs.ctx or from.skipped != to.skipped) return error.CrossDevice;
+    const f = from.fs.link orelse return error.ReadOnly;
+    return f(from.fs.ctx, from.rest, to.rest);
+}
 
 /// The number of the FIFO at `path` (normalized, absolute), or null if
 /// there is none.
@@ -278,7 +321,7 @@ pub fn mkdir(path: []const u8) Error!void {
 pub fn unlink(path: []const u8) Error!void {
     const at = resolve(path) orelse return error.NotFound;
     if (holdsMount(path)) return error.IsDirectory;
-    const f = at.fs.unlink orelse return if (lookupExists(path) or readLink(path) != null) error.ReadOnly else if (isDirectory(path)) error.IsDirectory else error.NotFound;
+    const f = at.fs.unlink orelse return if (lookupExists(path) or isLink(path)) error.ReadOnly else if (isDirectory(path)) error.IsDirectory else error.NotFound;
     return f(at.fs.ctx, at.rest);
 }
 
@@ -296,7 +339,7 @@ pub fn rename(old: []const u8, new: []const u8) Error!void {
     const to = resolve(new) orelse return error.NotFound;
     if (holdsMount(old) or holdsMount(new)) return error.Busy;
     if (from.fs.ctx != to.fs.ctx or from.skipped != to.skipped) return error.CrossDevice;
-    const f = from.fs.rename orelse return if (lookupExists(old) or isDirectory(old) or readLink(old) != null) error.ReadOnly else error.NotFound;
+    const f = from.fs.rename orelse return if (lookupExists(old) or isDirectory(old) or isLink(old)) error.ReadOnly else error.NotFound;
     return f(from.fs.ctx, from.rest, to.rest);
 }
 
@@ -371,11 +414,16 @@ pub fn next(dir: []const u8, cookie: *u64, name_buf: []u8) ?DirEntry {
 
 /// What the symbolic link at `path` (normalized; links before its last
 /// part already followed) points to, or null if it is not one.
-pub fn readLink(path: []const u8) ?[]const u8 {
+pub fn readLink(path: []const u8, buf: []u8) ?usize {
     const at = resolve(path) orelse return null;
     if (at.rest.len == 1) return null; // a mount point is a directory
     const f = at.fs.readlink orelse return null;
-    return f(at.fs.ctx, at.rest);
+    return f(at.fs.ctx, at.rest, buf);
+}
+
+/// Whether `path` is a symbolic link.
+pub fn isLink(path: []const u8) bool {
+    return readLink(path, &.{}) != null;
 }
 
 /// Most links one path may go through, as on Linux (`ELOOP` beyond).
@@ -407,7 +455,8 @@ pub fn followLinks(out: []u8, scratch: []u8, path: []const u8, follow_last: bool
             end = (std.mem.indexOfScalarPos(u8, out[0..len], end, '/') orelse len);
             const last = end == len;
             if (last and !follow_last) break;
-            const target = readLink(out[0..end]) orelse {
+            // The target, read into the start of `scratch`.
+            const target_len = readLink(out[0..end], scratch) orelse {
                 end += 1;
                 continue;
             };
@@ -418,8 +467,8 @@ pub fn followLinks(out: []u8, scratch: []u8, path: []const u8, follow_last: bool
             const dir_end = std.mem.lastIndexOfScalar(u8, out[0..end], '/').?;
             const base = if (dir_end == 0) "/" else out[0..dir_end];
             const rest = out[end..len];
-            if (target.len + rest.len > scratch.len) return error.NameTooLong;
-            @memcpy(scratch[0..target.len], target);
+            if (target_len + rest.len > scratch.len) return error.NameTooLong;
+            const target = scratch[0..target_len];
             @memcpy(scratch[target.len..][0..rest.len], rest);
             const joined = scratch[0 .. target.len + rest.len];
             // `normalize` writes `out` while reading `base` from it: the

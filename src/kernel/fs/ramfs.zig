@@ -34,7 +34,7 @@ pub const Error = error{
     TooLarge,
 };
 
-pub const Kind = enum { file, directory, fifo };
+pub const Kind = enum { file, directory, fifo, symlink };
 
 /// What a path names: the kind, and for a file its size.
 pub const Info = struct { kind: Kind, size: u64 };
@@ -57,9 +57,15 @@ pub fn RamFs(comptime Blocks: type) type {
             /// The first `size` bytes are the file. A null block is zeroes.
             blocks: std.ArrayListUnmanaged(?*[BLOCK]u8) = .empty,
             size: u64 = 0,
-            /// Who holds it: its name (while it has one) and everyone who
-            /// has it open.
+            /// Who holds it: each of its names and everyone who has it open.
             refs: usize = 1,
+            /// Its names (`link` adds one; `stat`'s `st_nlink`).
+            nlink: u32 = 1,
+            /// Last access, change of contents and change of anything, in
+            /// nanoseconds since 1970: kept for the owner, who sets them.
+            atime: i64 = 0,
+            mtime: i64 = 0,
+            ctime: i64 = 0,
         };
 
         const Entry = struct {
@@ -70,15 +76,26 @@ pub fn RamFs(comptime Blocks: type) type {
             /// For a FIFO (a named pipe, `mkfifo`): the number its owner
             /// knows it by, never 0. Its pipe is not here: the kernel's.
             fifo: u64 = 0,
+            /// For a symbolic link: what it points to. Owned.
+            link: ?[]u8 = null,
 
             fn isDir(e: Entry) bool {
-                return e.file == null and e.fifo == 0;
+                return e.file == null and e.fifo == 0 and e.link == null;
             }
 
             fn kind(e: Entry) Kind {
-                return if (e.file != null) .file else if (e.fifo != 0) .fifo else .directory;
+                return if (e.file != null) .file else if (e.fifo != 0) .fifo else if (e.link != null) .symlink else .directory;
             }
         };
+
+        /// Free what an entry owns besides its path.
+        fn dropEntry(self: *Self, e: Entry) void {
+            if (e.file) |f| {
+                f.nlink -= 1;
+                self.release(f);
+            }
+            if (e.link) |l| self.gpa.free(l);
+        }
 
         fn find(self: *const Self, path: []const u8) ?usize {
             for (self.entries.items, 0..) |e, i| {
@@ -117,7 +134,7 @@ pub fn RamFs(comptime Blocks: type) type {
         pub fn open(self: *Self, path: []const u8) Error!*File {
             if (path.len == 1) return error.IsDirectory;
             const e = self.entries.items[self.find(path) orelse return error.NotFound];
-            if (e.fifo != 0) return error.Invalid; // opened through its owner
+            if (e.fifo != 0 or e.link != null) return error.Invalid; // opened through its owner, or followed
             const f = e.file orelse return error.IsDirectory;
             f.refs += 1;
             return f;
@@ -150,6 +167,47 @@ pub fn RamFs(comptime Blocks: type) type {
             try self.checkParent(path);
             try self.addEntry(path, null);
             self.entries.items[self.entries.items.len - 1].fifo = id;
+        }
+
+        /// Make a symbolic link at `path` to `target`.
+        pub fn symlink(self: *Self, path: []const u8, target: []const u8) Error!void {
+            if (path.len == 1 or self.find(path) != null) return error.Exists;
+            try self.checkParent(path);
+            const copy = self.gpa.dupe(u8, target) catch return error.NoSpace;
+            self.addEntry(path, null) catch |e| {
+                self.gpa.free(copy);
+                return e;
+            };
+            self.entries.items[self.entries.items.len - 1].link = copy;
+        }
+
+        /// What the symbolic link `path` points to, or null if it is not one.
+        /// The memory is the filesystem's, valid until the link changes.
+        pub fn readlink(self: *const Self, path: []const u8) ?[]const u8 {
+            if (path.len == 1) return null;
+            return self.entries.items[self.find(path) orelse return null].link;
+        }
+
+        /// Give the file at `old` a second name, `new` (a hard link). Not a
+        /// directory, FIFO or symbolic link (`error.Invalid`, the caller's
+        /// `EPERM`).
+        pub fn link(self: *Self, old: []const u8, new: []const u8) Error!*File {
+            if (old.len == 1) return error.Invalid;
+            const e = self.entries.items[self.find(old) orelse return error.NotFound];
+            const f = e.file orelse return error.Invalid;
+            if (new.len == 1 or self.find(new) != null) return error.Exists;
+            try self.checkParent(new);
+            try self.addEntry(new, f);
+            f.refs += 1;
+            f.nlink += 1;
+            return f;
+        }
+
+        /// The file at `path` (no holder taken: the caller holds the
+        /// filesystem's lock while using it), or null.
+        pub fn fileAt(self: *const Self, path: []const u8) ?*File {
+            if (path.len == 1) return null;
+            return self.entries.items[self.find(path) orelse return null].file;
         }
 
         /// The number of the FIFO at `path`, or null if it is not one.
@@ -194,7 +252,7 @@ pub fn RamFs(comptime Blocks: type) type {
             if (e.isDir()) return error.IsDirectory;
             _ = self.entries.swapRemove(i);
             self.gpa.free(e.path);
-            if (e.file) |f| self.release(f); // a FIFO's pipe is its owner's
+            self.dropEntry(e); // a FIFO's pipe is its owner's
             self.trim();
         }
 
@@ -264,7 +322,7 @@ pub fn RamFs(comptime Blocks: type) type {
                 // entries have, and must be handed out in it.)
                 const e = self.entries.orderedRemove(to);
                 self.gpa.free(e.path);
-                if (e.file) |f| self.release(f);
+                self.dropEntry(e);
             }
             var taken: usize = 0;
             for (self.entries.items) |*e| {
@@ -365,7 +423,7 @@ pub fn RamFs(comptime Blocks: type) type {
         pub fn deinit(self: *Self) void {
             for (self.entries.items) |e| {
                 self.gpa.free(e.path);
-                if (e.file) |f| self.release(f);
+                self.dropEntry(e);
             }
             self.entries.deinit(self.gpa);
             self.entries = .empty;

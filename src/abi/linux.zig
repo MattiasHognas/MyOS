@@ -96,6 +96,23 @@ pub const Sys = struct {
     pub const wait4 = 61;
     /// `waitid(idtype, id, info, options, rusage)`: `wait4` with a `siginfo`.
     pub const waitid = 247;
+    /// `link(old, new)`, `linkat(olddirfd, old, newdirfd, new, flags)`:
+    /// a second name for a file; `symlink(target, path)`,
+    /// `symlinkat(target, dirfd, path)`: a symbolic link.
+    pub const link = 86;
+    pub const symlink = 88;
+    pub const linkat = 265;
+    pub const symlinkat = 266;
+    /// `utimensat(dirfd, path, times, flags)`: a file's access and
+    /// modification times (`futimens` with a null path).
+    pub const utimensat = 280;
+    /// `fallocate(fd, mode, offset, len)`, `fadvise64(fd, offset, len,
+    /// advice)` (`posix_fadvise`), `sendfile(out, in, offset, count)`,
+    /// `copy_file_range(in, off_in, out, off_out, len, flags)`.
+    pub const fallocate = 285;
+    pub const fadvise64 = 221;
+    pub const sendfile = 40;
+    pub const copy_file_range = 326;
     /// `getrusage(who, usage)`: CPU time and memory used.
     pub const getrusage = 98;
     /// `getpriority(which, who)` and `setpriority(which, who, prio)`: nice values.
@@ -623,6 +640,10 @@ pub const Stat = extern struct {
     _unused: [3]i64 = .{ 0, 0, 0 },
 };
 
+/// `utimensat`'s special nanosecond values.
+pub const UTIME_NOW = (1 << 30) - 1;
+pub const UTIME_OMIT = (1 << 30) - 2;
+
 /// File types in `Stat.mode`.
 pub const S = struct {
     /// Mask of the file type bits.
@@ -721,6 +742,8 @@ pub const ACCESS = struct {
     pub const R_OK = 4;
 };
 pub const AT_EMPTY_PATH = 0x1000;
+/// `linkat`: link what a symbolic link points to.
+pub const AT_SYMLINK_FOLLOW = 0x400;
 pub const AT_SYMLINK_NOFOLLOW = 0x100;
 /// Size of the structure `set_robust_list` registers.
 pub const ROBUST_LIST_HEAD_SIZE = 24;

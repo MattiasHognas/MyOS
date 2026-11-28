@@ -312,3 +312,28 @@ test "ramfs: FIFOs are names with a number, neither files nor directories" {
     try fs.unlink("/d/p2");
     try fs.rmdir("/d");
 }
+
+test "ramfs: symbolic links and hard links" {
+    var fs = newFs();
+    defer fs.deinit();
+    try put(&fs, "/f", "data");
+    try fs.symlink("/s", "f");
+    try testing.expectEqualStrings("f", fs.readlink("/s").?);
+    try expectEqual(ramfs.Kind.symlink, fs.info("/s").?.kind);
+    try expectError(error.Invalid, fs.open("/s")); // followed by the owner, not opened
+    try expectError(error.Exists, fs.symlink("/s", "g"));
+    try expectError(error.NotDirectory, fs.rmdir("/s"));
+    const f = try fs.link("/f", "/h");
+    try expectEqual(@as(u32, 2), f.nlink);
+    try expectError(error.Invalid, fs.link("/s", "/x")); // not a file
+    try fs.unlink("/f");
+    try expectEqual(@as(u32, 1), f.nlink);
+    const g = try fs.open("/h");
+    defer fs.release(g);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("data", buf[0..fs.read(g, 0, &buf)]);
+    try fs.rename("/s", "/t");
+    try testing.expectEqualStrings("f", fs.readlink("/t").?);
+    try fs.unlink("/t");
+    try fs.unlink("/h");
+}

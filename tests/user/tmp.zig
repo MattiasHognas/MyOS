@@ -276,6 +276,87 @@ pub fn main() noreturn {
     put("hello", "not a program any more");
     expect(lib.run("hello") == lib.err(.NOEXEC), 104);
 
+    // --- Links: symbolic ones, followed; hard ones, the same file twice.
+    put("target", "linked");
+    expect(lib.syscall(Sys.symlink, @intFromPtr("target"), @intFromPtr("soft"), 0) == 0, 120);
+    expect(std.mem.eql(u8, contents("soft"), "linked"), 121); // followed
+    var lbuf: [32]u8 = undefined;
+    expect(lib.syscall(Sys.readlink, @intFromPtr("soft"), @intFromPtr(&lbuf), lbuf.len) == 6 and std.mem.eql(u8, lbuf[0..6], "target"), 122);
+    {
+        var lst: abi.Stat = .{};
+        expect(lib.syscall6(Sys.newfstatat, CWD, @intFromPtr("soft"), @intFromPtr(&lst), abi.AT_SYMLINK_NOFOLLOW, 0, 0) == 0 and lst.mode & S.IFMT == S.IFLNK, 123);
+    }
+    expect(lib.syscall(Sys.symlink, @intFromPtr("x"), @intFromPtr("soft"), 0) == lib.err(.EXIST), 124);
+    expect(lib.syscall(Sys.symlink, @intFromPtr("nowhere"), @intFromPtr("dangling"), 0) == 0, 125); // need not exist
+    expect(open("dangling", O.RDONLY) == lib.err(.NOENT), 126);
+    expect(lib.syscall(Sys.symlink, @intFromPtr("x"), @intFromPtr("/etc/x"), 0) == lib.err(.ROFS), 127);
+    expect(lib.syscall(Sys.link, @intFromPtr("target"), @intFromPtr("hard"), 0) == 0, 128);
+    const a = stat("target").?;
+    const b = stat("hard").?;
+    expect(a.ino == b.ino and a.nlink == 2 and b.nlink == 2, 129);
+    put("hard", "changed"); // through one name, seen through the other
+    expect(std.mem.eql(u8, contents("target"), "changed"), 130);
+    expect(call1(Sys.unlink, "target") == 0 and stat("hard").?.nlink == 1 and std.mem.eql(u8, contents("hard"), "changed"), 131);
+    expect(lib.syscall(Sys.link, @intFromPtr("."), @intFromPtr("dirlink"), 0) == lib.err(.PERM), 132); // no directory
+    expect(lib.syscall(Sys.link, @intFromPtr("/etc/motd"), @intFromPtr("motd"), 0) == lib.err(.XDEV), 133);
+    expect(call1(Sys.unlink, "soft") == 0 and call1(Sys.unlink, "dangling") == 0 and call1(Sys.unlink, "hard") == 0, 134);
+
+    // --- Times: set by writing, by utimensat and futimens.
+    {
+        put("timed", "x");
+        const t0 = stat("timed").?;
+        expect(t0.mtime.sec > 1_700_000_000, 135); // the wall clock, not 1970
+        const times = [2]abi.TimeSpec{ .{ .sec = 1000, .nsec = 5 }, .{ .sec = 2000, .nsec = 7 } };
+        expect(lib.syscall6(Sys.utimensat, CWD, @intFromPtr("timed"), @intFromPtr(&times), 0, 0, 0) == 0, 136);
+        const t1 = stat("timed").?;
+        expect(t1.atime.sec == 1000 and t1.atime.nsec == 5 and t1.mtime.sec == 2000 and t1.mtime.nsec == 7, 137);
+        // UTIME_OMIT keeps one, UTIME_NOW sets it to now.
+        const some = [2]abi.TimeSpec{ .{ .sec = 0, .nsec = abi.UTIME_OMIT }, .{ .sec = 0, .nsec = abi.UTIME_NOW } };
+        expect(lib.syscall6(Sys.utimensat, CWD, @intFromPtr("timed"), @intFromPtr(&some), 0, 0, 0) == 0, 138);
+        const t2 = stat("timed").?;
+        expect(t2.atime.sec == 1000 and t2.mtime.sec > 1_700_000_000, 139);
+        // futimens: the descriptor's file, all of it now.
+        const tfd = open("timed", O.RDWR);
+        expect(lib.syscall6(Sys.utimensat, tfd, 0, 0, 0, 0, 0) == 0 and stat("timed").?.atime.sec > 1_700_000_000, 140);
+        _ = lib.syscall(Sys.close, tfd, 0, 0);
+        const bad = [2]abi.TimeSpec{ .{ .sec = 0, .nsec = 2_000_000_000 }, .{ .sec = 0, .nsec = 0 } };
+        expect(lib.syscall6(Sys.utimensat, CWD, @intFromPtr("timed"), @intFromPtr(&bad), 0, 0, 0) == lib.err(.INVAL), 141);
+        expect(lib.syscall6(Sys.utimensat, CWD, @intFromPtr("/etc/motd"), 0, 0, 0, 0) == lib.err(.ROFS), 142);
+        expect(stat("/etc/motd").?.mtime.sec > 1_700_000_000, 143); // the image's: when the system started
+        expect(call1(Sys.unlink, "timed") == 0, 144);
+    }
+
+    // --- fallocate, posix_fadvise, sendfile, copy_file_range.
+    {
+        put("src", "0123456789");
+        const sfd = open("src", O.RDWR);
+        expect(lib.syscall6(Sys.fallocate, sfd, 0, 0, 20, 0, 0) == 0 and stat("src").?.size == 20, 150); // longer
+        expect(lib.syscall6(Sys.fallocate, sfd, 1, 0, 100, 0, 0) == 0 and stat("src").?.size == 20, 151); // KEEP_SIZE
+        expect(lib.syscall6(Sys.fallocate, sfd, 3, 0, 4, 0, 0) == lib.err(.OPNOTSUPP), 152); // punch a hole
+        expect(lib.syscall6(Sys.fallocate, sfd, 0, 0, 0, 0, 0) == lib.err(.INVAL), 153);
+        _ = lib.syscall(Sys.ftruncate, sfd, 10, 0);
+        expect(lib.syscall6(Sys.fadvise64, sfd, 0, 0, 2, 0, 0) == 0 and lib.syscall6(Sys.fadvise64, sfd, 0, 0, 9, 0, 0) == lib.err(.INVAL), 154);
+        // sendfile into a pipe, from an offset given (the file's stays).
+        var p: [2]i32 = undefined;
+        expect(lib.syscall(Sys.pipe2, @intFromPtr(&p), 0, 0) == 0, 155);
+        var off: u64 = 3;
+        expect(lib.syscall6(Sys.sendfile, @intCast(p[1]), sfd, @intFromPtr(&off), 4, 0, 0) == 4 and off == 7, 156);
+        var got: [8]u8 = undefined;
+        expect(lib.read(@intCast(p[0]), &got) == 4 and std.mem.eql(u8, got[0..4], "3456"), 157);
+        expect(lib.syscall6(Sys.sendfile, sfd, @intCast(p[0]), 0, 4, 0, 0) == lib.err(.INVAL), 158); // from a pipe
+        _ = lib.syscall(Sys.close, @intCast(p[0]), 0, 0);
+        _ = lib.syscall(Sys.close, @intCast(p[1]), 0, 0);
+        // copy_file_range: between two files, from offsets that move.
+        const dfd = open("dst", O.RDWR | O.CREAT);
+        var in_off: u64 = 5;
+        expect(lib.syscall6(Sys.copy_file_range, sfd, @intFromPtr(&in_off), dfd, 0, 5, 0) == 5 and in_off == 10, 159);
+        expect(std.mem.eql(u8, contents("dst"), "56789"), 160);
+        expect(lib.syscall6(Sys.copy_file_range, sfd, 0, dfd, 0, 5, 1) == lib.err(.INVAL), 161); // flags
+        _ = lib.syscall(Sys.close, sfd, 0, 0);
+        _ = lib.syscall(Sys.close, dfd, 0, 0);
+        expect(call1(Sys.unlink, "src") == 0 and call1(Sys.unlink, "dst") == 0, 162);
+    }
+
     // --- And away with all of it.
     expect(call1(Sys.unlink, "hello") == 0 and call1(Sys.unlink, "moved/a") == 0, 110);
     expect(call1(Sys.unlink, "moved/deeper/b") == 0 and call1(Sys.unlink, "moved/deeper/other") == 0, 111);
