@@ -48,7 +48,7 @@ fn msrOf(off: usize) u32 {
     return 0x800 + @as(u32, @intCast(off >> 4));
 }
 
-fn readReg(off: usize) u32 {
+pub fn readReg(off: usize) u32 {
     return if (x2apic) @truncate(cpu.rdmsr(msrOf(off))) else lapicReg(off).*;
 }
 

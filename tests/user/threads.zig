@@ -334,7 +334,12 @@ pub fn main() noreturn {
     const t0 = nowNs();
     expect(futex(&gate_a, FUTEX.WAIT, 0, &limit) == lib.err(.TIMEDOUT), 11);
     const waited = nowNs() - t0;
-    expect(waited >= 30_000_000 and waited < 500_000_000, 12);
+    if (waited < 30_000_000) {
+        var line: [64]u8 = undefined;
+        lib.write(std.fmt.bufPrint(&line, "  threads: a 30 ms futex wait ended after {d} us\n", .{waited / 1000}) catch "");
+    }
+    expect(waited >= 30_000_000, 12); // not before its time
+    expect(waited < 500_000_000, 113); // nor much after
     // Until a time that has passed: at once.
     const past: abi.TimeSpec = .{ .sec = 0, .nsec = 1 };
     expect(lib.syscall6(Sys.futex, @intFromPtr(&gate_a), FUTEX.WAIT_BITSET, 0, @intFromPtr(&past), 0, 0xFFFF_FFFF) == lib.err(.TIMEDOUT), 13);

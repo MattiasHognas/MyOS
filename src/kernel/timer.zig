@@ -19,6 +19,7 @@
 //! `sleepTicks` adds one so that a sleep is never shorter than asked.
 
 const std = @import("std");
+const ipi = @import("../arch/x86_64/ipi.zig");
 
 const thread = @import("thread.zig");
 const timer_queue = @import("sync/timer_queue.zig");
@@ -63,6 +64,20 @@ pub fn cancel(timer: *Timer) bool {
     const held = lock.acquire();
     defer lock.release(held);
     return queue.cancel(timer);
+}
+
+/// For a panic report: the time in ticks and the first timers due, printed
+/// with `print`. Takes no lock (the other CPUs are stopped): a tick that
+/// stopped advancing shows here, with timers due long ago still waiting.
+pub fn dumpForPanic(comptime print: fn (comptime []const u8, anytype) void) void {
+    print("timers: tick {d}, {d} pending, lock {s}\n", .{ ticks, queue.count(), if (lock.isHeld()) "held" else "free" });
+    var t = queue.head;
+    var n: usize = 0;
+    while (t) |one| : (t = one.next) {
+        n += 1;
+        if (n > 8) return print("  ...\n", .{});
+        print("  due at tick {d} (in {d})\n", .{ one.deadline, @as(i64, @intCast(one.deadline)) - @as(i64, @intCast(ticks)) });
+    }
 }
 
 /// Number of timers pending.
@@ -135,7 +150,13 @@ pub const WakeTimer = struct {
     /// callback takes only the scheduler lock) but not the scheduler lock.
     pub fn finish(self: *WakeTimer) void {
         if (cancel(&self.timer)) return;
-        while (!self.finished.load(.acquire)) std.atomic.spinLoopHint();
+        // With interrupts off this is a loop that waits, so it does the
+        // requests of other CPUs meanwhile (`ipi.zig`): the CPU running the
+        // callback may be waiting for one this CPU has to answer.
+        while (!self.finished.load(.acquire)) {
+            ipi.poll();
+            std.atomic.spinLoopHint();
+        }
     }
 };
 

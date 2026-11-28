@@ -31,6 +31,7 @@ const abi = kernel_root.abi;
 const hpet = kernel_root.drivers.hpet;
 const tty = kernel_root.kernel.tty;
 const timer = kernel_root.kernel.timer;
+const clock = kernel_root.kernel.clock;
 const SpinLock = kernel_root.kernel.sync.spinlock.SpinLock;
 const WaitQueue = kernel_root.kernel.sync.wait_queue.WaitQueue;
 const Mutex = kernel_root.kernel.sync.mutex.Mutex;
@@ -1990,12 +1991,34 @@ pub fn quiesce() void {
 }
 
 /// Let other threads run until `count` returns `n`. False if it never happens.
+/// A request to switch threads that came for a thread which then blocked
+/// (`thread.preemptForWoken`, the interrupt not taken yet) must not keep
+/// the idle CPU from taking interrupts: it did, and on the boot CPU, whose
+/// tick runs the timers, a sleep then never ended. Sleeps three ticks
+/// with the request standing and checks that this CPU took timer
+/// interrupts meanwhile. Returns 0, or the number of the first failing check.
+pub fn idleWithPreemptRequest() u32 {
+    const flags = cpu.saveAndDisableInterrupts();
+    defer cpu.restoreInterrupts(flags);
+    const c = percpu.current();
+    const before = c.ticks;
+    thread.requestPreemptHere();
+    timer.sleepTicks(3); // with interrupts off, as a system call would
+    if (percpu.current() != c) return 0; // woken elsewhere: nothing to measure
+    if (c.ticks - before < 2) return 1; // it idled with interrupts shut out
+    if (c.preempt_requested) return 2;
+    return 0;
+}
+
 fn untilCount(comptime count: fn () usize, n: usize) bool {
-    for (0..10_000) |_| {
+    // Bounded by time, not by a number of yields: with the other virtual
+    // CPUs held up by the host, a program may take many yields to start.
+    const until = clock.nanos() + 10 * std.time.ns_per_s;
+    while (clock.nanos() < until) {
         if (count() == n) return true;
         thread.yield();
     }
-    return false;
+    return count() == n;
 }
 const SPIN_ROUNDS = 20_000;
 
@@ -2472,7 +2495,7 @@ pub fn keyboardReaders() u32 {
     // One key wakes one reader: the first.
     tty.inject("a");
     if (process.wait(readers[0]) != 'a') return 3;
-    if (tty.waitingReaders() != 2) return 4;
+    if (!untilCount(tty.waitingReaders, 2)) return 4; // the others may be on their way back to waiting
     // Two keys at once: one each, in order.
     tty.inject("b");
     tty.inject("c");
@@ -4112,7 +4135,6 @@ fn clockWorker() void {
 /// 100 ms), and threads on every CPU never see it go back. Returns 0, or
 /// the number of the first failing check.
 pub fn clockChecks() u32 {
-    const clock = kernel_root.kernel.clock;
     const c0 = clock.nanos();
     const h0 = hpet.nanos();
     timer.sleepMs(100);

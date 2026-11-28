@@ -57,6 +57,9 @@ iso="$out/os.iso"
 # Only there to end a boot that hangs: a full run takes 15 to 30 s on a
 # developer's machine and two to three times that on a CI runner.
 timeout_s="${MYOS_QEMU_TIMEOUT:-180}"
+# More QEMU options, for debugging: MYOS_QEMU_EXTRA="-s" lets gdb attach
+# to a boot that hangs (`target remote :1234`).
+read -ra extra <<<"${MYOS_QEMU_EXTRA:-}"
 
 # Boot one scenario on the CPU model $2 (default: max, every feature QEMU
 # emulates; "host" runs on the host's CPU with KVM) with $3 CPUs (default:
@@ -131,6 +134,7 @@ run_qemu() {
         -device nvme,serial=myos-test,drive=nvm \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
         -fw_cfg name=opt/myos/scenario,string="$told" \
+        "${extra[@]}" \
         >"$raw" 2>&1
 }
 
@@ -332,8 +336,10 @@ run_scenario() {
             expect_line '^PANIC: scenario: assertion failed: deliberate test panic$'
             expect_line '^backtrace:$'
             expect_line ' [^ ]*scenarioPanicSmp\+0x'
-            # Everything from the panic on is the report: the others were stopped first.
-            if sed -n '/^PANIC: /,$p' "$log" | grep -q 'chatter'; then fail "another CPU printed after the panic began"; fi
+            # Everything from the panic on is the report: the others were stopped
+            # first. (The report shows where each was: in `chatter`, by name.)
+            if sed -n '/^PANIC: /,$p' "$log" | grep -q '^chatter from thread'; then fail "another CPU printed after the panic began"; fi
+            expect_line '^CPU [0-9]+ was at:$' # where the others were when they stopped
             ;;
         fault)
             expect_status 3

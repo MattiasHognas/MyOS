@@ -341,9 +341,42 @@ fn readCr2() u64 {
 ///   the copy's error path: the syscall fails, nothing is killed.
 /// - Other exceptions from ring 0 print the register state and a symbolized
 ///   backtrace, then halt, except breakpoints (`int3`), which resume.
+/// Where an interrupt found a kernel stack deepest (kernels that measure
+/// stack use, `kstack.track_usage`): how deep, and the call chain it
+/// interrupted, for a run whose stack peak is too high to say which path
+/// it was (`deepestInterrupted`).
+pub const Deepest = struct { depth: u64 = 0, rip: u64 = 0, frames: [16]u64 = @splat(0), n: usize = 0 };
+var deepest: Deepest = .{};
+var deepest_depth: std.atomic.Value(u64) = .init(0);
+
+pub fn deepestInterrupted() Deepest {
+    return deepest;
+}
+
+fn noteDepth(f: *const Frame) void {
+    const stack = thread.current().stack orelse return;
+    const top = @intFromPtr(stack.ptr) + stack.len;
+    if (f.rsp <= @intFromPtr(stack.ptr) or f.rsp > top) return; // on another stack
+    const depth = top - f.rsp;
+    var seen = deepest_depth.load(.monotonic);
+    while (depth > seen) {
+        seen = deepest_depth.cmpxchgWeak(seen, depth, .monotonic, .monotonic) orelse {
+            // (Two CPUs at once may mix their records: a debugging aid.)
+            deepest.depth = depth;
+            deepest.rip = f.rip;
+            deepest.n = backtrace.capture(f.rbp, &deepest.frames);
+            return;
+        };
+    }
+}
+
 export fn interruptHandler(f: *Frame) callconv(.c) void {
     if (f.vector == apic.SPURIOUS) return; // spurious: no EOI
-    if (f.vector == VECTOR_NMI) ipi.haltIfStopped(); // another CPU is reporting a crash
+    if (comptime kstack.track_usage) {
+        if (f.cs & 3 == 0 and f.vector >= 32) noteDepth(f);
+    }
+    if (f.vector == VECTOR_NMI) // another CPU is reporting a crash: say where this one was
+        ipi.haltIfStoppedAt(.{ .rip = f.rip, .rbp = f.rbp, .user = f.cs & 3 == 3, .rflags = f.rflags });
     if (f.vector >= 32) {
         apic.eoi(); // BEFORE the handler: it may switch threads
         random.interruptTiming(f.vector, f.rip);

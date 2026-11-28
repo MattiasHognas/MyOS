@@ -8,6 +8,8 @@
 //! then QEMU is exited.
 
 const std = @import("std");
+/// The longest a test case may take before it counts as hung (`watchdog`).
+const WATCHDOG_NS: u64 = 90 * std.time.ns_per_s;
 const root = @import("root");
 const pmm = root.kernel.pmm;
 const process = root.kernel.process;
@@ -257,6 +259,10 @@ fn waitQueues() TestError!void {
 }
 
 /// Timers fire on their tick, in order; cancelling; sleeping.
+fn idleWithPreemptRequest() TestError!void {
+    try expectChecks("idle with a switch request", helpers.idleWithPreemptRequest());
+}
+
 fn timers() TestError!void {
     const irq = helpers.enableInterrupts();
     defer helpers.restoreInterrupts(irq);
@@ -1977,6 +1983,13 @@ noinline fn reportStackPeaks() usize {
     serial.puts(std.fmt.bufPrint(&peak_line, "MYOS_STACK_PEAK bytes={d} of={d} limit={d}\n", .{ peak, helpers.STACK_SIZE, helpers.STACK_WARN_BYTES }) catch unreachable);
     if (peak > helpers.STACK_WARN_BYTES) {
         too_deep += 1;
+        // Most often an interrupt on top of the deepest path: where one
+        // found a stack deepest.
+        const d = root.arch.x86_64.idt.deepestInterrupted();
+        var line: [96]u8 = undefined;
+        serial.puts(std.fmt.bufPrint(&line, "deepest an interrupt found a stack: {d} bytes, at:\n", .{d.depth}) catch unreachable);
+        root.kernel.debug.backtrace.printFrame(0, d.rip, false);
+        for (d.frames[0..d.n], 1..) |ret, i| root.kernel.debug.backtrace.printFrame(i, ret, true);
         serial.puts("[FAIL] kernel stack usage below the warning level\n");
     } else serial.puts("[PASS] kernel stack usage below the warning level\n");
 
@@ -2140,6 +2153,7 @@ fn runCases() noreturn {
         .{ .name = "on every CPU at once: programs run, are preempted, crash and are torn down", .func = parallelPrograms },
         .{ .name = "locking model (locks held per CPU, idle wake-up in place, wake timers, unstarted threads)", .func = lockingModel },
         .{ .name = "kernel timers (order, expiry, cancel, sleep)", .func = timers },
+        .{ .name = "an idle CPU takes interrupts with a request to switch threads left standing", .func = idleWithPreemptRequest },
         .{ .name = "mutex exclusion and hand-off under preemption", .func = mutexes },
         .{ .name = "keyboard readers wait on a queue", .func = keyboardReaders },
         .{ .name = "process exit status outlives the process; early exit, shared and no waiters", .func = processWaiting },
@@ -2187,7 +2201,11 @@ fn runCases() noreturn {
         break :blk t;
     };
     for (&table) |*case| {
+        // A case that hangs panics instead (`watchdog` in `main.zig`): the
+        // report says where every CPU was. No case takes a minute.
+        root.test_deadline.store(root.kernel.clock.nanos() + WATCHDOG_NS, .monotonic);
         const ok = runCase(case.func, case.alone);
+        root.test_deadline.store(0, .monotonic);
         if (ok) passed += 1 else failed += 1;
         serial.puts(if (ok) "[PASS] " else "[FAIL] ");
         serial.puts(case.name);

@@ -217,10 +217,56 @@ pub fn stopping() bool {
 /// If the CPUs are being stopped and this is not the CPU doing it: halt,
 /// with interrupts off, and never return.
 pub fn haltIfStopped() void {
+    haltIfStoppedAt(null);
+}
+
+/// Where a stopped CPU was when it stopped, for the report of the CPU that
+/// stopped it (`stoppedAt`): what each CPU was doing is often the cause of
+/// a panic on another (a lock it holds, a request it does not answer).
+pub const StoppedAt = struct {
+    /// The instruction it was interrupted at, and its frame pointer.
+    rip: u64 = 0,
+    rbp: u64 = 0,
+    /// It was running a program, not the kernel.
+    user: bool = false,
+    /// Recorded (it stopped from the NMI, not from a loop that polls).
+    known: bool = false,
+    /// Its flags (interrupts on or off), and its local APIC: interrupts in
+    /// service and requested of vectors 32 to 63 (the timer's and the
+    /// IPIs'), the timer's LVT entry and count, the task priority. A CPU
+    /// that has stopped taking interrupts shows here.
+    rflags: u64 = 0,
+    isr1: u32 = 0,
+    irr1: u32 = 0,
+    lvt_timer: u32 = 0,
+    timer_count: u32 = 0,
+    tpr: u32 = 0,
+};
+
+var stopped_at: [percpu.MAX_CPUS]StoppedAt = @splat(.{});
+
+/// `haltIfStopped` for the NMI handler, which knows where the CPU was
+/// interrupted (`at`): recorded first.
+pub fn haltIfStoppedAt(at: ?StoppedAt) void {
     const holder = stopper.load(.acquire);
     if (holder < 0) return;
     const me: i32 = if (percpu.currentIfReady()) |c| @intCast(c.id) else 0;
     if (holder == me) return;
-    _ = stopped.fetchAdd(1, .acq_rel);
+    if (at) |where| {
+        const s = &stopped_at[@intCast(me)];
+        s.* = where;
+        s.known = true;
+        s.isr1 = apic.readReg(0x110);
+        s.irr1 = apic.readReg(0x210);
+        s.lvt_timer = apic.readReg(0x320);
+        s.timer_count = apic.readReg(0x390);
+        s.tpr = apic.readReg(0x80);
+    }
+    _ = stopped.fetchAdd(1, .acq_rel); // after the record: the stopper reads it then
     while (true) asm volatile ("cli; hlt");
+}
+
+/// Where CPU `id` was when `stopOthers` stopped it, if it said.
+pub fn stoppedAt(id: usize) StoppedAt {
+    return stopped_at[id];
 }

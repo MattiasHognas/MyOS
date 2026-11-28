@@ -349,15 +349,31 @@ pub fn block() void {
 /// Another CPU can make a thread ready in that gap. It finds this CPU
 /// marked idle and sends it an interrupt, which is taken the moment the
 /// halt begins.
+///
+/// A request to switch threads (`preemptForWoken`) that came for the
+/// thread this CPU ran before it blocked is dropped here: there is no
+/// thread to switch from, and the ready queue is looked at anyway. Left
+/// standing, it made `pollForWork` find work at once on every round, and
+/// the CPU went round `block` with interrupts off for ever: on the boot
+/// CPU, time itself stopped (its tick runs the timers), and every timed
+/// wait in the system with it.
+///
+/// And whatever `pollForWork` finds, interrupts that are waiting are let
+/// in before the CPU looks again (`sti; nop; cli`: one instruction with
+/// them on), so that no flag left standing can shut this CPU's interrupts
+/// out for good.
 fn idleOnce() void {
     const c = percpu.current();
     assert.check(.thread, ready_head == null or !c.runs_threads, "halting while thread {d} is ready", .{if (ready_head) |t| t.id else 0});
     c.idle = true;
+    c.preempt_requested = false; // under the scheduler lock, as it is set
     vmm.enterLazy(); // not to be woken for flushes of the address space it has loaded
     lock.drop();
     if (!pollForWork(c)) {
         c.halts += 1;
         asm volatile ("sti; hlt; cli");
+    } else {
+        asm volatile ("sti; nop; cli");
     }
     vmm.leaveLazy();
     lock.take();
@@ -449,6 +465,15 @@ fn preemptForWoken() void {
     } else {
         ipi.preempt(c);
     }
+}
+
+/// For tests: leave a request to switch threads standing on this CPU, as
+/// `preemptForWoken` does for a thread that then blocks before the
+/// interrupt is taken.
+pub fn requestPreemptHere() void {
+    const held = lock.acquire();
+    defer lock.release(held);
+    percpu.current().preempt_requested = true;
 }
 
 /// The interrupt `preemptForWoken` sends: switch threads, if the request

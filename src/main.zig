@@ -182,8 +182,23 @@ fn findModule(name: []const u8) ?[]const u8 {
 /// its current thread when the time slice is used up.
 fn onTick(f: *idt.Frame) void {
     kernel.profile.sample(f.rip, f.cs & 3 == 3);
+    if (comptime build_options.is_test) watchdog();
     if (arch.x86_64.percpu.current().id == 0) kernel.timer.tick(); // first: a thread a timer wakes can run right away
     thread.tick();
+}
+
+/// In the test kernel: when the test case running now must be done by
+/// (`kernel.clock.nanos`), or 0 for no limit. Set by the test runner.
+pub var test_deadline: std.atomic.Value(u64) = .init(0);
+
+/// A test case that hangs is reported as a panic, from whichever CPU's
+/// timer sees it first, so that the report shows where every CPU was
+/// (`otherCpusReport`) instead of the run just timing out.
+fn watchdog() void {
+    const deadline = test_deadline.load(.monotonic);
+    if (deadline == 0 or kernel.clock.nanos() < deadline) return;
+    if (test_deadline.cmpxchgStrong(deadline, 0, .acq_rel, .monotonic) != null) return; // another CPU saw it
+    @panic("test watchdog: the test case has not finished in time (it hangs)");
 }
 
 /// Return the response pointer of the Limine request `req`, panicking if the
@@ -263,9 +278,36 @@ fn kernelPanic(msg: []const u8, ret_addr: ?usize) noreturn {
     onCrashStack(&panicReport);
 }
 
+/// For a panic: where each other CPU was when it was stopped. A lock held
+/// for ever, or a request never answered, is most often another CPU's doing.
+fn otherCpusReport() void {
+    const percpu = arch.x86_64.percpu;
+    const me = if (percpu.currentIfReady()) |c| c.id else return;
+    print("this CPU ({d}): {d} timer interrupts\n", .{ me, percpu.get(me).ticks });
+    for (0..percpu.count()) |i| {
+        if (i == me) continue;
+        const at = arch.x86_64.ipi.stoppedAt(i);
+        print("CPU {d}: {d} timer interrupts; interrupts {s}; APIC in service 0x{x}, requested 0x{x} (vectors 32-63), timer LVT 0x{x} count {d}, TPR 0x{x}\n", .{
+            i, percpu.get(i).ticks, if (at.rflags & (1 << 9) != 0) "on" else "off", at.isr1, at.irr1, at.lvt_timer, at.timer_count, at.tpr,
+        });
+        if (!at.known) {
+            print("CPU {d}: stopped without saying where it was\n", .{i});
+        } else if (at.user) {
+            print("CPU {d}: was running a program (at 0x{x})\n", .{ i, at.rip });
+        } else {
+            print("CPU {d} was at:\n", .{i});
+            backtrace.print(.{ .pc = at.rip }, at.rbp);
+        }
+    }
+}
+
 fn panicReport() noreturn {
     print("PANIC: {s}\n", .{panic_msg});
     backtrace.print(.{ .return_address = panic_ret }, panic_rbp);
+    otherCpusReport();
+    kernel.timer.dumpForPanic(print);
+    print("processes:\n", .{});
+    kernel.process.dumpForPanic(print);
     if (comptime build_options.is_test) serial.puts("MYOS_TEST_FAIL\n");
     halt();
 }

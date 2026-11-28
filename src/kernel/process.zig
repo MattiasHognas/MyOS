@@ -534,6 +534,32 @@ pub fn signalThreadInfo(p: *Process, tid: u64, sig: u32, info: signal.SigInfo) S
     return .no_such;
 }
 
+/// For a panic report: every process with its threads, their states and
+/// signals, printed with `print`. Takes no lock (the other CPUs are
+/// stopped, and one of them may hold any): what it shows can be a moment
+/// out of date, never wrong for long.
+pub fn dumpForPanic(comptime print: fn (comptime []const u8, anytype) void) void {
+    var p = all_processes;
+    var shown: usize = 0;
+    while (p) |one| : (p = one.all_next) {
+        shown += 1;
+        if (shown > 64) return print("  (more processes)\n", .{});
+        print("  pid {d} {s}: signals pending 0x{x}\n", .{ one.pid, one.name, one.signal_pending.load(.monotonic) });
+        var t = one.thread_list;
+        var threads: usize = 0;
+        while (t) |th| : (t = th.proc_next) {
+            threads += 1;
+            if (threads > 32) break;
+            const where: usize = if (th.cpu) |c| c.id else 99;
+            print("    thread {d}: {t}{s} cpu {d}, pending 0x{x}, blocked 0x{x}{s}\n", .{
+                th.id,                                                  th.state,                           if (th.on_cpu) " on" else "",
+                where,                                                  th.signal_pending.load(.monotonic), th.signal_mask,
+                if (th.wait_queue != null) ", on a wait queue" else "",
+            });
+        }
+    }
+}
+
 /// Send `sig` to every process but `init` and `except` (`kill(-1)`).
 /// Returns how many got it.
 pub fn signalAll(sig: u32, except: *Process) usize {
@@ -1817,6 +1843,15 @@ pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []cons
         else => error.NotExecutable,
     };
     errdefer img.destroy();
+    return execWith(frame, p, me, &img, path, run_argv, run_path);
+}
+
+/// The rest of `execve`, once the new program is loaded into `img`: the
+/// other threads end, and this one goes on in the new program. Not
+/// inlined, so that `execve`'s frame, which is on the stack while the
+/// program is looked up and loaded (deep, in a Debug build), stays small.
+/// On an error `execve` destroys `img`.
+noinline fn execWith(frame: *arch_syscall.Frame, p: *Process, me: *thread.Thread, img: *const Image, path: []const u8, run_argv: []const []const u8, run_path: []const u8) ExecError!void {
     const name = try heap.allocator.dupe(u8, path);
     errdefer heap.allocator.free(name);
     const cmdline = try joinArgs(run_argv, run_path);
@@ -1837,7 +1872,7 @@ pub fn execve(frame: *arch_syscall.Frame, path: []const u8, argv: []const []cons
     p.exec_thread.store(null, .release);
     if (p.killed.load(.acquire)) return error.Interrupted;
 
-    replaceProgram(p, &img, name, cmdline);
+    replaceProgram(p, img, name, cmdline);
     resetForExec(p, me);
 
     // Into the new program, as a new process starts: every register zero
@@ -1961,6 +1996,13 @@ const ProgramFile = struct {
 fn readProgram(path: []const u8, argv: []const []const u8) ExecError!ProgramFile {
     const first = readWhole(path) catch |e| return e;
     if (first.len < 2 or first[0] != '#' or first[1] != '!') return .{ .image = first };
+    return readScript(first, path, argv);
+}
+
+/// `readProgram` for a script (`first` starts with `#!`), which it frees.
+/// Not inlined: its temporaries stay out of `readProgram`'s frame, which
+/// is on the stack while the program's path is looked up.
+noinline fn readScript(first: []u8, path: []const u8, argv: []const []const u8) ExecError!ProgramFile {
     defer heap.allocator.free(first);
     const line_end = std.mem.indexOfScalar(u8, first[0..@min(first.len, 256)], '\n') orelse return error.NotExecutable;
     const line = std.mem.trim(u8, first[2..line_end], " \t");
@@ -2048,40 +2090,15 @@ noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOption
     const program = try loadProgram(root, image, image_limits_now, options.randomize, &regions);
     const loaded = &program.loaded;
 
-    // Where the stack goes, and how far below its top the program's
-    // startup data ends (a multiple of 16 bytes), so that nothing on the
-    // stack is at a fixed offset within its page either.
-    const stack_top = if (options.randomize) STACK_TOP_MAX - random.below(STACK_RANDOM_PAGES) * pmm.PAGE_SIZE else STACK_TOP_MAX;
-    const data_top = stack_top - (if (options.randomize) random.below(STACK_RANDOM_OFFSET / 16) * 16 else 0);
-
-    // The stack may grow to `STACK_RESERVE`: all of that is its region,
-    // and the pages come as they are touched (`user_memory.zig`). The
-    // top ones are given now, for the startup data.
-    regions.add(heap.allocator, stack_top - STACK_RESERVE, STACK_RESERVE, vm_regions.Prot.rw, .stack) catch return error.OutOfMemory;
     var stack_pages: [STACK_PAGES]u64 = undefined; // physical; [0] is the highest page
-    for (0..STACK_PAGES) |i| {
-        const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
-        vmm.map(root, stack_top - (i + 1) * pmm.PAGE_SIZE, phys, vmm.USER | vmm.WRITABLE | vmm.NX, false) catch |e| {
-            pmm.free(phys); // not mapped, so destroying the address space would not free it
-            return e;
-        };
-        stack_pages[i] = phys;
-    }
-
+    const layout = try setUpStack(root, &regions, options.randomize, &stack_pages);
+    const stack_top = layout.stack_top;
+    const data_top = layout.data_top;
+    const mmap_top = layout.mmap_top;
+    const vdso_base = layout.vdso_base;
     // A program that names an interpreter (the dynamic loader) is not
     // started itself: the interpreter is loaded beside it and started,
     // and finds the program through the auxiliary vector.
-    var mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE;
-    // The vDSO, at the top of where mappings go: its clock page, then the
-    // image, shared by every process and faulted in when first touched.
-    var vdso_base: u64 = 0;
-    if (vdso.present()) {
-        const vvar_at = mmap_top - vdso.PAGES * pmm.PAGE_SIZE;
-        try regions.add(heap.allocator, vvar_at, pmm.PAGE_SIZE, .{ .read = true }, .vvar);
-        try regions.add(heap.allocator, vvar_at + pmm.PAGE_SIZE, vdso.TEXT_PAGES * pmm.PAGE_SIZE, .{ .read = true, .exec = true }, .vdso);
-        vdso_base = vvar_at + pmm.PAGE_SIZE;
-        mmap_top = vvar_at - pmm.PAGE_SIZE; // a page apart from the first mapping
-    }
     var interp_limits = image_limits_now;
     interp_limits.max_bytes -|= loaded.pages * pmm.PAGE_SIZE;
     var first_entry = loaded.entry;
@@ -2112,6 +2129,43 @@ noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOption
     };
 }
 
+/// `buildImage`'s stack and vDSO: where the stack goes, and how far below
+/// its top the program's startup data ends (a multiple of 16 bytes), so
+/// that nothing on the stack is at a fixed offset within its page either;
+/// its top pages, given now for the startup data (their physical addresses
+/// in `stack_pages`); where mappings go, with the vDSO at the top of that.
+/// Not inlined: its temporaries stay out of `buildImage`'s frame, which is
+/// on the stack while programs are loaded.
+noinline fn setUpStack(root: u64, regions: *vm_regions.Regions, randomize: bool, stack_pages: *[STACK_PAGES]u64) !struct { stack_top: u64, data_top: u64, mmap_top: u64, vdso_base: u64 } {
+    const stack_top = if (randomize) STACK_TOP_MAX - random.below(STACK_RANDOM_PAGES) * pmm.PAGE_SIZE else STACK_TOP_MAX;
+    const data_top = stack_top - (if (randomize) random.below(STACK_RANDOM_OFFSET / 16) * 16 else 0);
+
+    // The stack may grow to `STACK_RESERVE`: all of that is its region,
+    // and the pages come as they are touched (`user_memory.zig`).
+    regions.add(heap.allocator, stack_top - STACK_RESERVE, STACK_RESERVE, vm_regions.Prot.rw, .stack) catch return error.OutOfMemory;
+    for (0..STACK_PAGES) |i| {
+        const phys = pmm.allocZeroed() orelse return error.OutOfMemory;
+        vmm.map(root, stack_top - (i + 1) * pmm.PAGE_SIZE, phys, vmm.USER | vmm.WRITABLE | vmm.NX, false) catch |e| {
+            pmm.free(phys); // not mapped, so destroying the address space would not free it
+            return e;
+        };
+        stack_pages[i] = phys;
+    }
+
+    var mmap_top = stack_top - STACK_RESERVE - 256 * pmm.PAGE_SIZE;
+    // The vDSO, at the top of where mappings go: its clock page, then the
+    // image, shared by every process and faulted in when first touched.
+    var vdso_base: u64 = 0;
+    if (vdso.present()) {
+        const vvar_at = mmap_top - vdso.PAGES * pmm.PAGE_SIZE;
+        try regions.add(heap.allocator, vvar_at, pmm.PAGE_SIZE, .{ .read = true }, .vvar);
+        try regions.add(heap.allocator, vvar_at + pmm.PAGE_SIZE, vdso.TEXT_PAGES * pmm.PAGE_SIZE, .{ .read = true, .exec = true }, .vdso);
+        vdso_base = vvar_at + pmm.PAGE_SIZE;
+        mmap_top = vvar_at - pmm.PAGE_SIZE; // a page apart from the first mapping
+    }
+    return .{ .stack_top = stack_top, .data_top = data_top, .mmap_top = mmap_top, .vdso_base = vdso_base };
+}
+
 /// Create a process named `name` that runs the ELF executable `image`.
 ///
 /// Creates a new address space, loads `image` into it (`image` is copied and
@@ -2126,14 +2180,17 @@ noinline fn buildImage(name: []const u8, image: []const u8, options: SpawnOption
 /// nothing is leaked and nothing is counted.
 pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Process {
     const limits = options.limits orelse if (options.parent) |parent| parent.limits else Limits.default();
-
     const img = try buildImage(name, image, options, limits);
     errdefer img.destroy();
-    const root = img.root;
+    return spawnWith(name, &img, options, limits);
+}
+
+/// The rest of `spawn`, once the program is loaded into `img`: the process
+/// and its thread. Not inlined, so that `spawn`'s frame, which is on the
+/// stack while the program is loaded (deep, in a Debug build), stays small.
+/// On an error `spawn` destroys `img`.
+noinline fn spawnWith(name: []const u8, img: *const Image, options: SpawnOptions, limits: Limits) !*Process {
     const regions = img.regions;
-    const first_entry = img.entry;
-    const stack_top = img.stack_top;
-    const entry_rsp = img.entry_rsp;
     const mmap_top = img.mmap_top;
     const pages = img.pages + kstack.STACK_PAGES;
     const loaded_end = img.brk;
@@ -2151,25 +2208,7 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     errdefer heap.allocator.free(files);
     errdefer heap.allocator.free(fd_cloexec);
     errdefer heap.allocator.free(cwd);
-    p.* = .{
-        .root = root,
-        .start_ticks = timer.now(),
-        .entry = first_entry,
-        .stack_top = stack_top,
-        .entry_rsp = entry_rsp,
-        .name = name_copy,
-        .limits = limits,
-        .pages = pages,
-        .parent = options.parent,
-        .parent_pid = .init(if (options.parent) |q| q.pid else 0),
-        .refs = if (options.parent != null) 3 else 2, // the thread's, the caller's, and the parent's list's
-        .mem = .{
-            .regions = regions,
-            .brk_start = loaded_end,
-            .brk_end = loaded_end,
-            .mmap_top = mmap_top,
-        },
-    };
+    initNew(p, img, name_copy, limits, pages, options.parent, regions, loaded_end, mmap_top);
     p.files = files;
     p.fd_cloexec = fd_cloexec;
     p.cwd = cwd;
@@ -2204,6 +2243,32 @@ pub fn spawn(name: []const u8, image: []const u8, options: SpawnOptions) !*Proce
     p.thread_count = 1;
     thread.start(t);
     return p;
+}
+
+/// Fill in the new process `p` of `spawn`. Not inlined: a `Process` built
+/// in place is a temporary of over a kilobyte in a Debug build, which
+/// would sit in `spawn`'s frame under the deep paths `spawn` takes before
+/// it gets here (loading the program).
+noinline fn initNew(p: *Process, img: *const Image, name: []u8, limits: Limits, pages: u64, parent: ?*Process, regions: vm_regions.Regions, loaded_end: u64, mmap_top: u64) void {
+    p.* = .{
+        .root = img.root,
+        .start_ticks = timer.now(),
+        .entry = img.entry,
+        .stack_top = img.stack_top,
+        .entry_rsp = img.entry_rsp,
+        .name = name,
+        .limits = limits,
+        .pages = pages,
+        .parent = parent,
+        .parent_pid = .init(if (parent) |q| q.pid else 0),
+        .refs = if (parent != null) 3 else 2, // the thread's, the caller's, and the parent's list's
+        .mem = .{
+            .regions = regions,
+            .brk_start = loaded_end,
+            .brk_end = loaded_end,
+            .mmap_top = mmap_top,
+        },
+    };
 }
 
 /// A new process's descriptor table, with the standard streams: three

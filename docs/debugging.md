@@ -140,6 +140,38 @@ Subtract that from an address before giving it to `addr2line`
 (`0xffffffff94d20304 - 0x14cb4000 = 0xffffffff8006c304`). The names in the
 backtrace are already right.
 
+### What the other CPUs were doing
+
+With several CPUs, the CPU that panics stops the others with an NMI first,
+and each records where it was. After its own backtrace the report shows,
+for each other CPU, its count of timer interrupts, whether it had
+interrupts on, its local APIC's interrupts in service and requested (the
+timer's and the IPIs' vectors), and its backtrace (or that it was running a
+program). Then the timers (the current tick and the next ones due) and
+every process with its threads, their states and signals. A lock held for
+ever, a request never answered, or time that stopped is most often another
+CPU's doing, and shows here:
+
+```
+this CPU (1): 9467 timer interrupts
+CPU 0: 404 timer interrupts; interrupts off; APIC in service 0x0, requested 0xf0000 (vectors 32-63), ...
+timers: tick 404, 1 pending, lock free
+  due at tick 406 (in 2)
+```
+
+(CPU 0 there had shut its interrupts out: its own four vectors waited,
+and time, which its tick advances, stood still.)
+
+### A test case that hangs
+
+In the test kernel each test case has 90 s (`WATCHDOG_NS` in
+`tests/kernel/main.zig`); one that takes longer is reported as a panic
+(`test watchdog: the test case has not finished in time`) from whichever
+CPU's timer sees it first, with the report above, instead of the run just
+timing out. To attach GDB to a boot that hangs anyway, pass QEMU's
+debugger option through the test script: `MYOS_QEMU_EXTRA="-s"
+scripts/test-qemu.sh tests_kvm`, then `target remote :1234`.
+
 ## Debugging with QEMU and GDB
 
 1. Build a Debug kernel and the ISO with the kernel at its link address,
