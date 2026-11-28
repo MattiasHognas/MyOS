@@ -36,6 +36,9 @@ pub const VVar = extern struct {
     shift: u32 = 0,
     _pad: u32 = 0,
     realtime_offset: i64 = 0,
+    /// How `getcpu` reads the CPU's number (`percpu.GetcpuMode`).
+    getcpu: u32 = 0,
+    _pad2: u32 = 0,
 };
 
 var pages: [PAGES]u64 = @splat(0);
@@ -81,5 +84,6 @@ pub fn update() void {
     v.mult = st.mult;
     v.shift = st.shift;
     v.realtime_offset = st.realtime_offset;
+    v.getcpu = @intFromEnum(@import("../arch/x86_64/percpu.zig").getcpuMode());
     @atomicStore(u32, &v.seq, seq +% 2, .seq_cst);
 }

@@ -984,6 +984,7 @@ fn pmmStressWorker() void {
 /// same time. Returns true if no page was ever handed out twice and the free
 /// count is back where it started.
 pub fn pmmConcurrentStress() bool {
+    settle(); // nothing from an earlier test still being freed
     const flags = cpu.saveAndDisableInterrupts();
     defer cpu.restoreInterrupts(flags);
     const before = pmm.free_pages;

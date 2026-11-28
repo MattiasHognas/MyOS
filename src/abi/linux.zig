@@ -240,8 +240,10 @@ pub const Sys = struct {
     /// `set_robust_list(head, size) -> 0`: the list of locks to release
     /// if the thread dies holding them. Recorded only.
     pub const set_robust_list = 273;
-    /// `rseq(...)`: restartable sequences are not offered (`ENOSYS`).
+    /// `rseq(area, len, flags, sig)`: register the thread's restartable-sequence area.
     pub const rseq = 334;
+    /// `getcpu(cpu, node, cache)`: the CPU and NUMA node the caller runs on.
+    pub const getcpu = 309;
     /// `pipe2(fds, flags) -> 0`: `pipe` with `O_NONBLOCK` and `O_CLOEXEC`.
     pub const pipe2 = 293;
     /// `dup3(old, new, flags) -> new`.

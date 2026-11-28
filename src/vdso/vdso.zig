@@ -26,6 +26,10 @@ const VVar = extern struct {
     _pad: u32,
     /// The wall clock minus the monotonic clock, in nanoseconds.
     realtime_offset: i64,
+    /// How `getcpu` reads the CPU's number: 1 `RDPID`, 2 `RDTSCP` (both
+    /// give `TSC_AUX`, which the kernel sets to it), 0 the system call.
+    getcpu: u32,
+    _pad2: u32,
 };
 
 const Timespec = extern struct { sec: i64, nsec: i64 };
@@ -126,8 +130,35 @@ export fn __vdso_time(t: ?*i64) callconv(.c) i64 {
     return sec;
 }
 
+const SYS_getcpu = 309;
+
+/// The CPU the caller runs on, and its NUMA node (0), as Linux's vDSO
+/// gives them: from `TSC_AUX` (the CPU's number in its low 12 bits, the
+/// node above), without entering the kernel where the CPU can read it.
+export fn __vdso_getcpu(cpu: ?*u32, node: ?*u32, unused: ?*anyopaque) callconv(.c) i32 {
+    _ = unused;
+    const aux: u64 = switch (vvar().getcpu) {
+        1 => asm volatile ("rdpid %[aux]"
+            : [aux] "=r" (-> u64),
+        ),
+        2 => blk: {
+            var ecx: u32 = undefined;
+            asm volatile ("rdtscp"
+                : [ecx] "={ecx}" (ecx),
+                :
+                : .{ .rax = true, .rdx = true });
+            break :blk ecx;
+        },
+        else => return @bitCast(@as(u32, @truncate(syscall2(SYS_getcpu, @intFromPtr(cpu), @intFromPtr(node))))),
+    };
+    if (cpu) |c| c.* = @truncate(aux & 0xFFF);
+    if (node) |n| n.* = @truncate(aux >> 12);
+    return 0;
+}
+
 // The names without the prefix, as Linux's vDSO has them too.
 comptime {
+    @export(&__vdso_getcpu, .{ .name = "getcpu", .linkage = .weak });
     @export(&__vdso_clock_gettime, .{ .name = "clock_gettime", .linkage = .weak });
     @export(&__vdso_gettimeofday, .{ .name = "gettimeofday", .linkage = .weak });
     @export(&__vdso_time, .{ .name = "time", .linkage = .weak });

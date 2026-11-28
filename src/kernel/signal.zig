@@ -40,6 +40,7 @@
 //! handler: `rt_sigtimedwait`, and reading a `signalfd`.
 
 const std = @import("std");
+const rseq = @import("rseq.zig");
 const root = @import("root");
 
 const abi = @import("abi");
@@ -500,6 +501,12 @@ const Regs = union(enum) {
     /// Load the registers of `c`. Selectors are always user mode's,
     /// whatever `c` says; the flags and RIP are checked on the way out
     /// (`sysret.zig`), as for any return.
+    fn ripPtr(self: Regs) rseq.Ip {
+        return switch (self) {
+            inline else => |f| .{ .ptr = &f.rip },
+        };
+    }
+
     fn load(self: Regs, c: sf.Context) void {
         switch (self) {
             inline else => |f| {
@@ -555,6 +562,12 @@ pub fn atSyscallReturn(f: *arch_syscall.Frame, number: u64) bool {
     const t = thread.current();
     const p = t.process orelse return false;
     proc.waitWhileStopped();
+    // Switched onto a CPU since it last ran here: its `rseq` area (a
+    // system call inside a critical section is the program's error, but
+    // the section is aborted all the same, as on Linux).
+    const ip_before = f.rip;
+    if (!rseq.atReturn(t, .{ .ptr = &f.rip })) proc.exitForFault(SIG.SEGV);
+    if (f.rip != ip_before) return true; // to the abort address, by `iretq`
     // `rt_sigreturn` has put back a whole context already, and the mask
     // with it: a signal that waited for the handler to end is delivered
     // now, on top of that context, as on Linux (nothing to make again).
@@ -594,7 +607,7 @@ pub fn atSyscallReturn(f: *arch_syscall.Frame, number: u64) bool {
 pub inline fn returnWorkPending(t: *const Thread, f: *const arch_syscall.Frame, number: u64) bool {
     const p = t.process orelse return false;
     if (number == abi.Sys.rt_sigreturn or f.rax == abi.err(.INTR) or t.signal_saved_mask != null) return true;
-    if (proc.ending(p) or p.exec_thread.load(.acquire) != null or p.stopped.load(.acquire)) return true;
+    if (proc.ending(p) or p.exec_thread.load(.acquire) != null or p.stopped.load(.acquire) or t.rseq_resume) return true;
     return (t.signal_pending.load(.acquire) | p.signal_pending.load(.acquire)) & ~t.signal_mask != 0;
 }
 
@@ -610,6 +623,7 @@ pub fn atInterruptReturn(f: *idt.Frame) void {
     const t = thread.current();
     const p = t.process orelse return;
     proc.waitWhileStopped();
+    if (!rseq.atReturn(t, .{ .ptr = &f.rip })) proc.exitForFault(SIG.SEGV);
     if (!pending(t)) return;
     _ = deliverNext(t, p, .{ .interrupt = f }, null);
 }
@@ -666,6 +680,7 @@ fn deliverNext(t: *Thread, p: *Process, regs: Regs, interrupted: ?u64) Outcome {
             const why = switch (e) {
                 error.NoRestorer => "a handler without SA_RESTORER",
                 error.NoRoom => "no room on its stack for a signal frame",
+                error.BadRseq => "an rseq area or critical section that cannot be used",
                 else => "a signal frame that cannot be written",
             };
             root.print("\n*** thread {d} ({s}): {s} for signal {d}, killed\n", .{ thread.id(), p.name, why, sig });
@@ -682,6 +697,9 @@ const FP_MAX = fpu.MAX_AREA_SIZE + 4;
 
 fn setUpHandler(t: *Thread, p: *Process, regs: Regs, sig: u32, action: abi.SigAction, info: sf.SigInfo, fault_regs: anytype) !void {
     if (action.flags & SA.RESTORER == 0 or action.restorer == 0) return error.NoRestorer;
+    // A critical section the thread was in is aborted: the handler
+    // returns to its abort address (`rseq.zig`).
+    if (!rseq.beforeSignal(t, regs.ripPtr())) return error.BadRseq;
     const old_mask = t.signal_saved_mask orelse t.signal_mask;
     t.signal_saved_mask = null;
     var ctx = regs.context();

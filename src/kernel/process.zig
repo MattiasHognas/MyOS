@@ -1474,6 +1474,9 @@ noinline fn newChildThread(child: *Process, frame: *const arch_syscall.Frame, ar
     t.gs_base = bases.gs;
     t.signal_mask = me.signal_mask;
     t.signal_stack = me.signal_stack;
+    // A forked child keeps its registration (its copy of the area); one
+    // that shares the parent's memory does not, as on Linux.
+    if (args.flags & CLONE.VM == 0) t.rseq = me.rseq;
     if (args.flags & CLONE.CHILD_CLEARTID != 0) t.clear_child_tid = args.child_tid;
     if (t.fpuArea()) |area| {
         const flags = cpu.saveAndDisableInterrupts();
@@ -1954,6 +1957,8 @@ noinline fn resetForExec(p: *Process, me: *thread.Thread) void {
         if (me.fpuArea()) |area| fpu.resetCurrent(area);
     }
     me.signal_stack = .{};
+    me.rseq = .{};
+    me.rseq_resume = false;
     me.signal_saved_mask = null;
     me.clear_child_tid = 0;
     {

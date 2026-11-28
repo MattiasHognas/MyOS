@@ -7,6 +7,7 @@
 //! and from kernel buffers with `uaccess`, which fails cleanly on bad pointers.
 
 const std = @import("std");
+const rseq = @import("rseq.zig");
 const root = @import("root");
 
 const abi = @import("abi");
@@ -1449,6 +1450,31 @@ fn nextEntry(dir: []const u8, position: *u64, name_buf: []u8) ?ListEntry {
     return null;
 }
 
+/// `rseq`: register the calling thread's restartable-sequence area, or
+/// take it back (`rseq.zig`). `EINVAL` for a bad area, length or flag,
+/// `EBUSY` for the same registration twice, `EPERM` for taking one back
+/// with the wrong signature, `EFAULT` for an area that cannot be written.
+fn sysRseq(area: u64, len: u64, flags: u64, sig: u64) u64 {
+    const t = thread.current();
+    if (flags & rseq.FLAG_UNREGISTER != 0 and t.rseq.area == area and t.rseq.sig != @as(u32, @truncate(sig))) return err(.PERM);
+    rseq.register(t, area, @truncate(len), @truncate(flags), @truncate(sig)) catch |e| return switch (e) {
+        error.Invalid => err(.INVAL),
+        error.Busy => err(.BUSY),
+        error.Fault => err(.FAULT),
+    };
+    return 0;
+}
+
+/// `getcpu`: the CPU the caller runs on, and its NUMA node (always 0),
+/// at the addresses given (either may be null).
+fn sysGetcpu(cpu_out: u64, node_out: u64) u64 {
+    const id: u32 = @intCast(percpu.current().id);
+    const node: u32 = 0;
+    if (cpu_out != 0) uaccess.copyToUser(cpu_out, std.mem.asBytes(&id)) catch return err(.FAULT);
+    if (node_out != 0) uaccess.copyToUser(node_out, std.mem.asBytes(&node)) catch return err(.FAULT);
+    return 0;
+}
+
 /// `set_robust_list`: a thread's list of locks to mark as abandoned if it
 /// dies holding them. The address is checked and otherwise ignored: a
 /// thread that dies takes its process with it (there is no shared memory
@@ -2770,9 +2796,8 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.fchdir => sysFchdir(f.rdi),
         Sys.getdents64 => sysGetdents64(f.rdi, f.rsi, f.rdx),
         Sys.set_robust_list => sysSetRobustList(f.rdi, f.rsi),
-        // Restartable sequences are not offered; a C library asks once
-        // and does without.
-        Sys.rseq => err(.NOSYS),
+        Sys.rseq => sysRseq(f.rdi, f.rsi, f.rdx, f.r10),
+        Sys.getcpu => sysGetcpu(f.rdi, f.rsi),
         Sys.eventfd => sysEventFd(f.rdi, 0),
         Sys.flock => sysFlock(f.rdi, f.rsi),
         Sys.rt_sigqueueinfo => sysSigQueueInfo(f.rdi, null, f.rsi, f.rdx),

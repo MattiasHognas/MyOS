@@ -225,7 +225,10 @@ pub fn main() noreturn {
         row(Sys.arch_prctl, .{ abi.ARCH.SET_FS, KERNEL }, .{ .e = .PERM }),
         row(Sys.set_tid_address, .{0}, .{ .is = me }),
         row(Sys.set_robust_list, .{ b, 1 }, .{ .e = .INVAL }),
-        row(Sys.rseq, .{ b, 32, 0, 0 }, .{ .e = .NOSYS }),
+        row(Sys.rseq, .{ b, 16, 0, 0 }, .{ .e = .INVAL }), // shorter than the area
+        row(Sys.rseq, .{ b, 32, 4, 0 }, .{ .e = .INVAL }), // an unknown flag
+        row(Sys.rseq, .{ KERNEL, 32, 0, 0 }, .{ .e = .FAULT }),
+        row(Sys.getcpu, .{ KERNEL, 0, 0 }, .{ .e = .FAULT }),
         row(Sys.membarrier, .{ 0x9999, 0, 0 }, .{ .e = .INVAL }),
         row(Sys.get_mempolicy, .{ 0, 0, 0, 0, 0x9999 }, .{ .e = .INVAL }),
 

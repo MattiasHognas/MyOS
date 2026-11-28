@@ -191,11 +191,12 @@ Linux calls, with Linux's numbers:
 | 318 | `getrandom(buf, len, flags)` | Never blocks, so `GRND_NONBLOCK`, `GRND_RANDOM` and `GRND_INSECURE` change nothing; `EINVAL` for other flags. |
 | 319 | `memfd_create(name, flags)` | Not offered yet: `ENOSYS`, on purpose. |
 | 322 | `execveat(dirfd, path, argv, envp, flags)` | `execve` with `path` relative to `dirfd`; `flags` must be 0. |
-| 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts every other CPU. What a garbage collector uses to stop paying for barriers in every thread. |
+| 324 | `membarrier(cmd, flags, cpu)` | `MEMBARRIER_CMD_QUERY`, `REGISTER_PRIVATE_EXPEDITED` and `PRIVATE_EXPEDITED`, which interrupts the CPUs that run the caller's address space. What a garbage collector uses to stop paying for barriers in every thread. |
 | 327 | `preadv2(fd, iov, count, offset, flags)` | `preadv`, or `readv` with offset -1; `flags` must be 0 (`EOPNOTSUPP`). |
 | 328 | `pwritev2(fd, iov, count, offset, flags)` | The same for writing. |
 | 332 | `statx(dirfd, path, flags, mask, buf)` | What `newfstatat` says, in `struct statx`, every basic field filled whatever `mask` asks (no birth time). The Zig standard library uses it. |
-| 334 | `rseq(...)` | Not offered: `ENOSYS`, on purpose. |
+| 309 | `getcpu(cpu, node, cache)` | The CPU the caller runs on, node 0; either pointer may be null. Also in the vDSO. |
+| 334 | `rseq(area, len, flags, sig)` | Registers the calling thread's 32-byte area (aligned to 32): the kernel writes the CPU's number into `cpu_id_start` and `cpu_id` whenever the thread is switched onto a CPU, and a thread switched out or given a signal inside the critical section named by `rseq_cs` goes on at the section's abort address (whose 4 bytes before must be `sig`), as on Linux; a bad area or section ends the process (`SIGSEGV`). `RSEQ_FLAG_UNREGISTER` takes it back (`EPERM` for another signature). Same registration twice `EBUSY`, another one `EINVAL`. Kept by a forked child, not by a thread or a child sharing the memory; cleared by `execve`. |
 | 435 | `clone3(args, size)` | `clone` with its arguments in a structure, under the same rules (threads, and processes with `exit_signal`). Fields past the first version of the structure must be zero. |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | As `access`; `AT_EACCESS`, `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH` accepted, `EINVAL` for other flags. |
 | 441 | `epoll_pwait2(epfd, events, max, timeout_ts, sigmask, size)` | `epoll_pwait` with the timeout as a `timespec`. |
@@ -366,7 +367,10 @@ the page below the image (`[vvar]` in `/proc/self/maps`) without a system
 call, for the realtime, monotonic and boot-time clocks and their coarse
 forms, and make the system call for the others or where the TSC is not
 the clock. Both pages are shared by every process and cannot be made
-writable (`mprotect`: `EACCES`). `getcpu` is not in it yet.
+writable (`mprotect`: `EACCES`). `__vdso_getcpu` (and `getcpu`) reads
+the CPU's number with `RDPID`, or `RDTSCP` where there is no `RDPID`, from
+`TSC_AUX`, which each CPU sets to its number as Linux does; without either
+it makes the system call.
 
 A program that sets up thread-local storage does so itself, from its
 `PT_TLS` program header, and tells the kernel where with

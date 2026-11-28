@@ -251,6 +251,35 @@ pub fn main() noreturn {
     var vstatus: i32 = 0;
     expect(lib.syscall6(Sys.wait4, vchild, @intFromPtr(&vstatus), 0, 0, 0, 0) == vchild and vstatus == 0, 170);
 
+    // getcpu, as a system call and through the vDSO (which reads TSC_AUX):
+    // a CPU that exists, node 0, the same answer both ways (the thread may
+    // move between the two; it is asked again until they agree).
+    {
+        var cpus: [128]u8 = @splat(0);
+        const mask_len = lib.syscall(Sys.sched_getaffinity, 0, cpus.len, @intFromPtr(&cpus));
+        expect(!lib.isError(mask_len), 171);
+        var ncpu: u32 = 0;
+        for (cpus[0..@intCast(mask_len)]) |byte| ncpu += @popCount(byte);
+        const vdso_getcpu = vdsoSymbol(vdso_base, "__vdso_getcpu") orelse lib.exit(172);
+        const getcpu_fn: *const fn (?*u32, ?*u32, ?*anyopaque) callconv(.c) i32 = @ptrFromInt(vdso_getcpu);
+        var agreed = false;
+        for (0..100) |_| {
+            var c1: u32 = 99;
+            var n1: u32 = 99;
+            var c2: u32 = 98;
+            expect(lib.syscall(Sys.getcpu, @intFromPtr(&c1), @intFromPtr(&n1), 0) == 0, 173);
+            expect(c1 < ncpu and n1 == 0, 174);
+            expect(getcpu_fn(&c2, null, null) == 0 and c2 < ncpu, 175);
+            if (c1 == c2) {
+                agreed = true;
+                break;
+            }
+        }
+        expect(agreed, 176);
+        expect(lib.syscall(Sys.getcpu, 0, 0, 0) == 0, 177); // both optional
+        expect(lib.syscall(Sys.getcpu, 8, 0, 0) == lib.err(.FAULT), 178);
+    }
+
     // statfs: the filesystem is in memory and read-only; a missing path is missing.
     var fs: abi.StatFs = undefined;
     expect(lib.syscall(Sys.statfs, @intFromPtr("/etc/motd"), @intFromPtr(&fs), 0) == 0, 109);
@@ -319,7 +348,7 @@ pub fn main() noreturn {
     // What a C library registers for its threads at startup.
     expect(lib.syscall(Sys.set_robust_list, @intFromPtr(&link), abi.ROBUST_LIST_HEAD_SIZE, 0) == 0, 157);
     expect(lib.syscall(Sys.set_robust_list, @intFromPtr(&link), 8, 0) == lib.err(.INVAL), 158);
-    expect(lib.syscall6(Sys.rseq, @intFromPtr(&link), 32, 0, 0, 0, 0) == lib.err(.NOSYS), 159); // not offered
+    expect(lib.syscall6(Sys.rseq, @intFromPtr(&link), 31, 0, 0, 0, 0) == lib.err(.INVAL), 159); // offered (`/test/rseq`); not this short
 
     // prctl: no option is known.
     expect(lib.syscall(Sys.prctl, 15, 0, 0) == lib.err(.INVAL), 122);

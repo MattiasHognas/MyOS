@@ -6,5 +6,7 @@ LINUX_2.6 {
         __vdso_gettimeofday;
         time;
         __vdso_time;
+        getcpu;
+        __vdso_getcpu;
     local: *;
 };

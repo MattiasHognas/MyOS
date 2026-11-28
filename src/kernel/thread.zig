@@ -281,6 +281,11 @@ pub const Thread = struct {
     /// be blocked. Changed by the thread itself only (`signal.zig`).
     signal_mask: u64 = 0,
     signal_stack: abi.SigStack = .{},
+    /// Its restartable-sequence area, if it registered one (`rseq.zig`),
+    /// and whether it has been switched onto a CPU since it last returned
+    /// to its program (set by the scheduler; `rseq.atReturn` acts on it).
+    rseq: @import("rseq.zig").Registration = .{},
+    rseq_resume: bool = false,
     /// Signals sent to this thread and not yet delivered (`tgkill`, and
     /// those from its faults). Others set bits, the thread clears them.
     signal_pending: std.atomic.Value(u64) = .init(0),
@@ -760,6 +765,7 @@ fn switchToNext() bool {
     next.slices += 1;
     next.state = .running;
     next.on_cpu = true;
+    if (next.rseq.area != 0) next.rseq_resume = true;
     next.cpu = c;
     c.thread = next;
     c.slice_left = SLICE_TICKS;

@@ -176,7 +176,23 @@ pub fn register(c: *PerCpu) void {
     const n = online_count.load(.acquire);
     c.id = n;
     cpus[n] = c;
+    // The CPU's number where a program can read it without the kernel
+    // (`RDPID`, `RDTSCP`: the vDSO's `getcpu`), as Linux keeps it there.
+    if (getcpuMode() != .none) cpu.wrmsr(MSR_TSC_AUX, n);
     online_count.store(n + 1, .release);
+}
+
+const MSR_TSC_AUX = 0xC000_0103;
+
+/// How a program can learn its CPU's number without a system call
+/// (`vdso.zig` tells the vDSO): `RDPID` where the CPU has it, else
+/// `RDTSCP`, both reading `TSC_AUX`.
+pub const GetcpuMode = enum(u32) { none = 0, rdpid = 1, rdtscp = 2 };
+
+pub fn getcpuMode() GetcpuMode {
+    if (cpu.cpuid(7, 0).ecx & (1 << 22) != 0) return .rdpid;
+    if (cpu.cpuid(0x8000_0000, 0).eax >= 0x8000_0001 and cpu.cpuid(0x8000_0001, 0).edx & (1 << 27) != 0) return .rdtscp;
+    return .none;
 }
 
 /// Number of CPUs that are up.

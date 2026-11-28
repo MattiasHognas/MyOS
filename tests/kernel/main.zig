@@ -924,6 +924,19 @@ fn hugePages() TestError!void {
     try expectFootprint(memory);
 }
 
+/// Restartable sequences from ring 3 (the CPU kept in the area, a
+/// critical section aborted by a signal, a forked child's registration),
+/// two copies at once; nothing left behind.
+fn restartableSequences() TestError!void {
+    _ = helpers.runProgram("/test/rseq"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/rseq") orelse return error.Failed;
+    if (code != 0) report("/test/rseq failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/rseq"));
+    try expectFootprint(memory);
+}
+
 /// Advisory file locks from ring 3, two copies at once; none left behind.
 fn fileLocks() TestError!void {
     _ = helpers.runProgram("/test/flock"); // warm up: the heap may grow
@@ -2088,6 +2101,7 @@ fn runCases() noreturn {
         .{ .name = "every system call's documented errors (ring 3)", .func = documentedErrors },
         .{ .name = "real-time signals, rt_sigtimedwait, signalfd (ring 3)", .func = queuedSignals },
         .{ .name = "flock: shared, exclusive, waiting, given up on close (ring 3)", .func = fileLocks },
+        .{ .name = "rseq and getcpu: the CPU in the area, a critical section aborted, kept by fork (ring 3)", .func = restartableSequences },
         .{ .name = "2 MiB pages: given, split, copied, moved (ring 3)", .func = hugePages },
         .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
         .{ .name = "clocks: TSC or HPET, in step on every CPU; sleeps; the wall clock from the RTC", .func = clocks },
