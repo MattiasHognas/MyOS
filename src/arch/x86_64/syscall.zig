@@ -195,10 +195,19 @@ export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     asm volatile ("sti"); // long syscalls may be preempted
     const number = f.rax;
     if (comptime replaceable) handler(f) else dispatcher.dispatch(f);
-    process.dieIfKilled(); // its process is ending: no return to the program
+    return leave(f, number);
+}
+
+/// The way back from a system call: what is to be done before the program
+/// runs again, and how to return to it. A function of its own, not
+/// inlined, so that its stack frame is not under the system call's (a
+/// frame is made whole when a function is entered).
+noinline fn leave(f: *Frame, number: u64) u64 {
     // A signal to deliver, or an interrupted call to make again: either
-    // rewrites the registers, which `iretq` then restores whole.
-    var rewritten = signal.atSyscallReturn(f, number);
+    // rewrites the registers, which `iretq` then restores whole. Looked
+    // for only if there may be something (one look at the thread).
+    var rewritten = false;
+    if (signal.returnWorkPending(thread.current(), f, number)) rewritten = returnWork(f, number);
     {
         const me = thread.current();
         if (me.return_by_iret) {
@@ -213,6 +222,15 @@ export fn syscall_handler_c(f: *Frame) callconv(.c) u64 {
     asm volatile ("cli"); // the exit path must not be interrupted
     if (how == .iret) iret_returns += 1;
     return @backingInt(how);
+}
+
+/// What the way back from a system call has to do when there is anything
+/// (`signal.returnWorkPending`): end the thread if its process is ending,
+/// deliver a signal, make an interrupted call again. Not inlined: its
+/// frame would otherwise be on the stack of every system call.
+noinline fn returnWork(f: *Frame, number: u64) bool {
+    process.dieIfKilled(); // its process is ending: no return to the program
+    return signal.atSyscallReturn(f, number);
 }
 
 /// Replace the syscall handler and return the previous one. For tests,

@@ -583,6 +583,21 @@ pub fn atSyscallReturn(f: *arch_syscall.Frame, number: u64) bool {
     }
 }
 
+/// Whether the way back from system call `number` has anything to do
+/// besides returning: the process is ending or being replaced, is
+/// stopped, a signal the thread does not block is pending, a mask is to be
+/// put back (`rt_sigsuspend`), the call was cut short (`EINTR`, perhaps to
+/// be made again), or it was `rt_sigreturn`. One look at the thread and
+/// its process, so that the usual call, with none of that, pays for no
+/// more (`process.dieIfKilled` and `atSyscallReturn` do the work when
+/// there is some, and look at all of it again).
+pub inline fn returnWorkPending(t: *const Thread, f: *const arch_syscall.Frame, number: u64) bool {
+    const p = t.process orelse return false;
+    if (number == abi.Sys.rt_sigreturn or f.rax == abi.err(.INTR) or t.signal_saved_mask != null) return true;
+    if (proc.ending(p) or p.exec_thread.load(.acquire) != null or p.stopped.load(.acquire)) return true;
+    return (t.signal_pending.load(.acquire) | p.signal_pending.load(.acquire)) & ~t.signal_mask != 0;
+}
+
 /// Back to the `syscall` instruction, with its number in RAX again.
 fn restart(f: *arch_syscall.Frame, number: u64) void {
     f.rax = number;
