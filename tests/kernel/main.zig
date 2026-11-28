@@ -950,6 +950,18 @@ fn fileWatches() TestError!void {
     try expectFootprint(memory);
 }
 
+/// Futexes in shared memory between processes and robust mutexes from
+/// ring 3, two copies at once; nothing left behind.
+fn sharedFutexes() TestError!void {
+    _ = helpers.runProgram("/test/robust"); // warm up: the heap may grow
+    const memory = helpers.footprint();
+    const code = helpers.runProgram("/test/robust") orelse return error.Failed;
+    if (code != 0) report("/test/robust failed check", code);
+    try check(code == 0);
+    try check(helpers.runPair("/test/robust"));
+    try expectFootprint(memory);
+}
+
 /// FIFOs from ring 3 (made in `/tmp`, opened end by end with and without
 /// waiting, a wait ended by a signal), two copies at once; no FIFO's
 /// pipe and nothing else left behind.
@@ -2146,6 +2158,7 @@ fn runCases() noreturn {
         .{ .name = "memfd_create and shared mappings: two views of one file, the JIT's W^X, fork, seals (ring 3)", .func = memoryFiles },
         .{ .name = "FIFOs: mknod in /tmp, each end waiting for the other, ENXIO, EINTR (ring 3)", .func = namedPipes },
         .{ .name = "inotify: a directory's and a file's watches, renames with a cookie, a read that waits (ring 3)", .func = fileWatches },
+        .{ .name = "futexes shared between processes, robust mutexes whose owner dies (ring 3)", .func = sharedFutexes },
         .{ .name = "2 MiB pages: given, split, copied, moved (ring 3)", .func = hugePages },
         .{ .name = "execve: arguments, descriptors, signal actions, scripts, threads (ring 3)", .func = execProgram },
         .{ .name = "clocks: TSC or HPET, in step on every CPU; sleeps; the wall clock from the RTC", .func = clocks },

@@ -484,6 +484,18 @@ pub fn threadName(p: *Process, tid: u64, buf: *[16]u8) ?[]const u8 {
     return null;
 }
 
+/// The robust-list head the thread `tid` of `p` registered, null if `p`
+/// has no such thread.
+pub fn robustHeadOf(p: *Process, tid: u64) ?u64 {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        if (one.id == tid) return one.robust_head;
+    }
+    return null;
+}
+
 /// Name the thread `tid` of `p` (cut to 15 bytes, as on Linux). False if
 /// `p` has no such thread.
 pub fn setThreadName(p: *Process, tid: u64, name: []const u8) bool {
@@ -786,6 +798,8 @@ fn reparentChildren(p: *Process) ?*Process {
 /// the process, this one just ends. Must be called from a thread that
 /// belongs to a process.
 pub fn exit(code: u64) noreturn {
+    // Its robust mutexes first, while its memory is there and no lock held.
+    @import("robust.zig").release(thread.current().process.?);
     _ = cpu.saveAndDisableInterrupts(); // never restored: we're done
     const me = thread.current();
     const p = me.process.?;
@@ -869,6 +883,7 @@ fn unlinkThread(p: *Process, t: *thread.Thread) void {
 /// End the calling thread because its process is ending: leave the
 /// process's list of threads, tell the thread that waits for that, and go.
 fn die() noreturn {
+    @import("robust.zig").release(thread.current().process.?);
     _ = cpu.saveAndDisableInterrupts();
     const me = thread.current();
     const p = me.process.?;
@@ -1209,6 +1224,7 @@ pub fn endsForExec(p: *const Process, t: *const thread.Thread) bool {
 pub fn exitThread(code: u64) noreturn {
     const me = thread.current();
     const p = me.process.?;
+    @import("robust.zig").release(p); // the mutexes it dies holding
     {
         const held = tree_lock.acquire();
         const last = p.thread_count == 1;
@@ -1219,7 +1235,11 @@ pub fn exitThread(code: u64) noreturn {
             if (me.clear_child_tid != 0) {
                 const zero: u32 = 0;
                 uaccess.copyToUser(me.clear_child_tid, std.mem.asBytes(&zero)) catch {};
-                _ = futex.wake(p, me.clear_child_tid, 1, futex.ANY);
+                // Both kinds: a C library may wait on it either way.
+                const own = futex.privateKey(p, me.clear_child_tid);
+                _ = futex.wake(own, 1, futex.ANY);
+                const shared = user_memory.futexKey(p, me.clear_child_tid, false);
+                if (!std.meta.eql(shared, own)) _ = futex.wake(shared, 1, futex.ANY);
             }
             thread.exit();
         }
@@ -2087,6 +2107,7 @@ noinline fn resetForExec(p: *Process, me: *thread.Thread) void {
     me.signal_stack = .{};
     me.rseq = .{};
     me.rseq_resume = false;
+    me.robust_head = 0; // a new program registers its own
     me.comm_len = 0; // named after the new program from now on
     me.signal_saved_mask = null;
     me.clear_child_tid = 0;

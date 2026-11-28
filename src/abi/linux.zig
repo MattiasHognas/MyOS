@@ -267,8 +267,10 @@ pub const Sys = struct {
     pub const faccessat = 269;
     pub const faccessat2 = 439;
     /// `set_robust_list(head, size) -> 0`: the list of locks to release
-    /// if the thread dies holding them. Recorded only.
+    /// if the thread dies holding them (`robust.zig`).
     pub const set_robust_list = 273;
+    /// `get_robust_list(tid, head, len)`: what `set_robust_list` registered.
+    pub const get_robust_list = 274;
     /// `rseq(area, len, flags, sig)`: register the thread's restartable-sequence area.
     pub const rseq = 334;
     /// `getcpu(cpu, node, cache)`: the CPU and NUMA node the caller runs on.

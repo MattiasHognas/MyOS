@@ -187,7 +187,8 @@ Linux calls, with Linux's numbers:
 | 266 | `symlinkat(target, dirfd, path)` | `symlink` relative to a descriptor. |
 | 267 | `readlinkat(dirfd, path, buf, size)` | As `readlink`. |
 | 269 | `faccessat(dirfd, path, mode)` | As `access`. |
-| 273 | `set_robust_list(head, size)` | Accepted and not used: a thread that dies takes its process with it. |
+| 273 | `set_robust_list(head, size)` | The thread's list of robust mutexes: when it ends (on its own, with its process, or for `execve`), each futex word on the list (and the one `list_op_pending` names) that still has its thread ID gets `FUTEX_OWNER_DIED`, keeping `FUTEX_WAITERS`, by an atomic compare-and-swap, and one waiter is woken (`robust.zig`); at most 2048 entries. New threads and `fork` children start without one, as on Linux. |
+| 274 | `get_robust_list(tid, head, len)` | What a thread of the caller's process registered. `ESRCH`. |
 | 280 | `utimensat(dirfd, path, times, flags)` | A file's access and modification times: now (null `times`), as given, `UTIME_NOW`, `UTIME_OMIT`; a null path is the descriptor (`futimens`). Files of `/tmp` keep their times (set by writing too; the change time follows); those of the image report when the system started and cannot be changed (`EROFS`). |
 | 281 | `epoll_pwait(epfd, events, max, timeout, sigmask, size)` | `epoll_wait` with `sigmask` blocked meanwhile. |
 | 282 | `signalfd(fd, mask, size)` | See `signalfd4`. |

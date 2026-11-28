@@ -48,6 +48,17 @@ const uaccess = @import("uaccess.zig");
 /// A bit set that matches every waiter.
 pub const ANY: u32 = 0xFFFF_FFFF;
 
+/// What a futex is known by: an address space (a `Process`, by address)
+/// and an address in it, for a private futex; a memory object and an
+/// offset in it, for one in shared memory, which other processes map at
+/// other addresses (`user_memory.futexKey`).
+pub const Key = struct { space: usize, addr: u64 };
+
+/// The key of a private futex at `addr` in the address space of `p`.
+pub fn privateKey(p: *const Process, addr: u64) Key {
+    return .{ .space = @intFromPtr(p), .addr = addr };
+}
+
 const BUCKETS = 256;
 
 const Bucket = struct {
@@ -139,17 +150,17 @@ fn readWord(addr: u64) ?u32 {
 /// Sleep until woken on the word at `addr` in the address space of `p`,
 /// if that word is `expected` now. `ticks` is the longest to sleep, in
 /// timer ticks, or null for no limit.
-pub fn wait(p: *Process, addr: u64, expected: u32, bitset: u32, ticks: ?u64) WaitError!void {
+pub fn wait(key: Key, addr: u64, expected: u32, bitset: u32, ticks: ?u64) WaitError!void {
     if (addr % 4 != 0) return error.Fault;
     const me = thread.current();
-    const space = @intFromPtr(p);
-    var waiter: Waiter = .{ .space = space, .addr = addr, .bitset = bitset, .thread = me };
+    const space = key.space;
+    var waiter: Waiter = .{ .space = space, .addr = key.addr, .bitset = bitset, .thread = me };
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
         // Bring the page in, and save a sleep that is not wanted anyway.
         if ((readWord(addr) orelse return error.Fault) != expected) return error.Again;
 
-        const home = bucket(space, addr);
+        const home = bucket(space, key.addr);
         const flags = cpu.saveAndDisableInterrupts();
         defer cpu.restoreInterrupts(flags);
         home.lock.take();
@@ -192,11 +203,11 @@ pub fn wait(p: *Process, addr: u64, expected: u32, bitset: u32, ticks: ?u64) Wai
 /// Wake up to `count` threads waiting on the word at `addr` in the
 /// address space of `p` whose bit set has a bit in common with `bitset`,
 /// longest waiter first. Returns how many were woken.
-pub fn wake(p: *Process, addr: u64, count: u32, bitset: u32) u32 {
-    const b = bucket(@intFromPtr(p), addr);
+pub fn wake(key: Key, count: u32, bitset: u32) u32 {
+    const b = bucket(key.space, key.addr);
     const held = b.lock.acquire();
     defer b.lock.release(held);
-    return wakeLocked(b, @intFromPtr(p), addr, count, bitset);
+    return wakeLocked(b, key.space, key.addr, count, bitset);
 }
 
 /// `wake` in the bucket `b`, whose lock is held.
@@ -223,15 +234,15 @@ fn wakeLocked(b: *Bucket, space: usize, addr: u64, count: u32, bitset: u32) u32 
 /// them. If `expected` is given and the word at `addr` is not that value,
 /// nothing is done (`error.Again`). Returns the number woken plus the
 /// number moved.
-pub fn requeue(p: *Process, addr: u64, wake_count: u32, move_count: u32, to: u64, expected: ?u32) WaitError!u32 {
-    if (addr % 4 != 0 or to % 4 != 0) return error.Fault;
+pub fn requeue(key: Key, addr: u64, wake_count: u32, move_count: u32, to: Key, expected: ?u32) WaitError!u32 {
+    if (addr % 4 != 0 or to.addr % 4 != 0) return error.Fault;
     const me = thread.current();
-    const space = @intFromPtr(p);
+    const space = key.space;
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
         if (expected != null and readWord(addr) == null) return error.Fault;
-        const from = bucket(space, addr);
-        const dest = bucket(space, to);
+        const from = bucket(space, key.addr);
+        const dest = bucket(to.space, to.addr);
         const flags = cpu.saveAndDisableInterrupts();
         defer cpu.restoreInterrupts(flags);
         // Both buckets, the lower address first, so that two requeues
@@ -254,17 +265,18 @@ pub fn requeue(p: *Process, addr: u64, wake_count: u32, move_count: u32, to: u64
             }
             if (now.? != want) return error.Again;
         }
-        const woken = wakeLocked(from, space, addr, wake_count, ANY);
+        const woken = wakeLocked(from, space, key.addr, wake_count, ANY);
         var moved: u32 = 0;
         var link = &from.head;
         while (link.*) |w| {
             if (moved == move_count) break;
-            if (w.space != space or w.addr != addr) {
+            if (w.space != space or w.addr != key.addr) {
                 link = &w.next;
                 continue;
             }
             link.* = w.next;
-            w.addr = to;
+            w.space = to.space;
+            w.addr = to.addr;
             insert(dest, w);
             moved += 1;
         }

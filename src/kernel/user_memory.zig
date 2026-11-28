@@ -411,6 +411,20 @@ pub fn mmap(p: *Process, hint: u64, length: u64, prot_bits: u64, flags: u64, fil
     return addr;
 }
 
+/// The key of the futex at `addr` of `p` (`futex.Key`): for a shared one
+/// (no `FUTEX_PRIVATE_FLAG`) in a shared mapping, the memory object and
+/// the offset in it, which every process mapping it shares; otherwise
+/// the process and the address.
+pub fn futexKey(p: *Process, addr: u64, private: bool) @import("futex.zig").Key {
+    const own: @import("futex.zig").Key = .{ .space = @intFromPtr(p), .addr = addr };
+    if (private) return own;
+    const held = p.mem.lock.acquire();
+    defer p.mem.lock.release(held);
+    const region = p.mem.regions.find(addr) orelse return own;
+    if (region.kind != .shared) return own;
+    return .{ .space = region.backing.file[1], .addr = region.fileOffset(addr) };
+}
+
 /// `vm_regions.hold` for the regions that hold a memory object: a shared
 /// mapping's (the object in `file[1]`) and a private mapping of one (its
 /// node's `ctx`, also `file[1]`).

@@ -1936,7 +1936,22 @@ fn sysGetcpu(cpu_out: u64, node_out: u64) u64 {
 /// between processes for another one to wait on such a lock in).
 fn sysSetRobustList(head: u64, size: u64) u64 {
     if (size != abi.ROBUST_LIST_HEAD_SIZE) return err(.INVAL);
-    _ = head;
+    thread.current().robust_head = head; // walked when the thread ends (`robust.zig`)
+    return 0;
+}
+
+/// `get_robust_list`: the head the thread `tid` (0: the caller, else one
+/// of the caller's process) registered, and its size. `ESRCH`, `EFAULT`.
+fn sysGetRobustList(tid: u64, head_ptr: u64, len_ptr: u64) u64 {
+    const me = thread.current();
+    const p = me.process orelse return err(.SRCH);
+    var head: u64 = 0;
+    if (tid == 0 or tid == me.id) {
+        head = me.robust_head;
+    } else {
+        head = proc.robustHeadOf(p, tid) orelse return err(.SRCH);
+    }
+    if (!toUser(head_ptr, head) or !toUser(len_ptr, @as(u64, abi.ROBUST_LIST_HEAD_SIZE))) return err(.FAULT);
     return 0;
 }
 
@@ -2910,6 +2925,10 @@ fn sysFutex(f: *const arch.Frame) u64 {
     if (addr % 4 != 0) return err(.INVAL);
     if (!user_range.valid(addr, 4)) return err(.FAULT);
     const command = op & abi.FUTEX.CMD_MASK;
+    // A futex without the private flag in shared memory is the memory
+    // object's, so that processes that share it meet on it.
+    const private = op & 128 != 0; // FUTEX_PRIVATE_FLAG
+    const key = user_memory.futexKey(p, addr, private);
     switch (command) {
         abi.FUTEX.WAIT, abi.FUTEX.WAIT_BITSET => {
             const bitset: u32 = if (command == abi.FUTEX.WAIT) kfutex.ANY else @truncate(f.r9);
@@ -2932,19 +2951,19 @@ fn sysFutex(f: *const arch.Frame) u64 {
                 }
                 ticks = kfutex.nanosToTicks(left);
             }
-            kfutex.wait(p, addr, value, bitset, ticks) catch |e| return futexError(e);
+            kfutex.wait(key, addr, value, bitset, ticks) catch |e| return futexError(e);
             return 0;
         },
         abi.FUTEX.WAKE, abi.FUTEX.WAKE_BITSET => {
             const bitset: u32 = if (command == abi.FUTEX.WAKE) kfutex.ANY else @truncate(f.r9);
             if (bitset == 0) return err(.INVAL);
-            return kfutex.wake(p, addr, value, bitset);
+            return kfutex.wake(key, value, bitset);
         },
         abi.FUTEX.REQUEUE, abi.FUTEX.CMP_REQUEUE => {
             if (f.r8 % 4 != 0) return err(.INVAL);
             if (!user_range.valid(f.r8, 4)) return err(.FAULT);
             const expected: ?u32 = if (command == abi.FUTEX.CMP_REQUEUE) @as(u32, @truncate(f.r9)) else null;
-            return kfutex.requeue(p, addr, value, @truncate(f.r10), f.r8, expected) catch |e| futexError(e);
+            return kfutex.requeue(key, addr, value, @truncate(f.r10), user_memory.futexKey(p, f.r8, private), expected) catch |e| futexError(e);
         },
         else => return err(.NOSYS),
     }
@@ -3536,6 +3555,7 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.fchdir => sysFchdir(f.rdi),
         Sys.getdents64 => sysGetdents64(f.rdi, f.rsi, f.rdx),
         Sys.set_robust_list => sysSetRobustList(f.rdi, f.rsi),
+        Sys.get_robust_list => sysGetRobustList(f.rdi, f.rsi, f.rdx),
         Sys.rseq => sysRseq(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getcpu => sysGetcpu(f.rdi, f.rsi),
         Sys.eventfd => sysEventFd(f.rdi, 0),

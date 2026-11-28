@@ -291,6 +291,9 @@ pub const Thread = struct {
     /// process tree lock.
     comm: [16]u8 = @splat(0),
     comm_len: u8 = 0,
+    /// The head of its list of robust mutexes in its program's memory
+    /// (`set_robust_list`), 0 for none: walked when it ends (`robust.zig`).
+    robust_head: u64 = 0,
     /// Signals sent to this thread and not yet delivered (`tgkill`, and
     /// those from its faults). Others set bits, the thread clears them.
     signal_pending: std.atomic.Value(u64) = .init(0),

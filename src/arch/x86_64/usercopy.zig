@@ -104,8 +104,60 @@ comptime {
     );
 }
 
+// user_cmpxchg32(addr: rdi, expected: esi, new: edx, old: rcx) -> rax:
+// 0 = done (the word that was there in *old), 1 = faulted. The address is
+// clamped like the copies' (outside user space it becomes 0, which
+// faults). What a robust futex is released with (`robust.zig`).
+comptime {
+    asm (
+        \\.section .text
+        \\.global user_cmpxchg32
+        \\.type user_cmpxchg32, @function
+        \\user_cmpxchg32:
+        \\  movabs $0x800000000000, %rax
+        \\  cmp %rax, %rdi
+        \\  sbb %rax, %rax
+        \\  and %rax, %rdi
+        \\  mov %esi, %eax
+        \\  cmpb $0, smap_enabled(%rip)
+        \\  je user_atomic_start
+        \\  .byte 0x0f, 0x01, 0xcb   # stac
+        \\.global user_atomic_start
+        \\user_atomic_start:
+        \\  lock cmpxchg %edx, (%rdi)
+        \\.global user_atomic_end
+        \\user_atomic_end:
+        \\  mov %eax, (%rcx)
+        \\  xor %eax, %eax
+        \\  jmp 1f
+        \\.global user_atomic_fault
+        \\user_atomic_fault:
+        \\  mov $1, %eax
+        \\1:
+        \\  cmpb $0, smap_enabled(%rip)
+        \\  je 2f
+        \\  .byte 0x0f, 0x01, 0xca   # clac
+        \\2:
+        \\  ret
+        \\.size user_cmpxchg32, . - user_cmpxchg32
+    );
+}
+
 comptime {
     std.debug.assert(user_range.USER_END == 0x8000_0000_0000); // the constant in the assembly above
+}
+
+extern fn user_cmpxchg32(addr: usize, expected: u32, new: u32, old: *u32) callconv(.c) u64;
+extern const user_atomic_start: u8;
+extern const user_atomic_end: u8;
+extern const user_atomic_fault: u8;
+
+/// Compare the 32-bit word at the user address `addr` with `expected` and,
+/// if equal, put `new` there, atomically. Returns the word that was there,
+/// or null if it could not be reached.
+pub fn cmpxchgUser32(addr: usize, expected: u32, new: u32) ?u32 {
+    var old: u32 = undefined;
+    return if (user_cmpxchg32(addr, expected, new, &old) == 0) old else null;
 }
 
 extern fn user_copy_from(dst: usize, src: usize, len: usize) callconv(.c) u64;
@@ -134,15 +186,17 @@ pub fn copyToUser(dst: usize, src: usize, len: usize) bool {
 /// instruction of `user_copy`, return the address to resume at; otherwise
 /// null, and the fault is a genuine kernel fault.
 pub fn fixup(rip: u64, fault_addr: u64) ?u64 {
-    if (rip < @intFromPtr(&user_copy_start) or rip >= @intFromPtr(&user_copy_end)) return null;
     if (fault_addr >= user_range.USER_END) return null; // a bad kernel buffer is a kernel bug
-    return @intFromPtr(&user_copy_fault);
+    if (rip >= @intFromPtr(&user_copy_start) and rip < @intFromPtr(&user_copy_end)) return @intFromPtr(&user_copy_fault);
+    if (rip >= @intFromPtr(&user_atomic_start) and rip < @intFromPtr(&user_atomic_end)) return @intFromPtr(&user_atomic_fault);
+    return null;
 }
 
 /// True if `rip` is the copy instruction of `user_copy`: a fault there is
 /// on the memory a system call was given.
 pub fn inCopy(rip: u64) bool {
-    return rip >= @intFromPtr(&user_copy_start) and rip < @intFromPtr(&user_copy_end);
+    return (rip >= @intFromPtr(&user_copy_start) and rip < @intFromPtr(&user_copy_end)) or
+        (rip >= @intFromPtr(&user_atomic_start) and rip < @intFromPtr(&user_atomic_end));
 }
 
 /// True once SMAP is on.
