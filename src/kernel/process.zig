@@ -350,6 +350,9 @@ pub const Process = struct {
     /// Set once it has taken a record lock (`reclock.zig`): closing a
     /// descriptor then gives up its locks on that file, as POSIX has it.
     record_locks: std.atomic.Value(bool) = .init(false),
+    /// Its file-mode creation mask (`umask`): the permission bits new
+    /// files and directories do not get. A child has its parent's.
+    umask: std.atomic.Value(u32) = .init(0o022),
     /// Its nice value (`setpriority`), -20 to 19. The scheduler does not
     /// look at it: every thread gets the same share.
     nice: i8 = 0,
@@ -1590,6 +1593,7 @@ noinline fn initChild(child: *Process, parent: *Process, root: u64, name: []cons
         .name = name,
         .limits = parent.limits,
         .other_limits = parent.other_limits,
+        .umask = .init(parent.umask.load(.monotonic)),
         .pages = pages,
         .parent = parent,
         .parent_pid = .init(parent.pid),
@@ -2173,38 +2177,55 @@ fn readProgram(path: []const u8, argv: []const []const u8) ExecError!ProgramFile
 /// Not inlined: its temporaries stay out of `readProgram`'s frame, which
 /// is on the stack while the program's path is looked up.
 noinline fn readScript(first: []u8, path: []const u8, argv: []const []const u8) ExecError!ProgramFile {
-    defer heap.allocator.free(first);
+    // The `#!` line, parsed in a frame of its own; the interpreter read
+    // from this small one (the lookup goes deep).
+    const parsed = parseScript(first, path) catch |e| {
+        heap.allocator.free(first);
+        return e;
+    };
+    heap.allocator.free(first);
+    errdefer heap.allocator.free(parsed.storage);
+    const image = readWhole(parsed.storage[0..parsed.interp_len]) catch |e| return e;
+    if (image.len >= 2 and image[0] == '#' and image[1] == '!') {
+        heap.allocator.free(image);
+        return error.NotExecutable; // one level, as on Linux
+    }
+    errdefer heap.allocator.free(image);
+    return scriptArgs(image, parsed.storage, parsed.interp_len, parsed.arg_len, argv);
+}
+
+/// The interpreter path and its argument of the script `first`, and the
+/// script's `path` behind them, copied (they outlive `first`).
+noinline fn parseScript(first: []const u8, path: []const u8) ExecError!struct { storage: []u8, interp_len: usize, arg_len: usize } {
     const line_end = std.mem.indexOfScalar(u8, first[0..@min(first.len, 256)], '\n') orelse return error.NotExecutable;
     const line = std.mem.trim(u8, first[2..line_end], " \t");
     const sep = std.mem.indexOfAny(u8, line, " \t");
     const interp = if (sep) |i| line[0..i] else line;
     const arg = if (sep) |i| std.mem.trim(u8, line[i..], " \t") else "";
     if (interp.len == 0 or interp[0] != '/') return error.NotExecutable;
-    // The interpreter path and its argument outlive `first`: a copy.
     const storage = try heap.allocator.alloc(u8, interp.len + arg.len + path.len);
-    errdefer heap.allocator.free(storage);
     @memcpy(storage[0..interp.len], interp);
     @memcpy(storage[interp.len..][0..arg.len], arg);
     @memcpy(storage[interp.len + arg.len ..], path);
-    const image = readWhole(storage[0..interp.len]) catch |e| return e;
-    if (image.len >= 2 and image[0] == '#' and image[1] == '!') {
-        heap.allocator.free(image);
-        return error.NotExecutable; // one level, as on Linux
-    }
-    errdefer heap.allocator.free(image);
+    return .{ .storage = storage, .interp_len = interp.len, .arg_len = arg.len };
+}
+
+/// The interpreter's arguments: itself, its argument if there is one,
+/// the script, then `argv` from its second on.
+noinline fn scriptArgs(image: []u8, storage: []u8, interp_len: usize, arg_len: usize, argv: []const []const u8) ExecError!ProgramFile {
     const rest = if (argv.len > 0) argv[1..] else argv;
-    const list = try heap.allocator.alloc([]const u8, @as(usize, 2) + @intFromBool(arg.len != 0) + rest.len);
+    const list = try heap.allocator.alloc([]const u8, @as(usize, 2) + @intFromBool(arg_len != 0) + rest.len);
     var n: usize = 0;
-    list[n] = storage[0..interp.len];
+    list[n] = storage[0..interp_len];
     n += 1;
-    if (arg.len != 0) {
-        list[n] = storage[interp.len..][0..arg.len];
+    if (arg_len != 0) {
+        list[n] = storage[interp_len..][0..arg_len];
         n += 1;
     }
-    list[n] = storage[interp.len + arg.len ..];
+    list[n] = storage[interp_len + arg_len ..];
     n += 1;
     @memcpy(list[n..], rest);
-    return .{ .image = image, .run_path = storage[0..interp.len], .argv = list, .argv_storage = storage };
+    return .{ .image = image, .run_path = storage[0..interp_len], .argv = list, .argv_storage = storage };
 }
 
 /// The whole file at `path`, symbolic links followed, on the heap.

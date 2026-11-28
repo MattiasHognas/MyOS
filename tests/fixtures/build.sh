@@ -41,6 +41,9 @@
 #                       the runtime's core asks of the kernel
 #   dotnet-hello-aot    `dotnet publish -r linux-x64 -p:PublishAot=true`:
 #                       dynamically linked against glibc
+#   dotnet-realapp/     the same of an app (`src/dotnet-realapp`): the generic
+#                       host, configuration reload, FileSystemWatcher,
+#                       Process.Start, File.Copy, a named Mutex, raw console.
 #   dotnet-hello-app/   `dotnet publish -r linux-x64 --self-contained`,
 #                       trimmed: a folder with the JIT runtime (needs the
 #                       .NET SDK)
@@ -115,13 +118,18 @@ fi
 # --- .NET.
 if have dotnet; then
     project="$work/dotnet"
-    publish() { # <output> <dotnet publish arguments...>
+    publish() { # <output> <dotnet publish arguments...>: the hello-world
         local out="$1"
         shift
+        publishFrom src/dotnet-hello hello.csproj "$out" "$@"
+    }
+    publishFrom() { # <source folder> <project file> <output> <dotnet publish arguments...>
+        local src="$1" proj="$2" out="$3"
+        shift 3
         rm -rf "$project"
         mkdir -p "$project"
-        cp src/dotnet-hello/hello.csproj src/dotnet-hello/Program.cs "$project/"
-        dotnet publish "$project/hello.csproj" -c Release "$@" -o "$project/out" >/dev/null
+        cp "$src"/* "$project/"
+        dotnet publish "$project/$proj" -c Release "$@" -o "$project/out" >/dev/null
         rm -f "$project/out"/*.pdb "$project/out"/*.dbg
         cp -r "$project/out" "$out"
     }
@@ -139,6 +147,10 @@ if have dotnet; then
     cp "$work/aot/hello" bin/dotnet-hello-aot
     # Self-contained with the JIT runtime, trimmed: 23 MB instead of 80.
     publish bin/dotnet-hello-app -r linux-x64 --self-contained -p:PublishTrimmed=true
+    # An app rather than a hello-world: the generic host with configuration
+    # that reloads, file watching, a child process, a named mutex (25 MB).
+    rm -rf bin/dotnet-realapp
+    publishFrom src/dotnet-realapp realapp.csproj bin/dotnet-realapp -r linux-x64 --self-contained -p:PublishTrimmed=true
 else
     note "no dotnet: dotnet-hello-static, dotnet-hello-aot and dotnet-hello-app left out"
 fi

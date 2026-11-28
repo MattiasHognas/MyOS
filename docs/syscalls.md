@@ -129,14 +129,19 @@ Linux calls, with Linux's numbers:
 | 87 | `unlink(path)` | Takes the name away; the file lives while it is open. `EISDIR`, `EROFS`, `ENOENT`. |
 | 88 | `symlink(target, path)` | A symbolic link in `/tmp`, stored as given (the target need not exist); followed by every call that follows links, read with `readlink`. `EROFS` elsewhere, `EEXIST`. |
 | 89 | `readlink(path, buf, size)` | What a symbolic link points to, cut to `size`: the links of the image (`/bin` and the rest) and `/proc/self/exe`. `EINVAL` for anything else that exists, `ENOENT` otherwise. |
-| 91 | `fchmod(fd, mode)` | No permissions exist: accepted for a file that can be written, `EROFS` otherwise. |
+| 90 | `chmod(path, mode)` | Permission bits of a file or directory of `/tmp`, kept and reported by `stat` (`/tmp` itself 1777); not enforced, as there are no users to keep out. `EROFS` elsewhere. |
+| 91 | `fchmod(fd, mode)` | The same through a descriptor (a file, or a directory). |
+| 95 | `umask(mask)` | The process's creation mask (022 at first; a child has its parent's): what `open` with `O_CREAT`, `mkdir` and `mknod` take from the mode asked for. Returns the old one. |
 | 96 | `gettimeofday(tv, tz)` | |
 | 98 | `getrusage(who, usage)` | The calling process's CPU time (`RUSAGE_SELF`; `RUSAGE_THREAD` says the same), its ended threads' included, or that of its children that were waited for (`RUSAGE_CHILDREN`): all of it as user time (the kernel does not tell user and system time apart), the most memory had (`ru_maxrss`, KiB) and the time slices (`ru_nvcsw`); the other fields 0. `EINVAL` for another `who`. |
 | 99 | `sysinfo(info)` | Memory in bytes (total and free), uptime, number of processes. No swap, no load averages. |
+| 102 | `getuid()` | 0: there are no users (identities on views: 12.0); every process is user 0 and group 0, which is who `stat` says owns every file. Also `geteuid` (107), `getgid` (104), `getegid` (108). |
 | 109 | `setpgid(pid, pgid)` | Puts the caller or one of its children (`pid` 0: the caller) in the group `pgid` (0: its own ID), which must be its own ID or a group of the same session. A session leader stays in its group. `EPERM`, `ESRCH`, `EINVAL`. |
 | 110 | `getppid()` | The parent's process ID; an orphan's new parent's; 0 for none. |
 | 111 | `getpgrp()` | The caller's process group. |
 | 112 | `setsid()` | A new session and group, led by the caller; `EPERM` for a group leader. There is one terminal, which stays where it is. |
+| 115 | `getgroups(size, list)` | No supplementary groups: 0. |
+| 118 | `getresuid(ruid, euid, suid)` | All 0. Also `getresgid` (120). |
 | 121 | `getpgid(pid)` | A process's group (0: the caller's); `ESRCH`. |
 | 124 | `getsid(pid)` | A process's session (0: the caller's); `ESRCH`. A process starts in its parent's group and session, or in its own if the kernel started it. |
 | 127 | `rt_sigpending(set, size)` | The signals waiting that the thread blocks. |
@@ -145,6 +150,7 @@ Linux calls, with Linux's numbers:
 | 130 | `rt_sigsuspend(mask, size)` | Waits with `mask` blocked instead until a signal is handled; the old mask is back after the handler. `EINTR`. |
 | 131 | `sigaltstack(ss, old_ss)` | The thread's alternate signal stack, used by handlers with `SA_ONSTACK`; reported as `SS_ONSTACK` while in use. |
 | 137 | `statfs(path, buf)` | One filesystem, in memory and read-only, reported as `tmpfs`. `ENOENT` for a path that does not exist. |
+| 138 | `fstatfs(fd, buf)` | `statfs` of what the descriptor's file is on. |
 | 140 | `getpriority(which, who)` | A process's nice value (`PRIO_PROCESS`; `who` 0 is the caller) as `20 - nice`. `ESRCH`; `EINVAL` for `PRIO_PGRP` and `PRIO_USER`. |
 | 141 | `setpriority(which, who, prio)` | Sets it, clamped to -20..19 as on Linux. Kept and reported, not used: the scheduler gives every thread the same share. |
 | 142 | `sched_setparam(pid, param)` | One policy, `SCHED_OTHER`, with priority 0: that may be set, anything else is `EINVAL`. `pid` is 0 or a thread of the calling process. |
@@ -186,6 +192,7 @@ Linux calls, with Linux's numbers:
 | 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | `link` relative to descriptors; `AT_SYMLINK_FOLLOW` links what a link points to (without it a link to a link is refused, `EPERM`). |
 | 266 | `symlinkat(target, dirfd, path)` | `symlink` relative to a descriptor. |
 | 267 | `readlinkat(dirfd, path, buf, size)` | As `readlink`. |
+| 268 | `fchmodat(dirfd, path, mode)` | `chmod` relative to a descriptor. |
 | 269 | `faccessat(dirfd, path, mode)` | As `access`. |
 | 273 | `set_robust_list(head, size)` | The thread's list of robust mutexes: when it ends (on its own, with its process, or for `execve`), each futex word on the list (and the one `list_op_pending` names) that still has its thread ID gets `FUTEX_OWNER_DIED`, keeping `FUTEX_WAITERS`, by an atomic compare-and-swap, and one waiter is woken (`robust.zig`); at most 2048 entries. New threads and `fork` children start without one, as on Linux. |
 | 274 | `get_robust_list(tid, head, len)` | What a thread of the caller's process registered. `ESRCH`. |

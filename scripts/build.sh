@@ -61,6 +61,12 @@ for f in zig-out/bin/bin-*; do
     cp "$f" "$initrd/usr/bin/${name#bin-}"
 done
 printf 'Welcome to MyOS!\n' > "$initrd/etc/motd"
+# The one user there is to programs: user 0 (the kernel has no users; this
+# is what the identity calls and `stat` report). C libraries look it up
+# here (`getpwuid`): the .NET runtime does, for a named Mutex.
+printf 'root:x:0:0:root:/root:/bin/sh\n' > "$initrd/etc/passwd"
+printf 'root:x:0:\n' > "$initrd/etc/group"
+printf 'passwd: files\ngroup: files\nhosts: files\n' > "$initrd/etc/nsswitch.conf"
 # The C library dynamically linked Linux programs expect on the system:
 # the loader and shared libraries of scripts/fetch-sysroot.sh, fetched the
 # first time (and checked against pinned checksums) so that a program

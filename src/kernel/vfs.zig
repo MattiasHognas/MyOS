@@ -102,6 +102,8 @@ pub const Ops = struct {
     /// Set its access and modification times (null: leave it; nanoseconds
     /// since 1970); the change time becomes now.
     set_times: ?*const fn (node: *const Node, atime: ?i64, mtime: ?i64) Error!void = null,
+    /// Set its permission bits (`fchmod`).
+    set_mode: ?*const fn (node: *const Node, mode: u16) Error!void = null,
     /// A file that can go away while someone uses it is counted: every
     /// node `Fs.lookup` or `Fs.create` hands out holds the file until it
     /// is given to `release`; `retain` makes a second holder of one. Null
@@ -118,7 +120,7 @@ pub fn canMapShared(node: *const Node) bool {
 }
 
 /// What `stat` tells about a file besides its size.
-pub const Meta = struct { atime: i64, mtime: i64, ctime: i64, nlink: u32 };
+pub const Meta = struct { atime: i64, mtime: i64, ctime: i64, nlink: u32, mode: u16 };
 
 /// The file's times and names, if its filesystem keeps them.
 pub fn metaOf(node: *const Node) ?Meta {
@@ -169,8 +171,34 @@ pub const Fs = struct {
     /// A symbolic link at `path` to `target`; a second name `new` for the
     /// file at `old` (a hard link: `error.Invalid` for what is not a file).
     symlink: ?*const fn (ctx: *anyopaque, path: []const u8, target: []const u8) Error!void = null,
+    /// The permission bits of what `path` names (its root included); and
+    /// giving it others (`chmod`). Null where they are not kept.
+    mode_of: ?*const fn (ctx: *anyopaque, path: []const u8) ?u16 = null,
+    set_mode: ?*const fn (ctx: *anyopaque, path: []const u8, mode: u16) Error!void = null,
     link: ?*const fn (ctx: *anyopaque, old: []const u8, new: []const u8) Error!void = null,
 };
+
+/// The permission bits of what `path` names, where its filesystem keeps
+/// them (null elsewhere).
+pub fn modeOf(path: []const u8) ?u16 {
+    const at = resolve(path) orelse return null;
+    const f = at.fs.mode_of orelse return null;
+    return f(at.fs.ctx, at.rest);
+}
+
+/// Give what `path` names the permission bits `mode`. `error.ReadOnly`
+/// where they are not kept.
+pub fn setMode(path: []const u8, mode: u16) Error!void {
+    const at = resolve(path) orelse return error.NotFound;
+    const f = at.fs.set_mode orelse return error.ReadOnly;
+    return f(at.fs.ctx, at.rest, mode);
+}
+
+/// Set a file's permission bits through its node (`fchmod`).
+pub fn setNodeMode(node: *const Node, mode: u16) Error!void {
+    const f = node.ops.set_mode orelse return error.ReadOnly;
+    return f(node, mode);
+}
 
 /// Make a symbolic link at `path` to `target` (stored as given).
 pub fn symlink(path: []const u8, target: []const u8) Error!void {

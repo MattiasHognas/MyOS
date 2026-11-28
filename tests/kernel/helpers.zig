@@ -297,6 +297,11 @@ pub fn traceUnknownSyscalls(on: bool) void {
     kernel_root.kernel.syscall.trace_unknown = on;
 }
 
+/// Log every system call that fails, with its arguments and error.
+pub fn traceFailingSyscalls(on: bool) void {
+    kernel_root.kernel.syscall.trace_errors = on;
+}
+
 /// Log every system call with its arguments and result.
 pub fn traceAllSyscalls(on: bool) void {
     kernel_root.kernel.syscall.trace_all = on;

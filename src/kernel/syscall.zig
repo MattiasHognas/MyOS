@@ -424,7 +424,7 @@ fn sysTruncate(path_ptr: u64, length: u64) u64 {
 
 /// `mkdir` and `mkdirat`: make an empty directory. `EEXIST`, `ENOENT` or
 /// `ENOTDIR` for the directory it is to go into, `EROFS`, `ENOSPC`.
-fn sysMkdir(dirfd: u64, path_ptr: u64) u64 {
+fn sysMkdir(dirfd: u64, path_ptr: u64, mode: u64) u64 {
     var given = switch (Path.fromNoFollow(dirfd, path_ptr)) {
         .path => |p| p,
         .fail => |e| return e,
@@ -432,6 +432,7 @@ fn sysMkdir(dirfd: u64, path_ptr: u64) u64 {
     defer given.deinit();
     if (named(given.text) != .none) return err(.EXIST);
     vfs.mkdir(given.text) catch |e| return vfsError(e);
+    if (thread.current().process) |p| vfs.setMode(given.text, createMode(p, mode)) catch {};
     kinotify.notify(given.text, kinotify.IN.CREATE, 0, true);
     return 0;
 }
@@ -496,10 +497,54 @@ fn sysRename(old_dirfd: u64, old_ptr: u64, new_dirfd: u64, new_ptr: u64, flags: 
 
 /// `fchmod`: there are no permissions; a file that can be written
 /// accepts any, the rest is `EROFS`.
-fn sysFchmod(fd: u64) u64 {
+/// `fchmod`: a file's or directory's permission bits, where they are kept
+/// (`/tmp`); `EROFS` elsewhere. Kept and reported by `stat`; not enforced:
+/// there are no users to keep out.
+fn sysFchmod(fd: u64, mode: u64) u64 {
     const of = getFile(fd) orelse return err(.BADF);
     defer putFile(of);
-    return if (of.kind == .file and of.generated == null and vfs.isWritable(&of.node)) 0 else err(.ROFS);
+    const bits: u16 = @truncate(mode & 0o7777);
+    switch (of.kind) {
+        .file => {
+            if (of.generated != null) return err(.ROFS);
+            vfs.setNodeMode(&of.node, bits) catch |e| return vfsError(e);
+            if (of.path.len != 0) kinotify.notify(of.path, kinotify.IN.ATTRIB, 0, false);
+            return 0;
+        },
+        .directory => {
+            vfs.setMode(of.path, bits) catch |e| return vfsError(e);
+            kinotify.notify(of.path, kinotify.IN.ATTRIB, 0, true);
+            return 0;
+        },
+        else => return err(.ROFS),
+    }
+}
+
+/// `chmod` and `fchmodat`: the same by path (links followed; a link's own
+/// bits cannot change). `ENOENT`, `EROFS`, `EINVAL` for flags.
+fn sysChmod(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) u64 {
+    if (flags != 0) return err(.INVAL);
+    var given = switch (Path.from(dirfd, path_ptr)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    defer given.deinit();
+    const what = named(given.text);
+    if (what == .none) return missing(given.text);
+    vfs.setMode(given.text, @truncate(mode & 0o7777)) catch |e| return vfsError(e);
+    kinotify.notify(given.text, kinotify.IN.ATTRIB, 0, what == .directory);
+    return 0;
+}
+
+/// `umask`: set the calling process's creation mask, return the old one.
+fn sysUmask(mask: u64) u64 {
+    const p = thread.current().process orelse return 0o022;
+    return p.umask.swap(@truncate(mask & 0o777), .acq_rel);
+}
+
+/// The bits a new file or directory of `p` asked for with `mode` gets.
+fn createMode(p: *proc.Process, mode: u64) u16 {
+    return @truncate(mode & 0o7777 & ~@as(u64, p.umask.load(.monotonic)));
 }
 
 /// A write to a thread's `comm` in `/proc`: its new name, the first 15
@@ -803,7 +848,7 @@ fn isOpen(fd: u64) bool {
 /// is in it. `ENOTDIR` for `O_DIRECTORY` or a path ending in a slash that
 /// names something else. `ENOENT`, `EMFILE`, `ENOMEM`, and what `Path.from`
 /// says.
-fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
+fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64, mode: u64) u64 {
     // O_NOFOLLOW: a link as the last part is refused (ELOOP) instead of
     // followed.
     var given = switch (if (flags & abi.O.NOFOLLOW != 0) Path.fromNoFollow(dirfd, ptr) else Path.from(dirfd, ptr)) {
@@ -811,13 +856,13 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
         .fail => |e| return e,
     };
     defer given.deinit();
-    return openNamed(&given, flags);
+    return openNamed(&given, flags, mode);
 }
 
 /// The rest of `open` once the path is resolved. Not inlined: its
 /// temporaries (an `OpenFile` being made, the kinds of file) stay out of
 /// the frame that is on the stack while the path is looked up.
-noinline fn openNamed(given: *const Path, flags: u64) u64 {
+noinline fn openNamed(given: *const Path, flags: u64, mode: u64) u64 {
     const path = given.text;
     const p = thread.current().process orelse return err(.BADF);
     const what = named(path);
@@ -839,6 +884,7 @@ noinline fn openNamed(given: *const Path, flags: u64) u64 {
             opened.readable = access != abi.O.WRONLY;
             opened.writable = access != abi.O.RDONLY;
             opened.append = flags & abi.O.APPEND != 0;
+            vfs.setNodeMode(&opened.node, createMode(p, mode)) catch {};
             kinotify.notify(path, kinotify.IN.CREATE, 0, false);
         },
         .directory => {
@@ -1220,9 +1266,11 @@ fn fileAt(path: []const u8) ?vfs.Node {
 }
 
 /// What `stat` says about a directory.
-fn directoryStat() abi.Stat {
+fn directoryStat(path: []const u8) abi.Stat {
     var st: abi.Stat = .{};
-    st.mode = abi.S.IFDIR | 0o555;
+    // Its own bits where they are kept (`/tmp`), else those of what
+    // cannot be changed.
+    st.mode = abi.S.IFDIR | @as(u32, vfs.modeOf(path) orelse 0o555);
     st.nlink = 2;
     st.dev = 1;
     st.ino = 2;
@@ -1253,7 +1301,7 @@ fn deviceStat() abi.Stat {
 fn fileStat(node: vfs.Node) abi.Stat {
     var st: abi.Stat = .{};
     const size = vfs.sizeOf(&node);
-    st.mode = abi.S.IFREG | @as(u32, if (vfs.isWritable(&node)) 0o644 else 0o555);
+    st.mode = abi.S.IFREG | @as(u32, if (vfs.metaOf(&node)) |m| m.mode else if (vfs.isWritable(&node)) 0o644 else 0o555);
     st.size = @intCast(size);
     st.blocks = @intCast((size + 511) / 512);
     st.blksize = 4096;
@@ -1563,7 +1611,7 @@ noinline fn statNamed(given: *const Path, flags: u64) StatResult {
     if (given.directory_wanted and what != .directory and what != .none) return .{ .fail = err(.NOTDIR) };
     const st = switch (what) {
         .none => return .{ .fail = missing(path) },
-        .directory => directoryStat(),
+        .directory => directoryStat(path),
         .file => blk: {
             const node = fileAt(path) orelse return .{ .fail = err(.NOENT) };
             defer vfs.release(&node);
@@ -1573,7 +1621,7 @@ noinline fn statNamed(given: *const Path, flags: u64) StatResult {
         .device => deviceStat(),
         .fifo => |id| blk: {
             var fifo_st: abi.Stat = .{};
-            fifo_st.mode = abi.S.IFIFO | 0o644;
+            fifo_st.mode = abi.S.IFIFO | @as(u32, vfs.modeOf(path) orelse 0o644);
             fifo_st.dev = 3;
             fifo_st.ino = id;
             fifo_st.blksize = 4096;
@@ -1620,12 +1668,14 @@ fn sysMknod(dirfd: u64, path_ptr: u64, mode: u64) u64 {
         // A FIFO (`mkfifo`): a name whose pipe is the kernel's.
         0o010000 => blk: {
             vfs.makeFifo(given.text, kfifo.newId()) catch |e| break :blk vfsError(e);
+            if (thread.current().process) |p| vfs.setMode(given.text, createMode(p, mode)) catch {};
             kinotify.notify(given.text, kinotify.IN.CREATE, 0, false);
             break :blk 0;
         },
         // A regular file, as `open` with `O_CREAT | O_EXCL` makes one.
         0, 0o100000 => blk: {
             const node = vfs.create(given.text) catch |e| break :blk vfsError(e);
+            if (thread.current().process) |p| vfs.setNodeMode(&node, createMode(p, mode)) catch {};
             vfs.release(&node);
             kinotify.notify(given.text, kinotify.IN.CREATE, 0, false);
             break :blk 0;
@@ -1978,7 +2028,7 @@ fn statFd(fd: u64) StatResult {
             st.blksize = kpipe.SIZE;
         },
         .null_device, .random_device => st = deviceStat(),
-        .directory => st = directoryStat(),
+        .directory => st = directoryStat(of.path),
         // No file of any kind: what Linux says of its anonymous files.
         .eventfd, .epoll, .signalfd, .inotify => st.mode = 0o600,
         .file => st = fileStat(of.node),
@@ -3400,6 +3450,25 @@ fn sysSysinfo(ptr: u64) u64 {
 /// `/sys/fs/cgroup` say they are what Linux's are (`procfs.fsMagic`),
 /// which is how a runtime finds control groups (v2) to read its limits
 /// from. `ENOENT` for a path that does not exist.
+/// `fstatfs`: `statfs` of the filesystem the descriptor's file is on: a
+/// directory or a file opened for writing by its path, a file of `/proc`
+/// as such, anything else as in memory.
+fn sysFstatfs(fd: u64, ptr: u64) u64 {
+    const of = getFile(fd) orelse return err(.BADF);
+    defer putFile(of);
+    const magic: i64 = if (of.generated != null) 0x9fa0 else if (of.path.len != 0) procfs.fsMagic(of.path) else procfs.fsMagic("/");
+    const st: abi.StatFs = .{ .type = magic };
+    return if (toUser(ptr, st)) 0 else err(.FAULT);
+}
+
+/// `getresuid` and `getresgid`: real, effective and saved IDs, all 0.
+fn sysGetres(a: u64, b: u64, c: u64) u64 {
+    for ([_]u64{ a, b, c }) |ptr| {
+        if (!toUser(ptr, @as(u32, 0))) return err(.FAULT);
+    }
+    return 0;
+}
+
 fn sysStatfs(path_ptr: u64, ptr: u64) u64 {
     var given = switch (Path.from(CWD, path_ptr)) {
         .path => |p| p,
@@ -3480,10 +3549,36 @@ pub fn dispatch(f: *arch.Frame) void {
         return;
     }
     const number = f.rax;
+    if (trace_errors) return dispatchTraced(f, number);
     const start = kstats.syscallStart(number);
     dispatchCall(f);
     if (start) |t| kstats.syscallEnd(number, t); // a call that waits counts its wait
 }
+
+/// `dispatch` with `trace_errors`. Not inlined: its buffer would be in
+/// the frame of every system call.
+noinline fn dispatchTraced(f: *arch.Frame, number: u64) void {
+    {
+        const args = [4]u64{ f.rdi, f.rsi, f.rdx, f.r10 };
+        dispatchCall(f);
+        if (abi.isError(f.rax)) {
+            // The path, for the calls that take one first or second.
+            var path_buf: [96]u8 = undefined;
+            const path_arg: ?u64 = switch (number) {
+                Sys.open, Sys.stat, Sys.lstat, Sys.mkdir, Sys.rmdir, Sys.unlink, Sys.chdir, Sys.readlink => args[0],
+                Sys.openat, Sys.newfstatat, Sys.mkdirat, Sys.unlinkat, Sys.readlinkat, Sys.statx => args[1],
+                else => null,
+            };
+            const shown = if (path_arg) |a| path_buf[0 .. uaccess.copyStringFromUser(&path_buf, a) catch 0] else "";
+            root.print("syscall: thread {d} call {d}(0x{x}, 0x{x}, 0x{x}, 0x{x}) failed: {d} {s}\n", .{ thread.id(), number, args[0], args[1], args[2], args[3], -%f.rax, shown });
+        }
+    }
+}
+
+/// Log every system call that fails, with its first four arguments and
+/// the error number: what a program that gives up on something tried.
+/// Off by default.
+pub var trace_errors: bool = false;
 
 /// Log every system call of every program, with its first three arguments
 /// when it starts and its result when it returns (calls that wait show
@@ -3504,7 +3599,7 @@ fn dispatchCall(f: *arch.Frame) void {
     f.rax = switch (f.rax) {
         Sys.read => sysRead(f.rdi, f.rsi, f.rdx),
         Sys.write => sysWrite(f.rdi, f.rsi, f.rdx),
-        Sys.open => sysOpenAt(CWD, f.rdi, f.rsi),
+        Sys.open => sysOpenAt(CWD, f.rdi, f.rsi, f.rdx),
         Sys.close => sysClose(f.rdi),
         Sys.sched_yield => blk: {
             thread.yield();
@@ -3513,7 +3608,7 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.fstat => sysFstat(f.rdi, f.rsi),
         Sys.lseek => sysLseek(f.rdi, f.rsi, f.rdx),
         Sys.pread64 => sysPread(f.rdi, f.rsi, f.rdx, f.r10),
-        Sys.openat => sysOpenAt(f.rdi, f.rsi, f.rdx),
+        Sys.openat => sysOpenAt(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.fcntl => sysFcntl(f.rdi, f.rsi, f.rdx),
         Sys.newfstatat => sysNewfstatat(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.stat => sysNewfstatat(CWD, f.rdi, f.rsi, 0),
@@ -3521,13 +3616,16 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.unlink => sysUnlink(CWD, f.rdi, 0),
         Sys.rmdir => sysUnlink(CWD, f.rdi, abi.AT_REMOVEDIR),
         Sys.unlinkat => sysUnlink(f.rdi, f.rsi, f.rdx),
-        Sys.mkdir => sysMkdir(CWD, f.rdi),
-        Sys.mkdirat => sysMkdir(f.rdi, f.rsi),
+        Sys.mkdir => sysMkdir(CWD, f.rdi, f.rsi),
+        Sys.mkdirat => sysMkdir(f.rdi, f.rsi, f.rdx),
         Sys.rename => sysRename(CWD, f.rdi, CWD, f.rsi, 0),
         Sys.renameat => sysRename(f.rdi, f.rsi, f.rdx, f.r10, 0),
         Sys.renameat2 => sysRename(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
         Sys.mknodat => sysMknod(f.rdi, f.rsi, f.rdx),
-        Sys.fchmod => sysFchmod(f.rdi),
+        Sys.fchmod => sysFchmod(f.rdi, f.rsi),
+        Sys.chmod => sysChmod(CWD, f.rdi, f.rsi, 0),
+        Sys.fchmodat => sysChmod(f.rdi, f.rsi, f.rdx, 0),
+        Sys.umask => sysUmask(f.rdi),
         Sys.pwrite64 => sysPwrite(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.readv => sysReadv(f.rdi, f.rsi, f.rdx),
         Sys.preadv => sysPreadv(f.rdi, f.rsi, f.rdx, f.r10, false),
@@ -3645,6 +3743,14 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.get_mempolicy => sysGetMempolicy(f.rdi, f.rsi, f.rdx, f.r8),
         Sys.mremap => memory(.mremap, f),
         Sys.statfs => sysStatfs(f.rdi, f.rsi),
+        Sys.fstatfs => sysFstatfs(f.rdi, f.rsi),
+        // There are no users (security comes from what a process is
+        // given, not from who it is): every process is user 0 and group
+        // 0, which is also who `stat` says owns every file, with no
+        // supplementary groups.
+        Sys.getuid, Sys.geteuid, Sys.getgid, Sys.getegid => 0,
+        Sys.getgroups => 0,
+        Sys.getresuid, Sys.getresgid => sysGetres(f.rdi, f.rsi, f.rdx),
         Sys.mlock, Sys.munlock => sysMlock(f.rdi, f.rsi),
         Sys.kill => sysKill(f.rdi, f.rsi),
         Sys.tgkill => sysTgkill(f.rdi, f.rsi, f.rdx),

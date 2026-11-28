@@ -315,6 +315,9 @@ run_scenario() {
             if libc && fixture dotnet-hello-app/hello; then
                 expect_line '^GREETING=hi dotnet jit$'
             fi
+            if libc && fixture dotnet-realapp/realapp; then
+                expect_line '^realapp: all correct$'
+            fi
             # The same C and Rust programs as position-independent executables.
             if fixture musl-hello-static-pie; then expect_line '^env GREETING=hi pie$'; fi
             if fixture rust-hello-static-pie; then expect_line '^GREETING=hi rust pie$'; fi

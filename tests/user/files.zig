@@ -137,9 +137,18 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.fstat, etc, @intFromPtr(&st), 0) == 0 and st.mode & S.IFMT == S.IFDIR, 110);
     expect(lib.read(etc, &buf) == lib.err(.ISDIR) and lib.syscall(Sys.write, etc, bufp, 1) == lib.err(.BADF), 111);
     expect(lib.syscall(Sys.fcntl, etc, 3, 0) == abi.O.RDONLY | abi.O.DIRECTORY, 112);
-    expect(std.mem.eql(u8, listing(etc), ". .. motd"), 113);
+    {
+        // `motd`, and the one user there is to programs (`passwd`, `group`,
+        // `nsswitch.conf`), in whatever order the image has them.
+        const etc_list = listing(etc);
+        var names: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, etc_list, ' ');
+        while (it.next()) |_| names += 1;
+        expect(std.mem.startsWith(u8, etc_list, ". .. ") and names == 6 and std.mem.indexOf(u8, etc_list, "motd") != null and
+            std.mem.indexOf(u8, etc_list, "passwd") != null and std.mem.indexOf(u8, etc_list, "nsswitch.conf") != null, 113);
+    }
     expect(std.mem.eql(u8, listing(etc), ""), 114); // at the end it stays at the end
-    expect(lib.syscall(Sys.lseek, etc, 0, abi.SEEK.SET) == 0 and std.mem.eql(u8, listing(etc), ". .. motd"), 115); // from the start again
+    expect(lib.syscall(Sys.lseek, etc, 0, abi.SEEK.SET) == 0 and std.mem.startsWith(u8, listing(etc), ". .. "), 115); // from the start again
     expect(lib.syscall(Sys.lseek, etc, 5, abi.SEEK.SET) == lib.err(.INVAL) and lib.syscall(Sys.lseek, etc, 0, abi.SEEK.END) == lib.err(.INVAL), 116);
     // A buffer for one entry at a time gives them one at a time; one too
     // small for the next entry is an error, not a short answer.
@@ -149,7 +158,13 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 24) == 24 and small[20] == '.', 118);
     expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 20) == lib.err(.INVAL), 119); // "motd" needs 24
     expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 24) == 24 and std.mem.eql(u8, small[19..23], "motd") and small[18] == abi.DT.REG, 120);
-    expect(lib.syscall(Sys.getdents64, etc, @intFromPtr(&small), 24) == 0, 121);
+    // The rest one at a time (`passwd` and the others), then the end.
+    var rest_left: usize = 0;
+    while (rest_left < 8) : (rest_left += 1) {
+        const got = lib.syscall(Sys.getdents64, etc, bufp, 40); // one record: `nsswitch.conf`'s is 40 bytes
+        if (got == 0 or lib.isError(got)) break;
+    }
+    expect(rest_left == 3, 121);
     expect(lib.syscall(Sys.getdents64, etc, 8, 4096) == lib.err(.INVAL) or lib.syscall(Sys.getdents64, etc, 8, 4096) == 0, 122);
     expect(lib.syscall(Sys.getdents64, 99, bufp, 64) == lib.err(.BADF), 123);
     const motd_for_dents = lib.open("/etc/motd");

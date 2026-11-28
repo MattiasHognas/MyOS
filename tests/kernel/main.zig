@@ -1276,6 +1276,31 @@ fn dotnetSelfContained() TestError!void {
     try expectFootprint(memory); // code heaps, mapped assemblies, threads: all gone
 }
 
+/// A .NET app rather than a hello-world (`tests/fixtures/src/dotnet-realapp`):
+/// the generic host with its configuration in `/tmp`, reloaded when the
+/// file changes; a `FileSystemWatcher`; `File.Copy`; a named `Mutex` (a
+/// file of `/tmp` mapped shared, a robust futex in it) held while a child
+/// it starts with `Process.Start` tries for it; the console in raw mode.
+/// It checks itself: exit 0, and the host script finds its last line.
+fn dotnetRealApp() TestError!void {
+    if (!helpers.haveFixtures(&.{"dotnet-realapp/realapp"})) return;
+    const path = "/fixtures/dotnet-realapp/realapp";
+    if (!helpers.fileExists("/lib64/ld-linux-x86-64.so.2")) {
+        root.print("  skipped: the image has no C library (scripts/fetch-sysroot.sh)\n", .{});
+        return;
+    }
+    helpers.traceUnknownSyscalls(true);
+    defer helpers.traceUnknownSyscalls(false);
+    // A home that can be written: the image's cannot be until there is a
+    // disk (11), and the runtime keeps per-user state there.
+    const code = helpers.runProgramArgs(path, &.{path}, &.{ "TMPDIR=/tmp", "HOME=/tmp" }) orelse return error.Failed;
+    if (code != 0) report("dotnet real app: checks that failed", code);
+    try check(code == 0);
+    // Its file watchers went with it.
+    if (root.kernel.inotify.count() != 0) report("inotify instances left", root.kernel.inotify.count());
+    try check(root.kernel.inotify.count() == 0);
+}
+
 /// The C, Rust and Go programs built the way a developer builds them, with
 /// no flags: `gcc hello.c`, `cargo build --release`, `go build`. The first
 /// two are linked against glibc. A toolchain built for newer CPUs (some
@@ -1424,7 +1449,11 @@ fn terminal() TestError!void {
 /// renames, a program copied there and run, from two processes at once;
 /// and nothing of it left when they are done.
 fn writableFiles() TestError!void {
-    _ = helpers.runProgram("/test/tmp"); // warm up: the heap may grow
+    // Warmed up as it is run, two at once too: `/tmp`'s table of entries
+    // keeps the room it grew to while anything else is in `/tmp` (the .NET
+    // runtime's `.dotnet` stays there, as on Linux).
+    _ = helpers.runProgram("/test/tmp");
+    _ = helpers.runPair("/test/tmp");
     const memory = helpers.footprint();
     const code = helpers.runProgram("/test/tmp") orelse return error.Failed;
     if (code != 0) report("/test/tmp failed check", code);
@@ -2209,6 +2238,7 @@ fn runCases() noreturn {
         .{ .name = "C, Rust and Go built with plain gcc, cargo build, go build run", .func = plainBuilds },
         .{ .name = "a .NET program published ahead of time for linux-x64 (glibc, dynamic) runs", .func = dotnetAot },
         .{ .name = "a self-contained .NET program with the JIT runtime runs", .func = dotnetSelfContained },
+        .{ .name = "a .NET app: the generic host, configuration reload, FileSystemWatcher, Process.Start, a named Mutex", .func = dotnetRealApp },
         .{ .name = "descriptors: standard streams, dup, pipes that wait, closed ends (ring 3)", .func = descriptorsAndPipes },
         .{ .name = "directories, /proc/self, /dev/null, a growing descriptor table, scheduling calls (ring 3)", .func = filesAndProc },
         .{ .name = "a woken thread preempts a busy CPU", .func = wakeLatency },

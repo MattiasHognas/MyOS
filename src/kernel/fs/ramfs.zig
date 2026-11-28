@@ -66,6 +66,8 @@ pub fn RamFs(comptime Blocks: type) type {
             atime: i64 = 0,
             mtime: i64 = 0,
             ctime: i64 = 0,
+            /// Its permission bits (`chmod`), shared by its names.
+            mode: u16 = 0o644,
         };
 
         const Entry = struct {
@@ -78,6 +80,9 @@ pub fn RamFs(comptime Blocks: type) type {
             fifo: u64 = 0,
             /// For a symbolic link: what it points to. Owned.
             link: ?[]u8 = null,
+            /// The permission bits of a directory or FIFO (a file keeps
+            /// its own, `File.mode`; a link's are 0777).
+            mode: u16 = 0o755,
 
             fn isDir(e: Entry) bool {
                 return e.file == null and e.fifo == 0 and e.link == null;
@@ -208,6 +213,28 @@ pub fn RamFs(comptime Blocks: type) type {
         pub fn fileAt(self: *const Self, path: []const u8) ?*File {
             if (path.len == 1) return null;
             return self.entries.items[self.find(path) orelse return null].file;
+        }
+
+        /// The permission bits of what `path` names (the root's are what
+        /// the owner says), or null if nothing.
+        pub fn modeOf(self: *const Self, path: []const u8) ?u16 {
+            if (path.len == 1) return null;
+            const e = self.entries.items[self.find(path) orelse return null];
+            if (e.file) |f| return f.mode;
+            if (e.link != null) return 0o777;
+            return e.mode;
+        }
+
+        /// Give what `path` names the permission bits `mode` (`chmod`). A
+        /// symbolic link's cannot change (`error.Invalid`), as on Linux.
+        pub fn setMode(self: *Self, path: []const u8, mode: u16) Error!void {
+            if (path.len == 1) return error.Invalid;
+            const e = &self.entries.items[self.find(path) orelse return error.NotFound];
+            if (e.file) |f| {
+                f.mode = mode & 0o7777;
+            } else if (e.link != null) {
+                return error.Invalid;
+            } else e.mode = mode & 0o7777;
         }
 
         /// The number of the FIFO at `path`, or null if it is not one.

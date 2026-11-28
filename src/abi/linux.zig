@@ -168,6 +168,10 @@ pub const Sys = struct {
     /// `unlink(path)`, and the same relative to directory descriptors.
     pub const rename = 82;
     pub const mkdir = 83;
+    /// `umask(mask)`, `chmod(path, mode)`, `fchmodat(dirfd, path, mode)`.
+    pub const umask = 95;
+    pub const chmod = 90;
+    pub const fchmodat = 268;
     pub const rmdir = 84;
     pub const unlink = 87;
     pub const mkdirat = 258;
@@ -214,6 +218,17 @@ pub const Sys = struct {
     pub const sigaltstack = 131;
     /// `statfs(path, buf) -> 0`: what kind of filesystem a path is on.
     pub const statfs = 137;
+    /// `fstatfs(fd, buf)`: `statfs` of what a descriptor is on.
+    pub const fstatfs = 138;
+    /// The identity calls: there are no users (every process is user 0,
+    /// group 0, as `stat` says every file is), so they report that.
+    pub const getuid = 102;
+    pub const getgid = 104;
+    pub const geteuid = 107;
+    pub const getegid = 108;
+    pub const getgroups = 115;
+    pub const getresuid = 118;
+    pub const getresgid = 120;
     /// `mlock(addr, length) -> 0` and `munlock`: memory is never paged out.
     pub const mlock = 149;
     pub const munlock = 150;

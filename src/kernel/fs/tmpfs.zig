@@ -57,7 +57,30 @@ const ops = vfs.Ops{
     .set_times = setTimes,
     .map_page = mapPage,
     .hold_map = holdMap,
+    .set_mode = setNodeMode,
 };
+
+fn setNodeMode(node: *const vfs.Node, mode: u16) vfs.Error!void {
+    const held = lock.acquire();
+    defer lock.release(held);
+    const f = fileOf(node);
+    f.mode = mode & 0o7777;
+    f.ctime = now();
+}
+
+fn modeOf(_: *anyopaque, path: []const u8) ?u16 {
+    if (path.len == 1) return 0o1777; // the mount point, as Linux's /tmp: anyone, sticky
+    const held = lock.acquire();
+    defer lock.release(held);
+    return fs.modeOf(path);
+}
+
+fn setMode(_: *anyopaque, path: []const u8, mode: u16) vfs.Error!void {
+    const held = lock.acquire();
+    defer lock.release(held);
+    fs.setMode(path, mode) catch |e| return toVfs(e);
+    if (fs.fileAt(path)) |f| f.ctime = now();
+}
 
 /// The block at `offset` of the file, as a page for a shared mapping:
 /// made (zeroed) where there is none, with one more owner for the
@@ -96,6 +119,8 @@ pub fn init() vfs.Fs {
         .readlink = readLink,
         .symlink = symlink,
         .link = link,
+        .mode_of = modeOf,
+        .set_mode = setMode,
     };
 }
 
@@ -189,7 +214,7 @@ fn meta(node: *const vfs.Node) vfs.Meta {
     const held = lock.acquire();
     defer lock.release(held);
     const f = fileOf(node);
-    return .{ .atime = f.atime, .mtime = f.mtime, .ctime = f.ctime, .nlink = f.nlink };
+    return .{ .atime = f.atime, .mtime = f.mtime, .ctime = f.ctime, .nlink = f.nlink, .mode = f.mode };
 }
 
 fn setTimes(node: *const vfs.Node, atime: ?i64, mtime: ?i64) vfs.Error!void {
