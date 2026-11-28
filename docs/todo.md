@@ -665,6 +665,7 @@ Order from the research of 2026-11-27 (`design-beyond-linux.md`, section 5): the
   - Timers are a sorted list, linear to arm (2.8).
   - Any change to a pipe, the terminal or an eventfd wakes every thread in `poll` or `epoll_wait`, which then look at all they watch again (`readiness.zig`); per-object wake lists would wake only those watching it.
   - The kernel heap never gives pages back to the page allocator: memory it grew by for one large allocation stays with it.
+- [ ] Per-CPU ready queues with stealing, wake-up on the waker's CPU when that helps, and a one-shot TSC-deadline timer instead of the 10 ms tick (no tick when idle), as section 5 of `docs/design-beyond-linux.md` orders them; with it the open task of 3.4 (affinity, load balancing). Before 12: the network's locality (interrupt, protocol work and woken thread on one CPU) needs it.
 - [ ] `MADV_DONTNEED` as section 5 of `docs/design-beyond-linux.md` has it (the path Go and .NET give memory back on; not yet looked at against it, found 2026-11-28): its TLB shootdowns batched per call, and zeroed pages kept ready so that the next touch need not clear one. Measured with a `tools/bench` case that frees and touches again.
 - [ ] Keep the safety features on in the benchmarked configuration (SMEP/SMAP, guard pages, user-copy checks), and record results per commit so regressions are visible.
 
@@ -710,6 +711,7 @@ How each task is done (decided 2026-11-28): before a task is built, what `docs/d
   - `tests/fixtures/src/dotnet-realapp` (25 MB published, trimmed): it checks itself, step by step, and the host script expects its last line. What it took beyond the calls of the tasks above: the identity calls (every process user 0, group 0), `fstatfs`, `/etc/passwd`, `/etc/group` and `/etc/nsswitch.conf` in the image (the runtime looks the user up for a named mutex), the umask and permission bits in `/tmp` (`chmod`, `fchmod`; the runtime checks its shared-memory directories are 0700). It runs with `HOME=/tmp`: the image's `/root` cannot be written until there is a disk.
 - [ ] The picture of a user that `docs/design-beyond-linux.md` section 2 asks for, where 9.3 stopped short (found 2026-11-28 in a check against the research): `init` sets `USER`, `LOGNAME`, `SHELL` and `TMPDIR` besides `HOME` (the .NET fixture sets `TMPDIR` itself today); `chown`, `fchown`, `lchown` and `fchownat` succeed as in a rootless container (today unknown calls, `ENOSYS`).
 - [ ] The execute bit means something: `execve` of a file whose mode has no execute bit fails with `EACCES`, and `access(X_OK)` answers by the mode, as on Linux even for root (today both succeed for any file). Go's `exec.LookPath` and .NET's `Process.Start` look for programs on `PATH` so; files the image has keep 0755, and files made in `/tmp` get the mode they are created with (a program copied there needs `chmod +x`, as on Linux).
+- [ ] What is left of the console and `/sys` rows of `docs/design-beyond-linux.md` section 1: `SIGWINCH` when the terminal's size changes, termios set again after `SIGCONT` as a stopped program expects, and `/sys/devices/system/node` (the .NET collector looks for NUMA nodes there; one node).
 - [ ] A writable home directory (`/root`, or the view's own) once there is a disk (11): programs keep per-user state under `$HOME`.
 - [x] The same published as a single file. Runs (`-p:PublishSingleFile=true -p:PublishTrimmed=true`, one file of 15 MB). Tried by hand with `MYOS_INITRD_EXTRA`; not a fixture, since it would be 15 MB in the repository for what the folder already tests.
 - [x] A way to put a published folder into the image, until there is a writable disk (11) or a network (12): `MYOS_INITRD_EXTRA=<dir> scripts/build.sh` copies the tree under `<dir>` over the image's root.
@@ -726,7 +728,12 @@ How each task is done (decided 2026-11-28): before a task is built, what `docs/d
 
 **Goal:** Display multiple interactive windows and run a graphical terminal.
 
+### 10.0 Before graphics
+- [ ] Profiles applied from outside (decision 1 of `docs/design-beyond-linux.md`): a short declaration of a view, rights and limits that the launcher applies at `execve` (pledge's vocabulary), with ready ones for ".NET app", "Go server" and "command". A graphical program is started through one.
+- [ ] Linux's self-sandboxing calls mapped onto views and rights, for programs that confine themselves: Landlock (`landlock_create_ruleset` and the rest) onto views, seccomp filters onto rights. Denials are clean errors, never `SIGSYS` unless the filter asks for it. (After storage, before graphics, as decided.)
+
 ### 10.1 Graphics
+- [ ] Map the framebuffer write-combining (through the PAT), not with ordinary caching: the usual setting, and much faster for drawing (`docs/research.md`, design notes).
 - [ ] Expose framebuffer information through a safe userspace API.
 - [ ] Implement pixel, rectangle, image, and text rendering.
 - [ ] Add back-buffering and a display update mechanism.
@@ -744,8 +751,8 @@ How each task is done (decided 2026-11-28): before a task is built, what `docs/d
 - [ ] Implement a basic userspace compositor/window manager.
 - [ ] Create/destroy windows and draw decorations.
 - [ ] Support movement, resizing, overlap, and focus.
-- [ ] Add shared memory mappings between processes (window buffers need them).
-- [ ] Add IPC for graphical clients, with the compositor waiting on input and clients through `poll` (6.2).
+- [ ] Window buffers in shared memory: `memfd_create` and `MAP_SHARED` are there (9.3), passed to the compositor as descriptors.
+- [ ] IPC for graphical clients over Unix sockets (12.3), descriptors passed with `SCM_RIGHTS` (and narrowed by the rights of 12.0), the compositor waiting on input and clients through the per-object wait lists and `epoll` of 12.0.
 - [ ] Build a graphical terminal and minimal desktop/launcher.
 - [ ] Add a simple editor or file viewer.
 - [ ] Test window management and graphical IPC with scripted clients, checking framebuffer output.
@@ -766,15 +773,15 @@ Off the critical path (programs can ship in the initrd). It does not depend on m
 - [ ] Define a generic block-device interface for read/write/capacity/block size.
 - [ ] Add device registration and consistent I/O error reporting.
 - [ ] Validate LBA ranges, buffer sizes, and alignment.
-- [ ] Add a small block cache with explicit flush (the page cache of 11.4 takes it over; FAT32 writes in 11.8 rely on it for flush ordering).
+- [ ] No block cache of its own: the page cache of 11.4 is the cache for block devices too (decision 3), so it is built before anything writes through a cache (FAT32 in 11.8 relies on it for flush ordering). The block layer has write and flush, and is uncached until then.
 - [ ] Test the block layer on the host against a fake in-memory device: bounds, sizes, alignment, error propagation, and cache hits, eviction and flush.
 - [ ] Stress-test I/O from every CPU at once (several programs reading and writing files on the disk, and later sockets), as 3.4 stress-tests memory and processes.
 
 ### 11.2 NVMe
 - [ ] Implement NVMe write operations.
-- [ ] Give the NVMe driver a lock (or a queue per CPU): today it polls with no lock and is used by its own test only (3.4).
+- [ ] A submission and completion queue per CPU (NVMe has them for that), its completions ending requests of the completion core of 12.0, as the network's do: today it polls with no lock and is used by its own test only (3.4).
 - [ ] Support multi-page transfers with PRP lists or another valid DMA mechanism.
-- [ ] Add PCI MSI/MSI-X support and switch NVMe from polling to interrupt-driven completion (legacy PCI interrupt routing would need an ACPI AML interpreter; the network driver in 12.1 reuses this).
+- [ ] Switch NVMe from polling to interrupt-driven completion with the MSI-X support of 12.1, one vector per queue.
 - [ ] Validate namespace geometry and bounds.
 - [ ] Handle command errors, timeouts, and controller failures.
 - [ ] Audit DMA allocation, synchronization, and queue handling.
@@ -849,7 +856,8 @@ Decided 2026-11-27 (`design-beyond-linux.md`, decisions 1 and 2): completion ins
 ### 12.1 Network hardware
 - [ ] Define a generic network-device interface.
 - [x] Choose the first network device: virtio-net is simpler than e1000e and its virtio groundwork is reusable for virtio-blk and virtio-gpu; e1000e matches real hardware. Decided: modern virtio-net over PCI (2026-11-27), with QEMU's user networking and `hostfwd` for tests from the host.
-- [ ] Implement the driver with TX/RX rings, using MSI/MSI-X interrupts (11.2).
+- [ ] PCI MSI/MSI-X support (moved here from 11.2, as networking now comes first; legacy PCI interrupt routing would need an ACPI AML interpreter): a vector per queue, steered to a CPU. NVMe (11.2) reuses it.
+- [ ] Implement the driver with TX/RX rings, using MSI/MSI-X interrupts.
 - [ ] Handle RX interrupts and link state.
 - [ ] Send/receive Ethernet frames in QEMU networking tests.
 
@@ -864,7 +872,7 @@ Decided 2026-11-27 (`design-beyond-linux.md`, decisions 1 and 2): completion ins
 - [ ] Per-core connection tables and accept queues, steered by a hash of the address and port pairs; `SO_REUSEPORT` as the native model.
 - [ ] Replace the sorted list behind kernel timers (2.8) with a heap or a timer wheel before TCP arms several timers per connection.
 - [ ] Implement packet buffers and basic flow control.
-- [ ] Add DNS resolution.
+- [ ] DNS works for unmodified programs: glibc's `getaddrinfo` (and Go's own resolver) ask QEMU's DNS server (10.0.2.3, from DHCP into `/etc/resolv.conf`) over UDP; no resolver in the kernel. Tested with a fixture that looks a name up.
 - [ ] Test protocol parsing, checksums and state machines on the host with recorded and malformed packets.
 
 ### 12.3 Sockets and programs
@@ -892,11 +900,11 @@ Decided 2026-11-27 (`design-beyond-linux.md`, decisions 1 and 2): completion ins
 - [ ] CPU feature discovery and more QEMU/real-hardware testing.
 
 ### Advanced processes and memory
-- [ ] Shared file-backed mappings (demand paging and private file mappings: 5; copy-on-write `fork`: 9.2).
+- [ ] Shared mappings of files on the disk: those of `/tmp` and memory files are there (9.3); for the disk they come with the page cache of 11.4.
 - [ ] 2 MiB pages shared copy-on-write by `fork` too (copied as 512 small pages now), and pages of files nobody wrote shared between processes (a page cache).
-- [ ] `fork`/`exec` semantics if desired. A static busybox would then supply the standard utilities and a broad compatibility test.
-- [ ] User/group permissions.
-- [ ] Divide memory between unrelated programs: accounting per user or per group of processes, with a share each cannot exceed. The limits of 2.6 bound one program and what it starts; they do not stop it from using up memory other programs need.
+- [ ] A static busybox as a broad compatibility test and the standard utilities (`fork` and `execve` are there since 6 and 9.2).
+- [ ] Enforce permissions between processes, once there is a reason (several people or services on one machine): on top of the identities of 12.0, never in place of views and rights (decision 1).
+- [ ] Divide memory between unrelated programs: accounting per view or profile (there are no users in the kernel, decision 1) or per group of processes, with a share each cannot exceed. The limits of 2.6 bound one program and what it starts; they do not stop it from using up memory other programs need.
 - [ ] Build the kernel with stack protectors and test that a smashed kernel stack is detected (moved from 2.9).
   - What it is: the compiler puts a secret value (a canary) between each function's local variables and its return address, and checks it before the function returns. A buffer overflow that reaches the return address has overwritten the canary first, so the kernel panics instead of jumping where the overflow says.
   - Waiting for Zig: version 0.17 refuses the option (`stack_protector` in `build.zig`, `-fstack-protector`) for a target without a C library, with "enabling stack protection requires libc", and it has no C library for a freestanding target such as the kernel. Zig has to allow stack protection without libc, or we need another way to pass the option to its LLVM backend. Try again whenever the Zig version is raised.
@@ -919,7 +927,7 @@ The native ABI is Linux's and there is one of it (see the primary goal). These a
 ### Performance and observability
 - [ ] CPU and memory usage statistics.
 - [ ] Scheduler tracing and kernel profiling.
-- [ ] Asynchronous I/O and a larger, smarter filesystem cache.
+- [ ] If a ring interface for I/O is ever offered (the completion core of 12.0 is underneath already): a few operations, no hidden worker threads, the same checks as the ordinary calls (section 3 of `docs/design-beyond-linux.md`: io_uring's record). And a smarter page cache than 11.4's.
 - [ ] Cover what `check-frames` (2.3) cannot see: a function reached only through a pointer stored in a data table, and assembly that moves RSP by a computed amount. Or build with stack probes (`stack_check`), the fallback if a function ever needs a larger frame.
 
 ---
