@@ -490,6 +490,18 @@ fn sysFchmod(fd: u64) u64 {
     return if (of.kind == .file and of.generated == null and vfs.isWritable(&of.node)) 0 else err(.ROFS);
 }
 
+/// A write to a thread's `comm` in `/proc`: its new name, the first 15
+/// bytes up to a newline. `ESRCH` if the thread is gone.
+fn writeComm(pid: u64, tid: u64, ptr: u64, count: u64) u64 {
+    var buf: [16]u8 = undefined;
+    const n: usize = @intCast(@min(count, buf.len));
+    uaccess.copyFromUser(buf[0..n], ptr) catch return err(.FAULT);
+    const name = std.mem.sliceTo(buf[0..n], '\n');
+    const p = thread.current().process orelse return err(.SRCH);
+    if (p.pid != pid) return err(.SRCH);
+    return if (proc.setThreadName(p, tid, name)) count else err(.SRCH);
+}
+
 fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
     {
         const of = getFile(fd) orelse return err(.BADF);
@@ -504,6 +516,7 @@ fn sysWrite(fd: u64, ptr: u64, count: u64) u64 {
             },
             .file => {
                 if (!of.writable) return err(.BADF);
+                if (of.comm_target) |t| return writeComm(t.pid, t.tid, ptr, count);
                 return fileWrite(of, ptr, @min(count, abi.MAX_RW_COUNT), null);
             },
             .eventfd => return eventFdWrite(of, ptr, count),
@@ -674,6 +687,41 @@ fn consoleRead(of: *OpenFile, ptr: u64, len: u64) u64 {
     }
 }
 
+/// `prctl`: `PR_SET_NAME` and `PR_GET_NAME`, the calling thread's name
+/// (at most 15 bytes; what `pthread_setname_np` and `pthread_getname_np`
+/// use for the caller). Other options are not offered (`EINVAL`):
+/// runtimes try a few (naming their mappings, for one) and go on.
+fn sysPrctl(option: u64, arg: u64) u64 {
+    const PR_SET_NAME = 15;
+    const PR_GET_NAME = 16;
+    const me = thread.current();
+    const p = me.process orelse return err(.INVAL);
+    switch (option) {
+        PR_SET_NAME => {
+            var buf: [16]u8 = @splat(0);
+            // Up to 16 bytes, a NUL among them or not: the name is the first 15.
+            var n: usize = 0;
+            while (n < 16) : (n += 1) {
+                const c = fromUser(u8, arg + n) orelse return err(.FAULT);
+                if (c == 0) break;
+                buf[n] = c;
+            }
+            _ = proc.setThreadName(p, me.id, buf[0..@min(n, 15)]);
+            return 0;
+        },
+        PR_GET_NAME => {
+            var buf: [16]u8 = undefined;
+            const own = proc.threadName(p, me.id, &buf) orelse "";
+            var out: [16]u8 = @splat(0);
+            const name = if (own.len != 0) own else procfs.commOf(p);
+            @memcpy(out[0..name.len], name);
+            uaccess.copyToUser(arg, &out) catch return err(.FAULT);
+            return 0;
+        },
+        else => return err(.INVAL),
+    }
+}
+
 /// `arch_prctl`: set or read the FS or GS base of the calling thread,
 /// where a program keeps its thread-local data. A base must be an address
 /// in user space (`EPERM` otherwise, as on Linux): the kernel tells its own
@@ -750,6 +798,13 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
         .fail => |e| return e,
     };
     defer given.deinit();
+    return openNamed(&given, flags);
+}
+
+/// The rest of `open` once the path is resolved. Not inlined: its
+/// temporaries (an `OpenFile` being made, the kinds of file) stay out of
+/// the frame that is on the stack while the path is looked up.
+noinline fn openNamed(given: *const Path, flags: u64) u64 {
     const path = given.text;
     const p = thread.current().process orelse return err(.BADF);
     const what = named(path);
@@ -799,9 +854,22 @@ fn sysOpenAt(dirfd: u64, ptr: u64, flags: u64) u64 {
         .file, .exe_link, .generated => {
             if (directory_wanted) return err(.NOTDIR);
             if (what == .generated) {
-                if (access != abi.O.RDONLY) return err(.ROFS);
                 const g = what.generated;
-                const text = if (g.pid == 0 or g.pid == p.pid) procfs.generateArg(g.file, p, g.arg) catch return err(.NOMEM) else blk: {
+                // A thread's name can be written (`pthread_setname_np` does
+                // it so): the caller's own threads only.
+                const comm_file = g.file == .comm or g.file == .task_comm;
+                if (access != abi.O.RDONLY) {
+                    if (!comm_file) return err(.ROFS);
+                    if (g.pid != 0 and g.pid != p.pid) return err(.ACCES);
+                    opened.comm_target = .{ .pid = p.pid, .tid = if (g.file == .task_comm) g.tid else p.pid };
+                    opened.writable = true;
+                    opened.readable = access == abi.O.RDWR;
+                }
+                const text = if (g.file == .task_comm or g.file == .task_stat) blk: {
+                    const target = if (g.pid == 0 or g.pid == p.pid) p else proc.findRetained(g.pid) orelse return err(.NOENT);
+                    defer if (target != p) proc.release(target);
+                    break :blk (procfs.generateThread(g.file, target, g.tid) catch return err(.NOMEM)) orelse return err(.NOENT);
+                } else if (g.pid == 0 or g.pid == p.pid) procfs.generateArg(g.file, p, g.arg) catch return err(.NOMEM) else blk: {
                     const other = proc.findRetained(g.pid) orelse return err(.NOENT);
                     defer proc.release(other);
                     break :blk procfs.generate(g.file, other) catch return err(.NOMEM);
@@ -1026,7 +1094,7 @@ const Named = union(enum) {
     symlink,
     /// A text file made when it is opened (`procfs.zig`), about the
     /// process with the ID `pid` (0: none, the machine).
-    generated: struct { file: procfs.File, pid: u64, arg: u8 = 0 },
+    generated: struct { file: procfs.File, pid: u64, arg: u8 = 0, tid: u64 = 0 },
     /// `/dev/null`, `/dev/urandom`, `/dev/random`.
     device: open_file.Kind,
     /// A FIFO (named pipe), by its number (`fifo.zig`).
@@ -1092,6 +1160,19 @@ fn procEntry(path: []const u8) ?Named {
         proc.release(other);
     }
     const name = rest[(slash orelse return .directory) + 1 ..];
+    // Its threads: `task/<tid>`, with each one's `comm` and `stat`.
+    if (std.mem.eql(u8, name, "task")) return .directory;
+    if (std.mem.startsWith(u8, name, "task/")) {
+        const in_task = name["task/".len..];
+        const slash2 = std.mem.indexOfScalar(u8, in_task, '/');
+        const tid = std.fmt.parseInt(u64, in_task[0 .. slash2 orelse in_task.len], 10) catch return .none;
+        const target = if (pid == p.pid) p else proc.findRetained(pid) orelse return .none;
+        defer if (target != p) proc.release(target);
+        if (!proc.hasThread(target, tid)) return .none;
+        const leaf = in_task[(slash2 orelse return .directory) + 1 ..];
+        const file: procfs.File = if (std.mem.eql(u8, leaf, "comm")) .task_comm else if (std.mem.eql(u8, leaf, "stat")) .task_stat else return .none;
+        return .{ .generated = .{ .file = file, .pid = pid, .tid = tid } };
+    }
     // Only a process's own directory has `exe` and `maps`.
     if (std.mem.eql(u8, name, "exe")) return if (pid == p.pid) .exe_link else .none;
     const file = procfs.find(name, true) orelse return .none;
@@ -1434,6 +1515,13 @@ fn statPath(dirfd: u64, path_ptr: u64, flags: u64) StatResult {
         .fail => |e| return .{ .fail = e },
     };
     defer given.deinit();
+    return statNamed(&given, flags);
+}
+
+/// The rest of `statPath` once the path is resolved. Not inlined: its
+/// temporaries (a `Stat` for each kind of thing) stay out of the frame
+/// that is on the stack while the path is looked up and links followed.
+noinline fn statNamed(given: *const Path, flags: u64) StatResult {
     const path = given.text;
     const what = named(path);
     if (given.directory_wanted and what != .directory and what != .none) return .{ .fail = err(.NOTDIR) };
@@ -1696,7 +1784,10 @@ fn extraEntries(dir: []const u8) []const ListEntry {
         .{ .name = "urandom", .type = abi.DT.CHR },
         .{ .name = "random", .type = abi.DT.CHR },
     };
-    if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG }, .{ .name = "cpuinfo", .type = REG }, .{ .name = "syscalls", .type = REG }, .{ .name = "lockstat", .type = REG } };
+    if (std.mem.eql(u8, dir, "/proc")) return &.{ .{ .name = "self", .type = DIR }, .{ .name = "meminfo", .type = REG }, .{ .name = "cpuinfo", .type = REG }, .{ .name = "syscalls", .type = REG }, .{ .name = "lockstat", .type = REG }, .{ .name = "mounts", .type = REG } };
+    // A thread's directory, `/proc/<pid>/task/<tid>`.
+    if (named(dir) == .directory and std.mem.indexOf(u8, dir, "/task/") != null) return &.{ .{ .name = "comm", .type = REG }, .{ .name = "stat", .type = REG } };
+    if (named(dir) == .directory and std.mem.endsWith(u8, dir, "/task")) return &.{};
     if (named(dir) == .directory and std.mem.startsWith(u8, dir, "/proc/")) {
         const own = std.mem.eql(u8, dir, "/proc/self") or blk: {
             var id_buf: [24]u8 = undefined;
@@ -1710,10 +1801,14 @@ fn extraEntries(dir: []const u8) []const ListEntry {
             .{ .name = "mountinfo", .type = REG },
             .{ .name = "cgroup", .type = REG },
             .{ .name = "schedstat", .type = REG },
+            .{ .name = "status", .type = REG },
+            .{ .name = "statm", .type = REG },
+            .{ .name = "mounts", .type = REG },
+            .{ .name = "task", .type = DIR },
             .{ .name = "exe", .type = abi.DT.LNK },
             .{ .name = "maps", .type = REG },
         };
-        return if (own) all else all[0..6];
+        return if (own) all else all[0..10];
     }
     return &.{};
 }
@@ -1729,6 +1824,19 @@ fn nextEntry(dir: []const u8, position: *u64, name_buf: []u8) ?ListEntry {
         if (index == 1) return .{ .name = "..", .type = abi.DT.DIR };
         if (index - 2 < extra.len) return extra[index - 2];
         position.* = LIST_BASE;
+    }
+    if (std.mem.startsWith(u8, dir, "/proc/") and std.mem.endsWith(u8, dir, "/task") and named(dir) == .directory) {
+        // A directory for each thread of the process, lowest ID first, as
+        // for the processes in `/proc` below.
+        const pid_text = dir["/proc/".len .. dir.len - "/task".len];
+        const me = thread.current().process orelse return null;
+        const pid = if (std.mem.eql(u8, pid_text, "self")) me.pid else std.fmt.parseInt(u64, pid_text, 10) catch return null;
+        const target = if (pid == me.pid) me else proc.findRetained(pid) orelse return null;
+        defer if (target != me) proc.release(target);
+        const next = proc.tidAfter(target, position.* - LIST_BASE) orelse return null;
+        position.* = LIST_BASE + next;
+        const name = std.fmt.bufPrint(name_buf, "{d}", .{next}) catch return null;
+        return .{ .name = name, .type = abi.DT.DIR };
     }
     if (std.mem.eql(u8, dir, "/proc")) {
         // Then a directory for each process, lowest ID first: the position
@@ -3312,9 +3420,7 @@ fn dispatchCall(f: *arch.Frame) void {
         Sys.prlimit64 => sysPrlimit(f.rdi, f.rsi, f.rdx, f.r10),
         Sys.getrlimit => sysPrlimit(0, f.rdi, 0, f.rsi),
         Sys.setrlimit => sysPrlimit(0, f.rdi, f.rsi, 0),
-        // No option exists here yet. Runtimes try a few (naming their
-        // mappings, for one) and go on without them.
-        Sys.prctl => err(.INVAL),
+        Sys.prctl => sysPrctl(f.rdi, f.rsi),
         Sys.membarrier => sysMembarrier(f.rdi, f.rsi),
         Sys.sysinfo => sysSysinfo(f.rdi),
         Sys.get_mempolicy => sysGetMempolicy(f.rdi, f.rsi, f.rdx, f.r8),

@@ -155,7 +155,7 @@ Linux calls, with Linux's numbers:
 | 147 | `sched_get_priority_min(policy)` | The same. |
 | 149 | `mlock(addr, length)` | Memory is never paged out: succeeds for a range that is all mapped, `ENOMEM` otherwise. |
 | 150 | `munlock(addr, length)` | The same. |
-| 157 | `prctl(option, ...)` | No option is supported: `EINVAL`. |
+| 157 | `prctl(option, ...)` | `PR_SET_NAME` and `PR_GET_NAME`: the calling thread's name (15 bytes; a new thread has its creator's, `execve` gives the program's). Other options: `EINVAL`. |
 | 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS`, `ARCH_SET_GS`, `ARCH_GET_FS`, `ARCH_GET_GS`: the thread's FS and GS base, kept across switches, also when the program sets them itself with `wrfsbase`/`wrgsbase` (FSGSBASE, on where the CPU has it). A base outside user space is `EPERM`. |
 | 186 | `gettid()` | |
 | 200 | `tkill(tid, sig)` | As `tgkill` with the calling process. |
@@ -269,7 +269,10 @@ Every other number returns `ENOSYS`.
   the caches in `/sys/devices/system/cpu/cpu0/cache/index*` (`level`,
   `size`, `type`, ...: what the .NET collector sizes itself by); `self`
   may be its own process ID, and every process has a directory by its ID
-  (`stat`, `cmdline`, `comm`). There are no control groups, but
+  (`stat`, `cmdline`, `comm`, `status`, `statm`, `mounts`, and `task`
+  with a directory for each thread: its `comm`, which the thread's own
+  process may write to name it, as `pthread_setname_np` does, and its
+  `stat`). `/proc/mounts` as well. There are no control groups, but
   `/sys/fs/cgroup` is laid out as the root of a cgroup v2 hierarchy whose
   `memory.max` is the reader's memory limit and `memory.current` its use,
   for runtimes that size themselves by them.

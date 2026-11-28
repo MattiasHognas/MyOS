@@ -175,7 +175,8 @@ pub fn lockReport(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "# class contended wait_ns\n");
-    inline for (comptime std.enums.values(lock_order.Rank)) |rank| {
+    // A loop, not unrolled: each unrolled `print` would add to the frame.
+    for (std.enums.values(lock_order.Rank)) |rank| {
         var n: u64 = 0;
         var cycles: u64 = 0;
         for (0..percpu.count()) |i| {

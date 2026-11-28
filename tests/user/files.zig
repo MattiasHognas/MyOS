@@ -92,6 +92,13 @@ fn has(names: []const u8, name: []const u8) bool {
 }
 
 /// Read the whole file at `path` into `text`.
+/// `fmt` with `n` in it, NUL-terminated in `buf`.
+fn zpath(buf: []u8, comptime fmt: []const u8, n: u64) [*:0]const u8 {
+    const out = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, .{n}) catch unreachable;
+    buf[out.len] = 0;
+    return @ptrCast(buf.ptr);
+}
+
 fn slurp(path: [*:0]const u8) []const u8 {
     const fd = lib.open(path);
     if (lib.isError(fd)) return "";
@@ -158,7 +165,7 @@ pub fn main() noreturn {
     expect(std.mem.eql(u8, listing(dev_dir), ". .. null urandom random"), 128);
     _ = lib.close(dev_dir);
     const self_dir = lib.open("/proc/self/");
-    expect(std.mem.eql(u8, listing(self_dir), ". .. stat cmdline comm mountinfo cgroup schedstat exe maps"), 129);
+    expect(std.mem.eql(u8, listing(self_dir), ". .. stat cmdline comm mountinfo cgroup schedstat status statm mounts task exe maps"), 129);
     _ = lib.close(self_dir);
     // Every process has a directory by its ID, this one included; another
     // process's has no `exe` or `maps`.
@@ -540,6 +547,51 @@ pub fn main() noreturn {
     _ = lib.close(tf);
     _ = lib.syscall(Sys.unlink, @intFromPtr(&tname), 0, 0);
     _ = lib.close(motd2);
+
+    // --- /proc/self/status, statm, mounts; threads in task/, with names.
+    {
+        const self_pid = lib.syscall(Sys.getpid, 0, 0, 0);
+        const my_tid = lib.syscall(Sys.gettid, 0, 0, 0);
+        var pbuf: [32]u8 = undefined;
+        const status = slurp("/proc/self/status");
+        expect(std.mem.indexOf(u8, status, std.fmt.bufPrint(&pbuf, "\nPid:\t{d}\n", .{self_pid}) catch unreachable) != null, 240);
+        expect(std.mem.startsWith(u8, status, "Name:\t") and std.mem.indexOf(u8, status, "\nThreads:\t1\n") != null, 241);
+        expect(std.mem.indexOf(u8, status, "\nVmRSS:\t") != null and std.mem.indexOf(u8, status, "\nCpus_allowed_list:\t") != null, 242);
+        var statm_fields = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, slurp("/proc/self/statm"), "\n"), ' ');
+        var statm_count: usize = 0;
+        while (statm_fields.next()) |f| : (statm_count += 1) _ = std.fmt.parseInt(u64, f, 10) catch expect(false, 243);
+        expect(statm_count == 7, 244);
+        expect(std.mem.indexOf(u8, slurp("/proc/self/mounts"), "tmpfs /tmp tmpfs rw") != null, 245);
+        expect(std.mem.indexOf(u8, slurp("/proc/mounts"), "proc /proc proc") != null, 246);
+        // A thread's thread_name: set with prctl, seen in both comm files.
+        expect(lib.syscall6(Sys.prctl, 15, @intFromPtr("worker-x"), 0, 0, 0, 0) == 0, 247); // PR_SET_NAME
+        var thread_name: [16]u8 = undefined;
+        expect(lib.syscall6(Sys.prctl, 16, @intFromPtr(&thread_name), 0, 0, 0, 0) == 0 and std.mem.eql(u8, std.mem.sliceTo(&thread_name, 0), "worker-x"), 248);
+        expect(std.mem.eql(u8, slurp("/proc/self/comm"), "worker-x\n"), 249);
+        var comm_buf: [48]u8 = undefined;
+        const comm_path = zpath(&comm_buf, "/proc/self/task/{d}/comm", my_tid);
+        expect(std.mem.eql(u8, slurp(comm_path), "worker-x\n"), 250);
+        // Written through the file: what pthread_setname_np does.
+        const thread_comm_fd = lib.syscall(Sys.open, @intFromPtr(comm_path), abi.O.WRONLY, 0);
+        expect(!lib.isError(thread_comm_fd) and lib.syscall(Sys.write, thread_comm_fd, @intFromPtr("renamed\n"), 8) == 8, 251);
+        _ = lib.close(thread_comm_fd);
+        expect(lib.syscall6(Sys.prctl, 16, @intFromPtr(&thread_name), 0, 0, 0, 0) == 0 and std.mem.eql(u8, std.mem.sliceTo(&thread_name, 0), "renamed"), 252);
+        var stat_buf: [48]u8 = undefined;
+        const stat_path = zpath(&stat_buf, "/proc/self/task/{d}/stat", my_tid);
+        var stat_start: [32]u8 = undefined;
+        expect(std.mem.startsWith(u8, slurp(stat_path), std.fmt.bufPrint(&stat_start, "{d} (renamed) ", .{my_tid}) catch unreachable), 253);
+        expect(lib.syscall(Sys.open, @intFromPtr("/proc/self/task/999999/comm"), 0, 0) == lib.err(.NOENT), 254);
+        expect(lib.syscall(Sys.open, @intFromPtr("/proc/self/status"), abi.O.WRONLY, 0) == lib.err(.ROFS), 255);
+        // The task directory lists the thread.
+        const task_fd = lib.syscall(Sys.open, @intFromPtr("/proc/self/task"), abi.O.RDONLY | abi.O.DIRECTORY, 0);
+        expect(!lib.isError(task_fd), 256);
+        var task_dents: [512]u8 align(8) = undefined;
+        const dent_len = lib.syscall(Sys.getdents64, task_fd, @intFromPtr(&task_dents), task_dents.len);
+        _ = lib.close(task_fd);
+        var tid_name: [16]u8 = undefined;
+        expect(!lib.isError(dent_len) and std.mem.indexOf(u8, task_dents[0..dent_len], std.fmt.bufPrint(&tid_name, "{d}", .{my_tid}) catch unreachable) != null, 257);
+        _ = lib.syscall6(Sys.prctl, 15, @intFromPtr("files"), 0, 0, 0, 0);
+    }
 
     lib.exit(0);
 }

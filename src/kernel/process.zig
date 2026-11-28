@@ -467,6 +467,50 @@ pub fn usage(p: *Process, children: bool) struct { run_cycles: u64, slices: u64,
     return .{ .run_cycles = p.children_run_cycles, .slices = p.children_slices, .max_pages = p.children_max_pages };
 }
 
+/// The name of the thread `tid` of `p` (its own, or empty for its
+/// process's), copied into `buf`; null if `p` has no such thread.
+pub fn threadName(p: *Process, tid: u64, buf: *[16]u8) ?[]const u8 {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        if (one.id != tid) continue;
+        buf.* = one.comm;
+        return buf[0..one.comm_len];
+    }
+    return null;
+}
+
+/// Name the thread `tid` of `p` (cut to 15 bytes, as on Linux). False if
+/// `p` has no such thread.
+pub fn setThreadName(p: *Process, tid: u64, name: []const u8) bool {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        if (one.id != tid) continue;
+        const n = @min(name.len, 15);
+        one.comm = @splat(0);
+        @memcpy(one.comm[0..n], name[0..n]);
+        one.comm_len = @intCast(n);
+        return true;
+    }
+    return false;
+}
+
+/// The lowest thread ID of `p` above `after`, for listing its threads in
+/// order (`/proc/<pid>/task`); null when there is none.
+pub fn tidAfter(p: *Process, after: u64) ?u64 {
+    const held = tree_lock.acquire();
+    defer tree_lock.release(held);
+    var best: ?u64 = null;
+    var t = p.thread_list;
+    while (t) |one| : (t = one.proc_next) {
+        if (one.id > after and (best == null or one.id < best.?)) best = one.id;
+    }
+    return best;
+}
+
 /// The nice value of the process `pid` (0: the caller), or null if there
 /// is none.
 pub fn getNice(pid: u64) ?i8 {
@@ -1235,6 +1279,8 @@ pub fn cloneThread(frame: *const arch_syscall.Frame, args: CloneArgs) error{ Out
     t.fs_base = if (args.flags & CLONE.SETTLS != 0) args.tls else bases.fs;
     t.gs_base = bases.gs;
     t.signal_mask = me.signal_mask;
+    t.comm = me.comm; // a new thread has its creator's name, as on Linux
+    t.comm_len = me.comm_len;
     if (args.flags & CLONE.CHILD_CLEARTID != 0) t.clear_child_tid = args.child_tid;
     // The extended state as it is now, in the registers.
     if (t.fpuArea()) |area| {
@@ -1549,6 +1595,8 @@ noinline fn newChildThread(child: *Process, frame: *const arch_syscall.Frame, ar
     t.gs_base = bases.gs;
     t.signal_mask = me.signal_mask;
     t.signal_stack = me.signal_stack;
+    t.comm = me.comm; // the name it was made with, as on Linux
+    t.comm_len = me.comm_len;
     // A forked child keeps its registration (its copy of the area); one
     // that shares the parent's memory does not, as on Linux.
     if (args.flags & CLONE.VM == 0) t.rseq = me.rseq;
@@ -2035,6 +2083,7 @@ noinline fn resetForExec(p: *Process, me: *thread.Thread) void {
     me.signal_stack = .{};
     me.rseq = .{};
     me.rseq_resume = false;
+    me.comm_len = 0; // named after the new program from now on
     me.signal_saved_mask = null;
     me.clear_child_tid = 0;
     {

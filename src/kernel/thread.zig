@@ -286,6 +286,11 @@ pub const Thread = struct {
     /// to its program (set by the scheduler; `rseq.atReturn` acts on it).
     rseq: @import("rseq.zig").Registration = .{},
     rseq_resume: bool = false,
+    /// Its name (`prctl(PR_SET_NAME)`, `/proc/<pid>/task/<tid>/comm`), at
+    /// most 15 bytes; none (length 0) means its process's. Under the
+    /// process tree lock.
+    comm: [16]u8 = @splat(0),
+    comm_len: u8 = 0,
     /// Signals sent to this thread and not yet delivered (`tgkill`, and
     /// those from its faults). Others set bits, the thread clears them.
     signal_pending: std.atomic.Value(u64) = .init(0),

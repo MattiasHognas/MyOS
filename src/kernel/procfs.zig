@@ -48,6 +48,13 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 
 pub const File = enum {
+    /// `/proc/<pid>/status`, `statm`, `mounts` (also `/proc/mounts`).
+    status,
+    statm,
+    mounts,
+    /// `/proc/<pid>/task/<tid>/comm` and `stat`: one thread's.
+    task_comm,
+    task_stat,
     maps,
     stat,
     cmdline,
@@ -76,9 +83,9 @@ pub const File = enum {
 /// if `per_process`, or below `/proc`.
 pub fn find(name: []const u8, per_process: bool) ?File {
     const table = if (per_process)
-        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm }, .{ "mountinfo", .mountinfo }, .{ "cgroup", .cgroup }, .{ "schedstat", .schedstat } }
+        &[_]struct { []const u8, File }{ .{ "maps", .maps }, .{ "stat", .stat }, .{ "cmdline", .cmdline }, .{ "comm", .comm }, .{ "mountinfo", .mountinfo }, .{ "cgroup", .cgroup }, .{ "schedstat", .schedstat }, .{ "status", .status }, .{ "statm", .statm }, .{ "mounts", .mounts } }
     else
-        &[_]struct { []const u8, File }{ .{ "meminfo", .meminfo }, .{ "cpuinfo", .cpuinfo }, .{ "syscalls", .syscalls }, .{ "lockstat", .lockstat }, .{ "profile", .profile } };
+        &[_]struct { []const u8, File }{ .{ "meminfo", .meminfo }, .{ "cpuinfo", .cpuinfo }, .{ "syscalls", .syscalls }, .{ "lockstat", .lockstat }, .{ "profile", .profile }, .{ "mounts", .mounts } };
     for (table) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return entry[1];
     }
@@ -162,6 +169,110 @@ pub fn generate(file: File, p: *proc.Process) error{OutOfMemory}![]u8 {
     return generateArg(file, p, 0);
 }
 
+/// The name `/proc/<pid>/task/<tid>/comm` gives: the thread's own, or its
+/// process's.
+fn threadComm(p: *proc.Process, tid: u64, buf: *[16]u8) []const u8 {
+    const own = proc.threadName(p, tid, buf) orelse return comm(p);
+    return if (own.len != 0) own else comm(p);
+}
+
+/// A file of one thread (`task_comm`, `task_stat`) of `p`: `tid` says
+/// which. Null if `p` has no such thread (any more).
+pub fn generateThread(file: File, p: *proc.Process, tid: u64) error{OutOfMemory}!?[]u8 {
+    var buf: [16]u8 = undefined;
+    if (proc.threadName(p, tid, &buf) == null) return null;
+    const name = threadComm(p, tid, &buf);
+    return switch (file) {
+        .task_comm => try std.fmt.allocPrint(heap.allocator, "{s}\n", .{name}),
+        .task_stat => blk: {
+            const info = proc.describe(p);
+            break :blk try std.fmt.allocPrint(heap.allocator, "{d} ({s}) {c} {d} {d} {d} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {d} 0 {d} 0 {d}\n", .{
+                tid, name, info.state, info.ppid, info.pgid, info.sid, info.threads, p.start_ticks, p.pages,
+            });
+        },
+        else => try generate(file, p),
+    };
+}
+
+/// `/proc/cpuinfo`. Not inlined: the CPUID leaves it gathers would sit in
+/// every generated file's frame.
+noinline fn cpuinfoText() error{OutOfMemory}![]u8 {
+        var leaves: cpuinfo.Leaves = .{};
+        const l0 = cpu.cpuid(0, 0);
+        leaves.l0 = .{ .eax = l0.eax, .ebx = l0.ebx, .ecx = l0.ecx, .edx = l0.edx };
+        const l1 = cpu.cpuid(1, 0);
+        leaves.l1 = .{ .eax = l1.eax, .ebx = l1.ebx, .ecx = l1.ecx, .edx = l1.edx };
+        if (l0.eax >= 7) {
+            const l7 = cpu.cpuid(7, 0);
+            leaves.l7 = .{ .eax = l7.eax, .ebx = l7.ebx, .ecx = l7.ecx, .edx = l7.edx };
+        }
+        const top = cpu.cpuid(0x8000_0000, 0).eax;
+        if (top >= 0x8000_0001) {
+            const e1 = cpu.cpuid(0x8000_0001, 0);
+            leaves.e1 = .{ .eax = e1.eax, .ebx = e1.ebx, .ecx = e1.ecx, .edx = e1.edx };
+        }
+        if (top >= 0x8000_0004) for (&leaves.brand, 0..) |*b, i| {
+            const r = cpu.cpuid(0x8000_0002 + @as(u32, @intCast(i)), 0);
+            b.* = .{ .eax = r.eax, .ebx = r.ebx, .ecx = r.ecx, .edx = r.edx };
+        };
+        const n = percpu.count();
+        const cpus = try heap.allocator.alloc(cpuinfo.Cpu, n); // up to 256: not on the stack
+        defer heap.allocator.free(cpus);
+        for (cpus, 0..) |*c, i| c.* = .{ .number = @intCast(i), .apic_id = percpu.get(i).apic_id };
+        return cpuinfo.format(heap.allocator, leaves, cpus, clock.tscHz());
+    
+}
+
+/// `/proc/<pid>/status`. Not inlined: its formatting of some thirty
+/// values makes a frame that every other generated file would carry.
+noinline fn statusText(p: *proc.Process) error{OutOfMemory}![]u8 {
+        const info = proc.describe(p);
+        const u = proc.usage(p, false);
+        const sets = signalSets(p);
+        const size_pages = blk: {
+            const held = p.mem.lock.acquire();
+            defer p.mem.lock.release(held);
+            break :blk p.mem.regions.accessiblePages();
+        };
+        var cpus_buf: [24]u8 = undefined;
+        const cpu_list = std.mem.trimEnd(u8, cpuinfo.rangeList(&cpus_buf, percpu.count()), "\n");
+        const n_cpus = percpu.count();
+        const mask: u64 = if (n_cpus >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n_cpus)) - 1;
+        return std.fmt.allocPrint(heap.allocator, "Name:\t{s}\nUmask:\t0022\nState:\t{c} ({s})\nTgid:\t{d}\nNgid:\t0\nPid:\t{d}\nPPid:\t{d}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t{d}\nGroups:\nVmPeak:\t{d} kB\nVmSize:\t{d} kB\nVmLck:\t0 kB\nVmHWM:\t{d} kB\nVmRSS:\t{d} kB\nRssAnon:\t{d} kB\nRssFile:\t0 kB\nRssShmem:\t0 kB\nVmData:\t{d} kB\nVmStk:\t0 kB\nVmExe:\t0 kB\nVmLib:\t0 kB\nVmPTE:\t0 kB\nVmSwap:\t0 kB\nThreads:\t{d}\nSigQ:\t{d}/{d}\nSigPnd:\t0000000000000000\nShdPnd:\t{x:0>16}\nSigBlk:\t0000000000000000\nSigIgn:\t{x:0>16}\nSigCgt:\t{x:0>16}\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nCpus_allowed:\t{x}\nCpus_allowed_list:\t{s}\nvoluntary_ctxt_switches:\t{d}\nnonvoluntary_ctxt_switches:\t0\n"
+        , .{
+            comm(p),                      info.state,
+            switch (info.state) {
+                'R' => "running",
+                'T' => "stopped",
+                'Z' => "zombie",
+                else => "sleeping",
+            },
+            p.pid,                        p.pid,
+            info.ppid,                    p.files.len,
+            size_pages * 4,               size_pages * 4,
+            u.max_pages * 4,              p.pages * 4,
+            p.pages * 4,                  p.pages * 4,
+            info.threads,                 p.signals_queued,
+            p.other_limits[@import("abi").RLIMIT.SIGPENDING].cur, p.signal_pending.load(.monotonic),
+            sets.ignored,                 sets.caught,
+            mask,                         cpu_list,
+            u.slices,
+        });
+    
+}
+
+/// The signals `p` ignores and catches, as `/proc/<pid>/status` shows
+/// them (bit `n - 1` for signal `n`).
+fn signalSets(p: *proc.Process) struct { ignored: u64, caught: u64 } {
+    var ignored: u64 = 0;
+    var caught: u64 = 0;
+    for (p.signal_actions, 0..) |a, i| {
+        if (i >= 64) break;
+        if (a.handler == 1) ignored |= @as(u64, 1) << @intCast(i) else if (a.handler > 1) caught |= @as(u64, 1) << @intCast(i);
+    }
+    return .{ .ignored = ignored, .caught = caught };
+}
+
 /// `generate` for a file that takes an argument (`SysEntry.arg`).
 pub fn generateArg(file: File, p: *proc.Process, arg: u8) error{OutOfMemory}![]u8 {
     switch (file) {
@@ -189,32 +300,24 @@ pub fn generateArg(file: File, p: *proc.Process, arg: u8) error{OutOfMemory}![]u
             defer p.files_lock.release(held);
             return heap.allocator.dupe(u8, p.cmdline);
         },
-        .comm => return std.fmt.allocPrint(heap.allocator, "{s}\n", .{comm(p)}),
-        .cpuinfo => {
-            var leaves: cpuinfo.Leaves = .{};
-            const l0 = cpu.cpuid(0, 0);
-            leaves.l0 = .{ .eax = l0.eax, .ebx = l0.ebx, .ecx = l0.ecx, .edx = l0.edx };
-            const l1 = cpu.cpuid(1, 0);
-            leaves.l1 = .{ .eax = l1.eax, .ebx = l1.ebx, .ecx = l1.ecx, .edx = l1.edx };
-            if (l0.eax >= 7) {
-                const l7 = cpu.cpuid(7, 0);
-                leaves.l7 = .{ .eax = l7.eax, .ebx = l7.ebx, .ecx = l7.ecx, .edx = l7.edx };
-            }
-            const top = cpu.cpuid(0x8000_0000, 0).eax;
-            if (top >= 0x8000_0001) {
-                const e1 = cpu.cpuid(0x8000_0001, 0);
-                leaves.e1 = .{ .eax = e1.eax, .ebx = e1.ebx, .ecx = e1.ecx, .edx = e1.edx };
-            }
-            if (top >= 0x8000_0004) for (&leaves.brand, 0..) |*b, i| {
-                const r = cpu.cpuid(0x8000_0002 + @as(u32, @intCast(i)), 0);
-                b.* = .{ .eax = r.eax, .ebx = r.ebx, .ecx = r.ecx, .edx = r.edx };
-            };
-            const n = percpu.count();
-            const cpus = try heap.allocator.alloc(cpuinfo.Cpu, n); // up to 256: not on the stack
-            defer heap.allocator.free(cpus);
-            for (cpus, 0..) |*c, i| c.* = .{ .number = @intCast(i), .apic_id = percpu.get(i).apic_id };
-            return cpuinfo.format(heap.allocator, leaves, cpus, clock.tscHz());
+        .comm => {
+            // The thread the process is known by: its first.
+            var buf: [16]u8 = undefined;
+            return std.fmt.allocPrint(heap.allocator, "{s}\n", .{threadComm(p, p.pid, &buf)});
         },
+        .status => return statusText(p),
+        .statm => {
+            // size resident shared text lib data dt, in pages.
+            const size_pages = blk: {
+                const held = p.mem.lock.acquire();
+                defer p.mem.lock.release(held);
+                break :blk p.mem.regions.accessiblePages();
+            };
+            return std.fmt.allocPrint(heap.allocator, "{d} {d} 0 0 0 {d} 0\n", .{ size_pages, p.pages, p.pages });
+        },
+        .mounts => return heap.allocator.dupe(u8, "initrd / tarfs ro,relatime 0 0\ntmpfs /tmp tmpfs rw,relatime 0 0\nproc /proc proc rw,relatime 0 0\nsysfs /sys sysfs ro,relatime 0 0\ncgroup2 /sys/fs/cgroup cgroup2 ro,relatime 0 0\ndevtmpfs /dev devtmpfs rw,relatime 0 0\n"),
+        .task_comm, .task_stat => return heap.allocator.dupe(u8, ""), // through `generateThread`
+        .cpuinfo => return cpuinfoText(),
         .cpus_online, .cg_cpuset => {
             var buf: [24]u8 = undefined;
             return heap.allocator.dupe(u8, cpuinfo.rangeList(&buf, percpu.count()));
@@ -303,6 +406,11 @@ fn cacheText(arg: u8) error{OutOfMemory}![]u8 {
 
 /// The name `stat` and `comm` give: the program file's name, at most 15
 /// characters, as Linux keeps it.
+/// The name a process has in `/proc` (its program's file name, 15 bytes).
+pub fn commOf(p: *const proc.Process) []const u8 {
+    return comm(p);
+}
+
 fn comm(p: *const proc.Process) []const u8 {
     const base = if (std.mem.lastIndexOfScalar(u8, p.name, '/')) |i| p.name[i + 1 ..] else p.name;
     return base[0..@min(base.len, 15)];

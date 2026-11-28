@@ -350,8 +350,9 @@ pub fn main() noreturn {
     expect(lib.syscall(Sys.set_robust_list, @intFromPtr(&link), 8, 0) == lib.err(.INVAL), 158);
     expect(lib.syscall6(Sys.rseq, @intFromPtr(&link), 31, 0, 0, 0, 0) == lib.err(.INVAL), 159); // offered (`/test/rseq`); not this short
 
-    // prctl: no option is known.
-    expect(lib.syscall(Sys.prctl, 15, 0, 0) == lib.err(.INVAL), 122);
+    // prctl: the thread's name (`/test/files`); other options are not known.
+    expect(lib.syscall(Sys.prctl, 15, 0, 0) == lib.err(.FAULT), 122);
+    expect(lib.syscall(Sys.prctl, 9999, 0, 0) == lib.err(.INVAL), 179);
 
     _ = lib.syscall(Sys.exit_group, 0, 0, 0);
     lib.exit(99); // exit_group returned

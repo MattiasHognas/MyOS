@@ -78,6 +78,9 @@ pub const OpenFile = struct {
     /// Set once `flock` has been asked for on it: its locks are given up
     /// when it goes (`destroy`).
     locked: bool = false,
+    /// For a thread's `comm` in `/proc` opened for writing: whose name a
+    /// write sets.
+    comm_target: ?struct { pid: u64, tid: u64 } = null,
 };
 
 var next_serial: std.atomic.Value(u64) = .init(1);
